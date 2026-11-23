@@ -4011,6 +4011,7 @@ name = "pluto-browser"
 version = "0.1.0"
 dependencies = [
  "libcosmic",
+ "pluto-paint",
  "tokio",
  "tracing",
  "wgpu",
@@ -4048,6 +4049,8 @@ name = "pluto-layout"
 version = "0.1.0"
 dependencies = [
  "cosmic-text",
+ "pluto-css",
+ "pluto-html",
  "taffy",
  "thiserror 2.0.21",
 ]
@@ -4071,7 +4074,11 @@ dependencies = [
 name = "pluto-paint"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "cosmic-text",
+ "pluto-css",
+ "pluto-html",
+ "pluto-layout",
  "thiserror 2.0.21",
  "wgpu",
 ]

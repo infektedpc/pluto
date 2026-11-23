@@ -8,3 +8,4 @@ libcosmic.workspace = true
 wgpu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+pluto-paint.workspace = true

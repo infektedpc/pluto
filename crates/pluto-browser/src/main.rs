@@ -3,6 +3,8 @@ mod viewport;
 use cosmic::app::{Core, Task};
 use cosmic::iced::{Alignment, Length};
 use cosmic::{Application, Element, executor, widget};
+use pluto_paint::DisplayList;
+use std::sync::Arc;
 use viewport::WebViewport;
 
 pub struct PlutoBrowser {
@@ -87,6 +89,9 @@ impl Application for PlutoBrowser {
         let web_view = cosmic::iced::widget::Shader::new(WebViewport {
             url: self.active_url.clone(),
             clear_color: [1.0, 1.0, 1.0, 1.0],
+            // M1.4 replaces this with the laid-out page; until then the
+            // viewport draws nothing (white, from clear_color).
+            display: Arc::new(DisplayList::new()),
         })
         .width(Length::Fill)
         .height(Length::Fill);

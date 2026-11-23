@@ -3,9 +3,9 @@
 //! libcosmic renders with wgpu under the hood, so `cosmic::iced::widget::Shader`
 //! hands the engine the shared `wgpu::Device`, `wgpu::Queue`, and render pass
 //! directly -- no CPU pixel readbacks. The `Program` produces a `Primitive`
-//! per frame; the `Primitive::prepare` step is where Pluto will upload its
-//! display-list vertex buffers and cosmic-text glyph atlases, and
-//! `Primitive::render` is where those get drawn.
+//! per frame; `Primitive::prepare` uploads the display-list vertex buffers
+//! and glyph atlas through [`PaintRenderer`], and `Primitive::render` draws
+//! them into the viewport's scissored region of the window texture.
 //!
 //! Import notes (verified against the pinned libcosmic rev `ecc5fe4`):
 //! - The shader widget is NOT `cosmic::widget::shader`; it lives at
@@ -17,11 +17,16 @@
 use cosmic::iced::widget::shader::{self, Pipeline, Primitive, Program};
 use cosmic::iced::wgpu;
 use cosmic::iced::{Rectangle, mouse};
+use pluto_paint::renderer::PaintRenderer;
+use pluto_paint::DisplayList;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct WebViewport {
     pub url: String,
     pub clear_color: [f32; 4],
+    /// The page to draw; empty until M1.4 wires fetch -> parse -> layout.
+    pub display: Arc<DisplayList>,
 }
 
 impl<Message> Program<Message> for WebViewport {
@@ -37,6 +42,7 @@ impl<Message> Program<Message> for WebViewport {
         WebPrimitive {
             bounds,
             clear_color: self.clear_color,
+            display: Arc::clone(&self.display),
         }
     }
 }
@@ -45,17 +51,22 @@ impl<Message> Program<Message> for WebViewport {
 pub struct WebPrimitive {
     bounds: Rectangle,
     clear_color: [f32; 4],
+    display: Arc<DisplayList>,
 }
 
-pub struct WebRenderPipeline;
+pub struct WebRenderPipeline {
+    renderer: PaintRenderer,
+}
 
 impl Pipeline for WebRenderPipeline {
     fn new(
-        _device: &wgpu::Device,
+        device: &wgpu::Device,
         _queue: &wgpu::Queue,
-        _format: wgpu::TextureFormat,
+        format: wgpu::TextureFormat,
     ) -> Self {
-        Self
+        Self {
+            renderer: PaintRenderer::new(device, format),
+        }
     }
 }
 
@@ -64,21 +75,27 @@ impl Primitive for WebPrimitive {
 
     fn prepare(
         &self,
-        _pipeline: &mut Self::Pipeline,
-        _device: &wgpu::Device,
-        _queue: &wgpu::Queue,
+        pipeline: &mut Self::Pipeline,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
         _bounds: &Rectangle,
         _viewport: &shader::Viewport,
     ) {
-        // Upload Pluto display-list vertex buffers & cosmic-text glyph atlases here.
-        // `self.clear_color` is the page background the first quad will paint.
+        // Upload the display-list vertex buffers and any new glyphs.
+        // `self.clear_color` is the fallback page background when the
+        // display list has no canvas fill yet.
         let _ = self.clear_color;
-        let _ = self.bounds;
+        pipeline.renderer.prepare(
+            &self.display,
+            device,
+            queue,
+            (self.bounds.width, self.bounds.height),
+        );
     }
 
     fn render(
         &self,
-        _pipeline: &Self::Pipeline,
+        pipeline: &Self::Pipeline,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         clip_bounds: &Rectangle<u32>,
@@ -111,6 +128,6 @@ impl Primitive for WebPrimitive {
             clip_bounds.width,
             clip_bounds.height,
         );
-        // Draw Pluto page background quad + laid-out quads & text here.
+        pipeline.renderer.render(&mut pass);
     }
 }

@@ -24,6 +24,7 @@ license = "MIT OR Apache-2.0"
 # from the one pluto-paint sees. One version everywhere, or nothing works.
 [workspace.dependencies]
 bytes = "1"
+bytemuck = "1"
 tokio = { version = "1", features = ["full"] }
 winnow = "0.7"
 taffy = "0.15"
@@ -53,9 +54,16 @@ http-body-util = "0.1"
 slotmap = "1"
 thiserror = "2"
 tracing = "0.1"
+pluto-html = { path = "crates/pluto-html", version = "0.1.0" }
+pluto-css = { path = "crates/pluto-css", version = "0.1.0" }
+pluto-layout = { path = "crates/pluto-layout", version = "0.1.0" }
 
 [workspace.dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic"
 rev = "ecc5fe4164e1c9024b932382d24ea41f24147e75"
 default-features = false
 features = ["wgpu", "tokio", "wayland", "x11"]
+
+[workspace.dependencies.pluto-paint]
+path = "crates/pluto-paint"
+version = "0.1.0"

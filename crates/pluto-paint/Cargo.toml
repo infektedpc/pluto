@@ -7,3 +7,10 @@ edition.workspace = true
 wgpu.workspace = true
 cosmic-text.workspace = true
 thiserror.workspace = true
+bytemuck.workspace = true
+pluto-layout.workspace = true
+
+# Only the tests build example documents, so these stay dev-only.
+[dev-dependencies]
+pluto-html.workspace = true
+pluto-css.workspace = true
