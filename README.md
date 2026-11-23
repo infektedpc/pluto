@@ -10,17 +10,31 @@ in Rust (`pluto-net`, `pluto-html`, `pluto-css`, `pluto-layout`,
 cargo run -p pluto-browser
 ```
 
-The window opens with a nav bar (Back / Forward / Reload / URL / Go) and a
-blank white viewport. Pressing Go records the URL but fetches nothing yet —
-the engine crates are stubs; see "Next step" below.
+The window opens with a nav bar (Back / Forward / Reload / URL / Go), a
+status line, and a viewport that loads https://example.com on startup —
+grey page, white centered box, "Example Domain" heading, paragraph, and
+link. The status line reads `Loaded https://example.com` when the page
+is up. Type a URL and press Go to navigate (a bare host works:
+`example.com` becomes `https://example.com`). A failed fetch renders
+an error page instead of a blank window.
 
 Build notes:
 
-- Toolchain: stable Rust 1.99 (`~/.cargo/bin` must be on `PATH`;
-  `cargo` is not on the default `PATH` in this VM).
-- `pluto-js` uses rquickjs with `bindgen`, which needs libclang:
+- Toolchain: stable Rust 1.99+ (`cargo` on `PATH`; install via
+  https://rustup.rs if it's missing). First build downloads the
+  dependency tree including the libcosmic git pin, so allow a few
+  minutes and a network connection.
+- System libraries: the same ones Frost needs (libcosmic/wayland/X11
+  stack). If Frost builds and runs on your box, Pluto should too — if
+  a build error names a missing system library, that's the one to
+  install.
+- No libclang needed: `pluto-js` uses rquickjs with pre-generated
+  bindings (the `bindgen` feature was dropped during bootstrap).
+- No gstreamer needed in M1: there is no media yet.
+- Clone is plain git — one repo, no submodules:
   ```sh
-  export LIBCLANG_PATH="$HOME/workspace/harness-tmp/llvm18/usr/lib/llvm-18/lib"
+  git clone https://github.com/infektedpc/pluto.git
+  cd pluto
   ```
 
 ## Version notes (read before "upgrading" anything)
@@ -47,15 +61,10 @@ during bootstrap, verified against the actual sources:
   (field is `pub(crate)`), so the window opens at the default 1024x768
   instead of 1280x800.
 
-## Next step — Milestone 1: "Hello, example.com"
+## Next step — Milestone 2
 
-End-to-end static page pipeline (see `ARCHITECTURE.md` for the full
-M1–M5 roadmap). Order:
-
-1. `pluto-net` — async HTTP/1.1 + HTTP/2 client, redirects 301/302/307/308
-2. `pluto-html` & `pluto-css` — winnow parsers (core tags, basic rules)
-3. `pluto-layout` & `pluto-paint` — taffy block/flex + cosmic-text,
-   quads and glyphs via wgpu in the viewport
-
-Done means: https://example.com renders its centered container, heading,
-paragraph, and link inside the libcosmic window.
+Full selectors and specificity, UA stylesheet, external `<link>` CSS,
+grid, border-radius, box-shadow, overflow/scroll, hit-testing,
+clickable links, and Back/Forward history (see `ARCHITECTURE.md` for
+the full M1–M10 roadmap). Done means 60+ FPS browsing of info.cern.ch,
+Hacker News, and Rust docs.
