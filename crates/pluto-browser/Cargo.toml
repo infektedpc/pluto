@@ -9,3 +9,7 @@ wgpu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 pluto-paint.workspace = true
+pluto-net.workspace = true
+pluto-html.workspace = true
+pluto-css.workspace = true
+pluto-layout.workspace = true

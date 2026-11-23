@@ -1,3 +1,4 @@
+mod page;
 mod viewport;
 
 use cosmic::app::{Core, Task};
@@ -11,6 +12,8 @@ pub struct PlutoBrowser {
     core: Core,
     url_input: String,
     active_url: String,
+    display: Arc<DisplayList>,
+    status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +23,20 @@ pub enum Message {
     Back,
     Forward,
     Reload,
+    PageLoaded(Arc<DisplayList>, String),
+    PageFailed(String),
+}
+
+/// Start loading `url` in the background; the result arrives as
+/// `PageLoaded` / `PageFailed`. This libcosmic pin's `Task` carries
+/// `Action<Message>`, so the mapper wraps the message in `Action::App`.
+fn load_task(url: String) -> Task<Message> {
+    Task::perform(page::load_page(url), |result| match result {
+        Ok((display, final_url)) => {
+            cosmic::Action::App(Message::PageLoaded(display, final_url))
+        }
+        Err(err) => cosmic::Action::App(Message::PageFailed(err)),
+    })
 }
 
 impl Application for PlutoBrowser {
@@ -38,22 +55,49 @@ impl Application for PlutoBrowser {
     }
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Self::Message>) {
+        let url = page::DEFAULT_URL.to_string();
         let app = Self {
             core,
-            url_input: "https://example.com".to_string(),
-            active_url: "https://example.com".to_string(),
+            url_input: url.clone(),
+            active_url: url.clone(),
+            display: Arc::new(DisplayList::new()),
+            status: format!("Loading {url}…"),
         };
-        (app, Task::none())
+        (app, load_task(url))
     }
 
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
         match message {
             Message::UrlChanged(val) => self.url_input = val,
             Message::Navigate => {
-                self.active_url = self.url_input.clone();
-                // Trigger pluto-net fetch -> pluto-html -> pluto-css -> pluto-layout
+                let url = page::normalize_url(&self.url_input);
+                self.active_url = url.clone();
+                self.url_input = url.clone();
+                self.display = Arc::new(DisplayList::new());
+                self.status = format!("Loading {url}…");
+                return load_task(url);
             }
-            Message::Back | Message::Forward | Message::Reload => {}
+            Message::Reload => {
+                let url = self.active_url.clone();
+                self.display = Arc::new(DisplayList::new());
+                self.status = format!("Loading {url}…");
+                return load_task(url);
+            }
+            Message::PageLoaded(display, final_url) => {
+                self.display = display;
+                self.active_url = final_url.clone();
+                self.url_input = final_url.clone();
+                self.status = format!("Loaded {final_url}");
+            }
+            Message::PageFailed(err) => {
+                // Render the failure as a page; the status line says why.
+                self.display =
+                    page::build_display_list(&page::error_document(&self.active_url, &err));
+                self.status = format!("Failed: {err}");
+            }
+            Message::Back | Message::Forward => {
+                // History lands in M2; no-op for now.
+            }
         }
         Task::none()
     }
@@ -89,16 +133,17 @@ impl Application for PlutoBrowser {
         let web_view = cosmic::iced::widget::Shader::new(WebViewport {
             url: self.active_url.clone(),
             clear_color: [1.0, 1.0, 1.0, 1.0],
-            // M1.4 replaces this with the laid-out page; until then the
-            // viewport draws nothing (white, from clear_color).
-            display: Arc::new(DisplayList::new()),
+            display: Arc::clone(&self.display),
         })
         .width(Length::Fill)
         .height(Length::Fill);
 
+        let status = widget::text(&self.status).size(12);
+
         widget::column([
             nav_bar.into(),
             widget::divider::horizontal::default().into(),
+            status.into(),
             web_view.into(),
         ])
         .into()

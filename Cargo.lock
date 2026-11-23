@@ -4011,6 +4011,10 @@ name = "pluto-browser"
 version = "0.1.0"
 dependencies = [
  "libcosmic",
+ "pluto-css",
+ "pluto-html",
+ "pluto-layout",
+ "pluto-net",
  "pluto-paint",
  "tokio",
  "tracing",
