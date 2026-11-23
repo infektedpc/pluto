@@ -1,0 +1,9 @@
+[package]
+name = "pluto-paint"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wgpu.workspace = true
+cosmic-text.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "pluto-browser"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libcosmic.workspace = true
+wgpu.workspace = true
+tokio.workspace = true
+tracing.workspace = true

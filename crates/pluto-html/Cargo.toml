@@ -1,0 +1,9 @@
+[package]
+name = "pluto-html"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+winnow.workspace = true
+slotmap.workspace = true
+thiserror.workspace = true

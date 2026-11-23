@@ -1,0 +1,9 @@
+[package]
+name = "pluto-layout"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+taffy.workspace = true
+cosmic-text.workspace = true
+thiserror.workspace = true
