@@ -56,6 +56,7 @@ impl Application for PlutoBrowser {
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Self::Message>) {
         let url = page::DEFAULT_URL.to_string();
+        eprintln!("[pluto] starting, loading {url}");
         let app = Self {
             core,
             url_input: url.clone(),
@@ -157,6 +158,46 @@ fn main() -> cosmic::iced::Result {
     // NOTE: this libcosmic pin has no `Settings::size()` builder (the field
     // is pub(crate)); the default window is 1024x768. Resize after launch
     // or set it once a size builder exists upstream.
-    let settings = cosmic::app::Settings::default();
+    let settings =
+        cosmic::app::Settings::default().client_decorations(use_client_decorations());
     cosmic::app::run::<PlutoBrowser>(settings, ())
+}
+
+/// Whether libcosmic should draw the window frame itself (client-side
+/// decorations). Use the window manager's frame when it provides one;
+/// only fall back to libcosmic drawing it where the WM doesn't — GNOME
+/// (Mutter on Wayland offers no server-side decorations). Without this,
+/// Pluto's window has no title bar or window controls at all, because
+/// the app draws no header bar of its own.
+fn use_client_decorations() -> bool {
+    let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match session.as_str() {
+        // X11 window managers draw the frame (KWin, Mutter, Xfwm...).
+        "x11" => false,
+        "wayland" => {
+            // GNOME is the holdout; KDE, sway, Hyprland, COSMIC and
+            // other wlroots compositors offer server-side decorations.
+            // An unknown compositor falls back to libcosmic drawing.
+            desktop.contains("gnome")
+                || !(desktop.contains("kde")
+                    || desktop.contains("sway")
+                    || desktop.contains("hyprland")
+                    || desktop.contains("cosmic")
+                    || desktop.contains("wlroots")
+                    || desktop.contains("labwc")
+                    || desktop.contains("wayfire"))
+        }
+        _ => {
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                desktop.contains("gnome") || desktop.is_empty()
+            } else {
+                // X11 (DISPLAY set) or no display vars: the WM usually
+                // draws the frame.
+                false
+            }
+        }
+    }
 }
