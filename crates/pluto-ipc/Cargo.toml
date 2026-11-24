@@ -1,0 +1,18 @@
+[package]
+name = "pluto-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+pluto-paint.workspace = true
+
+# Only the tests build real display lists, so this stays dev-only.
+[dev-dependencies]
+pluto-html.workspace = true
+pluto-css.workspace = true
+pluto-layout.workspace = true

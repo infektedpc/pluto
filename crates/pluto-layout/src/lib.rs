@@ -14,11 +14,24 @@
 //! the element's font size here (the CSS parser keeps them `Raw`).
 //! `display: none` subtrees are skipped entirely. Everything else the
 //! stylesheet says that M1 does not model is ignored, never an error.
+//!
+//! Style resolution runs as a separate two-phase pass before the taffy
+//! tree is built (Stage 4 #5): phase 1 collects every element into
+//! breadth-first levels from the root element, phase 2 resolves each
+//! level's styles — in parallel on rayon's shared pool, parents before
+//! children, so a level only ever reads styles resolved in earlier
+//! levels — into an owned `DomId -> Arc<ComputedStyle>` map. The
+//! `Builder` then looks styles up from that map instead of resolving
+//! them inline. The same level loop can run sequentially
+//! (`resolve_document_styles(..., parallel: false)`), so the two paths
+//! stay comparable and a serial fallback is real.
 
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, Weight};
 use pluto_css::{Stylesheet, Value};
 use pluto_html::{Dom, NodeId as DomId};
+use rayon::prelude::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 use taffy::{
     AvailableSpace, Dimension, Display, FlexDirection, LayoutInput, LayoutOutput, LengthPercentage,
     LengthPercentageAuto, NodeId as TaffyId, Size, Style, TaffyError, TaffyTree,
@@ -66,7 +79,7 @@ pub enum DisplayKind {
 }
 
 /// The computed style of one element: UA defaults + matched rules.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ComputedStyle {
     pub display: DisplayKind,
     pub width: Option<Dim>,
@@ -158,9 +171,14 @@ impl LayoutTree {
         viewport_height: f32,
     ) -> Result<Self, LayoutError> {
         let mut font_system = FontSystem::new();
+        // Two-phase style resolution (Stage 4 #5): every element's
+        // style is resolved up front, in parallel, before any taffy
+        // node is built. The builder looks styles up from this map.
+        let styles = resolve_document_styles(dom, sheet, true);
         let mut builder = Builder {
             dom,
             sheet,
+            styles,
             taffy: TaffyTree::new(),
             meta: HashMap::new(),
         };
@@ -269,11 +287,32 @@ fn find_element(dom: &Dom, id: DomId, tag: &str) -> Option<DomId> {
 struct Builder<'a> {
     dom: &'a Dom,
     sheet: &'a Stylesheet,
+    /// Pre-resolved styles for every element (two-phase pass, see
+    /// `resolve_document_styles`). `Arc`-shared: computed styles are
+    /// immutable once resolved, the Stylo pattern.
+    styles: HashMap<DomId, Arc<ComputedStyle>>,
     taffy: TaffyTree<NodeContext>,
     meta: HashMap<TaffyId, BoxMeta>,
 }
 
 impl<'a> Builder<'a> {
+    /// Style for `id` from the pre-resolved map. Falls back to an
+    /// inline resolve with the same inputs if the id was never
+    /// collected — e.g. a node outside the `<html>` subtree — so
+    /// behaviour stays identical; in practice the map covers every
+    /// element the builder visits.
+    fn style_for(
+        &self,
+        id: DomId,
+        parent_font_size: f32,
+        parent_color: [u8; 3],
+    ) -> ComputedStyle {
+        match self.styles.get(&id) {
+            Some(style) => (**style).clone(),
+            None => resolve_style(self.dom, id, self.sheet, parent_font_size, parent_color),
+        }
+    }
+
     /// Build a taffy node for one element (block or flex). Returns `None`
     /// for `display: none` and for inline elements (handled by the
     /// parent's inline pass).
@@ -283,7 +322,7 @@ impl<'a> Builder<'a> {
         parent_font_size: f32,
         parent_color: [u8; 3],
     ) -> Option<TaffyId> {
-        let style = resolve_style(self.dom, id, self.sheet, parent_font_size, parent_color);
+        let style = self.style_for(id, parent_font_size, parent_color);
         match style.display {
             DisplayKind::None | DisplayKind::Inline => None,
             _ => {
@@ -329,13 +368,7 @@ impl<'a> Builder<'a> {
             if self.dom.tag(child).is_none() {
                 continue;
             }
-            let style = resolve_style(
-                self.dom,
-                child,
-                self.sheet,
-                parent_style.font_size,
-                parent_style.color,
-            );
+            let style = self.style_for(child, parent_style.font_size, parent_style.color);
             match style.display {
                 DisplayKind::None => {}
                 DisplayKind::Inline => {
@@ -380,13 +413,7 @@ impl<'a> Builder<'a> {
             if self.dom.tag(child).is_none() {
                 continue;
             }
-            let child_style = resolve_style(
-                self.dom,
-                child,
-                self.sheet,
-                style.font_size,
-                style.color,
-            );
+            let child_style = self.style_for(child, style.font_size, style.color);
             match child_style.display {
                 DisplayKind::None => {}
                 DisplayKind::Inline => {
@@ -603,6 +630,118 @@ fn collect_boxes(
     for &child in &m.children {
         collect_boxes(taffy, meta, child, (x, y), out);
     }
+}
+
+// ---- two-phase style resolution (Stage 4 #5) ----
+
+/// Phase 1: collect every element node of the DOM into breadth-first
+/// levels from `roots` (level 0). Each entry knows its parent element
+/// (`None` for a root). Only elements are collected — text nodes carry
+/// no style and never pass inheritance on — but `display: none`
+/// subtrees are collected too: their styles are computed and unused,
+/// which keeps collection independent of style values. Which nodes get
+/// boxes is unchanged; the builder still skips `display: none`.
+fn collect_style_levels(
+    dom: &Dom,
+    roots: &[DomId],
+) -> Vec<Vec<(DomId, Option<DomId>)>> {
+    let mut levels: Vec<Vec<(DomId, Option<DomId>)>> = Vec::new();
+    let mut frontier: Vec<(DomId, Option<DomId>)> = roots
+        .iter()
+        .filter(|&&id| dom.tag(id).is_some())
+        .map(|&id| (id, None))
+        .collect();
+    while !frontier.is_empty() {
+        let mut next: Vec<(DomId, Option<DomId>)> = Vec::new();
+        for &(id, _) in &frontier {
+            for &child in dom.children(id) {
+                if dom.tag(child).is_some() {
+                    next.push((child, Some(id)));
+                }
+            }
+        }
+        levels.push(std::mem::take(&mut frontier));
+        frontier = next;
+    }
+    levels
+}
+
+/// Phase 2: resolve one style per entry of `levels`, level by level.
+/// A level's parents were all resolved in earlier levels, so each
+/// entry's parent font size / color is read from the already-resolved
+/// map and the entries of one level are independent: with
+/// `parallel` they resolve on rayon's shared global pool via
+/// `par_iter` over `&Dom` / `&Stylesheet` (both `Sync`, asserted in
+/// tests); without it the same loop runs sequentially, so the serial
+/// path is the same code path and a real fallback, not a comment.
+/// Returns an owned map from element to its (immutable, `Arc`-shared)
+/// computed style.
+fn resolve_styles(
+    dom: &Dom,
+    sheet: &Stylesheet,
+    levels: &[Vec<(DomId, Option<DomId>)>],
+    parallel: bool,
+) -> HashMap<DomId, Arc<ComputedStyle>> {
+    let mut resolved: HashMap<DomId, Arc<ComputedStyle>> = HashMap::new();
+    for level in levels {
+        // Parent font size / color first (serial, cheap): the parallel
+        // closure then only reads `&Dom` / `&Stylesheet` plus its own
+        // inputs, never the map being built.
+        let inputs: Vec<(DomId, f32, [u8; 3])> = level
+            .iter()
+            .map(|&(id, parent)| {
+                let (font_size, color) = match parent {
+                    Some(p) => {
+                        let parent_style = resolved
+                            .get(&p)
+                            .expect("parent style resolved in an earlier level");
+                        (parent_style.font_size, parent_style.color)
+                    }
+                    None => (16.0, [0, 0, 0]),
+                };
+                (id, font_size, color)
+            })
+            .collect();
+        let resolve_one = |&(id, font_size, color): &(DomId, f32, [u8; 3])| {
+            (
+                id,
+                Arc::new(resolve_style(dom, id, sheet, font_size, color)),
+            )
+        };
+        let resolved_level: Vec<(DomId, Arc<ComputedStyle>)> = if parallel {
+            inputs.par_iter().map(resolve_one).collect()
+        } else {
+            inputs.iter().map(resolve_one).collect()
+        };
+        for (id, style) in resolved_level {
+            resolved.insert(id, style);
+        }
+    }
+    resolved
+}
+
+/// Resolve styles for the whole document: phase 1 from the `<html>`
+/// element, or — for a fragment without one — from the document
+/// root's element children (whose parent style is the same synthetic
+/// body default the builder uses), then phase 2. `LayoutTree::build`
+/// calls this with `parallel: true`.
+fn resolve_document_styles(
+    dom: &Dom,
+    sheet: &Stylesheet,
+    parallel: bool,
+) -> HashMap<DomId, Arc<ComputedStyle>> {
+    let root = dom.root().expect("Dom always has a root node");
+    let roots: Vec<DomId> = match find_element(dom, root, "html") {
+        Some(html) => vec![html],
+        None => dom
+            .children(root)
+            .iter()
+            .copied()
+            .filter(|&id| dom.tag(id).is_some())
+            .collect(),
+    };
+    let levels = collect_style_levels(dom, &roots);
+    resolve_styles(dom, sheet, &levels, parallel)
 }
 
 // ---- style resolution ----
@@ -1072,5 +1211,152 @@ mod tests {
         assert_eq!(a.y, b.y);
         assert_eq!(b.x, a.x + 100.0);
         assert_eq!(a.width, 100.0);
+    }
+
+    // ---- two-phase (parallel) style resolution (Stage 4 #5) ----
+
+    /// Compile-time proof that the parallel pass may share `&Dom` /
+    /// `&Stylesheet` across rayon threads. `Dom` is a slotmap arena
+    /// of plain owned data (`String` / `Vec` / `NodeId`), so it is
+    /// `Sync`; if a future change ever makes it non-`Sync` this test
+    /// fails to compile and the parallel design must stop there —
+    /// never work around it with unsafe code.
+    fn assert_sync<T: Sync>() {}
+
+    #[test]
+    fn shared_style_inputs_are_sync() {
+        assert_sync::<Dom>();
+        assert_sync::<Stylesheet>();
+        assert_sync::<ComputedStyle>();
+    }
+
+    /// The `<style>` text of a document, parsed (same extraction the
+    /// layout tests use).
+    fn stylesheet_from(dom: &Dom) -> Stylesheet {
+        let style = find_element(dom, dom.root().unwrap(), "style").unwrap();
+        let css: String = dom
+            .children(style)
+            .iter()
+            .filter_map(|&c| dom.text(c))
+            .collect();
+        Stylesheet::parse(&css)
+    }
+
+    fn assert_same_styles(
+        a: &HashMap<DomId, Arc<ComputedStyle>>,
+        b: &HashMap<DomId, Arc<ComputedStyle>>,
+    ) {
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "parallel and serial maps cover different numbers of elements"
+        );
+        for (id, style) in a {
+            let other = b
+                .get(id)
+                .unwrap_or_else(|| panic!("serial map has no style for {id:?}"));
+            assert_eq!(**style, **other, "computed style differs for {id:?}");
+        }
+    }
+
+    /// First element descendant of `id` (or `id` itself) with this class.
+    fn find_by_class(dom: &Dom, id: DomId, class: &str) -> Option<DomId> {
+        if dom.attr(id, "class") == Some(class) {
+            return Some(id);
+        }
+        for &child in dom.children(id) {
+            if let Some(found) = find_by_class(dom, child, class) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn parallel_and_serial_styles_match_example_com() {
+        let dom = parse_html(EXAMPLE_COM);
+        let sheet = stylesheet_from(&dom);
+
+        // Levels are parent-before-children: every entry's parent
+        // appears in an earlier level.
+        let html = find_element(&dom, dom.root().unwrap(), "html").unwrap();
+        let levels = collect_style_levels(&dom, &[html]);
+        let mut seen: Vec<DomId> = Vec::new();
+        for level in &levels {
+            for &(id, parent) in level {
+                if let Some(p) = parent {
+                    assert!(seen.contains(&p), "parent of {id:?} not in an earlier level");
+                }
+            }
+            seen.extend(level.iter().map(|&(id, _)| id));
+        }
+
+        let parallel = resolve_document_styles(&dom, &sheet, true);
+        let serial = resolve_document_styles(&dom, &sheet, false);
+        assert_same_styles(&parallel, &serial);
+        // html head title meta style body div h1 p p a
+        assert_eq!(parallel.len(), 11);
+        // Spot-checks through the parallel map: the div keeps its
+        // stylesheet width, the h1 its UA 32px font.
+        let div = find_element(&dom, dom.root().unwrap(), "div").unwrap();
+        assert_eq!(parallel[&div].width, Some(Dim::Px(600.0)));
+        let h1 = find_element(&dom, dom.root().unwrap(), "h1").unwrap();
+        assert_eq!(parallel[&h1].font_size, 32.0);
+    }
+
+    #[test]
+    fn parallel_and_serial_styles_match_wide_document() {
+        // 200 sibling <p> elements at one level under a wrapper, each
+        // with a <span> child: wide enough that rayon's `par_iter`
+        // actually splits the level across threads.
+        let mut html = String::from("<html><body><div class=\"wrap\">");
+        for i in 0..200 {
+            html.push_str(&format!(
+                "<p class=\"item\">Item {i} <span>inner {i}</span></p>"
+            ));
+        }
+        html.push_str("</div></body></html>");
+        let dom = parse_html(&html);
+        let sheet = Stylesheet::parse(
+            ".wrap { font-size: 20px; color: #112233; } \
+             .item { font-size: 150%; margin: 1em; } \
+             span { color: #ff0000; }",
+        );
+        let parallel = resolve_document_styles(&dom, &sheet, true);
+        let serial = resolve_document_styles(&dom, &sheet, false);
+        assert_same_styles(&parallel, &serial);
+        // html + body + div.wrap + 200 p + 200 span
+        assert_eq!(parallel.len(), 403);
+
+        // Inheritance through the parallel map: a `.item` inherits
+        // the wrap's 20px font, so 150% is 30px and `1em` is 30px.
+        let root = dom.root().unwrap();
+        let wrap = find_by_class(&dom, root, "wrap").unwrap();
+        assert_eq!(parallel[&wrap].font_size, 20.0);
+        assert_eq!(parallel[&wrap].color, [0x11, 0x22, 0x33]);
+        let item = find_by_class(&dom, root, "item").unwrap();
+        assert_eq!(parallel[&item].font_size, 30.0);
+        assert_eq!(parallel[&item].color, [0x11, 0x22, 0x33]);
+        assert_eq!(parallel[&item].margin, [Spacing::Px(30.0); 4]);
+        let span = find_element(&dom, item, "span").unwrap();
+        assert_eq!(parallel[&span].font_size, 30.0);
+        assert_eq!(parallel[&span].color, [255, 0, 0]);
+    }
+
+    #[test]
+    fn parallel_and_serial_styles_match_fragment() {
+        // No <html>: roots are the document's element children.
+        let dom = parse_html(
+            r#"<div class="hide"><p>one</p></div><div><p>two</p></div>"#,
+        );
+        let sheet = Stylesheet::parse(".hide { display: none; }");
+        let parallel = resolve_document_styles(&dom, &sheet, true);
+        let serial = resolve_document_styles(&dom, &sheet, false);
+        assert_same_styles(&parallel, &serial);
+        // Both divs and both paragraphs are collected even though
+        // the first subtree is `display: none` (computed, unused).
+        assert_eq!(parallel.len(), 4);
+        let hide = find_by_class(&dom, dom.root().unwrap(), "hide").unwrap();
+        assert_eq!(parallel[&hide].display, DisplayKind::None);
     }
 }

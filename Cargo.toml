@@ -7,6 +7,7 @@ members = [
     "crates/pluto-css",
     "crates/pluto-layout",
     "crates/pluto-paint",
+    "crates/pluto-ipc",
     "crates/pluto-js",
 ]
 
@@ -54,6 +55,21 @@ http-body-util = "0.1"
 slotmap = "1"
 thiserror = "2"
 tracing = "0.1"
+# Stage 4: the browser<->renderer protocol (pluto-ipc) and the
+# serialisable display list (pluto-paint) are serde types; postcard is
+# the byte format for the in-process SubmitDisplayList payload (the
+# same bytes cross IPC at M5). rayon is the single shared pool for
+# parallel style (#5) and image decode (#6).
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+rayon = "1"
+# Image decoding (Stage 4 #6; the <img> pipeline itself is M3).
+# M3 formats only — the full default set pulls decoders Pluto never
+# uses. image 0.25 is already in the lock via iced/libcosmic.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# fontdb 0.23 is the version cosmic-text 0.19 uses; pluto-paint names
+# it directly to resolve serialised glyph keys back to font ids.
+fontdb = "0.23"
 pluto-html = { path = "crates/pluto-html", version = "0.1.0" }
 pluto-css = { path = "crates/pluto-css", version = "0.1.0" }
 pluto-layout = { path = "crates/pluto-layout", version = "0.1.0" }
@@ -67,4 +83,8 @@ features = ["wgpu", "tokio", "wayland", "x11"]
 
 [workspace.dependencies.pluto-paint]
 path = "crates/pluto-paint"
+version = "0.1.0"
+
+[workspace.dependencies.pluto-ipc]
+path = "crates/pluto-ipc"
 version = "0.1.0"

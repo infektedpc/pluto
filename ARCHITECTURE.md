@@ -130,8 +130,20 @@ Goal: log into websites, persistent state, crash-safe tab isolation.
   headers), localStorage, sessionStorage backed by disk storage.
 - **Multi-process sandboxing**: split pluto-browser (UI, network,
   storage) from pluto-renderer worker processes over IPC, sharing
-  rendered frames cleanly so a misbehaving page or infinite JS loop
-  cannot freeze or crash the main browser window.
+  display lists (and, later, rendered frames for video/canvas)
+  cleanly so a misbehaving page or infinite JS loop cannot freeze or
+  crash the main browser window. Display lists — not rendered
+  frames — are the M5 handoff (Stage 4, departure D1): they align
+  Pluto with Firefox/Servo rather than Chromium, keep the browser
+  process owning the one wgpu device and font system, and make the
+  IPC protocol (pluto-ipc, in-process since Stage 4) the same bytes
+  that cross the process boundary. Frame-sharing via DMA-BUF stays
+  a post-M5 optimisation for video/canvas only. The renderer at M5
+  is the same binary re-executed with `--renderer` (D3); there is
+  no separate GPU process at M5 (D4); seccomp sandboxing is
+  M5-adjacent, not M5 itself (D5); and the two font systems at M5
+  (one per process) are unavoidable under any out-of-process
+  renderer (D2).
 - **Done criteria**: type into search bars, submit forms, stay logged
   into basic web apps across restarts, close hung tabs cleanly.
 

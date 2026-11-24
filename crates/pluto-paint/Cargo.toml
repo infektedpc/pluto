@@ -7,8 +7,13 @@ license.workspace = true
 [dependencies]
 wgpu.workspace = true
 cosmic-text.workspace = true
+fontdb.workspace = true
 thiserror.workspace = true
 bytemuck.workspace = true
+serde.workspace = true
+postcard.workspace = true
+rayon.workspace = true
+image.workspace = true
 pluto-layout.workspace = true
 
 # Only the tests build example documents, so these stay dev-only.

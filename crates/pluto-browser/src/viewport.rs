@@ -18,7 +18,7 @@ use cosmic::iced::widget::shader::{self, Pipeline, Primitive, Program};
 use cosmic::iced::wgpu;
 use cosmic::iced::{Rectangle, mouse};
 use pluto_paint::renderer::PaintRenderer;
-use pluto_paint::DisplayList;
+use pluto_paint::{DisplayList, ResourceTable};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -26,6 +26,14 @@ pub struct WebViewport {
     pub clear_color: [f32; 4],
     /// The page to draw; empty until M1.4 wires fetch -> parse -> layout.
     pub display: Arc<DisplayList>,
+    /// The resource table the display list's image/blob ids resolve
+    /// against. Owned by the shell's compositor holder (Stage 4 #3);
+    /// empty until M3 produces images.
+    pub resources: Arc<ResourceTable>,
+    /// The compositor holder's scroll offset, in page pixels. It is
+    /// a view transform only: the renderer subtracts it in the
+    /// vertex shader, so a wheel event never round-trips to layout.
+    pub scroll: (f32, f32),
 }
 
 /// State the viewport widget keeps across frames: the last widget
@@ -39,9 +47,10 @@ impl Program<crate::Message> for WebViewport {
     type State = ViewportState;
     type Primitive = WebPrimitive;
 
-    /// Report the widget's bounds to the app when they change. The
-    /// bounds are the page area (window minus chrome) — the true
-    /// layout viewport. iced calls this on every event, including the
+    /// Report the widget's bounds to the app when they change, and
+    /// publish wheel events as scroll deltas. The bounds are the
+    /// page area (window minus chrome) — the true layout viewport.
+    /// iced calls this on every event, including the
     /// `RedrawRequested` that follows a resize's relayout, so the
     /// bounds here are current (the resize event itself still sees
     /// the pre-resize layout, but it publishes nothing: the bounds
@@ -49,14 +58,25 @@ impl Program<crate::Message> for WebViewport {
     /// change means one message per frame during a drag-resize, and
     /// nothing at all for mouse moves with unchanged bounds. The app
     /// re-lays out from the retained document and skips the message
-    /// entirely if the size is unchanged.
+    /// entirely if the size is unchanged. A wheel event scrolls
+    /// without touching layout at all: the shell stores the offset
+    /// in the compositor holder and the renderer subtracts it in
+    /// the vertex shader.
     fn update(
         &self,
         state: &mut Self::State,
-        _event: &cosmic::iced::Event,
+        event: &cosmic::iced::Event,
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Option<shader::Action<crate::Message>> {
+        if let cosmic::iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) = event {
+            // A line is ~16px; pixel deltas pass through as-is.
+            let (dx, dy) = match delta {
+                mouse::ScrollDelta::Lines { x, y } => (x * 16.0, y * 16.0),
+                mouse::ScrollDelta::Pixels { x, y } => (*x, *y),
+            };
+            return Some(shader::Action::publish(crate::Message::Scrolled(dx, dy)));
+        }
         let size = (bounds.width, bounds.height);
         if state.last_reported != Some(size) {
             state.last_reported = Some(size);
@@ -77,6 +97,8 @@ impl Program<crate::Message> for WebViewport {
             bounds,
             clear_color: self.clear_color,
             display: Arc::clone(&self.display),
+            resources: Arc::clone(&self.resources),
+            scroll: self.scroll,
         }
     }
 }
@@ -86,6 +108,8 @@ pub struct WebPrimitive {
     bounds: Rectangle,
     clear_color: [f32; 4],
     display: Arc<DisplayList>,
+    resources: Arc<ResourceTable>,
+    scroll: (f32, f32),
 }
 
 pub struct WebRenderPipeline {
@@ -121,9 +145,11 @@ impl Primitive for WebPrimitive {
         let _ = self.clear_color;
         pipeline.renderer.prepare(
             &self.display,
+            &self.resources,
             device,
             queue,
             (self.bounds.width, self.bounds.height),
+            self.scroll,
         );
     }
 

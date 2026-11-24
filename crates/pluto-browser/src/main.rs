@@ -1,9 +1,13 @@
+mod compositor;
 mod page;
+mod renderer;
 mod viewport;
 
+use compositor::Compositor;
 use cosmic::app::{Core, Task};
 use cosmic::iced::{Alignment, Length};
 use cosmic::{Application, Element, executor, widget};
+use pluto_ipc::{BrowserToRenderer, CommandSender, RendererToBrowser};
 use pluto_paint::DisplayList;
 use std::sync::Arc;
 use viewport::WebViewport;
@@ -12,15 +16,21 @@ pub struct PlutoBrowser {
     core: Core,
     url_input: String,
     active_url: String,
-    display: Arc<DisplayList>,
+    /// The shell's compositor holder (Stage 4 #3): the last-good
+    /// display list, its resource table, and the scroll offset.
+    /// The worker owns the document; the shell never lays out.
+    compositor: Compositor,
     status: String,
-    /// The parsed page, retained so a resize re-lays out without
-    /// refetching. `None` until the first load lands.
-    document: Option<page::Document>,
-    /// Last laid-out viewport (CSS px, logical — the page area of
-    /// the window). Starts at the default window size; the viewport
-    /// widget corrects it on the first frame.
+    /// Last viewport sent to the worker (CSS px, logical — the page
+    /// area of the window). Starts at the default window size; the
+    /// viewport widget corrects it on the first frame.
     viewport: (f32, f32),
+    /// The worker's command channel, once the subscription starts
+    /// it (`RendererReady`). `None` until then.
+    renderer_tx: Option<CommandSender>,
+    /// A navigation that arrived before the worker started (the
+    /// first load), flushed on `RendererReady`.
+    pending_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,21 +40,44 @@ pub enum Message {
     Back,
     Forward,
     Reload,
-    PageLoaded(page::Document, String),
-    PageFailed(String),
+    /// The worker subscription started: this is its command sender.
+    RendererReady(CommandSender),
+    /// One event from the worker (commit, display list, failure...).
+    RendererEvent(RendererToBrowser),
     /// The viewport widget's bounds changed (window resize, or the
     /// first frame reporting the real page area).
     ViewportResized(f32, f32),
+    /// A wheel event in the viewport, in pixels.
+    Scrolled(f32, f32),
 }
 
-/// Start loading `url` in the background; the result arrives as
-/// `PageLoaded` / `PageFailed`. This libcosmic pin's `Task` carries
-/// `Action<Message>`, so the mapper wraps the message in `Action::App`.
-fn load_task(url: String) -> Task<Message> {
-    Task::perform(page::load_page(url), |result| match result {
-        Ok((document, final_url)) => cosmic::Action::App(Message::PageLoaded(document, final_url)),
-        Err(err) => cosmic::Action::App(Message::PageFailed(err)),
-    })
+impl PlutoBrowser {
+    /// Post one command to the worker, if it is running. A failed
+    /// send means the worker is gone; the subscription restarts it
+    /// and `RendererReady` re-syncs state.
+    fn send_command(&mut self, command: BrowserToRenderer) {
+        if let Some(tx) = &self.renderer_tx
+            && tx.send(command).is_err()
+        {
+            self.renderer_tx = None;
+        }
+    }
+
+    /// Start a navigation: update the address bar and status, reset
+    /// the scroll, and hand the URL to the worker — or hold it until
+    /// the worker starts. The old page stays visible until the new
+    /// list lands: the holder keeps the last-good list.
+    fn commit(&mut self, url: String) {
+        self.active_url = url.clone();
+        self.url_input = url.clone();
+        self.compositor.reset_scroll();
+        self.status = format!("Loading {url}…");
+        if self.renderer_tx.is_some() {
+            self.send_command(BrowserToRenderer::CommitNavigation { url });
+        } else {
+            self.pending_url = Some(url);
+        }
+    }
 }
 
 /// A bundled toolbar icon: a Cosmic symbolic SVG, tinted by the
@@ -87,16 +120,26 @@ impl Application for PlutoBrowser {
         core.window.header_title = "Pluto".to_string();
         let url = page::DEFAULT_URL.to_string();
         eprintln!("[pluto] starting, loading {url}");
+        // No load task here: the worker subscription (Stage 4 #2)
+        // starts the pipeline, and the first navigation is flushed
+        // to it as `pending_url` when it reports ready.
         let app = Self {
             core,
             url_input: url.clone(),
             active_url: url.clone(),
-            display: Arc::new(DisplayList::new()),
+            compositor: Compositor::new(),
             status: format!("Loading {url}…"),
-            document: None,
             viewport: page::DEFAULT_VIEWPORT,
+            renderer_tx: None,
+            pending_url: Some(url),
         };
-        (app, load_task(url))
+        (app, Task::none())
+    }
+
+    /// The renderer worker subscription (Stage 4 #2): the page
+    /// pipeline runs there, off the UI thread.
+    fn subscription(&self) -> cosmic::iced::Subscription<Self::Message> {
+        renderer::renderer_subscription()
     }
 
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
@@ -104,47 +147,84 @@ impl Application for PlutoBrowser {
             Message::UrlChanged(val) => self.url_input = val,
             Message::Navigate => {
                 let url = page::normalize_url(&self.url_input);
-                self.active_url = url.clone();
-                self.url_input = url.clone();
-                self.display = Arc::new(DisplayList::new());
-                // Drop the old page: a resize mid-load must not
-                // re-lay out stale content while the new one fetches.
-                self.document = None;
-                self.status = format!("Loading {url}…");
-                return load_task(url);
+                self.commit(url);
             }
             Message::Reload => {
                 let url = self.active_url.clone();
-                self.display = Arc::new(DisplayList::new());
-                self.document = None;
-                self.status = format!("Loading {url}…");
-                return load_task(url);
+                self.commit(url);
             }
-            Message::PageLoaded(document, final_url) => {
-                eprintln!("[pluto] page loaded: {final_url}");
-                // Layout at the current viewport, not the one the load
-                // started with — a resize mid-load must not leave a
-                // stale layout behind.
-                self.display = page::layout_document(&document, self.viewport);
-                eprintln!("[pluto] display list ready: {} items", self.display.0.len());
-                self.document = Some(document);
-                self.active_url = final_url.clone();
-                self.url_input = final_url.clone();
-                self.status = format!("Loaded {final_url}");
+            Message::RendererReady(tx) => {
+                // The worker is up: sync its viewport first (it
+                // starts at the default size), then flush the
+                // pending navigation.
+                self.renderer_tx = Some(tx);
+                self.send_command(BrowserToRenderer::Resize {
+                    width: self.viewport.0,
+                    height: self.viewport.1,
+                });
+                if let Some(url) = self.pending_url.take() {
+                    self.send_command(BrowserToRenderer::CommitNavigation { url });
+                }
             }
-            Message::PageFailed(err) => {
-                eprintln!("[pluto] page failed: {err}");
-                // Render the failure as a page; the status line says why.
-                // The error document is retained like a real one, so a
-                // later resize re-lays it out too.
-                let (display, document) = page::build_display_list(
-                    &page::error_document(&self.active_url, &err),
-                    self.viewport,
-                );
-                self.display = display;
-                self.document = Some(document);
-                self.status = format!("Failed: {err}");
-            }
+            Message::RendererEvent(event) => match event {
+                RendererToBrowser::DidCommit { url, status } => {
+                    eprintln!("[pluto] page loaded: {url}");
+                    self.active_url = url.clone();
+                    self.url_input = url;
+                    self.status = status;
+                }
+                RendererToBrowser::SubmitDisplayList {
+                    epoch,
+                    bytes,
+                    resources,
+                } => {
+                    // The list crosses as postcard bytes even
+                    // in-process — the same bytes that cross IPC at
+                    // M5. Decode and validate before installing: a
+                    // corrupt or out-of-bounds list never reaches
+                    // the GPU.
+                    match DisplayList::from_bytes(&bytes) {
+                        Ok(list) => match list.validate(&resources) {
+                            Ok(()) => {
+                                if self.compositor.submit(
+                                    epoch,
+                                    Arc::new(list),
+                                    Arc::new(resources),
+                                ) {
+                                    eprintln!(
+                                        "[pluto] display list ready: epoch {}",
+                                        self.compositor.epoch()
+                                    );
+                                }
+                            }
+                            Err(err) => eprintln!(
+                                "[pluto] ignoring invalid display list (epoch {epoch}): {err:?}"
+                            ),
+                        },
+                        Err(err) => eprintln!(
+                            "[pluto] ignoring undecodable display list (epoch {epoch}): {err:?}"
+                        ),
+                    }
+                }
+                RendererToBrowser::LoadFailed { reason, .. } => {
+                    // The worker already submitted the error page as
+                    // a display list; the status line says why.
+                    self.status = format!("Failed: {reason}");
+                }
+                RendererToBrowser::TitleChanged { .. } => {
+                    // M3 (multi-tab) reads the title; the shell
+                    // ignores it for now.
+                }
+                RendererToBrowser::RendererCrashed { reason } => {
+                    eprintln!("[pluto] renderer crashed: {reason}");
+                    self.status = format!("Renderer crashed: {reason}");
+                    // The stale list stays visible; the next
+                    // navigation recovers.
+                }
+                RendererToBrowser::RequestResource { .. } => {
+                    // M2 (subresources) fetches these; ignored now.
+                }
+            },
             Message::ViewportResized(width, height) => {
                 // Degenerate sizes (minimised window) carry no layout;
                 // a real size arrives when the window is restored.
@@ -154,16 +234,16 @@ impl Application for PlutoBrowser {
                 // Skip when nothing changed: the widget only publishes
                 // on a bounds change, and the layout is deterministic
                 // at a fixed size, so a repeat would be pure waste.
-                // (Compare against the last *laid-out* size, not the
-                // last event — the two can differ mid-load.)
                 if (width, height) == self.viewport {
                     return Task::none();
                 }
                 self.viewport = (width, height);
-                if let Some(document) = &self.document {
-                    eprintln!("[pluto] viewport resized to {width}x{height}, re-layout");
-                    self.display = page::layout_document(document, self.viewport);
-                }
+                self.send_command(BrowserToRenderer::Resize { width, height });
+            }
+            Message::Scrolled(dx, dy) => {
+                // Wheel scrolling never touches layout: the holder
+                // stores the offset and the renderer subtracts it.
+                self.compositor.scroll_by(dx, dy);
             }
             Message::Back | Message::Forward => {
                 // History lands in M2; no-op for now.
@@ -209,11 +289,13 @@ impl Application for PlutoBrowser {
         .padding(8)
         .align_y(Alignment::Center);
 
-        // NOTE: `cosmic::widget::shader` does not exist in this libcosmic pin;
-        // the shader widget is `cosmic::iced::widget::Shader`.
+        // The viewport draws whatever the compositor holder
+        // currently holds; the worker updates it from its thread.
         let web_view = cosmic::iced::widget::Shader::new(WebViewport {
             clear_color: [1.0, 1.0, 1.0, 1.0],
-            display: Arc::clone(&self.display),
+            display: Arc::clone(self.compositor.display()),
+            resources: Arc::clone(self.compositor.resources()),
+            scroll: self.compositor.scroll(),
         })
         .width(Length::Fill)
         .height(Length::Fill);

@@ -347,7 +347,7 @@ mod tests {
                     assert_eq!(ag.len(), bg.len());
                     for (g, h) in ag.iter().zip(bg.iter()) {
                         assert_eq!((g.x, g.y), (h.x, h.y));
-                        assert_eq!(g.cache_key, h.cache_key);
+                        assert_eq!(g.key, h.key);
                     }
                 }
                 _ => panic!("display list items differ between identical layouts"),
