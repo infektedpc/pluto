@@ -2,6 +2,7 @@
 name = "pluto-layout"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 taffy.workspace = true

@@ -2,6 +2,7 @@
 name = "pluto-html"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 winnow.workspace = true

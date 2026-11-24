@@ -354,6 +354,17 @@ impl PaintRenderer {
             bind_group_layouts: &[&uniform_bind_group_layout, &atlas_bind_group_layout],
             immediate_size: 0,
         });
+        // The rect pipeline needs only the uniform. Built with the
+        // shared two-group layout, wgpu demands bind group 1 be set at
+        // draw time even though the rect shader never uses it — a
+        // validation panic that only surfaced once a FillRect actually
+        // drew (the white canvas default).
+        let rect_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("pluto rect pipeline layout"),
+                bind_group_layouts: &[&uniform_bind_group_layout],
+                immediate_size: 0,
+            });
         let rect_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("pluto rect shader"),
             source: wgpu::ShaderSource::Wgsl(RECT_WGSL.into()),
@@ -364,7 +375,7 @@ impl PaintRenderer {
         });
         let rect_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("pluto rect pipeline"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&rect_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &rect_shader,
                 entry_point: Some("rect_vs"),
