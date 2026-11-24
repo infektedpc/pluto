@@ -84,12 +84,14 @@ impl Application for PlutoBrowser {
                 return load_task(url);
             }
             Message::PageLoaded(display, final_url) => {
+                eprintln!("[pluto] page loaded: {final_url}");
                 self.display = display;
                 self.active_url = final_url.clone();
                 self.url_input = final_url.clone();
                 self.status = format!("Loaded {final_url}");
             }
             Message::PageFailed(err) => {
+                eprintln!("[pluto] page failed: {err}");
                 // Render the failure as a page; the status line says why.
                 self.display =
                     page::build_display_list(&page::error_document(&self.active_url, &err));
@@ -131,7 +133,6 @@ impl Application for PlutoBrowser {
         // NOTE: `cosmic::widget::shader` does not exist in this libcosmic pin;
         // the shader widget is `cosmic::iced::widget::Shader`.
         let web_view = cosmic::iced::widget::Shader::new(WebViewport {
-            url: self.active_url.clone(),
             clear_color: [1.0, 1.0, 1.0, 1.0],
             display: Arc::clone(&self.display),
         })

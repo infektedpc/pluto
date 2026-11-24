@@ -23,7 +23,6 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct WebViewport {
-    pub url: String,
     pub clear_color: [f32; 4],
     /// The page to draw; empty until M1.4 wires fetch -> parse -> layout.
     pub display: Arc<DisplayList>,

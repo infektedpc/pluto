@@ -41,10 +41,26 @@ pub fn normalize_url(input: &str) -> String {
 /// parse the HTML, lay it out, and paint it. Returns the display list
 /// and the final URL after redirects. The loader is fresh per navigation
 /// in M1 (no shared connection pool yet).
+///
+/// Logs each stage to stderr: the terminal is the only window into a
+/// load that stalls (no logging framework is wired up yet).
 pub async fn load_page(url: String) -> Result<(Arc<DisplayList>, String), String> {
+    eprintln!("[pluto] fetching {url}");
     let loader = ResourceLoader::new();
-    let response = loader.fetch(&url).await.map_err(|e| e.to_string())?;
+    let response = match loader.fetch(&url).await {
+        Ok(response) => response,
+        Err(e) => {
+            eprintln!("[pluto] fetch failed: {e}");
+            return Err(e.to_string());
+        }
+    };
+    eprintln!(
+        "[pluto] fetched {} ({} bytes), building display list",
+        response.final_url,
+        response.body.len()
+    );
     let display = build_display_list(&response.text());
+    eprintln!("[pluto] display list ready: {} items", display.0.len());
     Ok((display, response.final_url.to_string()))
 }
 
