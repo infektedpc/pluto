@@ -18,6 +18,16 @@ is up. Type a URL and press Go to navigate (a bare host works:
 `example.com` becomes `https://example.com`). A failed fetch renders
 an error page instead of a blank window.
 
+The window frame follows the desktop: the window manager draws it
+where it provides one (KDE, Xfce, sway...), and libcosmic draws it
+where it doesn't (GNOME). Override it from the command line —
+`--csd` forces the libcosmic frame, `--ssd` forces the window
+manager's (note the `--` separating cargo's args from Pluto's):
+
+```sh
+cargo run -p pluto-browser -- --csd
+```
+
 Build notes:
 
 - Toolchain: stable Rust 1.99+ (`cargo` on `PATH`; install via

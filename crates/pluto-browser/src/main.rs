@@ -158,9 +158,34 @@ fn main() -> cosmic::iced::Result {
     // NOTE: this libcosmic pin has no `Settings::size()` builder (the field
     // is pub(crate)); the default window is 1024x768. Resize after launch
     // or set it once a size builder exists upstream.
+    let client_decorations = parse_decorations_arg().unwrap_or_else(use_client_decorations);
+    eprintln!(
+        "[pluto] window decorations: {}",
+        if client_decorations {
+            "client-side (libcosmic)"
+        } else {
+            "server-side (window manager)"
+        }
+    );
     let settings =
-        cosmic::app::Settings::default().client_decorations(use_client_decorations());
+        cosmic::app::Settings::default().client_decorations(client_decorations);
     cosmic::app::run::<PlutoBrowser>(settings, ())
+}
+
+/// `--csd` / `--client-decorations` forces libcosmic to draw the frame;
+/// `--ssd` / `--server-decorations` forces the window manager's frame.
+/// Returns `None` when no flag is given (auto-detect per session).
+/// Last flag wins.
+fn parse_decorations_arg() -> Option<bool> {
+    let mut choice = None;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--csd" | "--client-decorations" => choice = Some(true),
+            "--ssd" | "--server-decorations" => choice = Some(false),
+            _ => {}
+        }
+    }
+    choice
 }
 
 /// Whether libcosmic should draw the window frame itself (client-side
