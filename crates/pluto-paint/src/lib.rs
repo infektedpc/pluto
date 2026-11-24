@@ -61,19 +61,18 @@ impl DisplayList {
     }
 
     /// Build the paint operations for one laid-out document. The canvas
-    /// background (html/body background, if any) paints the whole viewport
-    /// first; then each box's background, then its glyphs.
+    /// background (html/body background, or white by default) paints the
+    /// whole viewport first; then each box's background, then its glyphs.
     pub fn build(layout: &LayoutTree) -> Self {
         let mut list = Self::new();
-        if let Some(bg) = layout.canvas_background {
-            list.push(DisplayItem::FillRect {
-                x: 0.0,
-                y: 0.0,
-                width: layout.viewport.0,
-                height: layout.viewport.1,
-                color: rgba(bg),
-            });
-        }
+        let bg = layout.canvas_background;
+        list.push(DisplayItem::FillRect {
+            x: 0.0,
+            y: 0.0,
+            width: layout.viewport.0,
+            height: layout.viewport.1,
+            color: rgba(bg),
+        });
         for bx in layout.boxes() {
             if let Some(bg) = bx.style.background {
                 list.push(DisplayItem::FillRect {
@@ -235,11 +234,81 @@ mod tests {
     }
 
     #[test]
-    fn empty_document_is_empty_list() {
+    fn empty_document_is_white_canvas() {
+        // An empty page still paints its canvas: a browser's default
+        // canvas is white, not transparent.
         let dom = parse_html("<html><head></head><body></body></html>");
         let sheet = Stylesheet::parse("");
         let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
         let list = DisplayList::build(&tree);
-        assert!(list.is_empty());
+        assert_eq!(list.0.len(), 1);
+        assert!(matches!(
+            list.0[0],
+            DisplayItem::FillRect {
+                width: 800.0,
+                height: 600.0,
+                color: [1.0, 1.0, 1.0, 1.0],
+                ..
+            }
+        ));
+    }
+
+    /// The live example.com page as served 2026-11-23 (577 bytes):
+    /// unquoted attributes, a `<script src=/s.js>`, and a stylesheet
+    /// whose `background: light-dark(...)` is beyond M1. Regression:
+    /// the script tag used to parse-fail and render as literal text,
+    /// and with no canvas fill the black paragraph text was invisible
+    /// on the dark app background.
+    const NEW_EXAMPLE_COM: &str = "<!doctype html><html lang=en><head><meta charset=utf-8><link rel=icon href=data:,><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Example Domain</title><style>html{color-scheme:light dark;background:light-dark(#eee,#222)}body{font:16px/1.6 system-ui,sans-serif;max-width:26em;margin:auto;padding:25vh 2em 2em;text-align:center}</style></head><body><p>This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.</p><script src=/s.js></script></body></html>";
+
+    #[test]
+    fn new_example_com_renders() {
+        let dom = parse_html(NEW_EXAMPLE_COM);
+        let style = dom
+            .children(dom.root().unwrap())
+            .iter()
+            .find_map(|&c| {
+                if dom.tag(c) == Some("html") {
+                    dom.children(c)
+                        .iter()
+                        .find(|&&n| dom.tag(n) == Some("head"))
+                        .and_then(|&head| {
+                            dom.children(head)
+                                .iter()
+                                .find(|&&n| dom.tag(n) == Some("style"))
+                                .copied()
+                        })
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let css: String = dom
+            .children(style)
+            .iter()
+            .filter_map(|&c| dom.text(c))
+            .collect();
+        let sheet = Stylesheet::parse(&css);
+        let tree = LayoutTree::build(&dom, &sheet, 1024.0, 768.0).expect("layout builds");
+        let list = DisplayList::build(&tree);
+        // White canvas first, then the paragraph glyphs. The script
+        // tag contributes nothing: it is an element, not text.
+        assert_eq!(list.0.len(), 2);
+        assert!(matches!(
+            list.0[0],
+            DisplayItem::FillRect {
+                width: 1024.0,
+                height: 768.0,
+                color: [1.0, 1.0, 1.0, 1.0],
+                ..
+            }
+        ));
+        let glyph_total: usize = list.0.iter().fold(0, |acc, item| match item {
+            DisplayItem::Glyphs { glyphs, .. } => acc + glyphs.len(),
+            _ => acc,
+        });
+        // 155 paragraph glyphs (non-space chars). If the script tag
+        // leaked into text there would be 18 more.
+        assert_eq!(glyph_total, 155);
     }
 }

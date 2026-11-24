@@ -130,9 +130,10 @@ pub struct LayoutTree {
     pub boxes: Vec<LayoutBox>,
     pub viewport: (f32, f32),
     /// Canvas background: the html element's background, else the body's
-    /// (CSS canvas rule). Painted over the whole viewport by the display
-    /// list, not just the element's box.
-    pub canvas_background: Option<[u8; 3]>,
+    /// (CSS canvas rule), else white — a browser's canvas defaults to
+    /// white when neither element sets one. Painted over the whole
+    /// viewport by the display list, not just the element's box.
+    pub canvas_background: [u8; 3],
 }
 
 impl LayoutTree {
@@ -143,7 +144,7 @@ impl LayoutTree {
             root: None,
             boxes: Vec::new(),
             viewport: (0.0, 0.0),
-            canvas_background: None,
+            canvas_background: [255, 255, 255],
         }
     }
 
@@ -210,7 +211,8 @@ impl LayoutTree {
                 bx.glyphs = shape_leaf(&mut font_system, bx);
             }
         }
-        // Canvas background: html's, else body's (CSS canvas rule).
+        // Canvas background: html's, else body's (CSS canvas rule),
+        // else white — the browser default when neither sets one.
         let html_bg = boxes
             .iter()
             .find(|b| b.taffy == root)
@@ -219,7 +221,7 @@ impl LayoutTree {
             .and_then(|r| find_element(dom, r, "body"))
             .and_then(|body_id| boxes.iter().find(|b| b.dom == Some(body_id)))
             .and_then(|b| b.style.background);
-        let canvas_background = html_bg.or(body_bg);
+        let canvas_background = html_bg.or(body_bg).unwrap_or([255, 255, 255]);
 
         Ok(Self {
             taffy,

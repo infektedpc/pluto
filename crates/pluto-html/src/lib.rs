@@ -374,12 +374,16 @@ fn parse_open_tag(input: &mut &str) -> Option<(String, Vec<(String, String)>, bo
                     }
                 }
             } else {
-                let v: &str = tw(
-                    1..,
-                    |c: char| !c.is_whitespace() && c != '>' && c != '/',
-                )
-                .parse_next(&mut rest)
-                .ok()?;
+                // Unquoted values run to whitespace or `>`; `/` is a
+                // legal value character (e.g. `src=/s.js`). A trailing
+                // `/` right before `>` is the self-closing marker, not
+                // part of the value (`<img src=x/>` means `x`).
+                let mut v: &str = tw(1.., |c: char| !c.is_whitespace() && c != '>')
+                    .parse_next(&mut rest)
+                    .ok()?;
+                if v.ends_with('/') && rest.starts_with('>') {
+                    v = &v[..v.len() - 1];
+                }
                 value = v.to_string();
             }
         }
@@ -630,5 +634,34 @@ mod tests {
         let root = dom.root().unwrap();
         let p = find_tag(&dom, root, "p").unwrap();
         assert_eq!(text_content(&dom, p), "3 < 5");
+    }
+
+    #[test]
+    fn unquoted_values_may_contain_slashes() {
+        // Regression: the live example.com page carries
+        // `<script src=/s.js>`. The old parser stopped unquoted values
+        // at `/`, which failed the whole tag and rendered it as text.
+        let dom = parse("<body><script src=/s.js></script><p>ok</p></body>");
+        let root = dom.root().unwrap();
+        let script = find_tag(&dom, root, "script").unwrap();
+        assert_eq!(dom.attr(script, "src"), Some("/s.js"));
+        // No stray text nodes from a failed tag parse.
+        let body = find_tag(&dom, root, "body").unwrap();
+        let texts: Vec<&str> = dom
+            .children(body)
+            .iter()
+            .filter_map(|&c| dom.text(c))
+            .collect();
+        assert!(texts.is_empty(), "unexpected text nodes: {texts:?}");
+
+        // A trailing slash right before `>` is the self-closing
+        // marker, not part of the value.
+        let dom = parse("<img src=/a/b.png/><img src=x/>");
+        let root = dom.root().unwrap();
+        let mut imgs = Vec::new();
+        find_all_tags(&dom, root, "img", &mut imgs);
+        assert_eq!(imgs.len(), 2);
+        assert_eq!(dom.attr(imgs[0], "src"), Some("/a/b.png"));
+        assert_eq!(dom.attr(imgs[1], "src"), Some("x"));
     }
 }

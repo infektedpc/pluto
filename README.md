@@ -20,7 +20,9 @@ an error page instead of a blank window.
 
 The window frame follows the desktop: the window manager draws it
 where it provides one (KDE, Xfce, sway...), and libcosmic draws it
-where it doesn't (GNOME). Override it from the command line —
+where it doesn't (GNOME). Only one frame is ever drawn — with the
+window manager's frame, libcosmic's own header bar stays hidden.
+Override it from the command line —
 `--csd` forces the libcosmic frame, `--ssd` forces the window
 manager's (note the `--` separating cargo's args from Pluto's):
 

@@ -121,6 +121,21 @@ impl Primitive for WebPrimitive {
             multiview_mask: None,
         });
 
+        // The shader maps page coords into the *widget* (the uniform
+        // carries the widget's size), but a render pass covers the whole
+        // window texture by default. Without this, page (0,0) lands at
+        // the window's top-left — under the header, nav bar and status —
+        // and the top of every page is clipped away by the scissor
+        // below. Point the viewport at the widget's region so NDC maps
+        // to the widget, not the window.
+        pass.set_viewport(
+            clip_bounds.x as f32,
+            clip_bounds.y as f32,
+            clip_bounds.width as f32,
+            clip_bounds.height as f32,
+            0.0,
+            1.0,
+        );
         pass.set_scissor_rect(
             clip_bounds.x,
             clip_bounds.y,

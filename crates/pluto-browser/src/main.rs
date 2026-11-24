@@ -41,7 +41,7 @@ fn load_task(url: String) -> Task<Message> {
 
 impl Application for PlutoBrowser {
     type Executor = executor::Default;
-    type Flags = ();
+    type Flags = bool;
     type Message = Message;
 
     const APP_ID: &'static str = "org.plutobrowser.Pluto";
@@ -54,7 +54,13 @@ impl Application for PlutoBrowser {
         &mut self.core
     }
 
-    fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Self::Message>) {
+    fn init(mut core: Core, use_client_decorations: Self::Flags) -> (Self, Task<Self::Message>) {
+        // libcosmic draws its header bar whenever `show_headerbar` is
+        // set (default true) — even when the window manager is already
+        // drawing a frame, which gives the window two title bars. Show
+        // it only when libcosmic is drawing the frame itself.
+        core.window.show_headerbar = use_client_decorations;
+        core.window.header_title = "Pluto".to_string();
         let url = page::DEFAULT_URL.to_string();
         eprintln!("[pluto] starting, loading {url}");
         let app = Self {
@@ -169,7 +175,7 @@ fn main() -> cosmic::iced::Result {
     );
     let settings =
         cosmic::app::Settings::default().client_decorations(client_decorations);
-    cosmic::app::run::<PlutoBrowser>(settings, ())
+    cosmic::app::run::<PlutoBrowser>(settings, client_decorations)
 }
 
 /// `--csd` / `--client-decorations` forces libcosmic to draw the frame;
@@ -192,8 +198,8 @@ fn parse_decorations_arg() -> Option<bool> {
 /// decorations). Use the window manager's frame when it provides one;
 /// only fall back to libcosmic drawing it where the WM doesn't — GNOME
 /// (Mutter on Wayland offers no server-side decorations). Without this,
-/// Pluto's window has no title bar or window controls at all, because
-/// the app draws no header bar of its own.
+/// Pluto's window has no title bar or window controls at all on such
+/// desktops, because the app draws no header bar of its own there.
 fn use_client_decorations() -> bool {
     let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
     let desktop = std::env::var("XDG_CURRENT_DESKTOP")
