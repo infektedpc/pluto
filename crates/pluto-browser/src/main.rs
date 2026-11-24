@@ -47,6 +47,22 @@ fn load_task(url: String) -> Task<Message> {
     })
 }
 
+/// A bundled toolbar icon: a Cosmic symbolic SVG, tinted by the
+/// theme to its icon color (white on the dark nav bar).
+///
+/// Bundled because libcosmic's `from_name` only searches the Cosmic
+/// icon theme, which is not installed on every machine — and when
+/// the lookup finds nothing it silently draws a blank button.
+/// These bytes are compiled into the binary, so the icons render
+/// wherever Pluto runs. See `assets/icons/README.md` for the source
+/// and license.
+///
+/// Returns the [`Handle`], which is what `button::icon` takes —
+/// the same pattern libcosmic uses for its own bundled link icon.
+fn bundled_icon(bytes: &'static [u8]) -> widget::icon::Handle {
+    widget::icon::from_svg_bytes(bytes).symbolic(true)
+}
+
 impl Application for PlutoBrowser {
     type Executor = executor::Default;
     type Flags = bool;
@@ -161,16 +177,25 @@ impl Application for PlutoBrowser {
         // as an argument (no zero-arg builder + `.push()` chain).
         // Round icon buttons (ButtonClass::Icon), not the pill-shaped
         // text buttons — the glyphs render oval in a text button.
+        // The icons are bundled SVGs (see `bundled_icon`): a
+        // `from_name` lookup only searches the Cosmic icon theme and
+        // draws a blank button where that theme is not installed.
         let nav_bar = widget::row([
-            widget::button::icon(widget::icon::from_name("go-previous-symbolic"))
-                .on_press(Message::Back)
-                .into(),
-            widget::button::icon(widget::icon::from_name("go-next-symbolic"))
-                .on_press(Message::Forward)
-                .into(),
-            widget::button::icon(widget::icon::from_name("view-refresh-symbolic"))
-                .on_press(Message::Reload)
-                .into(),
+            widget::button::icon(bundled_icon(include_bytes!(
+                "../assets/icons/go-previous-symbolic.svg"
+            )))
+            .on_press(Message::Back)
+            .into(),
+            widget::button::icon(bundled_icon(include_bytes!(
+                "../assets/icons/go-next-symbolic.svg"
+            )))
+            .on_press(Message::Forward)
+            .into(),
+            widget::button::icon(bundled_icon(include_bytes!(
+                "../assets/icons/view-refresh-symbolic.svg"
+            )))
+            .on_press(Message::Reload)
+            .into(),
             widget::text_input("Enter URL...", &self.url_input)
                 .on_input(Message::UrlChanged)
                 .on_submit(|_| Message::Navigate)
@@ -279,6 +304,50 @@ fn use_client_decorations() -> bool {
                 // draws the frame.
                 false
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bundled nav icons must be present, well-formed SVG, and
+    /// single-color shapes — so the symbolic tint paints them wholly
+    /// in the theme's icon color. A truncated or corrupt asset would
+    /// otherwise fail silently at runtime: the same blank button as
+    /// the theme lookup it replaced.
+    #[test]
+    fn bundled_nav_icons_are_valid_single_color_svgs() {
+        let icons: [&[u8]; 3] = [
+            include_bytes!("../assets/icons/go-previous-symbolic.svg") as &[u8],
+            include_bytes!("../assets/icons/go-next-symbolic.svg") as &[u8],
+            include_bytes!("../assets/icons/view-refresh-symbolic.svg") as &[u8],
+        ];
+        for bytes in icons {
+            let text = std::str::from_utf8(bytes).expect("icon is UTF-8");
+            assert!(text.starts_with("<svg"), "icon starts with <svg");
+            assert!(text.contains("</svg>"), "icon closes </svg>");
+            assert!(
+                text.contains("viewBox=\"0 0 16 16\""),
+                "icon is a 16x16 canvas"
+            );
+            // Every painted fill must be the one shape color. The
+            // root fill="none" is not painted, and the clip-path
+            // rect's white is a mask, never drawn.
+            let fills: Vec<&str> = text
+                .split("fill=\"")
+                .skip(1)
+                .map(|s| s.split('"').next().unwrap_or(""))
+                .filter(|f| *f != "none" && *f != "white")
+                .collect();
+            assert!(!fills.is_empty(), "icon has a painted fill");
+            assert!(
+                fills.iter().all(|f| *f == "#232323"),
+                "icon is a single-color shape: {fills:?}"
+            );
+            // And the handle builds without panicking.
+            let _handle = bundled_icon(bytes);
         }
     }
 }
