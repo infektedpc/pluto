@@ -1,3 +1,4 @@
+# registered 2026-11-24 — Actions now enabled
 # Pluto CI — test, lint, and docs on every push and pull request.
 #
 # The test job is the same gate used locally: `cargo test --workspace`.
