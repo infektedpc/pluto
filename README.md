@@ -7,11 +7,11 @@ Goals
 -   **Robust.** The parser recovers from malformed HTML the way the WHATWG spec says to (it passes 99.6% of the html5lib corpus); a failed fetch renders an error page, never a blank window; a renderer that dies must not take the browser with it.
 -   **Rust, end to end.** Memory safety from the language, not from a sandbox bolted on afterwards — and then a sandbox anyway (see Security below).
 -   **Independent.** Pluto shares no code with Google, Apple, or Mozilla projects. It builds on Rust libraries (hyper, rustls, rquickjs, wgpu, taffy, cosmic-text, libcosmic) and on web standards text — never on another browser's code.     
-
-`git clone https://github.com/infektedpc/pluto.git
+```sh
+git clone https://github.com/infektedpc/pluto.git
 cd pluto
 cargo run -p pluto-browse`r
-
+```
 
 The window opens with a nav bar (Back / Forward / Reload / URL / Go), a
 status line, and a viewport that loads https://example.com on startup —
