@@ -46,11 +46,12 @@
 //!
 //! # What is NOT built here (Rec 11)
 //!
-//! Full WebIDL/codegen, workers, Shadow DOM, `MutationObserver` /
-//! `ResizeObserver` / `IntersectionObserver`, import maps, storage
-//! APIs, full fetch/CORS (CORS is M5 — see the `TODO(M5)` at the
-//! fetch gate in `fetch.rs`), CSP (M10 — see the `TODO(M10)` at the
-//! same gate). Each gets a one-line `TODO(stage)` at its hook point.
+//! Full WebIDL/codegen, workers, Shadow DOM, `IntersectionObserver`,
+//! import maps, storage APIs, full fetch/CORS (CORS is M5 — see the
+//! `TODO(M5)` at the fetch gate in `fetch.rs`), CSP (M10 — see the
+//! `TODO(M10)` at the same gate). `MutationObserver` /
+//! `ResizeObserver` landed in Stage 8 (see [`observers`]); each
+//! remaining item gets a one-line `TODO(stage)` at its hook point.
 //!
 //! TODO(M5): WebIDL/codegen — the bindings in this module are
 //! hand-written per interface; a generator would replace them when
@@ -59,6 +60,7 @@
 pub mod dom;
 pub mod events;
 pub mod fetch;
+pub mod observers;
 #[cfg(test)]
 pub mod test_host;
 #[cfg(test)]
@@ -74,6 +76,7 @@ use rquickjs::{Atom, Ctx, FromJs, Function, Object, Symbol, Value};
 use crate::error::JsError;
 use crate::event_loop::LoopState;
 use crate::host::{DomHost, DomKey};
+use crate::observers::{IntersectionObserverRegistry, ResizeObserverRegistry};
 use crate::realm::TabRealm;
 
 pub use fetch::{FetchBackend, FetchCompletion, FetchError, FetchRequest, FetchResponse};
@@ -132,6 +135,28 @@ pub struct BindingState {
     pub response_bodies: HashMap<u64, Vec<u8>>,
     /// Response headers, by body id.
     pub response_headers: HashMap<u64, Vec<(String, String)>>,
+    /// Next `MutationObserver` id (sequential; exact in an f64 JS
+    /// Map key). The callback + instance live in the registry's
+    /// `mutationObservers` / `mutationObserverInstances` Maps.
+    pub next_mutation_observer_id: u64,
+    /// Next `ResizeObserver` id. The callback + instance live in
+    /// the registry's `resizeObservers` /
+    /// `resizeObserverInstances` Maps.
+    pub next_resize_observer_id: u64,
+    /// The `ResizeObserver` registry: every observation of every
+    /// observer in this tab, plus their `lastReportedSizes`. The
+    /// `TabJs` rendering step drives its gather/broadcast loop.
+    pub resize_registry: ResizeObserverRegistry,
+    /// Next `IntersectionObserver` id. The callback + instance live
+    /// in the registry's `intersectionObservers` /
+    /// `intersectionObserverInstances` Maps.
+    pub next_intersection_observer_id: u64,
+    /// The `IntersectionObserver` registry: every observation of
+    /// every observer in this tab, plus their `lastReported`
+    /// ratios and the pending entries awaiting the queued delivery
+    /// task. The `TabJs` rendering step drives its gather; the
+    /// delivery task drains the pending queue after paint.
+    pub intersection_registry: IntersectionObserverRegistry,
 }
 
 impl BindingState {
@@ -149,6 +174,11 @@ impl BindingState {
             pending_fetches: HashMap::new(),
             response_bodies: HashMap::new(),
             response_headers: HashMap::new(),
+            next_mutation_observer_id: 1,
+            next_resize_observer_id: 1,
+            resize_registry: ResizeObserverRegistry::default(),
+            next_intersection_observer_id: 1,
+            intersection_registry: IntersectionObserverRegistry::default(),
         }
     }
 }
@@ -187,6 +217,12 @@ pub fn registry<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
         "prototypes",
         "classLists",
         "styles",
+        "mutationObservers",
+        "mutationObserverInstances",
+        "resizeObservers",
+        "resizeObserverInstances",
+        "intersectionObservers",
+        "intersectionObserverInstances",
         // Loop-driven modules (wave 2b): the module promise lives
         // here while its top-level await waits on a host event; the
         // loop polls it by id (see `TabRealm::poll_module`).
@@ -442,6 +478,7 @@ fn install_bindings_in<'js>(
     dom::install_window(&ctx, bindings).map_err(|e| format!("install window: {e}"))?;
     dom::install_console(&ctx, bindings).map_err(|e| format!("install console: {e}"))?;
     fetch::install_fetch(&ctx, state, bindings, fetch_tx).map_err(|e| format!("install fetch: {e}"))?;
+    observers::install_observers(&ctx, bindings).map_err(|e| format!("install observers: {e}"))?;
     Ok(())
 }
 

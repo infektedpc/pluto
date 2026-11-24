@@ -174,6 +174,7 @@ pub fn install_prototypes<'js>(
     // --- Text.prototype (proto: Node.prototype) ---
     let text = Object::new_proto(ctx.clone(), Some(&node))
         .map_err(|e| format!("Text prototype: {e}"))?;
+    install_text_methods(ctx, bindings, &text)?;
     protos
         .set("text", text)
         .map_err(|e| format!("prototypes text: {e}"))?;
@@ -749,6 +750,43 @@ fn install_element_methods<'js>(
 
 /// A live content-attribute accessor (`id`, `className`): reads the
 /// attribute fresh on every access, never a cached copy.
+/// `CharacterData.data` on the Text prototype (Stage 8 Rec 7):
+/// the JS-visible character-data mutation — setting it queues a
+/// `characterData` record (old text) for observing
+/// `MutationObserver`s.
+fn install_text_methods<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    text: &Object<'js>,
+) -> Result<(), String> {
+    let b = Rc::clone(bindings);
+    let get_data = move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+        let Some(key) = dom_key_of_this_opt(&ctx, &b, &this)? else {
+            return Ok(js_null(&ctx));
+        };
+        let host = host_of(&b).map_err(|e| throw_type_error(&ctx, &e))?;
+        Ok(match host.borrow().text_content(key) {
+            Some(t) => js(&ctx, t),
+            None => js_null(&ctx),
+        })
+    };
+    let b = Rc::clone(bindings);
+    let set_data = move |ctx: Ctx<'js>, This(this): This<Object<'js>>, value: Value<'js>| -> rquickjs::Result<()> {
+        let key = dom_key_of_this(&ctx, &b, &this)?;
+        let host = host_of(&b).map_err(|e| throw_type_error(&ctx, &e))?;
+        let data = to_dom_string(&ctx, &value)?;
+        if !host.borrow_mut().set_character_data(key, &data) {
+            return Err(throw_type_error(
+                &ctx,
+                "CharacterData.data: the node is not a text node",
+            ));
+        }
+        Ok(())
+    };
+    def_accessor(ctx, text, "data", get_data, set_data)?;
+    Ok(())
+}
+
 fn install_attr_accessor<'js>(
     ctx: &Ctx<'js>,
     bindings: &Rc<RefCell<BindingState>>,

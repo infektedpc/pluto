@@ -84,11 +84,25 @@
 //! data-only on the layout side (`LayoutTree::mark_dirty` drives
 //! taffy's own dirty flag); consuming DOM dirty bits is a follow-up
 //! once `pluto-html` grows them — no fields were added to `pluto-html`.
+//!
+//! Stage 8 Recommendation 6 — dirty-subtree layout v1 (see
+//! `incremental`): `LayoutTree::relayout_incremental` consumes the
+//! DOM dirty set Stage 7 populated, classifies the damage
+//! (paint-only / position-only / layout / reconstruct), re-lays out
+//! only a proven-safe subtree when it can (definite size,
+//! `contain: layout`, replaced element, or fixed-size leaf, with no
+//! margin collapse, float intrusion, or percentage resolution
+//! escaping the root), translates position-only moves without
+//! touching taffy, and falls back to a full rebuild for anything
+//! unsafe. In debug builds every incremental result is asserted
+//! equal to a cold full layout. Style re-resolution stays
+//! whole-document in v1 (the parallel pass is cheap; the serial
+//! taffy pass is where incrementality pays).
 
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, Weight};
 use pluto_css::{
     AnPlusB, AttrOp, BorderRadius, BoxShadow, CascadeKey, Combinator, Origin, PseudoClass,
-    Rule, Selector, SimpleSelector, Stylesheet, SupportsCondition, Value,
+    ResolvedCorners, Rule, Selector, SimpleSelector, Stylesheet, SupportsCondition, Value,
 };
 use pluto_html::{Dom, NodeId as DomId};
 use rayon::prelude::*;
@@ -105,6 +119,16 @@ use taffy::{
 };
 use taffy::GridPlacement;
 use taffy::prelude::{line as grid_line, span as grid_span};
+
+/// Stage 8 Recommendation 6 — dirty-subtree layout v1: damage
+/// classification, the safe-root predicate, the incremental relayout
+/// entry point, and the position-only fast path.
+mod incremental;
+
+pub use incremental::{
+    classify_damage, classify_style_change, is_safe_layout_root, unsafe_layout_root_reason,
+    DamageKind, RelayoutKind, RelayoutOutcome,
+};
 
 /// One styled run inside a text leaf.
 #[derive(Debug, Clone)]
@@ -205,6 +229,27 @@ impl OverflowKind {
     }
 }
 
+/// `overscroll-behavior` (Stage 8 Rec 9): whether a scroll that
+/// reaches this container's limit chains to the parent scroller
+/// (and eventually the viewport). `auto` chains (the default);
+/// `contain` and `none` stop the chain at this container — the
+/// leftover delta is dropped, not passed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverscrollBehavior {
+    #[default]
+    Auto,
+    Contain,
+    None,
+}
+
+impl OverscrollBehavior {
+    /// Whether a scroll reaching this container's limit stops
+    /// here instead of chaining to the parent scroller.
+    pub fn stops_chaining(self) -> bool {
+        matches!(self, OverscrollBehavior::Contain | OverscrollBehavior::None)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextAlign {
     Left,
@@ -296,6 +341,10 @@ pub struct ComputedStyle {
     pub white_space: WhiteSpace,
     pub overflow_x: OverflowKind,
     pub overflow_y: OverflowKind,
+    /// `overscroll-behavior-x` / `-y` (Stage 8 Rec 9): whether a
+    /// scroll reaching this container's limit chains onward.
+    pub overscroll_behavior_x: OverscrollBehavior,
+    pub overscroll_behavior_y: OverscrollBehavior,
     pub position: PositionKind,
     pub box_sizing: BoxSizingKind,
     /// `border-radius` corners in px (percentages resolve against the
@@ -314,6 +363,11 @@ pub struct ComputedStyle {
     /// (start, end) placement per axis; `Auto` = auto-placement.
     pub grid_column: (GridPlace, GridPlace),
     pub grid_row: (GridPlace, GridPlace),
+    /// `contain: layout` (also implied by `contain: strict` /
+    /// `content`): the subtree is layout-contained, so it can be a
+    /// layout root even without a definite size (Stage 8 Rec 6).
+    /// `contain: size` alone does NOT set this.
+    pub contain_layout: bool,
 }
 
 impl ComputedStyle {
@@ -343,6 +397,8 @@ impl ComputedStyle {
             white_space: WhiteSpace::Normal,
             overflow_x: OverflowKind::Visible,
             overflow_y: OverflowKind::Visible,
+            overscroll_behavior_x: OverscrollBehavior::Auto,
+            overscroll_behavior_y: OverscrollBehavior::Auto,
             position: PositionKind::Static,
             box_sizing: BoxSizingKind::ContentBox,
             border_radius: None,
@@ -357,6 +413,7 @@ impl ComputedStyle {
             grid_gap: (Dim::Px(0.0), Dim::Px(0.0)),
             grid_column: (GridPlace::Auto, GridPlace::Auto),
             grid_row: (GridPlace::Auto, GridPlace::Auto),
+            contain_layout: false,
         }
     }
 }
@@ -476,9 +533,28 @@ pub struct LayoutBox {
     /// Shaped glyphs for text leaves (empty otherwise).
     pub glyphs: Vec<ShapedGlyph>,
     /// Effective clip rect `[x, y, w, h]` in page coordinates, from
-    /// the nearest scroll-container ancestor (`None` = unclipped).
-    /// The display list turns clip changes into PushClip/PopClip.
+    /// the nearest clipping ancestor (`None` = unclipped). Any
+    /// `overflow` other than `visible` clips (hidden/scroll/auto
+    /// clip to the padding box; `clip` clips and forbids scrolling,
+    /// so it creates no scroll container). The display list turns
+    /// clip changes into PushClip/PopClip.
     pub clip: Option<[f32; 4]>,
+    /// The taffy node of the nearest clipping ancestor that produced
+    /// `clip` (`None` when unclipped). The position-only fast path
+    /// (Stage 8 Rec 6) moves a clip rect only when its source moves
+    /// with the translated subtree.
+    pub clip_source: Option<TaffyId>,
+    /// Resolved corner radii of the clip rect's own box (`None` =
+    /// square clip): the nearest clipping ancestor's
+    /// `border-radius`, resolved against that ancestor's box. The
+    /// renderer applies these as a rounded-rect clip; with no
+    /// borders modelled, the padding box and the border box are the
+    /// same rect, so the radii need no border-width adjustment.
+    pub clip_radii: Option<ResolvedCorners>,
+    /// This box's own resolved `border-radius` (zero when unset):
+    /// the background fill and the box-shadow shape are drawn with
+    /// these radii.
+    pub radii: ResolvedCorners,
     /// Nearest scroll-container ancestor (`None` = the viewport).
     pub scroll_ancestor: Option<DomId>,
 }
@@ -522,7 +598,13 @@ pub fn is_bfc_root(style: &ComputedStyle, is_root: bool) -> bool {
 /// document, plus the laid-out boxes in document order.
 pub struct LayoutTree {
     pub taffy: TaffyTree<NodeContext>,
-    pub font_system: FontSystem,
+    /// The font system, shared across rebuilds of this tree (Stage 8
+    /// Rec 9): a fresh `FontSystem` re-scans the system fonts, so a
+    /// full rebuild reuses the retained one instead of creating a
+    /// new one. `None` only transiently, inside `full_rebuild`
+    /// between the `take` and the fresh build (or its failure — the
+    /// actor then falls back to a fresh scan via `build_full_tree`).
+    pub font_system: Option<FontSystem>,
     pub root: Option<TaffyId>,
     pub boxes: Vec<LayoutBox>,
     pub viewport: (f32, f32),
@@ -536,8 +618,19 @@ pub struct LayoutTree {
     /// Retained scroll offsets per scroll container, mutated by input
     /// (`set_scroll_offset`), never recomputed by layout.
     pub scroll_offsets: HashMap<DomId, (f32, f32)>,
+    /// The root element's computed font size (`rem` basis for
+    /// border-radius / box-shadow resolution in [`collect_boxes`]).
+    pub root_font_size: f32,
     /// `DomId -> taffy node` for hit-testing / `mark_dirty`.
     pub dom_to_taffy: HashMap<DomId, TaffyId>,
+    /// Position-only translations recorded by `translate_subtree`
+    /// (Stage 8 Rec 6), keyed by the moved subtree's taffy root:
+    /// `(dx, dy)` to add to that subtree's boxes when they are
+    /// re-collected. The taffy layouts stay stale after a move, so
+    /// this map is the record of it; any path that rebuilds a node
+    /// from the DOM (subtree / full layout) drops its entry, because
+    /// the fresh taffy layout already carries the new position.
+    position_overrides: HashMap<TaffyId, (f32, f32)>,
     meta: HashMap<TaffyId, BoxMeta>,
 }
 
@@ -545,14 +638,16 @@ impl LayoutTree {
     pub fn new() -> Self {
         Self {
             taffy: TaffyTree::new(),
-            font_system: FontSystem::new(),
+            font_system: Some(FontSystem::new()),
             root: None,
             boxes: Vec::new(),
             viewport: (0.0, 0.0),
             canvas_background: [255, 255, 255],
             node_styles: SparseSecondaryMap::new(),
             scroll_offsets: HashMap::new(),
+            root_font_size: 16.0,
             dom_to_taffy: HashMap::new(),
+            position_overrides: HashMap::new(),
             meta: HashMap::new(),
         }
     }
@@ -586,7 +681,54 @@ impl LayoutTree {
         viewport_height: f32,
         state: &ElementState,
     ) -> Result<Self, LayoutError> {
-        let font_system = FontSystem::new();
+        // A fresh `FontSystem` scans the system fonts (~1.5 s):
+        // fine for a first layout, but a full rebuild must not pay
+        // it again — see `build_with_state_reusing_font_system`.
+        Self::build_with_state_and_font_system(
+            dom,
+            sheet,
+            viewport_width,
+            viewport_height,
+            state,
+            FontSystem::new(),
+        )
+    }
+
+    /// Like [`build_with_state`](Self::build_with_state), but the
+    /// tree reuses an existing `FontSystem` (Stage 8 Rec 9): the
+    /// layout actor hands back the retained tree's font system on
+    /// a full rebuild, so a hover restyle that lands on the
+    /// document root does not re-scan the system fonts per pointer
+    /// event. Fonts are system-global and shaping is per text run,
+    /// so reuse across documents is safe — the incremental path
+    /// already reuses the retained tree's font system across
+    /// mutations of the same document.
+    pub fn build_with_state_reusing_font_system(
+        dom: &Dom,
+        sheet: &Stylesheet,
+        viewport_width: f32,
+        viewport_height: f32,
+        state: &ElementState,
+        font_system: FontSystem,
+    ) -> Result<Self, LayoutError> {
+        Self::build_with_state_and_font_system(
+            dom,
+            sheet,
+            viewport_width,
+            viewport_height,
+            state,
+            font_system,
+        )
+    }
+
+    fn build_with_state_and_font_system(
+        dom: &Dom,
+        sheet: &Stylesheet,
+        viewport_width: f32,
+        viewport_height: f32,
+        state: &ElementState,
+        font_system: FontSystem,
+    ) -> Result<Self, LayoutError> {
         let ua = Stylesheet::ua();
         // Two-phase style resolution (Stage 4 #5): every element's
         // style is resolved up front, in parallel, before any taffy
@@ -599,12 +741,23 @@ impl LayoutTree {
             (viewport_width, viewport_height),
             state,
         );
+        // The root element's font size is the `rem` basis for
+        // border-radius / box-shadow resolution (Stage 8). Read it
+        // here: `styles` moves into the builder below.
+        let root_dom_pre = find_element(dom, dom.root().unwrap(), "html");
+        let root_font_size = root_dom_pre
+            .and_then(|r| styles.get(&r))
+            .map(|s| s.font_size)
+            .unwrap_or(16.0);
+        let mut taffy = TaffyTree::new();
+        let mut meta: HashMap<TaffyId, BoxMeta> = HashMap::new();
+        let mut leaves: Vec<TaffyId> = Vec::new();
         let mut builder = Builder {
             dom,
             styles,
-            taffy: TaffyTree::new(),
-            meta: HashMap::new(),
-            leaves: Vec::new(),
+            taffy: &mut taffy,
+            meta: &mut meta,
+            leaves: &mut leaves,
             viewport: (viewport_width, viewport_height),
         };
         let root_dom = find_element(dom, dom.root().unwrap(), "html");
@@ -633,9 +786,9 @@ impl LayoutTree {
                 node
             }
         };
-        let mut taffy = builder.taffy;
-        let mut meta = builder.meta;
-        let leaves = builder.leaves;
+        // The builder only borrowed the tree; drop it so the locals
+        // below are usable again.
+        drop(builder);
 
         // R11 pre-shaping: shape every distinct text run once, in
         // parallel on rayon workers each owning a FontSystem, and
@@ -663,14 +816,16 @@ impl LayoutTree {
         // else white — the browser default when neither sets one.
         let mut tree = Self {
             taffy,
-            font_system,
+            font_system: Some(font_system),
             root: Some(root),
             boxes: Vec::new(),
             viewport: (viewport_width, viewport_height),
             canvas_background: [255, 255, 255],
             node_styles,
             scroll_offsets: HashMap::new(),
+            root_font_size,
             dom_to_taffy,
+            position_overrides: HashMap::new(),
             meta,
         };
         // Re-collect boxes (which also shapes glyphs at final width).
@@ -704,9 +859,19 @@ impl LayoutTree {
             &self.scroll_offsets,
             None,
             None,
+            None,
+            None,
+            self.viewport,
+            self.root_font_size,
+            &self.position_overrides,
             &mut boxes,
         );
-        let fs = &mut self.font_system;
+        // `None` only transiently inside `full_rebuild` (see the
+        // field docs): every other path holds a font system.
+        let fs = self
+            .font_system
+            .as_mut()
+            .expect("LayoutTree holds a FontSystem outside a full rebuild");
         for bx in boxes.iter_mut() {
             if bx.text.is_some() {
                 bx.glyphs = shape_leaf(fs, bx);
@@ -813,20 +978,24 @@ fn find_element(dom: &Dom, id: DomId, tag: &str) -> Option<DomId> {
     None
 }
 
-struct Builder<'a> {
+struct Builder<'a, 't> {
     dom: &'a Dom,
     /// Pre-resolved styles for every element (two-phase pass, see
     /// `resolve_document_styles`). `Arc`-shared: computed styles are
     /// immutable once resolved, the Stylo pattern.
     styles: HashMap<DomId, Arc<ComputedStyle>>,
-    taffy: TaffyTree<NodeContext>,
-    meta: HashMap<TaffyId, BoxMeta>,
+    /// Borrowed from the caller: `build_with_state` passes a fresh
+    /// tree, the incremental path passes the retained tree, so a
+    /// subtree rebuild reuses the live taffy nodes instead of
+    /// rebuilding the world (Stage 8 Rec 6).
+    taffy: &'t mut TaffyTree<NodeContext>,
+    meta: &'t mut HashMap<TaffyId, BoxMeta>,
     /// Text-leaf taffy nodes, in build order (pre-shape input).
-    leaves: Vec<TaffyId>,
+    leaves: &'t mut Vec<TaffyId>,
     viewport: (f32, f32),
 }
 
-impl<'a> Builder<'a> {
+impl<'a, 't> Builder<'a, 't> {
     /// Style for `id` from the pre-resolved map. Falls back to the
     /// parent style if the id was never collected — e.g. a node
     /// outside the `<html>` subtree — so behaviour stays identical;
@@ -1502,8 +1671,13 @@ fn intersect_clip(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
 /// (page) coordinates. Scroll offsets of scroll-container ancestors
 /// are subtracted as the walk descends (offsets are retained input
 /// state, applied here — never recomputed by layout), and each box
-/// records the effective clip rect from its nearest scroll-container
-/// ancestor.
+/// records the effective clip rect from its nearest clipping
+/// ancestor. `overflow: hidden|scroll|auto` clips to the padding box
+/// (and makes a scroll container); `overflow: clip` clips the same
+/// way but creates no scroll container; `overflow: visible` clips
+/// nothing. Each box also resolves its own `border-radius` against
+/// its box (see [`BorderRadius::resolve`]), which the display list
+/// uses for rounded fills, shadows, and rounded clips.
 #[allow(clippy::too_many_arguments)]
 fn collect_boxes(
     taffy: &TaffyTree<NodeContext>,
@@ -1512,7 +1686,18 @@ fn collect_boxes(
     offset: (f32, f32),
     scroll_offsets: &HashMap<DomId, (f32, f32)>,
     parent_clip: Option<[f32; 4]>,
+    parent_clip_radii: Option<ResolvedCorners>,
+    parent_clip_source: Option<TaffyId>,
     parent_scroll_ancestor: Option<DomId>,
+    viewport: (f32, f32),
+    root_font_size: f32,
+    // Position-only translations recorded by `translate_subtree`
+    // (Stage 8 Rec 6): the taffy layouts are stale after a move,
+    // so the override is the record of it. Each node's own override
+    // is added to its position; children inherit it through `offset`,
+    // and clips are computed from the translated rects, so an inner
+    // clip moves with its subtree while an outer clip stays put.
+    position_overrides: &HashMap<TaffyId, (f32, f32)>,
     out: &mut Vec<LayoutBox>,
 ) {
     let Some(layout) = taffy.layout(node).ok() else {
@@ -1521,31 +1706,63 @@ fn collect_boxes(
     let Some(m) = meta.get(&node) else {
         return;
     };
-    let x = offset.0 + layout.location.x;
-    let y = offset.1 + layout.location.y;
+    let (ox, oy) = position_overrides.get(&node).copied().unwrap_or((0.0, 0.0));
+    let x = offset.0 + layout.location.x + ox;
+    let y = offset.1 + layout.location.y + oy;
+    let width = layout.size.width;
+    let height = layout.size.height;
+    let radii = m
+        .style
+        .border_radius
+        .map(|br| {
+            br.resolve(
+                width,
+                height,
+                m.style.font_size,
+                root_font_size,
+                viewport,
+            )
+        })
+        .unwrap_or(ResolvedCorners::ZERO);
     let is_scroll_container = m.style.overflow_x.is_scroll_container()
         || m.style.overflow_y.is_scroll_container();
-    let (clip, scroll_ancestor) = if is_scroll_container {
-        let own_rect = [x, y, layout.size.width, layout.size.height];
+    // Any non-visible overflow clips (including `clip`, which is
+    // not a scroll container); the clip rect is the box's own
+    // padding box — with no borders modelled, the border box.
+    let clips_content = m.style.overflow_x != OverflowKind::Visible
+        || m.style.overflow_y != OverflowKind::Visible;
+    let (clip, clip_radii, clip_source) = if clips_content {
+        let own_rect = [x, y, width, height];
         let clip = Some(match parent_clip {
             Some(pc) => intersect_clip(pc, own_rect),
             None => own_rect,
         });
-        (clip, m.dom.or(parent_scroll_ancestor))
+        let clip_radii = if radii.is_zero() { None } else { Some(radii) };
+        (clip, clip_radii, Some(node))
     } else {
-        (parent_clip, parent_scroll_ancestor)
+        (parent_clip, parent_clip_radii, parent_clip_source)
+    };
+    // Only a real scroll container becomes a scroll ancestor:
+    // `overflow: clip` clips but never scrolls.
+    let scroll_ancestor = if is_scroll_container {
+        m.dom.or(parent_scroll_ancestor)
+    } else {
+        parent_scroll_ancestor
     };
     out.push(LayoutBox {
         taffy: node,
         dom: m.dom,
         x,
         y,
-        width: layout.size.width,
-        height: layout.size.height,
+        width,
+        height,
         style: m.style.clone(),
         text: m.text.clone(),
         glyphs: Vec::new(),
         clip,
+        clip_source,
+        clip_radii,
+        radii,
         scroll_ancestor,
     });
     // Descendants of a scroll container move with its offset.
@@ -1563,7 +1780,12 @@ fn collect_boxes(
             (x - sx, y - sy),
             scroll_offsets,
             clip,
+            clip_radii,
+            clip_source,
             scroll_ancestor,
+            viewport,
+            root_font_size,
+            position_overrides,
             out,
         );
     }
@@ -2615,6 +2837,20 @@ fn apply_decl(
                 };
             }
         }
+        "contain" => {
+            // `contain: layout` (and `strict` / `content`, which imply
+            // it) marks the subtree layout-contained — a layout-root
+            // signal for Stage 8 Rec 6. `size` / `paint` / `style`
+            // alone do not imply layout containment.
+            let has_layout = match value {
+                Value::Keyword(k) => matches!(k.as_str(), "layout" | "strict" | "content"),
+                Value::Raw(raw) => raw
+                    .split_whitespace()
+                    .any(|w| matches!(w, "layout" | "strict" | "content")),
+                _ => false,
+            };
+            style.contain_layout = has_layout;
+        }
         "overflow" => {
             if let Value::Keyword(k) = value {
                 if let Some(o) = overflow_kind(k) {
@@ -2634,6 +2870,28 @@ fn apply_decl(
             if let Value::Keyword(k) = value {
                 if let Some(o) = overflow_kind(k) {
                     style.overflow_y = o;
+                }
+            }
+        }
+        "overscroll-behavior" => {
+            if let Value::Keyword(k) = value {
+                if let Some(o) = overscroll_behavior(k) {
+                    style.overscroll_behavior_x = o;
+                    style.overscroll_behavior_y = o;
+                }
+            }
+        }
+        "overscroll-behavior-x" => {
+            if let Value::Keyword(k) = value {
+                if let Some(o) = overscroll_behavior(k) {
+                    style.overscroll_behavior_x = o;
+                }
+            }
+        }
+        "overscroll-behavior-y" => {
+            if let Value::Keyword(k) = value {
+                if let Some(o) = overscroll_behavior(k) {
+                    style.overscroll_behavior_y = o;
                 }
             }
         }
@@ -2781,6 +3039,18 @@ fn overflow_kind(k: &str) -> Option<OverflowKind> {
         "scroll" => OverflowKind::Scroll,
         "auto" => OverflowKind::Auto,
         "clip" => OverflowKind::Clip,
+        _ => return None,
+    })
+}
+
+/// `overscroll-behavior` keyword to value (Stage 8 Rec 9). The
+/// two-value form (`overscroll-behavior: contain auto`) is not
+/// parsed — the shorthand takes one keyword for both axes.
+fn overscroll_behavior(k: &str) -> Option<OverscrollBehavior> {
+    Some(match k {
+        "auto" => OverscrollBehavior::Auto,
+        "contain" => OverscrollBehavior::Contain,
+        "none" => OverscrollBehavior::None,
         _ => return None,
     })
 }
@@ -3910,6 +4180,47 @@ mod tests {
     }
 
     #[test]
+    fn overscroll_behavior_parses_to_computed_style() {
+        // Stage 8 Rec 9: `overscroll-behavior` (and the -x/-y
+        // longhands) reach the computed style; the default is
+        // `auto` (chains), `contain`/`none` stop the chain.
+        let dom = parse_html(
+            r#"<div class="a"></div><div class="b"></div><div class="c"></div><div class="d"></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".a { overflow: auto; overscroll-behavior: none; } \
+             .b { overflow: auto; overscroll-behavior-x: contain; overscroll-behavior-y: auto; } \
+             .c { overflow: auto; } \
+             .d { overflow: auto; overscroll-behavior: bogus; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let root = dom.root().unwrap();
+        let style_of = |class: &str| {
+            let id = find_by_class(&dom, root, class).unwrap();
+            tree.boxes
+                .iter()
+                .find(|b| b.dom == Some(id))
+                .unwrap()
+                .style
+                .clone()
+        };
+        let a = style_of("a");
+        assert_eq!(a.overscroll_behavior_x, OverscrollBehavior::None);
+        assert_eq!(a.overscroll_behavior_y, OverscrollBehavior::None);
+        assert!(a.overscroll_behavior_x.stops_chaining());
+        let b = style_of("b");
+        assert_eq!(b.overscroll_behavior_x, OverscrollBehavior::Contain);
+        assert_eq!(b.overscroll_behavior_y, OverscrollBehavior::Auto);
+        assert!(!b.overscroll_behavior_y.stops_chaining());
+        let c = style_of("c");
+        assert_eq!(c.overscroll_behavior_x, OverscrollBehavior::Auto);
+        assert_eq!(c.overscroll_behavior_y, OverscrollBehavior::Auto);
+        // An unknown keyword is dropped: the initial value stands.
+        let d = style_of("d");
+        assert_eq!(d.overscroll_behavior_x, OverscrollBehavior::Auto);
+    }
+
+    #[test]
     fn bfc_root_predicate() {
         let mut style = ComputedStyle::initial();
         assert!(!is_bfc_root(&style, false));
@@ -3948,6 +4259,67 @@ mod tests {
         let rbox = tree.boxes.iter().find(|b| b.dom == Some(r)).unwrap();
         assert!(rbox.style.border_radius.is_some());
         assert_eq!(rbox.style.box_shadow.len(), 1);
+    }
+
+    // ---- Stage 8: resolved radii, overflow: clip ----
+
+    #[test]
+    fn overflow_clip_clips_but_creates_no_scroll_container() {
+        // Stage 8 Rec 3: `overflow: clip` clips to the padding box
+        // and forbids scrolling — the child is clipped, but the box
+        // is not a scroll ancestor and not a scroll container.
+        let dom = parse_html(
+            r#"<div class="clip"><div class="tall">hello</div></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".clip { overflow: clip; height: 50px; width: 200px; } .tall { height: 200px; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let root = dom.root().unwrap();
+        let clip = find_by_class(&dom, root, "clip").unwrap();
+        let tall = find_by_class(&dom, root, "tall").unwrap();
+        let tall_box = tree.boxes.iter().find(|b| b.dom == Some(tall)).unwrap();
+        assert_eq!(tall_box.clip, Some([8.0, 8.0, 200.0, 50.0]));
+        assert_eq!(tall_box.scroll_ancestor, None);
+        assert!(tree.scroll_containers().is_empty());
+        assert!(!is_bfc_root(
+            &tree.boxes.iter().find(|b| b.dom == Some(clip)).unwrap().style,
+            false
+        ));
+    }
+
+    #[test]
+    fn boxes_carry_resolved_radii_and_clip_radii() {
+        // Stage 8 Rec 3/4: a box's own radii are resolved against
+        // its box (here 200x50 with 50% → rx 100, ry 25, no
+        // scale-down: top 200/200 = 1, left 50/50 = 1), and a child
+        // of a rounded scroll container inherits the clip radii.
+        let dom = parse_html(
+            r#"<div class="scroll"><div class="tall">hello</div></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".scroll { overflow: hidden; height: 50px; width: 200px; border-radius: 50%; } \
+             .tall { height: 200px; border-radius: 4px; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let root = dom.root().unwrap();
+        let scroll = find_by_class(&dom, root, "scroll").unwrap();
+        let tall = find_by_class(&dom, root, "tall").unwrap();
+        let scroll_box = tree.boxes.iter().find(|b| b.dom == Some(scroll)).unwrap();
+        assert_eq!(scroll_box.radii.top_left, (100.0, 25.0));
+        assert_eq!(scroll_box.clip_radii, Some(scroll_box.radii));
+        let tall_box = tree.boxes.iter().find(|b| b.dom == Some(tall)).unwrap();
+        assert_eq!(tall_box.radii.top_left, (4.0, 4.0));
+        assert_eq!(tall_box.clip, Some([8.0, 8.0, 200.0, 50.0]));
+        assert_eq!(tall_box.clip_radii, Some(scroll_box.radii));
+        // A square box carries zero radii and no clip radii.
+        let dom = parse_html(r#"<div class="plain">x</div>"#);
+        let sheet = Stylesheet::parse(".plain { width: 100px; height: 100px; }");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let plain = find_by_class(&dom, dom.root().unwrap(), "plain").unwrap();
+        let plain_box = tree.boxes.iter().find(|b| b.dom == Some(plain)).unwrap();
+        assert!(plain_box.radii.is_zero());
+        assert_eq!(plain_box.clip_radii, None);
     }
 
     // ---- R19 node styles ----

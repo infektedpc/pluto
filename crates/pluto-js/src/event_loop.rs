@@ -286,6 +286,12 @@ pub struct LoopState {
     /// rAF callbacks pending (e.g. a DOM mutation marked the document
     /// dirty). Cleared when a frame runs.
     pub render_requested: bool,
+    /// Whether the tab is visible (Stage 8 Rec 1). A hidden tab gets
+    /// no rendering opportunities: `maybe_render` returns early, so
+    /// rAF callbacks stay queued and no frame is produced — while
+    /// timers, tasks, and microtasks keep running (they are not
+    /// rendering). Set by the shell through `TabJs::set_visible`.
+    pub visible: bool,
 }
 
 impl Default for LoopState {
@@ -311,6 +317,7 @@ impl LoopState {
             created: now,
             script_errors: Vec::new(),
             render_requested: false,
+            visible: true,
         }
     }
 

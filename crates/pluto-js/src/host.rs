@@ -20,6 +20,7 @@
 //!   trait — it is not needed to validate a key.
 
 use pluto_html::NodeId;
+use pluto_html::observers::{MutationObserverOptions, ObserverMutationRecord};
 
 /// A handle to a DOM node, as held by JS wrappers. This is
 /// `pluto-html`'s generational slotmap key: the index identifies the
@@ -100,6 +101,14 @@ pub trait DomHost {
     /// Returns false if the key is stale, in which case the binding
     /// surfaces a `TypeError` or a no-op per WebIDL.
     fn set_text_content(&mut self, key: DomKey, text: &str) -> bool;
+
+    /// Set a text node's data (`CharacterData.data`). Returns false
+    /// if the key is stale or not a text node. Stage 8 Rec 7: this
+    /// is the JS-visible character-data mutation (it queues a
+    /// `characterData` record with the old text).
+    fn set_character_data(&mut self, _key: DomKey, _data: &str) -> bool {
+        false
+    }
 
     /// A content attribute value, or `None` if absent / key stale.
     fn get_attribute(&self, key: DomKey, name: &str) -> Option<String>;
@@ -315,4 +324,59 @@ pub trait DomHost {
     /// wave wires this to `window.onerror` reporting / the shell log).
     /// Default: ignore — `TabJs::script_errors` already records it.
     fn report_error(&self, _message: &str) {}
+
+    // --- Stage 8 Rec 7: MutationObserver (DOM-side registry) ---
+
+    /// Register a mutation observer on `target`. Returns false when
+    /// the target is not a live node. Default: no registry — the
+    /// observer never fires (the production and test hosts override
+    /// this by delegating to `pluto-html`'s `Dom`).
+    fn observe_mutation(
+        &mut self,
+        _observer_id: u64,
+        _target: DomKey,
+        _options: MutationObserverOptions,
+    ) -> bool {
+        false
+    }
+
+    /// Drop a mutation observer: registrations and queued records
+    /// are discarded.
+    fn disconnect_mutation_observer(&mut self, _observer_id: u64) {}
+
+    /// Drain one mutation observer's queued records.
+    fn take_mutation_records(&mut self, _observer_id: u64) -> Vec<ObserverMutationRecord> {
+        Vec::new()
+    }
+
+    /// Mutation observers with undelivered records, in
+    /// first-record order (peek — does not drain).
+    fn pending_mutation_observers(&self) -> Vec<u64> {
+        Vec::new()
+    }
+
+    /// Mutation observers with undelivered records, in
+    /// first-record order. Drained by the loop's microtask
+    /// checkpoint before delivery.
+    fn take_pending_mutation_observers(&mut self) -> Vec<u64> {
+        Vec::new()
+    }
+
+    // --- Stage 8 Rec 8: ResizeObserver (layout sizes) ---
+
+    /// Content-box size of `key` in CSS px, or `None` when the key
+    /// is stale / unrendered. Default: the border-box size from
+    /// [`DomHost::geometry`] (no padding data at this layer — the
+    /// browser's worker step supplies real content sizes from the
+    /// layout tree instead).
+    fn content_size(&mut self, key: DomKey) -> Option<(f64, f64)> {
+        self.geometry(key).map(|g| (g.width, g.height))
+    }
+
+    /// DOM depth of `key` (document root = 0), or `None` when the
+    /// key is stale. The resize gather orders entries
+    /// shallowest-first; `None` is treated as depth 0.
+    fn depth(&self, _key: DomKey) -> Option<usize> {
+        None
+    }
 }

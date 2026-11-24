@@ -116,12 +116,19 @@ Go pressed
   M2 simplification scans the whole fetched body post-fetch),
   honouring non-UTF-8 encodings (needs an encoding crate), `:visited`
   (no visited set in `ElementState` yet — that field lives in
-  pluto-layout), `:hover` restyle (no hover variant in the IPC
-  `InputEvent` — adding one is a protocol change), a cursor position
-  on wheel events for multi-container scroll targeting, scissor /
-  Stage 8 paint for clip (the renderer ignores `PushClip`/`PopClip`
-  for now), Spineless Traversal (later swap), CORS (M5), CSP (M10),
-  H3/DoH/0-RTT (post-M5).
+  pluto-layout), Spineless Traversal (later swap),
+  CORS (M5), CSP (M10), H3/DoH/0-RTT (post-M5). Stage 8 Rec 3/4
+  are done: the renderer honours `PushClip`/`PopClip` (rect clips
+  as `set_scissor_rect` runs with CPU culling, rounded clips as
+  SDF slots in the clip uniform) and rasterises rounded rects +
+  box shadows (SDF coverage, erf blur profile, blur capped at
+  64); the display list is walked once, in paint order, into
+  per-pipeline runs. Stage 8 Rec 9 is done: `InputEvent` v3
+  (pointer move/down/up, wheel with position + delta mode +
+  gesture phase, keys) with `:hover`/`:active`/`:focus` restyle
+  via the sheet's `rules_by_pseudo_class` index, wheel chaining
+  over nested scroll containers with `overscroll-behavior`, and
+  Tab/Enter/Space/arrows/PageUp/PageDown/Home keyboard handling.
 - Stage 7 application (JS engine + event loop, applied 2026-11-24):
   rquickjs 0.14.0 pinned (QuickJS-NG, no JIT — a JIT is a whole
   second compiler, multi-month baseline; engine swap to V8 stays the
@@ -164,12 +171,15 @@ Go pressed
   counted in a debug forced-flush counter (read/write loop: one
   flush per iteration, by design; batched writes: one flush).
   Full re-layout is the M4 fallback — dirty-subtree layout is
-  Stage 8, the bits are populated correctly so Stage 8 can trust
-  them. rAF runs inside update-the-rendering with one shared
-  frame timestamp; the cadence is a ~60 Hz timer on the tab thread
-  (the shell/compositor exposes no frame signal), and hidden tabs
-  get the same cadence in M4 — no visibility signal to throttle
-  on yet. Error isolation: a throwing script reports via
+  Stage 8 Rec 6 (safe roots + full-layout fallback + a debug
+  incremental==cold assertion), applied after Stage 7. rAF runs
+  inside update-the-rendering with one shared frame timestamp;
+  the cadence is a ~60 Hz timer on the tab thread (the
+  shell/compositor exposes no frame signal), and a hidden tab
+  stops producing frames in Stage 8 Rec 1: the shell forwards
+  window focus as `SetVisible` (focus is the single-window
+  proxy for visibility), the tab tick skips relayout while
+  hidden, and JS timers keep running. Error isolation: a throwing script reports via
   `window.onerror` (`onerror` returning `true` suppresses the
   default report) and never blocks later scripts or the loop;
   5 s script budget + 256 MiB memory limit + interrupt handler
@@ -199,9 +209,61 @@ Go pressed
   ticks after the blocking post-parse drive and starved the
   command channel for ~500 ms. Deferred, each with a one-line
   `TODO(stage)` at its hook point: full WebIDL/codegen (M5),
-  workers (M5), Shadow DOM (M5), MutationObserver /
-  ResizeObserver / IntersectionObserver (M8), import maps (M5),
-  storage APIs (M5), full fetch/CORS (M5), CSP (M10).
+  workers (M5), Shadow DOM (M5), import maps (M5), storage APIs
+  (M5), full fetch/CORS (M5), CSP (M10). (IntersectionObserver
+  was deferred here too — it landed as Stage 8 Rec 10, see the
+  entry below.)
+- Stage 8 application (rendering pipeline, applied 2026-11-24, all
+  13 recommendations; original code only — concepts from the
+  research report, nothing copied/ported/adapted from Chromium,
+  Firefox, or WebKit): Rec 1 visibility + frame-skip gate (shell
+  forwards window focus as `SetVisible`/`SetFocused`; hidden tabs
+  keep JS timers but skip relayout, dirty flags stay set);
+  Rec 2 pending/active display lists (submit lands pending, the
+  frame boundary activates atomically; a frame built with no
+  pending list while one is awaited counts a deadline miss);
+  Rec 3/4 clip + raster pipelines (one `prepare` walk emitting
+  ordered runs with per-run scissor + clip bind group; CPU
+  culling; damage scissor; clean skip on identical list +
+  viewport + scroll); Rec 5 perf instrumentation (`perf::summary`
+  per navigation, `frames_hidden_skipped`, WorkerBuild/Ipc spans,
+  first-paint clock started on link clicks too); Rec 6
+  dirty-subtree layout (damage classification, safe-root
+  predicate, incremental relayout with full-rebuild fallback and
+  a debug incremental==cold assertion — plus two fixes found by
+  the worker tests: a text change inside an inline span was
+  dropped as "not rendered", and every full rebuild re-scanned
+  the system fonts, so the retained `FontSystem` is now reused
+  across rebuilds); Rec 7 MutationObserver (spec-shaped records,
+  delivery at the microtask checkpoint) and Rec 8 ResizeObserver
+  (gather/broadcast between layout and display-list build);
+  Rec 9 input v3 (see the M2 entry above); Rec 10
+  IntersectionObserver (registry + threshold-band change
+  detection in pluto-js, clip-chain geometry on the layout
+  actor, queued-task delivery after paint — callbacks run on a
+  later turn, never inline; viewport scroll is mirrored
+  worker-side so viewport-root intersections need no protocol
+  change, and wheel/keyboard scrolls re-run the step on the
+  retained tree; `isIntersecting` follows the spec text — true
+  on any overlap — not the Chrome/Firefox quirk in the report's
+  open questions; per-axis overflow clipping, html/body overflow
+  propagates to the viewport and never clips); Rec 11 glyph atlas
+  LRU (guillotine packer, separate mask/colour atlases, growth
+  1024→2048 before eviction) and Rec 12 image cache (64 MiB
+  byte cap, LRU, decode-once dedup, mip chains, animated-frame
+  dirtying — small-image atlas packing NOT done, follow-up);
+  Rec 13 raster-thread spike: PROVEN at the wgpu level (a worker
+  thread can encode into an offscreen texture with the device /
+  queue handed to `Primitive::prepare` — both are `Send + Sync`
+  in wgpu 28, and libcosmic exposes no device creation), but the
+  production shell wiring (stash the clones, submit from
+  `render`, blit into the swapchain view) is NOT done. On-box
+  checks owed after the Stage 8 pull: live fetch + first load,
+  resize re-layout, page + nested-container scroll, link-click
+  navigation, Back/Forward, external CSS, hover restyle, wheel
+  chaining, Tab focus movement, emoji rendering, downscaled
+  image draw, animated-frame advance, IntersectionObserver
+  initial entry + scroll flip on a real page.
 
 ## Roadmap (Joel, 2026-11-23 — replaces the scratched vertical-slice plan)
 

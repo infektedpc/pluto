@@ -21,6 +21,7 @@
 //! right-to-left matcher lives in `pluto-layout` (wave 2) and consumes
 //! [`Selector::compounds`] / [`Selector::combinators`] directly.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// A parsed CSS value.
@@ -82,6 +83,220 @@ impl CssLength {
             Value::Vw(v) => CssLength::Vw(*v),
             _ => return None,
         })
+    }
+
+    /// Resolve this length to used pixels. `font_size` is the
+    /// element's own computed font size (`em`), `root_font_size`
+    /// the root element's (`rem`), `viewport` the layout viewport
+    /// (`vw`/`vh`); a percentage resolves against `percent_base`,
+    /// which the caller supplies per axis (width for horizontal
+    /// radii, height for vertical ones).
+    pub fn resolve_px(
+        self,
+        font_size: f32,
+        root_font_size: f32,
+        viewport: (f32, f32),
+        percent_base: f32,
+    ) -> f32 {
+        match self {
+            CssLength::Px(v) => v,
+            CssLength::Percentage(v) => v / 100.0 * percent_base,
+            CssLength::Em(v) => v * font_size,
+            CssLength::Rem(v) => v * root_font_size,
+            CssLength::Vh(v) => v / 100.0 * viewport.1,
+            CssLength::Vw(v) => v / 100.0 * viewport.0,
+        }
+    }
+}
+
+/// One corner's resolved radii, in used pixels: `(rx, ry)` — the
+/// horizontal radius (a percentage of the box width) and the vertical
+/// radius (a percentage of the box height). Kept as plain numbers so
+/// the display list can carry them over IPC.
+pub type CornerRadii = (f32, f32);
+
+/// A box's four resolved corner radii, clockwise from the top-left.
+/// Produced by [`BorderRadius::resolve`] at build time (Stage 8):
+/// percentages resolved per axis, then normalised by the
+/// corner-overlap rule, so paint and the renderer never re-derive
+/// them and never see an overlapping pair.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedCorners {
+    pub top_left: CornerRadii,
+    pub top_right: CornerRadii,
+    pub bottom_right: CornerRadii,
+    pub bottom_left: CornerRadii,
+}
+
+impl ResolvedCorners {
+    /// All radii zero: a square box.
+    pub const ZERO: Self = Self {
+        top_left: (0.0, 0.0),
+        top_right: (0.0, 0.0),
+        bottom_right: (0.0, 0.0),
+        bottom_left: (0.0, 0.0),
+    };
+
+    /// True when every radius is zero.
+    pub fn is_zero(self) -> bool {
+        self.top_left == (0.0, 0.0)
+            && self.top_right == (0.0, 0.0)
+            && self.bottom_right == (0.0, 0.0)
+            && self.bottom_left == (0.0, 0.0)
+    }
+
+    /// Every radius grown by `spread` (a box-shadow spread expands
+    /// the shape the shadow is cast from, radii included), clamped
+    /// at zero.
+    pub fn expanded_by(self, spread: f32) -> Self {
+        let grow = |(rx, ry): CornerRadii| ((rx + spread).max(0.0), (ry + spread).max(0.0));
+        Self {
+            top_left: grow(self.top_left),
+            top_right: grow(self.top_right),
+            bottom_right: grow(self.bottom_right),
+            bottom_left: grow(self.bottom_left),
+        }
+    }
+
+    /// Every radius scaled by `factor` (the corner-overlap
+    /// normalisation step).
+    pub fn scaled_by(self, factor: f32) -> Self {
+        let scale = |(rx, ry): CornerRadii| (rx * factor, ry * factor);
+        Self {
+            top_left: scale(self.top_left),
+            top_right: scale(self.top_right),
+            bottom_right: scale(self.bottom_right),
+            bottom_left: scale(self.bottom_left),
+        }
+    }
+}
+
+impl BorderRadius {
+    /// Resolve this `border-radius` against a box of `width` ×
+    /// `height`: each corner's single length becomes `(rx, ry)` —
+    /// a percentage is of the width for `rx` and of the height for
+    /// `ry` — and the result is normalised by the corner-overlap
+    /// rule (CSS Backgrounds and Borders 3, §4.5 "Overlapping
+    /// Curves", verified live against
+    /// https://drafts.csswg.org/css-backgrounds-3/#corner-overlap
+    /// on 2026-11-24): `f = min(Li / Si)` over the four sides,
+    /// where `Si` is the sum of the two radii on side `i` (the
+    /// horizontal radii on the top/bottom, the vertical radii on
+    /// the left/right) and `Ltop = Lbottom = width`,
+    /// `Lleft = Lright = height`; when `f < 1` every radius is
+    /// multiplied by `f`. Negative lengths are invalid in CSS and
+    /// clamp to zero here rather than failing the frame.
+    pub fn resolve(
+        self,
+        width: f32,
+        height: f32,
+        font_size: f32,
+        root_font_size: f32,
+        viewport: (f32, f32),
+    ) -> ResolvedCorners {
+        let corner = |len: CssLength| {
+            let rx = len
+                .resolve_px(font_size, root_font_size, viewport, width)
+                .max(0.0);
+            let ry = len
+                .resolve_px(font_size, root_font_size, viewport, height)
+                .max(0.0);
+            (rx, ry)
+        };
+        let resolved = ResolvedCorners {
+            top_left: corner(self.top_left),
+            top_right: corner(self.top_right),
+            bottom_right: corner(self.bottom_right),
+            bottom_left: corner(self.bottom_left),
+        };
+        // §4.5: a side's factor is its length over the sum of the
+        // two radii on that side (a zero sum means the side cannot
+        // overflow, so it does not constrain `f`).
+        let side = |a: f32, b: f32, len: f32| {
+            let sum = a + b;
+            if sum > 0.0 {
+                len / sum
+            } else {
+                f32::INFINITY
+            }
+        };
+        let f = side(resolved.top_left.0, resolved.top_right.0, width)
+            .min(side(
+                resolved.top_right.1,
+                resolved.bottom_right.1,
+                height,
+            ))
+            .min(side(
+                resolved.bottom_right.0,
+                resolved.bottom_left.0,
+                width,
+            ))
+            .min(side(resolved.bottom_left.1, resolved.top_left.1, height));
+        if f < 1.0 {
+            resolved.scaled_by(f)
+        } else {
+            resolved
+        }
+    }
+}
+
+/// The largest `box-shadow` blur Pluto renders (Stage 8): above it
+/// the display list fails validation instead of silently drawing a
+/// cheaper shadow than the author asked for. Chromium caps at 128;
+/// Pluto's 64 keeps the erf falloff (`~3σ`) inside a sane quad.
+pub const MAX_BOX_SHADOW_BLUR: f32 = 64.0;
+
+/// One `box-shadow` layer, fully resolved to used pixels: the shape
+/// the renderer draws it from (the box's border box, expanded by
+/// `spread` and translated by the offsets at draw time).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedShadow {
+    pub inset: bool,
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub blur: f32,
+    pub spread: f32,
+    /// `(r, g, b, a)` in 0..=1; `currentcolor` already resolved by
+    /// the caller to the element's text color.
+    pub color: [f32; 4],
+}
+
+impl BoxShadow {
+    /// Resolve this shadow to used pixels. Offsets may be negative
+    /// (a shadow may fall up/left); blur and spread clamp at zero
+    /// (negative values are invalid in CSS). Blur is *not* clamped
+    /// to [`MAX_BOX_SHADOW_BLUR`] here: a blur above the cap is a
+    /// validation error on the display list, not a silent clamp.
+    pub fn resolve(
+        self,
+        font_size: f32,
+        root_font_size: f32,
+        viewport: (f32, f32),
+        current_color: [u8; 3],
+    ) -> ResolvedShadow {
+        let len = |l: CssLength| l.resolve_px(font_size, root_font_size, viewport, 0.0);
+        let color = match self.color {
+            Some((r, g, b, a)) => [
+                r as f32 / 255.0,
+                g as f32 / 255.0,
+                b as f32 / 255.0,
+                a,
+            ],
+            None => [
+                current_color[0] as f32 / 255.0,
+                current_color[1] as f32 / 255.0,
+                current_color[2] as f32 / 255.0,
+                1.0,
+            ],
+        };
+        ResolvedShadow {
+            inset: self.inset,
+            offset_x: len(self.offset_x),
+            offset_y: len(self.offset_y),
+            blur: len(self.blur).max(0.0),
+            spread: len(self.spread).max(0.0),
+            color,
+        }
     }
 }
 
@@ -602,6 +817,9 @@ pub const KNOWN_PROPERTIES: &[&str] = &[
     "overflow",
     "overflow-x",
     "overflow-y",
+    "overscroll-behavior",
+    "overscroll-behavior-x",
+    "overscroll-behavior-y",
     "flex",
     "flex-direction",
     "flex-wrap",
@@ -836,6 +1054,14 @@ pub fn sort_key(
 #[derive(Debug, Clone, Default)]
 pub struct Stylesheet {
     pub rules: Vec<Rule>,
+    /// The `rules_by_pseudo_class` index (Stage 8 Rec 9): which
+    /// rules mention `:hover` / `:active` / `:focus`, and how far
+    /// a state change on one element can reach. Rebuilt by
+    /// [`Stylesheet::rebuild_pseudo_class_index`], which parsing
+    /// and sheet merging call; pushing rules into `rules` by hand
+    /// must rebuild it too, or hover/active/focus restyles will
+    /// miss rules.
+    pub pseudo_class_index: PseudoClassIndex,
     /// Human-readable notes for every skipped rule, declaration, or
     /// at-rule. Empty means the whole sheet parsed cleanly.
     pub errors: Vec<String>,
@@ -870,7 +1096,15 @@ impl Stylesheet {
         let mut seen_rule = false;
         let ctx = RuleCtx::default();
         parse_rules(css, &mut sheet, &mut order, &ctx, origin, &mut seen_rule, true);
+        sheet.rebuild_pseudo_class_index();
         sheet
+    }
+
+    /// Rebuild the [`PseudoClassIndex`] from the current rules
+    /// (Stage 8 Rec 9). Call after pushing rules by hand; parsing
+    /// and sheet merging call it already.
+    pub fn rebuild_pseudo_class_index(&mut self) {
+        self.pseudo_class_index = PseudoClassIndex::for_rules(&self.rules);
     }
 
     /// Resolve a layer name to its sort position: the index in
@@ -889,6 +1123,165 @@ impl Stylesheet {
                 .unwrap_or(self.layers.len() as i32),
         }
     }
+}
+
+/// Which elements a pseudo-class state change may restyle, beyond
+/// the changed element itself (Stage 8 Rec 9). Over-marking is
+/// safe (a bigger subtree relayout); under-marking is a missed
+/// restyle, so the scan below is conservative.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PseudoReach {
+    /// A rule styles descendants/children of the changed element
+    /// (e.g. `a:hover b`, `a:hover > b`).
+    pub descendants: bool,
+    /// A rule styles following siblings (e.g. `a:hover + b`).
+    pub siblings: bool,
+    /// A rule styles ancestors of the changed element. Only
+    /// `:focus-within` does this: focusing an element matches its
+    /// ancestors.
+    pub ancestors: bool,
+}
+
+impl std::ops::BitOrAssign for PseudoReach {
+    fn bitor_assign(&mut self, other: Self) {
+        self.descendants |= other.descendants;
+        self.siblings |= other.siblings;
+        self.ancestors |= other.ancestors;
+    }
+}
+
+/// The `rules_by_pseudo_class` index (Stage 8 Rec 9): for each
+/// dynamic pseudo-class, the rule indices whose selectors mention
+/// it, plus how far a state change on one element can reach. A
+/// hover/active/focus change re-matches only these rules, on the
+/// changed elements plus the reach (descendants/siblings/ancestors
+/// when a candidate rule has a combinator reaching them); the
+/// resulting computed-style changes flow through the existing
+/// RestyleHint/RestyleDamage path.
+#[derive(Debug, Clone, Default)]
+pub struct PseudoClassIndex {
+    pub hover: Vec<usize>,
+    pub active: Vec<usize>,
+    pub focus: Vec<usize>,
+    pub hover_reach: PseudoReach,
+    pub active_reach: PseudoReach,
+    pub focus_reach: PseudoReach,
+}
+
+impl PseudoClassIndex {
+    /// Build the index for `rules` (rule indices are positions in
+    /// the slice). `:has()` arguments are skipped — a selector
+    /// containing `:has()` never matches, so its rules can never
+    /// apply. `:is()`/`:not()`/`:where()` arguments are scanned:
+    /// they match, so a pseudo-class inside one counts, with the
+    /// reach taken from the argument's own combinators after the
+    /// pseudo plus (conservatively) the outer combinators after
+    /// the compound holding the argument.
+    pub fn for_rules(rules: &[Rule]) -> Self {
+        let mut index = Self::default();
+        for (i, rule) in rules.iter().enumerate() {
+            for selector in &rule.selectors {
+                if selector.has_unimplemented {
+                    continue;
+                }
+                let mut scan = ScanOut::default();
+                scan_selector(selector, &mut scan, None);
+                if scan.hover {
+                    push_unique(&mut index.hover, i);
+                    index.hover_reach |= scan.hover_reach;
+                }
+                if scan.active {
+                    push_unique(&mut index.active, i);
+                    index.active_reach |= scan.active_reach;
+                }
+                if scan.focus {
+                    push_unique(&mut index.focus, i);
+                    index.focus_reach |= scan.focus_reach;
+                }
+            }
+        }
+        index
+    }
+}
+
+fn push_unique(list: &mut Vec<usize>, value: usize) {
+    if !list.contains(&value) {
+        list.push(value);
+    }
+}
+
+/// Per-selector scan output: which dynamic pseudo-classes the
+/// selector mentions, and how far each one's state change reaches.
+#[derive(Debug, Default)]
+struct ScanOut {
+    hover: bool,
+    active: bool,
+    focus: bool,
+    hover_reach: PseudoReach,
+    active_reach: PseudoReach,
+    focus_reach: PseudoReach,
+}
+
+/// Scan one complex selector for dynamic pseudo-class mentions.
+/// `outer_after` is the combinators after the compound holding
+/// this selector when it appears as an `:is()`/`:not()`/`:where()`
+/// argument (`None` at the top level): they reach from the element
+/// the argument is attached to, so they count toward the reach
+/// too.
+fn scan_selector(sel: &Selector, out: &mut ScanOut, outer_after: Option<&[Combinator]>) {
+    for (ci, compound) in sel.compounds.iter().enumerate() {
+        // Combinators after this compound (joining it to the next
+        // one, and everything beyond): a rule styles the changed
+        // element's descendants/siblings only through these.
+        let after_here: &[Combinator] = sel.combinators.get(ci..).unwrap_or(&[]);
+        for part in &compound.parts {
+            let SimpleSelector::PseudoClass(pc) = part else {
+                continue;
+            };
+            match pc {
+                PseudoClass::Hover => {
+                    out.hover = true;
+                    out.hover_reach |= reach_from(after_here, outer_after);
+                }
+                PseudoClass::Active => {
+                    out.active = true;
+                    out.active_reach |= reach_from(after_here, outer_after);
+                }
+                PseudoClass::Focus | PseudoClass::FocusVisible => {
+                    out.focus = true;
+                    out.focus_reach |= reach_from(after_here, outer_after);
+                }
+                PseudoClass::FocusWithin => {
+                    out.focus = true;
+                    out.focus_reach.ancestors = true;
+                    out.focus_reach |= reach_from(after_here, outer_after);
+                }
+                PseudoClass::Is(args) | PseudoClass::Not(args) | PseudoClass::Where(args) => {
+                    for arg in args {
+                        scan_selector(arg, out, Some(after_here));
+                    }
+                }
+                // `:has()` never matches — skip its arguments.
+                // Everything else is static (structural/link) and
+                // cannot change on hover/active/focus.
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The reach of combinators after a pseudo-class: descendant/child
+/// combinators reach descendants, sibling combinators reach
+/// following siblings.
+fn reach_from(after_here: &[Combinator], outer_after: Option<&[Combinator]>) -> PseudoReach {
+    let mut reach = PseudoReach::default();
+    for c in after_here.iter().chain(outer_after.into_iter().flatten()) {
+        match c {
+            Combinator::Descendant | Combinator::Child => reach.descendants = true,
+            Combinator::NextSibling | Combinator::SubsequentSibling => reach.siblings = true,
+        }
+    }
+    reach
 }
 
 /// Rule context threaded through nested group rules: the enclosing
@@ -3481,6 +3874,75 @@ mod tests {
     }
 
     #[test]
+    fn border_radius_resolve_normalises_by_spec_overlap_rule() {
+        // CSS Backgrounds and Borders 3 §4.5, worked example (verified
+        // live 2026-11-24): a 6em x 2em box with
+        // `border-radius: 0.5em 2em 0.5em 2em` at 16px type is reduced
+        // by factor 0.8, to 0.4em and 1.6em.
+        let sheet = Stylesheet::parse("div { border-radius: 0.5em 2em 0.5em 2em; }");
+        let Value::BorderRadius(br) = decl(&sheet.rules[0], "border-radius").unwrap() else {
+            panic!("border-radius parses");
+        };
+        let resolved = br.resolve(96.0, 32.0, 16.0, 16.0, (1024.0, 768.0));
+        assert_eq!(resolved.top_left, (6.4, 6.4));
+        assert_eq!(resolved.top_right, (25.6, 25.6));
+        assert_eq!(resolved.bottom_right, (6.4, 6.4));
+        assert_eq!(resolved.bottom_left, (25.6, 25.6));
+        // The same radii on a tall enough box are untouched.
+        let roomy = br.resolve(96.0, 40.0, 16.0, 16.0, (1024.0, 768.0));
+        assert_eq!(roomy.top_left, (8.0, 8.0));
+        assert_eq!(roomy.top_right, (32.0, 32.0));
+    }
+
+    #[test]
+    fn border_radius_percentages_resolve_per_axis() {
+        // `border-radius: 50%` on a 200x100 box: rx is 50% of the
+        // width, ry 50% of the height — and the pair fits exactly,
+        // so no scale-down.
+        let sheet = Stylesheet::parse("div { border-radius: 50%; }");
+        let Value::BorderRadius(br) = decl(&sheet.rules[0], "border-radius").unwrap() else {
+            panic!("border-radius parses");
+        };
+        let resolved = br.resolve(200.0, 100.0, 16.0, 16.0, (1024.0, 768.0));
+        assert_eq!(resolved.top_left, (100.0, 50.0));
+        // `border-radius: 100%` overflows both axes by 2x: f = 0.5.
+        let sheet = Stylesheet::parse("div { border-radius: 100%; }");
+        let Value::BorderRadius(br) = decl(&sheet.rules[0], "border-radius").unwrap() else {
+            panic!("border-radius parses");
+        };
+        let resolved = br.resolve(200.0, 100.0, 16.0, 16.0, (1024.0, 768.0));
+        assert_eq!(resolved.top_left, (100.0, 50.0));
+        // A zero box never divides by zero: all radii stay zero.
+        let resolved = br.resolve(0.0, 0.0, 16.0, 16.0, (1024.0, 768.0));
+        assert!(resolved.is_zero());
+    }
+
+    #[test]
+    fn box_shadow_resolve_keeps_offsets_and_caps_blur_at_validation() {
+        let sheet = Stylesheet::parse(
+            "div { box-shadow: -2px 3px 7px 2px rgba(0,0,0,0.5), inset 0 0 100px black; }",
+        );
+        let Value::BoxShadow(shadows) = decl(&sheet.rules[0], "box-shadow").unwrap() else {
+            panic!("box-shadow parses");
+        };
+        let first = shadows[0].resolve(16.0, 16.0, (1024.0, 768.0), [0, 0, 0]);
+        assert_eq!(
+            (first.offset_x, first.offset_y, first.blur, first.spread),
+            (-2.0, 3.0, 7.0, 2.0)
+        );
+        assert_eq!(first.color, [0.0, 0.0, 0.0, 0.5]);
+        assert!(!first.inset);
+        // The blur is resolved, not clamped: the cap is enforced by
+        // display-list validation, so a 100px blur still resolves
+        // here and is rejected there.
+        let second = shadows[1].resolve(16.0, 16.0, (1024.0, 768.0), [255, 0, 0]);
+        assert!(second.inset);
+        assert_eq!(second.blur, 100.0);
+        assert!(second.blur > MAX_BOX_SHADOW_BLUR);
+        assert_eq!(second.color, [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
     fn border_radius_and_box_shadow_parse() {
         let sheet = Stylesheet::parse(
             "div { border-radius: 4px 8px; box-shadow: 2px 3px 7px 2px rgba(0,0,0,0.02); }",
@@ -3603,5 +4065,65 @@ mod tests {
             decl(&sheet.rules[0], "color"),
             Some(&Value::Color(0, 0, 255))
         );
+    }
+
+    #[test]
+    fn pseudo_class_index_covers_hover_active_focus_and_reach() {
+        // A plain rule mentions nothing; a bare `:hover` reaches
+        // nothing beyond its element; a descendant combinator after
+        // the pseudo reaches descendants; `+`/`~` reach siblings.
+        let sheet = Stylesheet::parse(
+            "p { color: red; } \
+             a:hover { color: blue; } \
+             div:hover span { color: green; } \
+             div:hover + p { color: yellow; } \
+             button:active { color: pink; } \
+             input:focus { color: orange; } \
+             form:focus-within { color: purple; } \
+             div:has(a:hover) { color: grey; }",
+        );
+        let index = &sheet.pseudo_class_index;
+        assert_eq!(index.hover, vec![1, 2, 3]);
+        assert_eq!(index.active, vec![4]);
+        assert_eq!(index.focus, vec![5, 6]);
+        assert!(index.hover_reach.descendants); // `div:hover span`
+        assert!(index.hover_reach.siblings); // `div:hover + p`
+        assert!(!index.hover_reach.ancestors);
+        assert!(!index.active_reach.descendants && !index.active_reach.siblings);
+        assert!(index.focus_reach.ancestors); // `:focus-within`
+        // `:has()` never matches, so its `:hover` is not indexed.
+        assert!(!index.hover.contains(&7));
+    }
+
+    #[test]
+    fn pseudo_class_index_reaches_through_is_not_and_ignores_plain_combinators() {
+        // A combinator BEFORE the pseudo does not reach: hovering
+        // the `b` in `div b:hover` restyles only `b` itself.
+        // `:is()`/`:not()` arguments count; a combinator after the
+        // argument's pseudo still reaches.
+        let sheet = Stylesheet::parse(
+            "div b:hover { color: red; } \
+             a:is(span:hover) { color: blue; } \
+             a:not(:hover) { color: green; } \
+             div:is(span:hover b) { color: yellow; }",
+        );
+        let index = &sheet.pseudo_class_index;
+        assert_eq!(index.hover, vec![0, 1, 2, 3]);
+        // Only the last rule reaches: its `:hover` sits before a
+        // descendant combinator inside the `:is()` argument.
+        assert!(index.hover_reach.descendants);
+        assert!(!index.hover_reach.siblings);
+    }
+
+    #[test]
+    fn pseudo_class_index_rebuilds_after_hand_pushed_rules() {
+        let mut sheet = Stylesheet::parse("p { color: red; }");
+        assert!(sheet.pseudo_class_index.hover.is_empty());
+        let mut pushed = Stylesheet::parse("a:hover { color: blue; }");
+        sheet.rules.append(&mut pushed.rules);
+        // Stale until rebuilt: the index still says no hover rule.
+        assert!(sheet.pseudo_class_index.hover.is_empty());
+        sheet.rebuild_pseudo_class_index();
+        assert_eq!(sheet.pseudo_class_index.hover, vec![1]);
     }
 }

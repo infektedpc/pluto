@@ -66,6 +66,7 @@
 
 pub mod builder;
 pub mod entities;
+pub mod observers;
 pub mod scanner;
 pub mod scripts;
 pub mod streaming;
@@ -77,6 +78,9 @@ use builder::ParseOutput;
 use slotmap::{SlotMap, new_key_type};
 
 pub use builder::{DomEvent, QName, SinkStats};
+pub use observers::{
+    MutationObserverOptions, MutationObserverRegistry, ObserverMutationRecord, ObserverRecordKind,
+};
 pub use scanner::{Destination, DiscoveredResource, Priority, resolve_url, scan};
 pub use scripts::{
     AsyncQueue, CloseOutcome, DeferQueue, DocumentWriter, DynamicMarkupError, OpenOutcome,
@@ -257,6 +261,10 @@ pub struct Dom {
     quirks_mode: QuirksMode,
     mutations: Vec<MutationRecord>,
     dirty: DirtySet,
+    /// Mutation-observer registrations + queued records (Stage 8
+    /// Rec 7). The JS half drains these; the `Dom` only matches
+    /// mutations against registrations and queues records.
+    observers: MutationObserverRegistry,
     /// Parser privilege: while true, mutators still maintain
     /// parent/child invariants but skip mutation records and dirty
     /// bits. Set by the builder for the duration of a parse and cleared
@@ -342,6 +350,127 @@ impl Dom {
 
     pub fn clear_mutations(&mut self) {
         self.mutations.clear();
+    }
+
+    // --- MutationObserver state (Stage 8 Rec 7) ---
+
+    /// Register `observer_id` on `target` (replaces an existing
+    /// registration for the same observer + target). Returns false
+    /// when `target` is not a live node.
+    pub fn observe_mutation(
+        &mut self,
+        observer_id: u64,
+        target: NodeId,
+        options: MutationObserverOptions,
+    ) -> bool {
+        if self.arena.get(target).is_none() {
+            return false;
+        }
+        self.observers.observe(observer_id, target, options);
+        true
+    }
+
+    /// Drop `observer_id` entirely: registrations and any queued
+    /// records are discarded (a later `observe()` starts fresh).
+    pub fn disconnect_mutation_observer(&mut self, observer_id: u64) {
+        self.observers.disconnect(observer_id);
+    }
+
+    /// Drain one observer's queued records (delivery, or
+    /// `takeRecords()`).
+    pub fn take_mutation_records(
+        &mut self,
+        observer_id: u64,
+    ) -> Vec<ObserverMutationRecord> {
+        self.observers.take_records(observer_id)
+    }
+
+    /// Observers with undelivered records, in first-record order.
+    pub fn pending_mutation_observers(&self) -> Vec<u64> {
+        self.observers.pending_observers()
+    }
+
+    /// Take the pending-observer list, clearing it.
+    pub fn take_pending_mutation_observers(&mut self) -> Vec<u64> {
+        self.observers.take_pending_observers()
+    }
+
+    /// True when `node` is `ancestor` or a descendant of it.
+    pub fn is_descendant_or_self(&self, node: NodeId, ancestor: NodeId) -> bool {
+        let mut cur = Some(node);
+        while let Some(id) = cur {
+            if id == ancestor {
+                return true;
+            }
+            cur = self.arena.get(id).and_then(|n| n.parent);
+        }
+        false
+    }
+
+    /// (previous, next) siblings of `id` in its current parent.
+    fn sibling_pair(&self, id: NodeId) -> (Option<NodeId>, Option<NodeId>) {
+        let Some(parent) = self.arena.get(id).and_then(|n| n.parent) else {
+            return (None, None);
+        };
+        let kids = self.children(parent);
+        let Some(pos) = kids.iter().position(|&c| c == id) else {
+            return (None, None);
+        };
+        (
+            if pos > 0 { Some(kids[pos - 1]) } else { None },
+            kids.get(pos + 1).copied(),
+        )
+    }
+
+    /// Match `record` against every registered observer and queue
+    /// it for the ones whose options cover this mutation on this
+    /// node (directly, or via `subtree` on an ancestor target).
+    /// Skipped while a parse is in progress (parser privilege —
+    /// parsing never fires observers). `old_value` is stripped
+    /// unless the observer asked for it.
+    fn notify_observers(&mut self, record: ObserverMutationRecord) {
+        if self.suppress_records {
+            return;
+        }
+        for (observer_id, target, options) in self.observers.registrations() {
+            let in_scope = record.target == target
+                || (options.subtree && self.is_descendant_or_self(record.target, target));
+            if !in_scope {
+                continue;
+            }
+            let wanted = match record.kind {
+                ObserverRecordKind::ChildList => options.child_list,
+                ObserverRecordKind::Attributes => {
+                    if !options.wants_attributes() {
+                        false
+                    } else if let Some(filter) = &options.attribute_filter {
+                        record
+                            .attribute_name
+                            .as_ref()
+                            .is_some_and(|n| filter.iter().any(|f| f == n))
+                    } else {
+                        true
+                    }
+                }
+                ObserverRecordKind::CharacterData => options.character_data,
+            };
+            if !wanted {
+                continue;
+            }
+            let mut rec = record.clone();
+            match rec.kind {
+                ObserverRecordKind::Attributes if !options.attribute_old_value => {
+                    rec.old_value = None
+                }
+                ObserverRecordKind::CharacterData
+                    if !options.character_data_old_value =>
+                {
+                    rec.old_value = None
+                }
+                _ => {}
+            }
+            self.observers.queue(observer_id, rec);
+        }
     }
 
     pub fn dirty_set(&self) -> &DirtySet {
@@ -530,8 +659,16 @@ impl Dom {
 
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
         let before = BeforeSnapshot::capture(self, child);
+        let previous_sibling = self.children(parent).last().copied();
         self.link_at(parent, child, None);
         self.note_mutation(child, MutationKind::ChildInserted { parent }, Some(before));
+        self.notify_observers(ObserverMutationRecord::child_list(
+            parent,
+            vec![child],
+            vec![],
+            previous_sibling,
+            None,
+        ));
     }
 
     /// Insert `child` as a child of `parent` immediately before
@@ -542,23 +679,53 @@ impl Dom {
             .arena
             .get(parent)
             .and_then(|n| n.children.iter().position(|&c| c == sibling));
+        let previous_sibling = pos.and_then(|p| {
+            if p > 0 {
+                self.children(parent).get(p - 1).copied()
+            } else {
+                None
+            }
+        });
         self.link_at(parent, child, pos);
         self.note_mutation(child, MutationKind::ChildInserted { parent }, Some(before));
+        self.notify_observers(ObserverMutationRecord::child_list(
+            parent,
+            vec![child],
+            vec![],
+            previous_sibling,
+            Some(sibling),
+        ));
     }
 
     /// Detach `child` from `parent`. (Lenient: detaches wherever the
     /// child currently lives.)
     pub fn remove_child(&mut self, parent: NodeId, child: NodeId) {
         let before = BeforeSnapshot::capture(self, child);
+        let (previous_sibling, next_sibling) = self.sibling_pair(child);
         self.detach(child);
         self.note_mutation(child, MutationKind::ChildRemoved { parent }, Some(before));
+        self.notify_observers(ObserverMutationRecord::child_list(
+            parent,
+            vec![],
+            vec![child],
+            previous_sibling,
+            next_sibling,
+        ));
     }
 
     /// Detach `target` from whatever parent it has, if any.
     pub fn remove_from_parent(&mut self, target: NodeId) {
         let before = BeforeSnapshot::capture(self, target);
+        let (previous_sibling, next_sibling) = self.sibling_pair(target);
         if let Some(parent) = self.detach(target) {
             self.note_mutation(target, MutationKind::ChildRemoved { parent }, Some(before));
+            self.notify_observers(ObserverMutationRecord::child_list(
+                parent,
+                vec![],
+                vec![target],
+                previous_sibling,
+                next_sibling,
+            ));
         }
     }
 
@@ -570,9 +737,17 @@ impl Dom {
             .arena
             .get(parent)
             .and_then(|n| n.children.iter().position(|&c| c == old));
+        let (previous_sibling, next_sibling) = self.sibling_pair(old);
         self.detach(old);
         self.link_at(parent, new, pos);
         self.note_mutation(new, MutationKind::ChildReplaced { parent }, Some(before));
+        self.notify_observers(ObserverMutationRecord::child_list(
+            parent,
+            vec![new],
+            vec![old],
+            previous_sibling,
+            next_sibling,
+        ));
     }
 
     /// Move all children of `node` to `new_parent`, in order. (The
@@ -584,7 +759,23 @@ impl Dom {
         }
         let kids: Vec<NodeId> = self.children(node).to_vec();
         for kid in kids {
+            let (previous_sibling, next_sibling) = self.sibling_pair(kid);
+            let previous_in_new = self.children(new_parent).last().copied();
             self.link_at(new_parent, kid, None);
+            self.notify_observers(ObserverMutationRecord::child_list(
+                node,
+                vec![],
+                vec![kid],
+                previous_sibling,
+                next_sibling,
+            ));
+            self.notify_observers(ObserverMutationRecord::child_list(
+                new_parent,
+                vec![kid],
+                vec![],
+                previous_in_new,
+                None,
+            ));
         }
         self.note_mutation(
             new_parent,
@@ -598,6 +789,7 @@ impl Dom {
     /// attribute list; the DOM API replaces.)
     pub fn set_attribute(&mut self, id: NodeId, name: &str, value: &str) {
         let before = BeforeSnapshot::capture(self, id);
+        let old_value = self.attr(id, name).map(|v| v.to_string());
         if let Some(node) = self.arena.get_mut(id) {
             match node.attrs.iter_mut().find(|(n, _)| n == name) {
                 Some((_, v)) => *v = value.to_string(),
@@ -609,10 +801,12 @@ impl Dom {
             MutationKind::AttributeChanged { name: name.to_string() },
             Some(before),
         );
+        self.notify_observers(ObserverMutationRecord::attribute(id, name, old_value));
     }
 
     pub fn remove_attribute(&mut self, id: NodeId, name: &str) {
         let before = BeforeSnapshot::capture(self, id);
+        let old_value = self.attr(id, name).map(|v| v.to_string());
         let mut removed = false;
         if let Some(node) = self.arena.get_mut(id) {
             let before_len = node.attrs.len();
@@ -625,6 +819,7 @@ impl Dom {
                 MutationKind::AttributeRemoved { name: name.to_string() },
                 Some(before),
             );
+            self.notify_observers(ObserverMutationRecord::attribute(id, name, old_value));
         }
     }
 
@@ -633,39 +828,44 @@ impl Dom {
     /// carries new attributes.
     pub fn add_attrs_if_missing(&mut self, target: NodeId, attrs: Vec<(String, String)>) {
         let before = BeforeSnapshot::capture(self, target);
-        let mut added: Option<String> = None;
+        let mut added: Vec<String> = Vec::new();
         if let Some(node) = self.arena.get_mut(target) {
             for (name, value) in attrs {
                 if !node.attrs.iter().any(|(n, _)| *n == name) {
-                    if added.is_none() {
-                        added = Some(name.clone());
-                    }
+                    added.push(name.clone());
                     node.attrs.push((name, value));
                 }
             }
         }
-        if let Some(name) = added {
+        if let Some(name) = added.first().cloned() {
             self.note_mutation(target, MutationKind::AttributeChanged { name }, Some(before));
+        }
+        for name in added {
+            self.notify_observers(ObserverMutationRecord::attribute(target, &name, None));
         }
     }
 
     /// Replace a text node's data.
     pub fn set_text(&mut self, id: NodeId, data: &str) {
         let before = BeforeSnapshot::capture(self, id);
+        let old_value = self.text(id).map(|v| v.to_string());
         if let Some(Node { kind: NodeKind::Text(contents), .. }) = self.arena.get_mut(id) {
             *contents = data.to_string();
         }
         self.note_mutation(id, MutationKind::CharacterDataChanged, Some(before));
+        self.notify_observers(ObserverMutationRecord::character_data(id, old_value));
     }
 
     /// Append to an existing text node (adjacent-text merging: the
     /// builder hands the tree text in chunks).
     pub fn append_to_text(&mut self, id: NodeId, data: &str) {
         let before = BeforeSnapshot::capture(self, id);
+        let old_value = self.text(id).map(|v| v.to_string());
         if let Some(Node { kind: NodeKind::Text(contents), .. }) = self.arena.get_mut(id) {
             contents.push_str(data);
         }
         self.note_mutation(id, MutationKind::CharacterDataChanged, Some(before));
+        self.notify_observers(ObserverMutationRecord::character_data(id, old_value));
     }
 }
 
@@ -1148,6 +1348,90 @@ mod tests {
         // …and draining the log empties it.
         assert!(!dom.take_mutations().is_empty());
         assert!(dom.mutations().is_empty());
+    }
+
+    #[test]
+    fn mutation_observer_records_in_order_and_respects_options() {
+        // Stage 8 Rec 7 (DOM half): childList / attributes /
+        // characterData records, in mutation order, with the
+        // observer's options (subtree, attributeFilter, old values)
+        // deciding what is queued.
+        let mut dom = Dom::new();
+        let root = dom.root().unwrap();
+        let div = dom.create_element("div");
+        dom.append_child(root, div);
+        let text = dom.create_text("hello");
+        dom.append_child(div, text);
+        dom.clear_mutations();
+
+        // Observer 1: childList + attributes on `div`, subtree on.
+        let opts = MutationObserverOptions {
+            child_list: true,
+            attributes: true,
+            character_data: true,
+            subtree: true,
+            attribute_old_value: true,
+            character_data_old_value: true,
+            attribute_filter: None,
+        };
+        assert!(dom.observe_mutation(1, div, opts));
+        // Observer 2: attributes only, filtered to `id`, no subtree.
+        let opts2 = MutationObserverOptions {
+            attribute_filter: Some(vec!["id".into()]),
+            ..Default::default()
+        };
+        assert!(dom.observe_mutation(2, div, opts2));
+
+        let span = dom.create_element("span");
+        dom.append_child(div, span);
+        dom.set_attribute(div, "class", "red");
+        dom.set_attribute(div, "class", "blue");
+        dom.set_attribute(div, "id", "x");
+        dom.set_text(text, "bye");
+        dom.remove_child(div, span);
+
+        // Observer 1 sees everything, in order, with old values.
+        let recs = dom.take_mutation_records(1);
+        assert_eq!(recs.len(), 6, "records: {recs:?}");
+        assert_eq!(recs[0].kind, ObserverRecordKind::ChildList);
+        assert_eq!(recs[0].target, div);
+        assert_eq!(recs[0].added_nodes, vec![span]);
+        assert!(recs[0].removed_nodes.is_empty());
+        assert_eq!(recs[1].kind, ObserverRecordKind::Attributes);
+        assert_eq!(recs[1].attribute_name.as_deref(), Some("class"));
+        assert_eq!(recs[1].old_value.as_deref(), None);
+        assert_eq!(recs[2].old_value.as_deref(), Some("red"));
+        assert_eq!(recs[3].attribute_name.as_deref(), Some("id"));
+        assert_eq!(recs[4].kind, ObserverRecordKind::CharacterData);
+        assert_eq!(recs[4].target, text);
+        assert_eq!(recs[4].old_value.as_deref(), Some("hello"));
+        assert_eq!(recs[5].kind, ObserverRecordKind::ChildList);
+        assert_eq!(recs[5].removed_nodes, vec![span]);
+        // The span followed the text node, so that is its previous
+        // sibling at removal time.
+        assert_eq!(recs[5].previous_sibling, Some(text));
+        // takeRecords drains: a second take is empty.
+        assert!(dom.take_mutation_records(1).is_empty());
+        // Observer 2 saw only the `id` attribute change.
+        let recs2 = dom.take_mutation_records(2);
+        assert_eq!(recs2.len(), 1, "filtered records: {recs2:?}");
+        assert_eq!(recs2[0].attribute_name.as_deref(), Some("id"));
+        // `takeRecords` cleared the pending list for both.
+        assert!(dom.pending_mutation_observers().is_empty());
+
+        // Disconnect stops delivery: later mutations queue nothing.
+        dom.disconnect_mutation_observer(1);
+        let b = dom.create_element("b");
+        dom.append_child(div, b);
+        assert!(dom.take_mutation_records(1).is_empty());
+        assert!(dom.pending_mutation_observers().is_empty());
+        // A detached node is still a live arena node, so
+        // observing it succeeds (it just never matches a mutation
+        // while detached).
+        assert!(dom.observe_mutation(3, span, MutationObserverOptions {
+            child_list: true,
+            ..Default::default()
+        }));
     }
 
     #[test]

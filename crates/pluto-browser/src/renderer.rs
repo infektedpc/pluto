@@ -59,18 +59,27 @@ use crate::page::{self, Document};
 use cosmic::iced::futures::SinkExt;
 use cosmic::iced::futures::channel::mpsc;
 use pluto_html::NodeId;
-use pluto_ipc::{BrowserToRenderer, CommandReceiver, InputEvent, RendererToBrowser};
+use pluto_ipc::{
+    BrowserToRenderer, CommandReceiver, DeltaMode, InputEvent, PointerKind, RendererToBrowser,
+    WheelPhase,
+};
 use pluto_js::TabJs;
-use pluto_layout::{ElementState, LayoutTree};
+use pluto_layout::{ElementState, LayoutTree, OverscrollBehavior};
 use pluto_net::ResourceLoader;
-use pluto_paint::{DisplayList, ResourceTable};
+use pluto_paint::{DisplayList, ResourceTable, perf};
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+
+/// Rendering-step observer helpers (Stage 8 Rec 8): measuring
+/// observed targets on the retained layout tree. Declared here
+/// with an explicit path so `main.rs` needs no new `mod` line.
+#[path = "observers.rs"]
+pub(crate) mod observers;
 
 /// The subscription that runs the worker. The shell's `Application`
 /// wires this in via `fn subscription`.
@@ -109,23 +118,68 @@ fn worker_stream() -> impl cosmic::iced::futures::stream::Stream<Item = crate::M
 /// plain OS thread, not an async task.
 pub(crate) enum LayoutJob {
     /// (Re-)lay out at `viewport` with `state`, re-applying the
-    /// retained `offsets` after the rebuild. `document: Some` replaces
-    /// the actor's document (a new navigation / error page / a
+    /// retained `offsets` after the rebuild — but build NO display
+    /// list yet (Stage 8 Rec 8/10: the ResizeObserver and
+    /// IntersectionObserver steps run after layout and before the
+    /// list is built; see [`layout_and_submit`]). `document: Some` replaces the
+    /// actor's document (a new navigation / error page / a
     /// JS-mutated document); `None` re-lays out the retained one
     /// (a resize).
-    Layout {
+    LayoutTree {
         document: Box<Option<Document>>,
         viewport: (f32, f32),
         state: ElementState,
         offsets: HashMap<NodeId, (f32, f32)>,
+        /// Try the Stage 8 Rec 6 incremental path on the actor's
+        /// retained tree (the incoming document is a snapshot of
+        /// the same live `Dom` — a dirty tick or a resize — so its
+        /// node ids match the retained tree). False for a fresh
+        /// navigation / error page, whose ids belong to a new
+        /// document: the actor must full-rebuild. A failed
+        /// incremental attempt falls back to a full rebuild
+        /// either way.
+        incremental: bool,
+        reply: oneshot::Sender<()>,
+    },
+    /// Build the display list from the actor's retained tree
+    /// (after the ResizeObserver step has run).
+    CollectDisplayList {
         reply: oneshot::Sender<Arc<DisplayList>>,
     },
-    /// Scroll one container: `set_scroll_offset` + re-collect, no
-    /// re-layout. `None` when the actor holds no tree.
-    Scroll {
-        id: NodeId,
+    /// Sizes + DOM depths for observed targets, from the retained
+    /// tree + document (Stage 8 Rec 8). `None` size = unrendered.
+    ResizeSizes {
+        ids: Vec<NodeId>,
+        reply: oneshot::Sender<Vec<(NodeId, Option<pluto_js::ObservedSizes>, usize)>>,
+    },
+    /// Intersection geometry for observed targets, from the retained
+    /// tree + document (Stage 8 Rec 10). `None` = the target (or an
+    /// element root) has no box — unrendered, so no entry fires.
+    /// `viewport_scroll` is the worker's mirrored viewport scroll
+    /// (see `TabState::viewport_scroll`).
+    IntersectionGeometry {
+        queries: Vec<observers::IntersectionQuery>,
+        viewport_scroll: (f32, f32),
+        reply: oneshot::Sender<Vec<Option<pluto_js::ComputedIntersection>>>,
+    },
+    /// The innermost-first chain of scroll containers containing
+    /// the point (page coordinates), each with its
+    /// `overscroll-behavior` per axis (Stage 8 Rec 9). The worker
+    /// applies a wheel to the chain in order, chaining the leftover
+    /// delta to the next container — and to the viewport when the
+    /// chain is exhausted. Root/body are excluded (their overflow
+    /// propagates to the viewport).
+    ScrollChain {
         x: f32,
         y: f32,
+        reply: oneshot::Sender<Vec<ScrollChainEntry>>,
+    },
+    /// Scroll several containers at once: apply all offsets, then
+    /// re-collect ONE display list (Stage 8 Rec 9 — a wheel that
+    /// crosses two containers in one gesture must not submit
+    /// twice). `None` when the actor holds no tree.
+    ScrollMany {
+        scrolls: Vec<(NodeId, f32, f32)>,
         reply: oneshot::Sender<Option<Arc<DisplayList>>>,
     },
     /// Hit-test a click (page coordinates) and resolve the nearest
@@ -174,6 +228,80 @@ pub(crate) enum LayoutJob {
     },
 }
 
+/// One entry of a wheel scroll chain (Stage 8 Rec 9): the scroll
+/// container and its `overscroll-behavior` per axis — whether a
+/// scroll reaching this container's limit chains onward or stops
+/// here.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScrollChainEntry {
+    pub id: NodeId,
+    pub overscroll_x: OverscrollBehavior,
+    pub overscroll_y: OverscrollBehavior,
+}
+
+/// The innermost-first chain of scroll containers containing the
+/// point (Stage 8 Rec 9): every scroll container whose rect
+/// contains the point, deepest first, ties broken by rect area
+/// (the smaller, more nested container wins). Root/body are
+/// excluded — their overflow propagates to the viewport, which the
+/// worker scrolls with a `ScrollViewport` message instead. Each
+/// entry carries the container's `overscroll-behavior` per axis,
+/// read from the retained tree's computed styles.
+fn scroll_chain_for(
+    tree: &LayoutTree,
+    doc: &Document,
+    x: f32,
+    y: f32,
+) -> Vec<ScrollChainEntry> {
+    let dom = doc.dom();
+    let mut chain: Vec<(usize, f32, ScrollChainEntry)> = tree
+        .scroll_containers()
+        .into_iter()
+        .filter(|&(id, rect)| {
+            // Rect contains the point, and the container is not
+            // root/body.
+            x >= rect[0]
+                && x < rect[0] + rect[2]
+                && y >= rect[1]
+                && y < rect[1] + rect[3]
+                && !matches!(dom.tag(id), Some("html" | "body"))
+        })
+        .map(|(id, rect)| {
+            // DOM depth: walk the parent chain. A detached node
+            // (no depth) sorts shallowest.
+            let mut depth = 0usize;
+            let mut cur = dom.get(id).and_then(|n| n.parent);
+            while let Some(parent) = cur {
+                depth += 1;
+                cur = dom.get(parent).and_then(|n| n.parent);
+            }
+            let (overscroll_x, overscroll_y) = tree
+                .node_styles
+                .get(id)
+                .map(|s| {
+                    (
+                        s.computed.overscroll_behavior_x,
+                        s.computed.overscroll_behavior_y,
+                    )
+                })
+                .unwrap_or((OverscrollBehavior::Auto, OverscrollBehavior::Auto));
+            (
+                depth,
+                rect[2] * rect[3],
+                ScrollChainEntry {
+                    id,
+                    overscroll_x,
+                    overscroll_y,
+                },
+            )
+        })
+        .collect();
+    // Deepest first; a smaller rect wins a depth tie (the more
+    // nested container is usually the smaller one).
+    chain.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)));
+    chain.into_iter().map(|(_, _, entry)| entry).collect()
+}
+
 /// Geometry of one node from a laid-out tree, in page coordinates.
 fn geometry_of(tree: &LayoutTree, id: NodeId) -> Option<pluto_js::Geometry> {
     tree.boxes_for_dom(id).first().map(|b| pluto_js::Geometry {
@@ -184,6 +312,54 @@ fn geometry_of(tree: &LayoutTree, id: NodeId) -> Option<pluto_js::Geometry> {
     })
 }
 
+/// Full rebuild of the layout tree for `doc`: the fallback for a
+/// failed incremental attempt and the path for fresh navigations.
+/// Builds the tree directly (not via `layout_document_with_state`,
+/// which also builds a display list that would be thrown away here
+/// — the list is built after the ResizeObserver step, by
+/// `CollectDisplayList`). A layout failure renders the error page
+/// through the same pipeline. `old_tree` is the retained tree
+/// being replaced: its `FontSystem` is reused for the new build
+/// (Stage 8 Rec 9) — a fresh `FontSystem` re-scans the system
+/// fonts (~1.5 s), and a hover restyle that lands on the document
+/// root would otherwise pay that per pointer event.
+fn build_full_tree(
+    doc: &Document,
+    viewport: (f32, f32),
+    state: &ElementState,
+    old_tree: Option<LayoutTree>,
+) -> LayoutTree {
+    let old_fonts = old_tree.and_then(|t| t.font_system);
+    let result = match old_fonts {
+        Some(fonts) => LayoutTree::build_with_state_reusing_font_system(
+            doc.dom(),
+            doc.sheet(),
+            viewport.0,
+            viewport.1,
+            state,
+            fonts,
+        ),
+        None => LayoutTree::build_with_state(doc.dom(), doc.sheet(), viewport.0, viewport.1, state),
+    };
+    match result {
+        Ok(tree) => tree,
+        Err(e) => {
+            let err_doc = page::parse_document(&page::error_document(
+                "about:blank",
+                &format!("layout failed: {e}"),
+            ));
+            LayoutTree::build_with_state(
+                err_doc.dom(),
+                err_doc.sheet(),
+                viewport.0,
+                viewport.1,
+                state,
+            )
+            .unwrap_or_default()
+        }
+    }
+}
+
 /// The layout actor: owns the tree + document, answers jobs until the
 /// channel closes. Runs on its own OS thread (`pluto-layout`), so the
 /// `!Send` tree never crosses an await or a thread boundary.
@@ -192,37 +368,125 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
     let mut document: Option<Document> = None;
     while let Ok(job) = jobs.recv() {
         match job {
-            LayoutJob::Layout {
+            LayoutJob::LayoutTree {
                 document: new_document,
                 viewport,
                 state,
                 offsets,
+                incremental,
                 reply,
             } => {
                 if let Some(doc) = *new_document {
                     document = Some(doc);
                 }
                 let Some(doc) = document.as_ref() else {
-                    let _ = reply.send(Arc::new(DisplayList::new()));
+                    let _ = reply.send(());
                     continue;
                 };
-                let (mut display, mut new_tree) =
-                    page::layout_document_with_state(doc, viewport, &state);
-                if !offsets.is_empty() {
-                    for (&id, &(x, y)) in &offsets {
-                        new_tree.set_scroll_offset(id, x, y);
+                // Stage 8 Rec 6: a dirty tick / resize hands the
+                // actor a snapshot of the same live Dom the
+                // retained tree was built from, so re-lay out
+                // incrementally on the retained tree — dirty
+                // subtree only, full rebuild only when the root
+                // is unsafe (the function decides, and reports
+                // which path ran). A fresh navigation's document
+                // has new node ids, so it never takes this path
+                // (`incremental` false). A failed incremental
+                // attempt discards the retained tree and rebuilds
+                // from scratch — never a stale or half-updated
+                // tree.
+                let mut built_fresh = true;
+                if incremental
+                    && let Some(retained) = tree.as_mut()
+                {
+                    match retained.relayout_incremental(
+                        doc.dom(),
+                        doc.sheet(),
+                        viewport.0,
+                        viewport.1,
+                        &state,
+                    ) {
+                        Ok(outcome) => {
+                            eprintln!(
+                                "[pluto] incremental layout: {:?} ({})",
+                                outcome.kind, outcome.reason
+                            );
+                            built_fresh = false;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[pluto] incremental layout failed ({e}), full rebuild"
+                            );
+                        }
                     }
-                    // Offsets shift already-laid-out descendants
-                    // (re-collect, no re-layout), so the list built
-                    // before them is stale.
-                    display = Arc::new(DisplayList::build(&new_tree));
                 }
-                tree = Some(new_tree);
+                if built_fresh {
+                    // Hand the retained tree's FontSystem to the
+                    // rebuild (Stage 8 Rec 9): a fresh one would
+                    // re-scan the system fonts per rebuild.
+                    let old_tree = tree.take();
+                    let mut new_tree = build_full_tree(doc, viewport, &state, old_tree);
+                    if !offsets.is_empty() {
+                        for (&id, &(x, y)) in &offsets {
+                            new_tree.set_scroll_offset(id, x, y);
+                        }
+                    }
+                    tree = Some(new_tree);
+                } else if !offsets.is_empty() {
+                    // Incremental success: the retained tree was
+                    // updated in place; re-apply the scroll
+                    // offsets the same way (they survive in the
+                    // tree, but the job's map is authoritative).
+                    if let Some(retained) = tree.as_mut() {
+                        for (&id, &(x, y)) in &offsets {
+                            retained.set_scroll_offset(id, x, y);
+                        }
+                    }
+                }
+                let _ = reply.send(());
+            }
+            LayoutJob::CollectDisplayList { reply } => {
+                let display = tree
+                    .as_ref()
+                    .map(|tree| Arc::new(DisplayList::build(tree)))
+                    .unwrap_or_else(|| Arc::new(DisplayList::new()));
                 let _ = reply.send(display);
             }
-            LayoutJob::Scroll { id, x, y, reply } => {
+            LayoutJob::ResizeSizes { ids, reply } => {
+                let rows = match (tree.as_ref(), document.as_ref()) {
+                    (Some(tree), Some(doc)) => observers::resize_sizes_for(tree, doc.dom(), &ids),
+                    _ => ids.iter().map(|&id| (id, None, 0)).collect(),
+                };
+                let _ = reply.send(rows);
+            }
+            LayoutJob::IntersectionGeometry {
+                queries,
+                viewport_scroll,
+                reply,
+            } => {
+                let rows = match (tree.as_ref(), document.as_ref()) {
+                    (Some(tree), Some(doc)) => observers::intersection_geometry_for(
+                        tree,
+                        doc.dom(),
+                        &queries,
+                        viewport_scroll,
+                    ),
+                    _ => queries.iter().map(|_| None).collect(),
+                };
+                let _ = reply.send(rows);
+            }
+            LayoutJob::ScrollChain { x, y, reply } => {
+                let chain = match (tree.as_ref(), document.as_ref()) {
+                    (Some(tree), Some(doc)) => scroll_chain_for(tree, doc, x, y),
+                    _ => Vec::new(),
+                };
+                let _ = reply.send(chain);
+            }
+            LayoutJob::ScrollMany { scrolls, reply } => {
                 let display = tree.as_mut().map(|tree| {
-                    tree.set_scroll_offset(id, x, y);
+                    for (id, x, y) in scrolls {
+                        tree.set_scroll_offset(id, x, y);
+                    }
                     Arc::new(DisplayList::build(tree))
                 });
                 let _ = reply.send(display);
@@ -304,9 +568,10 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
 // `TabJs` turns, and re-lays out + submits only when a mutation
 // marked the document dirty or an rAF callback is pending (the
 // loop's own `maybe_render` already skips frames with nothing to
-// do). Hidden/background tabs get the same cadence in M4 — there
-// is no visibility signal to throttle on yet; throttling is a
-// later-stage refinement, not faked here.
+// do). Hidden tabs stop producing frames (Stage 8 Rec 1):
+// the shell forwards window focus as the visibility signal, the
+// tick gate skips relayout while hidden (dirty flags stay set, so
+// the first visible tick re-lays out), and JS timers keep running.
 
 /// How often the tab thread ticks (the M4 rendering cadence:
 /// ~60 Hz; see the module docs — no shell vsync exists to drive it).
@@ -356,7 +621,46 @@ struct TabState {
     has_document: bool,
     element_state: ElementState,
     scroll_offsets: HashMap<NodeId, (f32, f32)>,
+    /// The currently hovered element chain — the hit element plus
+    /// its ancestors (browsers hover ancestors too: hovering text
+    /// inside a button highlights the button). Drives `:hover`
+    /// restyle (Stage 8 Rec 9).
+    hovered: Vec<NodeId>,
+    /// The element under an active press (for `:active` restyle).
+    active_element: Option<NodeId>,
+    /// The element a pointer press started on: a left release over
+    /// the same target synthesises the click (Stage 8 Rec 9).
+    pointer_down_target: Option<NodeId>,
+    /// The element with keyboard focus (for `:focus` restyle and
+    /// Enter/Space activation).
+    focused: Option<NodeId>,
+    /// Whether the window is focused (Stage 8 Rec 9): the shell
+    /// forwards focus alongside visibility; keyboard input is only
+    /// acted on while focused.
+    window_focused: bool,
+    /// The scroll chain the current wheel gesture is applying to,
+    /// picked on the gesture's first wheel (Stage 8 Rec 9).
+    wheel_chain: Vec<ScrollChainEntry>,
+    /// Ticks since the last wheel event: the gesture expires after
+    /// ~200 ms (~12 ticks) with no wheel, and the next wheel
+    /// re-picks its chain.
+    wheel_idle_ticks: u32,
+    /// Frame ticks elapsed (gesture timeout bookkeeping).
+    tick_count: u64,
     viewport: (f32, f32),
+    /// The viewport scroll offset, mirrored from the shell (Stage 8
+    /// Rec 10): every viewport scroll flows through
+    /// `emit_scroll_viewport`, which updates this with the same
+    /// ≥0 clamp the shell's `compositor.scroll_by` applies, and
+    /// `start_navigation` resets it — so the IntersectionObserver
+    /// step can compute viewport-root intersections from the
+    /// retained tree without a protocol change. The worker works
+    /// entirely in page coordinates; the viewport root is
+    /// `[viewport_scroll, viewport]` in page coordinates.
+    viewport_scroll: (f32, f32),
+    /// When this tab started (the `IntersectionObserver` entry
+    /// `time` clock: ms since the tab started).
+    tab_started: std::time::Instant,
     /// Display-list epoch (advances per submitted list).
     epoch: u64,
     /// Navigation epoch (cancels the old navigation's fetch +
@@ -413,7 +717,17 @@ impl TabState {
             has_document: false,
             element_state: ElementState::default(),
             scroll_offsets: HashMap::new(),
+            hovered: Vec::new(),
+            active_element: None,
+            pointer_down_target: None,
+            focused: None,
+            window_focused: true,
+            wheel_chain: Vec::new(),
+            wheel_idle_ticks: 0,
+            tick_count: 0,
             viewport: page::DEFAULT_VIEWPORT,
+            viewport_scroll: (0.0, 0.0),
+            tab_started: std::time::Instant::now(),
             epoch: 0,
             nav_epoch: 0,
             nav_cancel: None,
@@ -500,37 +814,52 @@ async fn tab_main(
     loop {
         tokio::select! {
             _ = tick.tick() => {
+                state.tick_count += 1;
+                // Wheel gesture expiry (Stage 8 Rec 9): no wheel
+                // for ~200 ms (~12 ticks) ends the gesture — the
+                // chain is forgotten, so the next wheel re-picks
+                // its containers under the cursor.
+                if !state.wheel_chain.is_empty() {
+                    state.wheel_idle_ticks += 1;
+                    if state.wheel_idle_ticks > 12 {
+                        state.wheel_chain.clear();
+                        state.wheel_idle_ticks = 0;
+                    }
+                }
                 drive_js(&mut state);
                 // Dirty-bit flow (Rec 7): a JS mutation sets the
                 // host's render flag / dirty bits and returns
                 // immediately (no layout); the frame tick re-lays
-                // out and submits.
-                if state.render_requested.get() || state.host.lock().unwrap().dom_is_dirty() {
+                // out and submits — with the ResizeObserver step
+                // (Rec 8) running inside `relayout_and_submit`,
+                // after layout and before the display list is
+                // built. Stage 8 Rec 1: a hidden tab
+                // skips the relayout — the dirty flags stay set,
+                // so the first visible tick re-lays out and
+                // submits. A tab with no JS realm yet counts as
+                // visible (the first layout must still happen).
+                let visible = state
+                    .tab_js
+                    .as_ref()
+                    .map(|js| js.is_visible())
+                    .unwrap_or(true);
+                let dirty = state.render_requested.get()
+                    || state.host.lock().unwrap().dom_is_dirty();
+                if visible && dirty {
                     state.render_requested.set(false);
                     relayout_and_submit(&mut state, &events).await;
+                } else if !visible && dirty {
+                    // Perf (Stage 8 Rec 5): a hidden tab that
+                    // would have re-laid out counts the skip.
+                    if let Ok(mut counters) = perf::global().lock() {
+                        counters.frames_hidden_skipped += 1;
+                    }
                 }
             }
             cmd = commands.recv() => {
                 let Some(cmd) = cmd else { break };
-                match cmd {
-                    BrowserToRenderer::Shutdown => break,
-                    BrowserToRenderer::CommitNavigation { url } => {
-                        start_navigation(&mut state, url);
-                    }
-                    BrowserToRenderer::Resize { width, height } => {
-                        resize(&mut state, &events, width, height).await;
-                    }
-                    BrowserToRenderer::ResourceEvent(event) => {
-                        // The M5 shape: the shell streams fetch events back
-                        // to the renderer. Today the worker fetches through
-                        // its own loader, which consumes the events
-                        // internally, so nothing arrives here — ignore it if
-                        // it ever does.
-                        eprintln!("[pluto] ignoring ResourceEvent from shell: {event:?}");
-                    }
-                    BrowserToRenderer::InputEvent(event) => {
-                        handle_input(&mut state, &events, event).await;
-                    }
+                if !handle_command(&mut state, &events, cmd, &mut commands).await {
+                    break;
                 }
             }
             msg = exec_rx.recv() => {
@@ -543,6 +872,97 @@ async fn tab_main(
             }
         }
     }
+}
+
+/// Handle one shell command. Returns false when the loop should
+/// stop (`Shutdown`). Pointer moves are coalesced before handling:
+/// only the latest position per frame reaches the worker (Stage 8
+/// Rec 9) — a drag can queue dozens of moves between ticks, and
+/// only the last one matters for hover. Non-move commands found
+/// while draining are handled in order, right after.
+async fn handle_command(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    cmd: BrowserToRenderer,
+    commands: &mut tokio::sync::mpsc::Receiver<BrowserToRenderer>,
+) -> bool {
+    let cmd = match cmd {
+        BrowserToRenderer::InputEvent(ev @ InputEvent::Pointer {
+            kind: PointerKind::Move,
+            ..
+        }) => {
+            let mut latest = BrowserToRenderer::InputEvent(ev);
+            loop {
+                match commands.try_recv() {
+                    Ok(other @ BrowserToRenderer::InputEvent(InputEvent::Pointer {
+                        kind: PointerKind::Move,
+                        ..
+                    })) => latest = other,
+                    Ok(other) => {
+                        if !handle_single_command(state, events, other).await {
+                            return false;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            latest
+        }
+        other => other,
+    };
+    handle_single_command(state, events, cmd).await
+}
+
+/// Handle one shell command that is not a coalescible pointer
+/// move. Returns false when the loop should stop (`Shutdown`).
+async fn handle_single_command(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    cmd: BrowserToRenderer,
+) -> bool {
+    match cmd {
+        BrowserToRenderer::Shutdown => return false,
+        BrowserToRenderer::CommitNavigation { url } => {
+            start_navigation(state, url);
+        }
+        BrowserToRenderer::Resize { width, height } => {
+            resize(state, events, width, height).await;
+        }
+        BrowserToRenderer::SetVisible { visible } => {
+            // Stage 8 Rec 1: the shell forwards window
+            // visibility. A hidden tab keeps its JS
+            // timers running (drive_js still runs each
+            // tick — a timer fires while hidden) but
+            // produces no frames and no display lists
+            // until visible again: the tick gate below
+            // skips relayout. No realm is created just to
+            // record this — a tab with no JS yet is visible
+            // by default.
+            if let Some(js) = state.tab_js.as_mut() {
+                js.set_visible(visible);
+            }
+        }
+        BrowserToRenderer::SetFocused { focused } => {
+            // Stage 8 Rec 9: the shell forwards window focus
+            // alongside visibility. The shell also filters keys
+            // to uncaptured ones only, so this is the
+            // worker-side half: keyboard input is acted on only
+            // while focused.
+            state.window_focused = focused;
+        }
+        BrowserToRenderer::ResourceEvent(event) => {
+            // The M5 shape: the shell streams fetch events back
+            // to the renderer. Today the worker fetches through
+            // its own loader, which consumes the events
+            // internally, so nothing arrives here — ignore it if
+            // it ever does.
+            eprintln!("[pluto] ignoring ResourceEvent from shell: {event:?}");
+        }
+        BrowserToRenderer::InputEvent(event) => {
+            handle_input(state, events, event).await;
+        }
+    }
+    true
 }
 
 /// Drive the JS loop for one tick: a few turns (one turn runs one
@@ -717,6 +1137,25 @@ fn start_navigation(state: &mut TabState, url: String) {
     let epoch = state.nav_epoch;
     let token = CancellationToken::new();
     state.nav_cancel = Some(token.clone());
+    // Perf (Stage 8 Rec 5): a navigation — address bar, reload,
+    // or link click — starts the first-paint clock here, not just
+    // in the shell's `commit` (link clicks bypass `commit`).
+    if let Ok(mut counters) = perf::global().lock() {
+        counters.note_navigation_start();
+    }
+    // A new page drops the old page's input state: hover/active/
+    // focus chains and any in-flight wheel gesture belong to node
+    // ids that no longer exist.
+    state.hovered.clear();
+    state.active_element = None;
+    state.pointer_down_target = None;
+    state.focused = None;
+    state.wheel_chain.clear();
+    state.wheel_idle_ticks = 0;
+    // The shell resets its scroll on commit; mirror it here (the
+    // viewport scroll is mirrored, not messaged — see
+    // `viewport_scroll`).
+    state.viewport_scroll = (0.0, 0.0);
     if let Some(backend) = &state.fetch_backend {
         backend.set_epoch(epoch);
         backend.set_base_url(&url);
@@ -804,14 +1243,14 @@ async fn handle_nav_outcome(
             {
                 return;
             }
-            layout_and_submit(state, events, Some(*document)).await;
+            layout_and_submit(state, events, Some(*document), false).await;
         }
         LoadOutcome::Failed { url, reason, .. } => {
             eprintln!("[pluto] worker fetch failed: {reason}");
             let document = page::parse_document(&page::error_document(&url, &reason));
             state.document = Some(document.clone());
             state.scroll_offsets.clear();
-            layout_and_submit(state, events, Some(document)).await;
+            layout_and_submit(state, events, Some(document), false).await;
             let _ = emit_tab(
                 events,
                 RendererToBrowser::LoadFailed { url, reason },
@@ -847,11 +1286,18 @@ async fn submit(
     display: Arc<DisplayList>,
 ) -> bool {
     state.epoch += 1;
+    // Perf (Stage 8 Rec 5): the postcard encode is the IPC cost.
+    let started = std::time::Instant::now();
+    let bytes = display.to_bytes();
+    perf::record_span(
+        perf::SpanKind::Ipc,
+        started.elapsed().as_secs_f32() * 1000.0,
+    );
     emit_tab(
         events,
         RendererToBrowser::SubmitDisplayList {
             epoch: state.epoch,
-            bytes: display.to_bytes(),
+            bytes,
             resources: ResourceTable::new(),
         },
     )
@@ -861,21 +1307,42 @@ async fn submit(
 /// Lay out at the tab's viewport on the layout-actor thread and
 /// submit the result. `document: Some` hands the actor a new
 /// document (a navigation / error page / a JS-mutated document);
-/// `None` re-lays out the retained one (a resize). A dead actor is
-/// reported as a crash; the old page stays visible until the new
-/// list lands either way.
+/// `None` re-lays out the retained one (a resize). `incremental`
+/// tells the actor the document is a snapshot of the same live
+/// `Dom` the retained tree was built from (a dirty tick or a
+/// resize), so it may re-lay out incrementally (Stage 8 Rec 6);
+/// false for a fresh navigation, whose node ids are new. A dead
+/// actor is reported as a crash; the old page stays visible until
+/// the new list lands either way.
+///
+/// Stage 8 Rec 8 ordering: (1) build the layout tree, (2) run
+/// the ResizeObserver gather/broadcast step against it, (3) build
+/// the display list from the tree, (4) submit. A ResizeObserver
+/// callback that mutates the DOM marks the document dirty again,
+/// so the *next* tick re-lays out and submits a fresh list — the
+/// callback's write lands one tick later, not in the list being
+/// built here (the actor's tree is already built by then; see
+/// `run_resize_observer_step`).
 async fn layout_and_submit(
     state: &mut TabState,
     events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
     document: Option<Document>,
+    incremental: bool,
 ) -> bool {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    let job = LayoutJob::Layout {
+    // Perf (Stage 8 Rec 5): the whole build — layout tree,
+    // ResizeObserver step, IntersectionObserver step, display-list
+    // collect — is the worker build span. The submit's postcard
+    // encode is measured separately, in `submit`.
+    let build_started = std::time::Instant::now();
+    // (1) Layout tree on the actor (no display list yet).
+    let (tree_tx, tree_rx) = oneshot::channel();
+    let job = LayoutJob::LayoutTree {
         document: Box::new(document),
         viewport: state.viewport,
         state: state.element_state.clone(),
         offsets: state.scroll_offsets.clone(),
-        reply: reply_tx,
+        incremental,
+        reply: tree_tx,
     };
     if state.layout_tx.send(job).is_err() {
         return emit_tab(
@@ -886,9 +1353,43 @@ async fn layout_and_submit(
         )
         .await;
     }
-    match reply_rx.await {
+    if tree_rx.await.is_err() {
+        return emit_tab(
+            events,
+            RendererToBrowser::RendererCrashed {
+                reason: "layout actor reply lost".to_string(),
+            },
+        )
+        .await;
+    }
+    state.has_document = true;
+    // (2) ResizeObserver step, after layout, before the list.
+    run_resize_observer_step(state).await;
+    // (2b) IntersectionObserver step, after layout, before the
+    // list: the geometry is computed here, but the callbacks are a
+    // queued task — they run after the submit, on a later turn.
+    run_intersection_observer_step(state).await;
+    // (3) Display list from the retained tree.
+    let (list_tx, list_rx) = oneshot::channel();
+    if state
+        .layout_tx
+        .send(LayoutJob::CollectDisplayList { reply: list_tx })
+        .is_err()
+    {
+        return emit_tab(
+            events,
+            RendererToBrowser::RendererCrashed {
+                reason: "layout actor is gone".to_string(),
+            },
+        )
+        .await;
+    }
+    match list_rx.await {
         Ok(display) => {
-            state.has_document = true;
+            perf::record_span(
+                perf::SpanKind::WorkerBuild,
+                build_started.elapsed().as_secs_f32() * 1000.0,
+            );
             state.host.lock().unwrap().clear_dirty();
             submit(state, events, display).await
         }
@@ -900,6 +1401,107 @@ async fn layout_and_submit(
         )
         .await,
     }
+}
+
+/// Stage 8 Rec 8: the ResizeObserver gather/broadcast step, run
+/// after layout and before the display list is built. The `TabJs`
+/// registry owns the observations; this step only supplies the
+/// sizes the layout actor just measured (border + content boxes)
+/// and the DOM depths, then lets the loop deliver the callbacks
+/// through the JS event loop. No observations → no actor round
+/// trip at all. A resize-loop error is logged (the loop already
+/// recorded it in the tab's script errors).
+async fn run_resize_observer_step(state: &mut TabState) {
+    let targets = match state.tab_js.as_mut() {
+        Some(js) => js.resize_observation_targets(),
+        None => return,
+    };
+    if targets.is_empty() {
+        return;
+    }
+    let ids: Vec<NodeId> = targets.iter().map(|(_, target, _)| *target).collect();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if state
+        .layout_tx
+        .send(LayoutJob::ResizeSizes {
+            ids,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return;
+    }
+    let Ok(rows) = reply_rx.await else {
+        return;
+    };
+    let mut sizes = HashMap::new();
+    let mut depths = HashMap::new();
+    for (id, size, depth) in rows {
+        if let Some(size) = size {
+            sizes.insert(id, size);
+        }
+        depths.insert(id, depth);
+    }
+    let Some(js) = state.tab_js.as_mut() else {
+        return;
+    };
+    let outcome = js.run_resize_observers_with_sizes(&sizes, &depths);
+    if outcome.loop_error {
+        eprintln!("[pluto] ResizeObserver loop completed with undelivered notifications.");
+    }
+}
+
+/// Stage 8 Rec 10: the IntersectionObserver gather step, run after
+/// layout (and after the ResizeObserver step) and before the display
+/// list is built. The `TabJs` registry owns the observations; this
+/// step only supplies the intersections the layout actor just
+/// measured from the retained tree, then lets the registry queue
+/// the delivery task — the callbacks run after the submit, on a
+/// later turn, never inline here. No observations → no actor round
+/// trip at all. Runs on the retained tree, so scrolls can re-run it
+/// without a re-layout (see `handle_wheel`).
+async fn run_intersection_observer_step(state: &mut TabState) {
+    let targets = match state.tab_js.as_mut() {
+        Some(js) => js.intersection_observation_targets(),
+        None => return,
+    };
+    if targets.is_empty() {
+        return;
+    }
+    let queries: Vec<observers::IntersectionQuery> = targets
+        .iter()
+        .map(|(_, target, root, root_margin)| observers::IntersectionQuery {
+            target: *target,
+            root: *root,
+            root_margin: *root_margin,
+        })
+        .collect();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if state
+        .layout_tx
+        .send(LayoutJob::IntersectionGeometry {
+            queries,
+            viewport_scroll: state.viewport_scroll,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return;
+    }
+    let Ok(rows) = reply_rx.await else {
+        return;
+    };
+    let mut geometry = HashMap::new();
+    for ((observer_id, target, _, _), row) in targets.iter().zip(rows) {
+        if let Some(geo) = row {
+            geometry.insert((*observer_id, *target), geo);
+        }
+    }
+    let time_ms = state.tab_started.elapsed().as_secs_f64() * 1000.0;
+    let Some(js) = state.tab_js.as_mut() else {
+        return;
+    };
+    js.run_intersection_observers_with_geometry(&geometry, time_ms);
 }
 
 /// Re-layout the live (possibly JS-mutated) document and submit.
@@ -914,7 +1516,9 @@ async fn relayout_and_submit(
     }
     let document = state.host.lock().unwrap().current_document();
     state.document = Some(document.clone());
-    layout_and_submit(state, events, Some(document)).await;
+    // Same-lineage snapshot of the live Dom: the actor may lay
+    // out incrementally on its retained tree (Stage 8 Rec 6).
+    layout_and_submit(state, events, Some(document), true).await;
 }
 
 /// Hit-test a click (page coordinates: the shell already added the
@@ -955,108 +1559,598 @@ async fn click_target(state: &TabState, x: f32, y: f32) -> Option<String> {
     reply_rx.await.ok().flatten()
 }
 
+/// Input handling (Stage 8 Rec 9, InputEvent v3): pointer
+/// move/down/up (hover + active restyle, click synthesis on a
+/// left release over its press target), wheel (nested containers
+/// first, viewport remainder last), and keys (Tab focus movement,
+/// Enter/Space activation, scroll keys).
 async fn handle_input(
     state: &mut TabState,
     events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
     event: InputEvent,
 ) {
-    // R15 (shell side): clicks hit-test the retained tree and
-    // navigate; wheel scrolls a nested scroll container when there
-    // is exactly one. Hover is NOT wired here: there is no hover
-    // variant in `InputEvent` yet, and adding one is a protocol
-    // change (v3) — see `scroll_container` / the ARCHITECTURE.md
-    // status. `:visited` stays false for the same reason the layout
-    // matcher documents: the visited-URL set has no `ElementState`
-    // field to ride in (that field lives in pluto-layout, which
-    // this workstream may not change) — follow-up, not silently
-    // faked.
     match event {
-        InputEvent::Click { x, y } => {
-            // A link navigates (new epoch, Stage 5 cancellation);
-            // any other hit dispatches a bubbling click into the
-            // JS event loop, so `addEventListener('click')` pages
-            // (counters, accordions) respond. The tick drives the
-            // dispatch and the re-layout that follows it.
-            if let Some(url) = click_target(state, x, y).await {
-                start_navigation(state, url);
-            } else if let Some(node) = hit_test(state, x, y).await
-                && let Some(js) = state.tab_js.as_mut()
-            {
-                js.dispatch_event(node, "click", true);
-            }
-        }
-        InputEvent::WheelScrolled { dx, dy } => {
-            scroll_container(state, events, dx, dy).await;
-        }
-        InputEvent::KeyPressed { key } => {
-            eprintln!("[pluto] key pressed (no focus model yet): {key}");
-        }
+        InputEvent::Pointer {
+            kind,
+            x,
+            y,
+            button,
+            ..
+        } => match kind {
+            PointerKind::Move => handle_pointer_move(state, events, x, y).await,
+            PointerKind::Down => handle_pointer_down(state, events, x, y, button).await,
+            PointerKind::Up => handle_pointer_up(state, events, x, y, button).await,
+        },
+        InputEvent::Wheel {
+            x,
+            y,
+            dx,
+            dy,
+            delta_mode,
+            phase,
+            ..
+        } => handle_wheel(state, events, x, y, dx, dy, delta_mode, phase).await,
+        InputEvent::Key {
+            key,
+            pressed,
+            modifiers,
+            ..
+        } => handle_key(state, events, &key, pressed, modifiers).await,
     }
 }
 
-/// Wheel-scroll a nested scroll container (R14/R15 shell side).
-/// The viewport-level wheel scroll stays with the shell's Stage 4
-/// shader-side scroll in the compositor; this handles the containers
-/// *inside* the page: `set_scroll_offset` + re-collect + resubmit on
-/// the layout actor, no re-layout.
-///
-/// Limits, by design: `InputEvent::WheelScrolled` carries no cursor
-/// position, so with more than one scroll container there is no way
-/// to know which one the wheel is over — only the exactly-one case
-/// is scrolled, the rest is left to the viewport scroll (a position
-/// on the event is a protocol change, follow-up). The root/body
-/// (`<html>`/`<body>`) overflow propagates to the viewport instead,
-/// so the actor excludes it from the container list. Offsets clamp
-/// at zero on both axes, matching the shell; the bottom clamp needs
-/// per-container content height, which the tree does not expose yet
-/// (same documented gap as the shell scroll).
-async fn scroll_container(
+/// The hover chain for a hit target (Stage 8 Rec 9): the element
+/// plus its ancestors, from the tab's synced document. Browsers
+/// hover ancestors too — hovering text inside a button highlights
+/// the button — so the chain, not just the hit element, is what
+/// `:hover` restyles. Falls back to the target alone when there
+/// is no document yet.
+fn hover_chain(state: &TabState, target: NodeId) -> Vec<NodeId> {
+    let mut chain = vec![target];
+    if let Some(doc) = state.document.as_ref() {
+        let dom = doc.dom();
+        let mut cur = dom.get(target).and_then(|n| n.parent);
+        while let Some(parent) = cur {
+            chain.push(parent);
+            cur = dom.get(parent).and_then(|n| n.parent);
+        }
+    }
+    chain
+}
+
+/// Expand a restyle set by the sheet's pseudo-class reach (Stage 8
+/// Rec 9): a `:hover`/`:active`/`:focus` change may restyle
+/// descendants and siblings of the changed elements (per the
+/// rules' combinators) and ancestors (`:focus-within`). The
+/// changed set itself is always included.
+fn restyle_dirty_set(
+    state: &TabState,
+    changed: &[NodeId],
+    reach: pluto_css::PseudoReach,
+) -> Vec<NodeId> {
+    let mut dirty: HashSet<NodeId> = changed.iter().copied().collect();
+    if reach.descendants || reach.siblings || reach.ancestors {
+        if let Some(doc) = state.document.as_ref() {
+            let dom = doc.dom();
+            for &id in changed {
+                if reach.descendants {
+                    collect_descendants(dom, id, &mut dirty);
+                }
+                if reach.siblings {
+                    if let Some(parent) = dom.get(id).and_then(|n| n.parent) {
+                        for &sib in dom.children(parent) {
+                            dirty.insert(sib);
+                        }
+                    }
+                }
+                if reach.ancestors {
+                    let mut cur = dom.get(id).and_then(|n| n.parent);
+                    while let Some(parent) = cur {
+                        dirty.insert(parent);
+                        cur = dom.get(parent).and_then(|n| n.parent);
+                    }
+                }
+            }
+        }
+    }
+    dirty.into_iter().collect()
+}
+
+/// All descendants of `id` (exclusive), into `out`.
+fn collect_descendants(
+    dom: &pluto_html::Dom,
+    id: NodeId,
+    out: &mut HashSet<NodeId>,
+) {
+    for &child in dom.children(id) {
+        out.insert(child);
+        collect_descendants(dom, child, out);
+    }
+}
+
+/// Apply a restyle: sync the host's element-state copy (the
+/// forced-flush path reads it), mark the dirty nodes on the live
+/// Dom, and re-layout + submit. The incremental path re-resolves
+/// styles for the dirty nodes; a failed attempt falls back to a
+/// full rebuild. No-op when there is no document yet.
+async fn restyle(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    dirty: &[NodeId],
+) {
+    {
+        let mut host = state.host.lock().unwrap();
+        host.set_element_state(state.element_state.clone());
+        host.mark_dirty(dirty);
+    }
+    relayout_and_submit(state, events).await;
+}
+
+/// The sheet's pseudo-class reach for `which` (`hover`, `active`,
+/// or `focus`): which elements beyond the changed one a restyle
+/// may touch. Empty when there is no document yet.
+fn pseudo_reach(state: &TabState, which: &str) -> pluto_css::PseudoReach {
+    state
+        .document
+        .as_ref()
+        .map(|doc| {
+            let index = &doc.sheet().pseudo_class_index;
+            match which {
+                "active" => index.active_reach,
+                "focus" => index.focus_reach,
+                _ => index.hover_reach,
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// A pointer move: hover restyle. The chain changes only when the
+/// hit element (or its ancestors) change — moving within the same
+/// element is a no-op. Moving off every element clears the chain.
+async fn handle_pointer_move(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    x: f32,
+    y: f32,
+) {
+    let Some(target) = hit_test(state, x, y).await else {
+        if !state.hovered.is_empty() {
+            let old = std::mem::take(&mut state.hovered);
+            state.element_state.hover.clear();
+            let dirty = restyle_dirty_set(state, &old, pseudo_reach(state, "hover"));
+            restyle(state, events, &dirty).await;
+        }
+        return;
+    };
+    let chain = hover_chain(state, target);
+    if chain == state.hovered {
+        return;
+    }
+    let old = std::mem::replace(&mut state.hovered, chain.clone());
+    state.element_state.hover = chain.iter().copied().collect();
+    let changed: Vec<NodeId> = old.iter().chain(&chain).copied().collect();
+    let dirty = restyle_dirty_set(state, &changed, pseudo_reach(state, "hover"));
+    restyle(state, events, &dirty).await;
+}
+
+/// A pointer press: `:active` restyle on the hit chain, and the
+/// press target is recorded for click synthesis. The press also
+/// hovers the chain — a press without a preceding move still
+/// highlights. Only a left press records a click target.
+async fn handle_pointer_down(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    x: f32,
+    y: f32,
+    button: Option<u8>,
+) {
+    let Some(target) = hit_test(state, x, y).await else {
+        return;
+    };
+    if button == Some(0) {
+        state.pointer_down_target = Some(target);
+    }
+    let chain = hover_chain(state, target);
+    let old_hover = std::mem::replace(&mut state.hovered, chain.clone());
+    state.element_state.hover = chain.iter().copied().collect();
+    state.active_element = Some(target);
+    state.element_state.active = chain.iter().copied().collect();
+    let changed: Vec<NodeId> = old_hover.iter().chain(&chain).copied().collect();
+    let mut reach = pseudo_reach(state, "hover");
+    reach |= pseudo_reach(state, "active");
+    let dirty = restyle_dirty_set(state, &changed, reach);
+    restyle(state, events, &dirty).await;
+}
+
+/// A pointer release: clear `:active`, then synthesise the click
+/// — a left release over its press target navigates a link, or
+/// dispatches a bubbling click into the JS event loop (counters,
+/// accordions). A release over a different element is no click.
+async fn handle_pointer_up(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    x: f32,
+    y: f32,
+    button: Option<u8>,
+) {
+    if let Some(active) = state.active_element.take() {
+        let chain = hover_chain(state, active);
+        state.element_state.active.clear();
+        let dirty = restyle_dirty_set(state, &chain, pseudo_reach(state, "active"));
+        restyle(state, events, &dirty).await;
+    }
+    if button != Some(0) {
+        return;
+    }
+    let Some(down) = state.pointer_down_target.take() else {
+        return;
+    };
+    let Some(target) = hit_test(state, x, y).await else {
+        return;
+    };
+    if target != down {
+        return;
+    }
+    // A link navigates (new epoch, Stage 5 cancellation); any
+    // other hit dispatches a bubbling click into the JS event
+    // loop. The tick drives the dispatch and the re-layout that
+    // follows it.
+    if let Some(url) = click_target(state, x, y).await {
+        start_navigation(state, url);
+    } else if let Some(js) = state.tab_js.as_mut() {
+        js.dispatch_event(target, "click", true);
+    }
+}
+
+/// The innermost-first scroll chain under the cursor (page
+/// coordinates), from the layout actor. Empty when the actor
+/// holds no tree.
+async fn scroll_chain(state: &TabState, x: f32, y: f32) -> Vec<ScrollChainEntry> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if state
+        .layout_tx
+        .send(LayoutJob::ScrollChain {
+            x,
+            y,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return Vec::new();
+    }
+    reply_rx.await.unwrap_or_default()
+}
+
+/// Apply several container scrolls at once and submit the single
+/// re-collected display list (Stage 8 Rec 9). False when the actor
+/// is gone or holds no tree.
+async fn apply_scrolls(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    scrolls: Vec<(NodeId, f32, f32)>,
+) -> bool {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if state
+        .layout_tx
+        .send(LayoutJob::ScrollMany {
+            scrolls: scrolls.clone(),
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    match reply_rx.await {
+        Ok(Some(display)) => {
+            for (id, x, y) in scrolls {
+                state.scroll_offsets.insert(id, (x, y));
+            }
+            submit(state, events, display).await
+        }
+        _ => false,
+    }
+}
+
+/// Apply one axis of a wheel delta to a container offset (Stage 8
+/// Rec 9). Returns (new offset, remaining delta). A negative delta
+/// consumes the offset down to zero; the remainder chains onward —
+/// unless the container's `overscroll-behavior` stops the chain,
+/// in which case the remainder is dropped. A positive delta is
+/// always fully consumed: the tree exposes no per-container
+/// content height yet, so there is no bottom limit to hit (the
+/// same documented gap as the shell scroll).
+fn consume_axis(offset: f32, delta: f32, stops: bool) -> (f32, f32) {
+    let next = (offset + delta).max(0.0);
+    let consumed = next - offset;
+    let mut remaining = delta - consumed;
+    if stops {
+        remaining = 0.0;
+    }
+    (next, remaining)
+}
+
+/// Emit a `ScrollViewport` delta and mirror it in
+/// `state.viewport_scroll` (Stage 8 Rec 10): every viewport scroll
+/// flows through here, with the same ≥0 clamp the shell's
+/// `compositor.scroll_by` applies — so the worker's mirror of the
+/// shell scroll stays exact, and the IntersectionObserver step can
+/// use it without a protocol change. Callers re-run the
+/// IntersectionObserver step after a scroll (the geometry changed
+/// even though nothing re-laid out).
+async fn emit_scroll_viewport(
     state: &mut TabState,
     events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
     dx: f32,
     dy: f32,
 ) {
+    state.viewport_scroll = (
+        (state.viewport_scroll.0 + dx).max(0.0),
+        (state.viewport_scroll.1 + dy).max(0.0),
+    );
+    emit_tab(
+        events,
+        RendererToBrowser::ScrollViewport { dx, dy },
+    )
+    .await;
+}
+
+/// A wheel event (Stage 8 Rec 9): the worker owns the whole wheel.
+/// The delta is scaled by mode (lines × 16 px, pages × the
+/// viewport size, pixels as-is); a new gesture picks the
+/// innermost-first container chain under the cursor, and the delta
+/// walks it — each container consumes what it can, the leftover
+/// chains onward, and the viewport takes the rest (via
+/// `ScrollViewport`, which the shell clamps at zero).
+async fn handle_wheel(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    x: f32,
+    y: f32,
+    dx: f32,
+    dy: f32,
+    delta_mode: DeltaMode,
+    phase: WheelPhase,
+) {
+    let (mut rx, mut ry) = match delta_mode {
+        DeltaMode::Pixel => (dx, dy),
+        DeltaMode::Line => (dx * 16.0, dy * 16.0),
+        DeltaMode::Page => (dx * state.viewport.0, dy * state.viewport.1),
+    };
+    if phase == WheelPhase::Began || state.wheel_chain.is_empty() {
+        state.wheel_chain = scroll_chain(state, x, y).await;
+    }
+    state.wheel_idle_ticks = 0;
+    let mut scrolls: Vec<(NodeId, f32, f32)> = Vec::new();
+    for entry in state.wheel_chain.clone() {
+        if rx == 0.0 && ry == 0.0 {
+            break;
+        }
+        let (ox, oy) = state
+            .scroll_offsets
+            .get(&entry.id)
+            .copied()
+            .unwrap_or((0.0, 0.0));
+        let (nx, rem_x) = consume_axis(ox, rx, entry.overscroll_x.stops_chaining());
+        let (ny, rem_y) = consume_axis(oy, ry, entry.overscroll_y.stops_chaining());
+        if (nx, ny) != (ox, oy) {
+            scrolls.push((entry.id, nx, ny));
+        }
+        rx = rem_x;
+        ry = rem_y;
+    }
+    let scrolled = !scrolls.is_empty();
+    if scrolled {
+        apply_scrolls(state, events, scrolls).await;
+    }
+    if rx != 0.0 || ry != 0.0 {
+        emit_scroll_viewport(state, events, rx, ry).await;
+    }
+    // A scroll moved the page under the observed targets: re-run
+    // the IntersectionObserver step on the retained tree (no
+    // re-layout — the step reads the tree as it stands).
+    if scrolled || rx != 0.0 || ry != 0.0 {
+        run_intersection_observer_step(state).await;
+    }
+}
+
+/// The tab's scroll containers, excluding root/body (whose
+/// overflow propagates to the viewport). Empty when the actor
+/// holds no tree.
+async fn scroll_containers(state: &TabState) -> Vec<NodeId> {
     let (reply_tx, reply_rx) = oneshot::channel();
     if state
         .layout_tx
         .send(LayoutJob::ScrollContainers { reply: reply_tx })
         .is_err()
     {
+        return Vec::new();
+    }
+    reply_rx.await.unwrap_or_default()
+}
+
+/// A key press (Stage 8 Rec 9). Releases do nothing in M2 (no
+/// `keyup` listeners yet), and keys are ignored while the window
+/// is unfocused — the shell filters to uncaptured keys only, so
+/// this is the worker-side half. Repeats re-fire the action
+/// (holding an arrow scrolls repeatedly).
+async fn handle_key(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    key: &str,
+    pressed: bool,
+    modifiers: pluto_ipc::Modifiers,
+) {
+    if !pressed || !state.window_focused {
         return;
     }
-    let Ok(containers) = reply_rx.await else {
+    match key {
+        "Tab" => move_focus(state, events, !modifiers.shift).await,
+        "Enter" | " " => activate_focused(state, events, key).await,
+        "ArrowDown" => scroll_focused_or_viewport(state, events, 0.0, 40.0).await,
+        "ArrowUp" => scroll_focused_or_viewport(state, events, 0.0, -40.0).await,
+        "ArrowRight" => scroll_focused_or_viewport(state, events, 40.0, 0.0).await,
+        "ArrowLeft" => scroll_focused_or_viewport(state, events, -40.0, 0.0).await,
+        "PageDown" => {
+            scroll_focused_or_viewport(state, events, 0.0, state.viewport.1).await
+        }
+        "PageUp" => {
+            scroll_focused_or_viewport(state, events, 0.0, -state.viewport.1).await
+        }
+        // The shell clamps the viewport scroll at zero, so a huge
+        // negative delta is "scroll to the top". `End` needs the
+        // page's content height, which the tree does not expose
+        // yet — skipped (the same documented gap as the bottom
+        // clamp).
+        "Home" => {
+            emit_scroll_viewport(state, events, 0.0, -1e9).await;
+            run_intersection_observer_step(state).await;
+        }
+        _ => {}
+    }
+}
+
+/// The focusable elements in DOM order: links with `href`,
+/// buttons, inputs, selects, textareas, and anything with a
+/// `tabindex`. Pre-order walk from the document root.
+fn focusable_in_order(doc: &Document) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    let dom = doc.dom();
+    if let Some(root) = dom.root() {
+        walk_focusable(dom, root, &mut out);
+    }
+    out
+}
+
+fn walk_focusable(dom: &pluto_html::Dom, id: NodeId, out: &mut Vec<NodeId>) {
+    if is_focusable(dom, id) {
+        out.push(id);
+    }
+    for &child in dom.children(id) {
+        walk_focusable(dom, child, out);
+    }
+}
+
+fn is_focusable(dom: &pluto_html::Dom, id: NodeId) -> bool {
+    if dom.attr(id, "tabindex").is_some() {
+        return true;
+    }
+    match dom.tag(id) {
+        Some("button" | "input" | "select" | "textarea") => true,
+        Some("a") => dom
+            .attr(id, "href")
+            .map(|href| !href.trim().is_empty())
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Move keyboard focus (Stage 8 Rec 9): Tab forward, Shift+Tab
+/// backward, wrapping at the ends. The old and new elements (plus
+/// the new element's ancestors, for `:focus-within`) are marked
+/// dirty and restyled.
+async fn move_focus(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    forward: bool,
+) {
+    let Some(doc) = state.document.as_ref() else {
         return;
     };
-    if containers.len() != 1 {
+    let focusable = focusable_in_order(doc);
+    if focusable.is_empty() {
         return;
     }
-    let id = containers[0];
-    let (x, y) = state.scroll_offsets.get(&id).copied().unwrap_or((0.0, 0.0));
-    // NOTE: the protocol documents these deltas as lines; the shell
-    // forwards pixel deltas (lines × 16), and the worker treats them
-    // as page pixels — a protocol-doc fix for Stage 8, not a second
-    // conversion here.
-    let (next_x, next_y) = ((x + dx).max(0.0), (y + dy).max(0.0));
-    if (next_x, next_y) == (x, y) {
-        return;
-    }
-    let (scroll_tx, scroll_rx) = oneshot::channel();
-    if state
-        .layout_tx
-        .send(LayoutJob::Scroll {
-            id,
-            x: next_x,
-            y: next_y,
-            reply: scroll_tx,
-        })
-        .is_err()
+    let next = match state
+        .focused
+        .and_then(|f| focusable.iter().position(|&id| id == f))
     {
+        Some(i) if forward => focusable[(i + 1) % focusable.len()],
+        Some(i) => focusable[(i + focusable.len() - 1) % focusable.len()],
+        None if forward => focusable[0],
+        None => *focusable.last().unwrap(),
+    };
+    let old = state.focused.replace(next);
+    state.element_state.focus = [next].into_iter().collect();
+    let mut changed: Vec<NodeId> = vec![next];
+    if let Some(old) = old {
+        changed.push(old);
+    }
+    let dirty = restyle_dirty_set(state, &changed, pseudo_reach(state, "focus"));
+    restyle(state, events, &dirty).await;
+}
+
+/// Activate the focused element (Stage 8 Rec 9): a link navigates,
+/// a button/input/select/textarea dispatches a click into the JS
+/// event loop. Space on a non-activatable element scrolls a page
+/// down; Enter on one does nothing.
+async fn activate_focused(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    key: &str,
+) {
+    let Some(focused) = state.focused else {
+        if key == " " {
+            scroll_focused_or_viewport(state, events, 0.0, state.viewport.1).await;
+        }
         return;
+    };
+    let (tag, href) = {
+        let Some(doc) = state.document.as_ref() else {
+            return;
+        };
+        (
+            doc.dom().tag(focused).map(|t| t.to_string()),
+            page::find_link_href(doc, focused),
+        )
+    };
+    match tag.as_deref() {
+        Some("a") => {
+            if let Some(url) = href {
+                start_navigation(state, url);
+            }
+        }
+        Some("button" | "input" | "select" | "textarea") => {
+            if let Some(js) = state.tab_js.as_mut() {
+                js.dispatch_event(focused, "click", true);
+            }
+        }
+        _ => {
+            if key == " " {
+                scroll_focused_or_viewport(state, events, 0.0, state.viewport.1).await;
+            }
+        }
     }
-    if let Ok(Some(display)) = scroll_rx.await {
-        state.scroll_offsets.insert(id, (next_x, next_y));
-        submit(state, events, display).await;
+}
+
+/// Scroll the focused element when it is a scroll container,
+/// otherwise the viewport (Stage 8 Rec 9). A container at its
+/// limit chains to the viewport — keyboard scroll has no
+/// `overscroll-behavior` stop (unlike the wheel), so a key always
+/// moves something when anything can move.
+async fn scroll_focused_or_viewport(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    dx: f32,
+    dy: f32,
+) {
+    if let Some(focused) = state.focused {
+        let containers = scroll_containers(state).await;
+        if containers.contains(&focused) {
+            let (ox, oy) = state
+                .scroll_offsets
+                .get(&focused)
+                .copied()
+                .unwrap_or((0.0, 0.0));
+            let (nx, ny) = ((ox + dx).max(0.0), (oy + dy).max(0.0));
+            if (nx, ny) != (ox, oy) {
+                apply_scrolls(state, events, vec![(focused, nx, ny)]).await;
+                run_intersection_observer_step(state).await;
+                return;
+            }
+        }
     }
+    emit_scroll_viewport(state, events, dx, dy).await;
+    run_intersection_observer_step(state).await;
 }
 
 /// A resize: record the viewport and re-lay out the retained
@@ -1078,7 +2172,7 @@ async fn resize(
     state.host.lock().unwrap().set_viewport((width, height));
     if state.has_document {
         eprintln!("[pluto] worker viewport resized to {width}x{height}, re-layout");
-        layout_and_submit(state, events, None).await;
+        layout_and_submit(state, events, None, true).await;
     }
 }
 
@@ -1174,6 +2268,132 @@ mod tests {
             crate::Message::RendererEvent(event) => event,
             other => panic!("expected a RendererEvent, got {other:?}"),
         }
+    }
+
+    /// Send a left click (press + release) at page coordinates
+    /// (Stage 8 Rec 9: a click is a Down + Up pair on the same
+    /// target, not one `Click` event).
+    fn send_click(cmd_tx: &pluto_ipc::CommandSender, x: f32, y: f32) {
+        let pointer = |kind: PointerKind, buttons: u16| {
+            BrowserToRenderer::InputEvent(InputEvent::Pointer {
+                kind,
+                x,
+                y,
+                button: Some(0),
+                buttons,
+                modifiers: pluto_ipc::Modifiers::default(),
+                timestamp_ms: 0,
+                pointer_id: 0,
+            })
+        };
+        cmd_tx
+            .send(pointer(PointerKind::Down, 1))
+            .expect("worker takes the pointer down");
+        cmd_tx
+            .send(pointer(PointerKind::Up, 0))
+            .expect("worker takes the pointer up");
+    }
+
+    /// Send one wheel event at page coordinates (Stage 8 Rec 9):
+    /// a `Began` pixel-mode wheel, as the shell synthesises for a
+    /// first wheel after idle.
+    fn send_wheel(cmd_tx: &pluto_ipc::CommandSender, x: f32, y: f32, dx: f32, dy: f32) {
+        cmd_tx
+            .send(BrowserToRenderer::InputEvent(InputEvent::Wheel {
+                x,
+                y,
+                dx,
+                dy,
+                delta_mode: DeltaMode::Pixel,
+                phase: WheelPhase::Began,
+                modifiers: pluto_ipc::Modifiers::default(),
+                timestamp_ms: 0,
+            }))
+            .expect("worker takes the wheel event");
+    }
+
+    /// Send one pointer move at page coordinates (Stage 8 Rec 9).
+    fn send_move(cmd_tx: &pluto_ipc::CommandSender, x: f32, y: f32) {
+        cmd_tx
+            .send(BrowserToRenderer::InputEvent(InputEvent::Pointer {
+                kind: PointerKind::Move,
+                x,
+                y,
+                button: None,
+                buttons: 0,
+                modifiers: pluto_ipc::Modifiers::default(),
+                timestamp_ms: 0,
+                pointer_id: 0,
+            }))
+            .expect("worker takes the pointer move");
+    }
+
+    /// Send one key press (Stage 8 Rec 9). `modifiers` defaults to
+    /// none; pass a `Modifiers` with `shift: true` for Shift+Tab.
+    fn send_key(
+        cmd_tx: &pluto_ipc::CommandSender,
+        key: &str,
+        code: &str,
+        modifiers: pluto_ipc::Modifiers,
+    ) {
+        cmd_tx
+            .send(BrowserToRenderer::InputEvent(InputEvent::Key {
+                key: key.to_string(),
+                code: code.to_string(),
+                pressed: true,
+                repeat: false,
+                modifiers,
+                timestamp_ms: 0,
+            }))
+            .expect("worker takes the key event");
+    }
+
+    /// Every glyph in a display list as (colour, x, y).
+    fn glyph_colors(list: &DisplayList) -> Vec<([f32; 4], f32, f32)> {
+        let mut out = Vec::new();
+        for item in list.0.iter() {
+            if let DisplayItem::Glyphs { color, glyphs } = item {
+                for g in glyphs {
+                    out.push((*color, g.x, g.y));
+                }
+            }
+        }
+        out
+    }
+
+    /// Wait for a `SubmitDisplayList` containing a glyph of
+    /// `color` (a restyle resubmits), and return that list. Other
+    /// display lists are skipped; anything else panics.
+    async fn wait_for_glyph_color(
+        rx: &mut mpsc::Receiver<crate::Message>,
+        color: [f32; 4],
+        timeout: Duration,
+    ) -> Option<DisplayList> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let event = match tokio::time::timeout(remaining, next_event(rx)).await {
+                Ok(event) => event,
+                Err(_) => return None,
+            };
+            match event {
+                RendererToBrowser::SubmitDisplayList { bytes, .. } => {
+                    let list = DisplayList::from_bytes(&bytes).expect("list bytes decode");
+                    if glyph_colors(&list).iter().any(|(c, _, _)| *c == color) {
+                        return Some(list);
+                    }
+                }
+                other => panic!("expected SubmitDisplayList while waiting for a colour, got {other:?}"),
+            }
+        }
+    }
+
+    /// True when no event arrives within `timeout`.
+    async fn no_event_within(rx: &mut mpsc::Receiver<crate::Message>, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, next_event(rx)).await.is_err()
     }
 
     #[tokio::test]
@@ -1402,18 +2622,17 @@ mod tests {
             RendererToBrowser::SubmitDisplayList { .. }
         ));
         // The link is a 500x100 block at (0,0); (100,50) is inside it.
-        cmd_tx
-            .send(BrowserToRenderer::InputEvent(InputEvent::Click {
-                x: 100.0,
-                y: 50.0,
-            }))
-            .expect("worker takes the click");
-        match next_event(&mut event_rx).await {
-            RendererToBrowser::DidCommit { url: committed, .. } => {
-                assert_eq!(committed, page2);
+        // The press/release restyle the link (:hover/:active) and
+        // resubmit first; the navigation's commit follows.
+        send_click(&cmd_tx, 100.0, 50.0);
+        let committed = loop {
+            match next_event(&mut event_rx).await {
+                RendererToBrowser::DidCommit { url, .. } => break url,
+                RendererToBrowser::SubmitDisplayList { .. } => continue,
+                other => panic!("expected DidCommit for page2, got {other:?}"),
             }
-            other => panic!("expected DidCommit for page2, got {other:?}"),
-        }
+        };
+        assert_eq!(committed, page2);
         assert!(matches!(
             next_event(&mut event_rx).await,
             RendererToBrowser::SubmitDisplayList { .. }
@@ -1421,12 +2640,7 @@ mod tests {
         // A click on empty page area (below the 100px link, e.g.
         // y=500 — the page is otherwise blank) navigates nowhere:
         // no event arrives within 200 ms.
-        cmd_tx
-            .send(BrowserToRenderer::InputEvent(InputEvent::Click {
-                x: 100.0,
-                y: 500.0,
-            }))
-            .expect("worker takes the click");
+        send_click(&cmd_tx, 100.0, 500.0);
         assert!(
             tokio::time::timeout(Duration::from_millis(200), next_event(&mut event_rx))
                 .await
@@ -1492,12 +2706,10 @@ mod tests {
             RendererToBrowser::SubmitDisplayList { epoch, .. } => epoch,
             other => panic!("expected SubmitDisplayList, got {other:?}"),
         };
-        cmd_tx
-            .send(BrowserToRenderer::InputEvent(InputEvent::WheelScrolled {
-                dx: 0.0,
-                dy: 48.0,
-            }))
-            .expect("worker takes the wheel event");
+        // The container is a 100px-tall div at (0,0); (50,50) is
+        // inside it. The wheel scrolls the container (new epoch)
+        // instead of the viewport.
+        send_wheel(&cmd_tx, 50.0, 50.0, 0.0, 48.0);
         let (epoch, bytes) = match next_event(&mut event_rx).await {
             RendererToBrowser::SubmitDisplayList { epoch, bytes, .. } => (epoch, bytes),
             other => panic!("expected SubmitDisplayList after wheel, got {other:?}"),
@@ -1510,6 +2722,319 @@ mod tests {
             .expect("worker takes Shutdown");
         handle.await.expect("worker task ends cleanly");
     }
+
+    /// One-page server with a single nested scroll container whose
+    /// `overscroll-behavior` is `behavior` (Stage 8 Rec 9): a
+    /// 100px-tall `overflow:auto` div with ten lines inside it.
+    async fn serve_overscroll_page(listener: TcpListener, behavior: &'static str) {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let Ok(n) = stream.read(&mut buf).await else {
+                    return;
+                };
+                let _ = n;
+                let mut body = String::from(
+                    "<!doctype html><html><head><style>body{margin:0}\n                     div{height:100px;overflow:auto;overscroll-behavior:",
+                );
+                body.push_str(behavior);
+                body.push_str("}</style></head><body><div>");
+                for i in 0..10 {
+                    body.push_str(&format!("<p>line {i}</p>"));
+                }
+                body.push_str("</div></body></html>");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    }
+
+    /// Stage 8 Rec 9: hovering a link restyles it (`:hover`), the
+    /// restyle resubmits with the new colour; moving within the
+    /// same link resubmits nothing; moving off restores the colour.
+    #[tokio::test]
+    async fn worker_hover_restyle_recolors_the_link() {
+        let page = "<!doctype html><html><head><style>body{margin:0}            a{display:block;width:200px;height:40px} a:hover{color:red}</style></head><body>            <a href=\"/page2\">Link</a></body></html>";
+        let routes = std::sync::Arc::new(vec![(
+            "/".to_string(),
+            "text/html".to_string(),
+            page.to_string(),
+        )]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_routes(listener, routes));
+        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 4);
+        // Hover the link: the glyphs turn red.
+        send_move(&cmd_tx, 100.0, 20.0);
+        assert!(
+            wait_for_glyph_color(&mut event_rx, [1.0, 0.0, 0.0, 1.0], Duration::from_secs(5))
+                .await
+                .is_some(),
+            "hover did not recolor the link"
+        );
+        // Moving within the same link: the chain is unchanged, so
+        // no resubmit arrives within 200 ms.
+        send_move(&cmd_tx, 100.0, 25.0);
+        assert!(
+            no_event_within(&mut event_rx, Duration::from_millis(200)).await,
+            "move within the hovered link must not resubmit"
+        );
+        // Moving off the link: the colour leaves red again.
+        send_move(&cmd_tx, 400.0, 400.0);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut restored = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                next_event(&mut event_rx),
+            )
+            .await
+            {
+                Ok(RendererToBrowser::SubmitDisplayList { bytes, .. }) => {
+                    let list = DisplayList::from_bytes(&bytes).expect("list bytes decode");
+                    if !glyph_colors(&list)
+                        .iter()
+                        .any(|(c, _, _)| *c == [1.0, 0.0, 0.0, 1.0])
+                    {
+                        restored = true;
+                        break;
+                    }
+                }
+                Ok(other) => panic!("expected SubmitDisplayList, got {other:?}"),
+                Err(_) => break,
+            }
+        }
+        assert!(restored, "moving off the link did not restore its colour");
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Stage 8 Rec 9: a wheel scrolled up past a container's top
+    /// limit chains the leftover to the viewport — unless the
+    /// container's `overscroll-behavior` stops the chain, in which
+    /// case the leftover is dropped and no `ScrollViewport` arrives.
+    async fn wheel_overscroll_case(behavior: &'static str, expect_viewport: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_overscroll_page(listener, behavior));
+        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        cmd_tx
+            .send(BrowserToRenderer::CommitNavigation { url })
+            .expect("worker takes the command");
+        assert!(matches!(
+            next_event(&mut event_rx).await,
+            RendererToBrowser::DidCommit { .. }
+        ));
+        let first_epoch = match next_event(&mut event_rx).await {
+            RendererToBrowser::SubmitDisplayList { epoch, .. } => epoch,
+            other => panic!("expected SubmitDisplayList, got {other:?}"),
+        };
+        // Wheel down 48px inside the container: the container
+        // scrolls (new epoch), nothing chains to the viewport.
+        send_wheel(&cmd_tx, 50.0, 50.0, 0.0, 48.0);
+        let (epoch, _) = match next_event(&mut event_rx).await {
+            RendererToBrowser::SubmitDisplayList { epoch, bytes, .. } => (epoch, bytes),
+            other => panic!("expected SubmitDisplayList after wheel down, got {other:?}"),
+        };
+        assert!(epoch > first_epoch, "wheel down resubmits");
+        // Wheel up 100px: the container consumes 48 (back to 0)
+        // and 52px are left over.
+        send_wheel(&cmd_tx, 50.0, 50.0, 0.0, -100.0);
+        assert!(matches!(
+            next_event(&mut event_rx).await,
+            RendererToBrowser::SubmitDisplayList { .. }
+        ));
+        if expect_viewport {
+            match next_event(&mut event_rx).await {
+                RendererToBrowser::ScrollViewport { dx, dy } => {
+                    assert_eq!(dx, 0.0);
+                    assert!((dy - (-52.0)).abs() < 0.01, "leftover delta is -52, got {dy}");
+                }
+                other => panic!("expected ScrollViewport with the leftover, got {other:?}"),
+            }
+        } else {
+            assert!(
+                no_event_within(&mut event_rx, Duration::from_millis(200)).await,
+                "overscroll-behavior:{behavior} must drop the leftover, not chain it"
+            );
+        }
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    #[tokio::test]
+    async fn worker_wheel_overscroll_none_drops_the_remainder() {
+        wheel_overscroll_case("none", false).await;
+    }
+
+    #[tokio::test]
+    async fn worker_wheel_overscroll_auto_chains_to_the_viewport() {
+        wheel_overscroll_case("auto", true).await;
+    }
+
+    /// Stage 8 Rec 9: Tab moves keyboard focus between buttons
+    /// (`:focus` recolors the focused one, lower on the page each
+    /// Tab), and Enter activates the focused button (its click
+    /// handler runs).
+    #[tokio::test]
+    async fn worker_tab_moves_focus_and_enter_activates() {
+        let page = "<!doctype html><html><head><style>body{margin:0}            button{display:block} button:focus{color:red}</style></head><body>            <button id=\"b1\">One</button><button id=\"b2\">Two</button><span id=\"c\">0</span>            <script>document.getElementById('b1').addEventListener('click', () => {            document.getElementById('c').textContent = 'clicked'; });</script>            </body></html>";
+        let routes = std::sync::Arc::new(vec![(
+            "/".to_string(),
+            "text/html".to_string(),
+            page.to_string(),
+        )]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_routes(listener, routes));
+        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        // "One" (3) + "Two" (3) + "0" (1) = 7 glyphs.
+        assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 7);
+        let no_modifiers = pluto_ipc::Modifiers::default();
+        // Tab: focus lands on the first button — its glyphs turn
+        // red. Record their height: the second button sits lower.
+        send_key(&cmd_tx, "Tab", "Tab", no_modifiers);
+        let first_list = wait_for_glyph_color(
+            &mut event_rx,
+            [1.0, 0.0, 0.0, 1.0],
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("Tab did not focus the first button");
+        let first_red_y = glyph_colors(&first_list)
+            .iter()
+            .filter(|(c, _, _)| *c == [1.0, 0.0, 0.0, 1.0])
+            .map(|(_, _, y)| *y)
+            .fold(f32::INFINITY, f32::min);
+        // Enter: the focused button's click handler runs — the span
+        // becomes "clicked" (7 glyphs): 3 + 3 + 7 = 13.
+        send_key(&cmd_tx, "Enter", "Enter", no_modifiers);
+        assert!(
+            wait_for_glyphs(&mut event_rx, 13, Duration::from_secs(5)).await,
+            "Enter did not activate the focused button"
+        );
+        // Tab again: focus moves to the second button — the red
+        // glyphs sit lower on the page than the first button's.
+        send_key(&cmd_tx, "Tab", "Tab", no_modifiers);
+        let second_list = wait_for_glyph_color(
+            &mut event_rx,
+            [1.0, 0.0, 0.0, 1.0],
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("second Tab did not focus the second button");
+        let second_red_y = glyph_colors(&second_list)
+            .iter()
+            .filter(|(c, _, _)| *c == [1.0, 0.0, 0.0, 1.0])
+            .map(|(_, _, y)| *y)
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            second_red_y > first_red_y,
+            "focus did not move down: first red y={first_red_y}, second red y={second_red_y}"
+        );
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Stage 8 Rec 10: an `IntersectionObserver` fires its initial
+    /// entry for a target in view — the callback runs as a queued
+    /// task after paint (so the text it writes lands on a later
+    /// submit), and no second entry arrives while the geometry is
+    /// unchanged.
+    #[tokio::test]
+    async fn worker_intersection_observer_fires_initial_entry() {
+        let page = "<!doctype html><html><head><style>body{margin:0}#t{width:100px;height:100px}</style></head><body><div id=\"t\">Target</div><div id=\"out\"></div><script>new IntersectionObserver((es) => { document.getElementById('out').textContent = es[0].isIntersecting ? 'IN' : 'OUT'; }).observe(document.getElementById('t'));</script></body></html>";
+        let routes = std::sync::Arc::new(vec![(
+            "/".to_string(),
+            "text/html".to_string(),
+            page.to_string(),
+        )]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_routes(listener, routes));
+        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        // "Target" is 6 glyphs; the callback writes "IN" (2 more).
+        assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 6);
+        assert!(
+            wait_for_glyphs(&mut event_rx, 8, Duration::from_secs(5)).await,
+            "IntersectionObserver initial entry did not write IN"
+        );
+        // Unchanged geometry: no further submit within 300 ms.
+        assert!(
+            no_event_within(&mut event_rx, Duration::from_millis(300)).await,
+            "identical geometry must not deliver a second entry"
+        );
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Stage 8 Rec 10: scrolling the viewport re-runs the
+    /// IntersectionObserver step on the retained tree — a target
+    /// that scrolls into view flips `isIntersecting` and the
+    /// callback writes the new state.
+    #[tokio::test]
+    async fn worker_intersection_observer_scroll_changes_the_entry() {
+        let page = "<!doctype html><html><head><style>body{margin:0}#sp{height:1000px}#t{width:100px;height:100px}</style></head><body><div id=\"sp\"></div><div id=\"t\">Target</div><div id=\"out\"></div><script>new IntersectionObserver((es) => { document.getElementById('out').textContent = es[0].isIntersecting ? 'IN' : 'OUT'; }).observe(document.getElementById('t'));</script></body></html>";
+        let routes = std::sync::Arc::new(vec![(
+            "/".to_string(),
+            "text/html".to_string(),
+            page.to_string(),
+        )]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_routes(listener, routes));
+        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        // "Target" is 6 glyphs; out of view the callback writes
+        // "OUT" (3 more).
+        assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 6);
+        assert!(
+            wait_for_glyphs(&mut event_rx, 9, Duration::from_secs(5)).await,
+            "IntersectionObserver initial entry did not write OUT"
+        );
+        // Wheel down 500px over the spacer: no container, so the
+        // whole delta chains to the viewport (target 1000..1100
+        // enters the 500..1268 visible region).
+        send_wheel(&cmd_tx, 50.0, 50.0, 0.0, 500.0);
+        match next_event(&mut event_rx).await {
+            RendererToBrowser::ScrollViewport { dx, dy } => {
+                assert_eq!(dx, 0.0);
+                assert!((dy - 500.0).abs() < 0.01, "viewport scrolled 500, got {dy}");
+            }
+            other => panic!("expected ScrollViewport after the wheel, got {other:?}"),
+        }
+        // The scroll re-ran the step; the callback flips OUT -> IN
+        // (2 glyphs instead of 3).
+        assert!(
+            wait_for_glyphs(&mut event_rx, 8, Duration::from_secs(5)).await,
+            "scrolling the target into view did not write IN"
+        );
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
     // ------------------------------------------------ M4 acceptance
     //
     // Stage 7, wave 2b: the M4 done-criteria, end to end through the
@@ -1648,12 +3173,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{}/", addr.port());
         // "Inc" (3) + "9" (1) = 4 glyphs.
         assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 4);
-        cmd_tx
-            .send(BrowserToRenderer::InputEvent(InputEvent::Click {
-                x: 100.0,
-                y: 20.0,
-            }))
-            .expect("worker takes the click");
+        send_click(&cmd_tx, 100.0, 20.0);
         // "Inc" (3) + "10" (2) = 5 glyphs: the click dispatched,
         // the handler ran, the DOM mutated, and the dirty-bit flow
         // re-laid out and resubmitted.
@@ -1685,12 +3205,7 @@ mod tests {
         // "Toggle" (6), details empty.
         assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 6);
         let click = || {
-            cmd_tx
-                .send(BrowserToRenderer::InputEvent(InputEvent::Click {
-                    x: 100.0,
-                    y: 20.0,
-                }))
-                .expect("worker takes the click")
+            send_click(&cmd_tx, 100.0, 20.0);
         };
         click();
         // "Toggle" (6) + "details-here-now" (16) = 22.

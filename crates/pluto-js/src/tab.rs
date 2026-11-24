@@ -39,6 +39,7 @@
 //! re-entered.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -55,6 +56,9 @@ use crate::event_loop::{
     FRAME_INTERVAL, LoopState, Microtask, TaskKind, TaskSource,
 };
 use crate::host::{DomHost, DomKey};
+use crate::observers::{
+    ComputedIntersection, RootMargin, MAX_ROUNDS, ObservedSizes, ResizeBoxKind, ResizeStepOutcome,
+};
 use crate::realm::{RealmConfig, TabRealm};
 
 /// Bytecode cache capacity per tab realm (8 MiB of compiled modules).
@@ -393,6 +397,180 @@ impl TabJs {
         self.navigate()
     }
 
+    /// Set the tab's visibility (Stage 8 Rec 1): a hidden tab runs
+    /// no rAF callbacks and produces no frames until visible again.
+    /// Timers, tasks, and microtasks are unaffected — only the
+    /// rendering opportunity is gated (see `maybe_render`). Pending
+    /// rAF callbacks stay queued and fire on the first visible
+    /// frame; `next_frame_at` is left alone, so that frame is due
+    /// immediately.
+    pub fn set_visible(&mut self, visible: bool) {
+        self.state.borrow_mut().visible = visible;
+    }
+
+    /// Whether the tab is currently visible.
+    pub fn is_visible(&self) -> bool {
+        self.state.borrow().visible
+    }
+
+    /// Every (observer, target, box) currently observed by a
+    /// `ResizeObserver` in this tab. The browser's worker step
+    /// uses this to ask the layout actor for exactly these
+    /// targets' sizes.
+    pub fn resize_observation_targets(&self) -> Vec<(u64, DomKey, ResizeBoxKind)> {
+        self.bindings.borrow().resize_registry.targets()
+    }
+
+    /// Run one `ResizeObserver` gather/broadcast step from the
+    /// host's geometry (`geometry()` for the border box,
+    /// `content_size()` for the content box). The rendering-step
+    /// driver: tests call this directly; the per-tab worker calls
+    /// [`Self::run_resize_observers_with_sizes`] with layout-tree
+    /// sizes instead (same registry, same loop — the size source
+    /// is the only difference).
+    pub fn run_resize_observers(&mut self) -> ResizeStepOutcome {
+        let Some(host) = self.bindings.borrow().host.clone() else {
+            return ResizeStepOutcome::default();
+        };
+        self.run_resize_rounds(
+            &|key| crate::bindings::observers::host_observed_sizes(&host, key),
+            &|key| host.borrow().depth(key).unwrap_or(0),
+        )
+    }
+
+    /// Run one `ResizeObserver` gather/broadcast step from sizes
+    /// the browser measured on the layout tree (border + content
+    /// boxes, per target) and DOM depths. Called by the per-tab
+    /// worker's rendering update, after layout and before the
+    /// display list is built.
+    pub fn run_resize_observers_with_sizes(
+        &mut self,
+        sizes: &HashMap<DomKey, ObservedSizes>,
+        depths: &HashMap<DomKey, usize>,
+    ) -> ResizeStepOutcome {
+        self.run_resize_rounds(
+            &|key| sizes.get(&key).copied(),
+            &|key| depths.get(&key).copied().unwrap_or(0),
+        )
+    }
+
+    /// The gather/broadcast loop: gather a round, deliver its
+    /// batches, re-query sizes (a callback may have resized
+    /// something), repeat while anything is active — up to
+    /// [`MAX_ROUNDS`] rounds, after which the resize-loop error
+    /// fires and the step stops with observations still active
+    /// for the next step.
+    fn run_resize_rounds(
+        &mut self,
+        sizes: &dyn Fn(DomKey) -> Option<ObservedSizes>,
+        depth: &dyn Fn(DomKey) -> usize,
+    ) -> ResizeStepOutcome {
+        let mut outcome = ResizeStepOutcome::default();
+        for round in 1..=MAX_ROUNDS {
+            let batches = self
+                .bindings
+                .borrow_mut()
+                .resize_registry
+                .gather_round(sizes, depth);
+            if batches.is_empty() {
+                break;
+            }
+            outcome.delivered = true;
+            outcome.rounds = round;
+            for (id, entries) in batches {
+                let bindings = Rc::clone(&self.bindings);
+                if let Err(e) = crate::bindings::observers::deliver_resize_entries(
+                    &mut self.realm,
+                    &bindings,
+                    id,
+                    &entries,
+                ) {
+                    self.state.borrow_mut().script_errors.push(e.to_string());
+                }
+            }
+            if !self
+                .bindings
+                .borrow()
+                .resize_registry
+                .has_active(sizes)
+            {
+                break;
+            }
+            if round == MAX_ROUNDS {
+                outcome.loop_error = true;
+                self.state.borrow_mut().script_errors.push(
+                    "ResizeObserver loop completed with undelivered notifications."
+                        .to_string(),
+                );
+            }
+        }
+        outcome
+    }
+
+    /// Every (observer, target, root, rootMargin) currently observed
+    /// by an `IntersectionObserver` in this tab. The browser's
+    /// worker step uses this to ask the layout actor for exactly
+    /// these targets' intersections.
+    pub fn intersection_observation_targets(
+        &self,
+    ) -> Vec<(u64, DomKey, Option<DomKey>, RootMargin)> {
+        self.bindings.borrow().intersection_registry.targets()
+    }
+
+    /// Run one `IntersectionObserver` gather from geometry the
+    /// browser measured on the layout tree, keyed by
+    /// (observer, target). Entries that crossed a threshold band
+    /// (or flipped `isIntersecting`) are queued in the registry,
+    /// and ONE host task is enqueued to deliver them — so the
+    /// callbacks run after paint, on a later turn, never inline in
+    /// the rendering step (Stage 8 report §(e): an
+    /// `IntersectionObserver` callback that writes to the DOM must
+    /// not affect the same frame). `time_ms` is the computation
+    /// timestamp the entries carry (ms since the tab started).
+    pub fn run_intersection_observers_with_geometry(
+        &mut self,
+        geometry: &HashMap<(u64, DomKey), ComputedIntersection>,
+        time_ms: f64,
+    ) {
+        let enqueue = {
+            let mut bindings = self.bindings.borrow_mut();
+            bindings
+                .intersection_registry
+                .gather(&|id, key| geometry.get(&(id, key)).copied(), time_ms)
+        };
+        if enqueue {
+            self.enqueue_host_task(
+                TaskSource::DomManipulation,
+                Box::new(|tab| tab.deliver_pending_intersection_entries()),
+            );
+        }
+    }
+
+    /// Drain the pending `IntersectionObserver` entries and invoke
+    /// their callbacks, one call per observer. Runs as the queued
+    /// host task enqueued by
+    /// [`Self::run_intersection_observers_with_geometry`]. A
+    /// throwing callback is recorded as a script error, never fatal.
+    pub fn deliver_pending_intersection_entries(&mut self) {
+        let batches = {
+            self.bindings
+                .borrow_mut()
+                .intersection_registry
+                .take_pending()
+        };
+        for (id, entries) in batches {
+            let bindings = Rc::clone(&self.bindings);
+            if let Err(e) = crate::bindings::observers::deliver_intersection_entries(
+                &mut self.realm,
+                &bindings,
+                id,
+                &entries,
+            ) {
+                self.state.borrow_mut().script_errors.push(e.to_string());
+            }
+        }
+    }
+
     /// Run one turn of the event loop: one task to completion, then the
     /// microtask checkpoint, then update-the-rendering at a rendering
     /// opportunity. Returns what the turn did. A script error is
@@ -524,11 +702,13 @@ impl TabJs {
     }
 
     /// When the loop should next wake while idle: the earliest timer
-    /// deadline, or the next frame time if a frame is wanted.
+    /// deadline, or the next frame time if a frame is wanted. A hidden
+    /// tab never wakes for a frame (Stage 8 Rec 1: zero rendering
+    /// opportunities while hidden); its timers still wake it.
     fn next_wake(&self) -> Option<Instant> {
         let state = self.state.borrow();
         let mut wake = state.next_timer_deadline();
-        if !state.raf.is_empty() || state.render_requested {
+        if state.visible && (!state.raf.is_empty() || state.render_requested) {
             wake = Some(match wake {
                 Some(t) => t.min(state.next_frame_at),
                 None => state.next_frame_at,
@@ -615,6 +795,34 @@ impl TabJs {
     fn microtask_checkpoint(&mut self) -> Result<(), JsError> {
         let mut drained = 0usize;
         loop {
+            // MutationObserver delivery (Stage 8 Rec 7): one
+            // compound callback per observer per checkpoint, in
+            // pending order. This runs at the start of the
+            // checkpoint, before the engine's promise jobs — a
+            // deliberate approximation of the spec's "one compound
+            // microtask per observer": the record queue is drained
+            // here, so a callback that mutates the DOM queues fresh
+            // records that the next checkpoint iteration delivers
+            // (and the 100_000 bound below counts each delivery
+            // round, so an observer loop that keeps mutating
+            // starves loudly instead of forever). A throwing
+            // callback is recorded, never fatal.
+            let had_pending = self
+                .bindings
+                .borrow()
+                .host
+                .as_ref()
+                .is_some_and(|h| !h.borrow().pending_mutation_observers().is_empty());
+            if had_pending {
+                drained += 1;
+                let bindings = Rc::clone(&self.bindings);
+                if let Err(e) = crate::bindings::observers::deliver_mutation_observers(
+                    &mut self.realm,
+                    &bindings,
+                ) {
+                    self.state.borrow_mut().script_errors.push(e.to_string());
+                }
+            }
             let microtask = self.state.borrow_mut().microtasks.pop_front();
             match microtask {
                 Some(Microtask::Host(task)) => {
@@ -640,10 +848,17 @@ impl TabJs {
 
     /// Update the rendering, but only at a rendering opportunity: a
     /// frame is due AND (an rAF callback is pending OR a render was
-    /// requested). Runs each rAF callback with the shared frame
-    /// timestamp, with a microtask checkpoint after each callback (per
-    /// spec, each callback is invoked from an empty stack).
+    /// requested). A hidden tab gets no rendering opportunity at all
+    /// (Stage 8 Rec 1): this returns early with the rAF queue and
+    /// `render_requested` untouched, so the callbacks fire on the
+    /// first frame after the tab becomes visible again. Runs each rAF
+    /// callback with the shared frame timestamp, with a microtask
+    /// checkpoint after each callback (per spec, each callback is
+    /// invoked from an empty stack).
     fn maybe_render(&mut self) -> Result<(), JsError> {
+        if !self.state.borrow().visible {
+            return Ok(());
+        }
         let now = Instant::now();
         let (due, wanted) = {
             let state = self.state.borrow();
@@ -1055,6 +1270,40 @@ mod tests {
         tab.state.borrow_mut().epoch += 1;
         tab.run_until_idle().unwrap();
         assert!(!RAN.load(AtomicOrdering::SeqCst));
+    }
+
+    #[test]
+    fn hidden_tab_runs_no_raf_but_timers_still_fire() {
+        // Stage 8 Rec 1: hidden = zero rendering opportunities.
+        // The rAF callback stays queued while hidden and fires on
+        // the first visible frame; a timer fires while hidden
+        // (timers are not rendering).
+        let mut tab = test_tab();
+        // Hide first: `eval_script` itself runs one turn, and that
+        // turn must not fire the rAF callback either.
+        tab.set_visible(false);
+        assert!(!tab.is_visible());
+        tab.eval_script(
+            "globalThis.__raf = 0; globalThis.__timer = 0; \
+             requestAnimationFrame(() => { globalThis.__raf = 1; }); \
+             setTimeout(() => { globalThis.__timer = 1; }, 0);",
+            "test.js",
+        )
+        .unwrap();
+        for _ in 0..10 {
+            tab.run_turn().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(read_num(&mut tab, "__timer"), 1.0, "timers run while hidden");
+        assert_eq!(read_num(&mut tab, "__raf"), 0.0, "no rAF while hidden");
+        tab.set_visible(true);
+        assert!(tab.is_visible());
+        tab.run_turn().unwrap();
+        assert_eq!(
+            read_num(&mut tab, "__raf"),
+            1.0,
+            "queued rAF fires when visible again"
+        );
     }
 
     #[test]

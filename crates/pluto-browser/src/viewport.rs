@@ -48,20 +48,25 @@ impl Program<crate::Message> for WebViewport {
     type Primitive = WebPrimitive;
 
     /// Report the widget's bounds to the app when they change, and
-    /// publish wheel events as scroll deltas. The bounds are the
-    /// page area (window minus chrome) — the true layout viewport.
-    /// iced calls this on every event, including the
-    /// `RedrawRequested` that follows a resize's relayout, so the
-    /// bounds here are current (the resize event itself still sees
-    /// the pre-resize layout, but it publishes nothing: the bounds
-    /// are unchanged from the last report then). Publishing only on
-    /// change means one message per frame during a drag-resize, and
-    /// nothing at all for mouse moves with unchanged bounds. The app
-    /// re-lays out from the retained document and skips the message
-    /// entirely if the size is unchanged. A wheel event scrolls
-    /// without touching layout at all: the shell stores the offset
-    /// in the compositor holder and the renderer subtracts it in
-    /// the vertex shader.
+    /// publish pointer + wheel events. The bounds are the page area
+    /// (window minus chrome) — the true layout viewport. iced calls
+    /// this on every event, including the `RedrawRequested` that
+    /// follows a resize's relayout, so the bounds here are current
+    /// (the resize event itself still sees the pre-resize layout,
+    /// but it publishes nothing: the bounds are unchanged from the
+    /// last report then). Publishing only on change means one
+    /// message per frame during a drag-resize, and nothing at all
+    /// for mouse moves with unchanged bounds. The app re-lays out
+    /// from the retained document and skips the message entirely if
+    /// the size is unchanged.
+    ///
+    /// Pointer/wheel events publish widget coordinates; the shell
+    /// adds the scroll offset and forwards page coordinates to the
+    /// worker (Stage 8 Rec 9, InputEvent v3). The wheel delta is
+    /// forwarded raw with its mode — the worker scales lines
+    /// (×16 px) and pages (× viewport) itself. A wheel with no
+    /// cursor position (cursor outside the window) is dropped: it
+    /// cannot be targeted.
     fn update(
         &self,
         state: &mut Self::State,
@@ -69,25 +74,48 @@ impl Program<crate::Message> for WebViewport {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<shader::Action<crate::Message>> {
-        if let cosmic::iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) = event {
-            // A line is ~16px; pixel deltas pass through as-is.
-            let (dx, dy) = match delta {
-                mouse::ScrollDelta::Lines { x, y } => (x * 16.0, y * 16.0),
-                mouse::ScrollDelta::Pixels { x, y } => (*x, *y),
-            };
-            return Some(shader::Action::publish(crate::Message::Scrolled(dx, dy)));
-        }
-        // A left click publishes widget coordinates; the shell adds
-        // the scroll offset and forwards page coordinates to the
-        // worker, which hit-tests the retained layout tree (R15).
-        // Other buttons and releases are ignored by the page.
-        if let cosmic::iced::Event::Mouse(mouse::Event::ButtonPressed(button)) = event
-            && *button == mouse::Button::Left
+        let widget_pos = |pos: cosmic::iced::Point| (pos.x - bounds.x, pos.y - bounds.y);
+        if let cosmic::iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) = event
             && let Some(pos) = cursor.position()
         {
-            return Some(shader::Action::publish(crate::Message::Clicked {
-                x: pos.x - bounds.x,
-                y: pos.y - bounds.y,
+            let (dx, dy, delta_mode) = match delta {
+                mouse::ScrollDelta::Lines { x, y } => (*x, *y, pluto_ipc::DeltaMode::Line),
+                mouse::ScrollDelta::Pixels { x, y } => (*x, *y, pluto_ipc::DeltaMode::Pixel),
+            };
+            let (x, y) = widget_pos(pos);
+            return Some(shader::Action::publish(crate::Message::Scrolled {
+                x,
+                y,
+                dx,
+                dy,
+                delta_mode,
+            }));
+        }
+        if let cosmic::iced::Event::Mouse(mouse::Event::CursorMoved { position }) = event {
+            let (x, y) = widget_pos(*position);
+            return Some(shader::Action::publish(crate::Message::PointerMoved {
+                x,
+                y,
+            }));
+        }
+        if let cosmic::iced::Event::Mouse(mouse::Event::ButtonPressed(button)) = event
+            && let Some(pos) = cursor.position()
+        {
+            let (x, y) = widget_pos(pos);
+            return Some(shader::Action::publish(crate::Message::PointerDown {
+                x,
+                y,
+                button: button_number(button),
+            }));
+        }
+        if let cosmic::iced::Event::Mouse(mouse::Event::ButtonReleased(button)) = event
+            && let Some(pos) = cursor.position()
+        {
+            let (x, y) = widget_pos(pos);
+            return Some(shader::Action::publish(crate::Message::PointerUp {
+                x,
+                y,
+                button: button_number(button),
             }));
         }
         let size = (bounds.width, bounds.height);
@@ -216,6 +244,39 @@ impl Primitive for WebPrimitive {
             clip_bounds.width,
             clip_bounds.height,
         );
-        pipeline.renderer.render(&mut pass);
+        // The widget rect (physical px) and the physical-per-layout-px
+        // scale: per-run scissors are page-space rects, converted
+        // inside `render` — `bounds.width` is the widget's layout
+        // width, so the ratio is the scale.
+        let scale = if self.bounds.width > 0.0 {
+            clip_bounds.width as f32 / self.bounds.width
+        } else {
+            1.0
+        };
+        pipeline.renderer.render(
+            &mut pass,
+            (
+                clip_bounds.x,
+                clip_bounds.y,
+                clip_bounds.width,
+                clip_bounds.height,
+            ),
+            scale,
+        );
+    }
+}
+
+/// The IPC button number for an iced mouse button (Stage 8 Rec 9):
+/// 0 = left, 1 = middle, 2 = right, 3 = back, 4 = forward. Any
+/// other button shares 5 — the worker only distinguishes the left
+/// button (click synthesis); the rest get `:active` only.
+fn button_number(button: &mouse::Button) -> u8 {
+    match button {
+        mouse::Button::Left => 0,
+        mouse::Button::Middle => 1,
+        mouse::Button::Right => 2,
+        mouse::Button::Back => 3,
+        mouse::Button::Forward => 4,
+        mouse::Button::Other(_) => 5,
     }
 }

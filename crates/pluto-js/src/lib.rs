@@ -37,6 +37,7 @@
 
 pub mod bytecode;
 pub mod bindings;
+pub mod observers;
 pub mod engine;
 pub mod error;
 pub mod event_loop;
@@ -50,6 +51,11 @@ pub use bytecode::{BytecodeCache, CacheHit, CacheStats, CacheKey};
 pub use engine::{EvalKind, JsEngine, JsValue};
 pub use error::JsError;
 pub use event_loop::{FRAME_INTERVAL, TaskSource};
+pub use observers::{
+    ComputedIntersection, IntersectionObserverEntry, IntersectionObserverRegistry, MarginValue,
+    RootMargin, MAX_ROUNDS, ObservedSizes, ResizeBoxKind, ResizeObserverEntry,
+    ResizeObserverRegistry, ResizeStepOutcome,
+};
 pub use host::{DomHost, DomHostError, DomKey, Geometry};
 pub use realm::{DEFAULT_MEMORY_LIMIT_BYTES, DEFAULT_SCRIPT_BUDGET, RealmConfig, TabRealm};
 pub use tab::{TabJs, TurnOutcome};

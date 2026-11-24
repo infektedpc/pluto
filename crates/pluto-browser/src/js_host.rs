@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use pluto_css::{Selector, Stylesheet};
+use pluto_html::observers::{MutationObserverOptions, ObserverMutationRecord};
 use pluto_html::{
     Dom, NodeId, NodeKind, Parser, QueuedScript, ScriptPaused, parse_fragment,
     resolve_url,
@@ -47,10 +48,9 @@ use crate::renderer::LayoutJob;
 // agent/loop/realm; the per-tab `TabJs` here is the window agent only.
 // TODO(M5): Shadow DOM — no shadow-root host methods exist yet; the
 // `DomHost` surface would gain `attach_shadow` / `shadow_root` here.
-// TODO(M8): MutationObserver / ResizeObserver / IntersectionObserver —
-// the observer notification queues hook into the loop's
-// `DomManipulation` source and the rendering step; no observer state
-// is kept here in M4.
+// (IntersectionObserver landed as Stage 8 Rec 10 — see
+// `crate::renderer::run_intersection_observer_step` and
+// `pluto-js::observers::IntersectionObserverRegistry`.)
 // TODO(M5): import maps — module `import` specifiers resolve as
 // relative/absolute URLs only in M4; an import-map layer would land
 // in the module loader the runner uses.
@@ -199,6 +199,19 @@ impl BrowserDomHost {
     /// re-layout has consumed them).
     pub fn clear_dirty(&mut self) {
         self.dom.lock().unwrap().clear_dirty();
+    }
+
+    /// Mark nodes dirty on the live `Dom` (Stage 8 Rec 9): a
+    /// `:hover`/`:active`/`:focus` restyle marks the changed
+    /// elements, so the next re-layout re-resolves their styles
+    /// (the incremental path reads the dirty set from the
+    /// snapshot). The tab thread owns this host; JS mutators mark
+    /// dirty through their own path.
+    pub fn mark_dirty(&mut self, ids: &[NodeId]) {
+        let mut dom = self.dom.lock().unwrap();
+        for &id in ids {
+            dom.mark_dirty(id);
+        }
     }
 
     /// First descendant element of `id` (inclusive) with this tag.
@@ -477,6 +490,20 @@ impl DomHost for BrowserDomHost {
         }
         let text_node = dom.create_text(text);
         dom.append_child(key, text_node);
+        dom.mark_dirty(key);
+        self.render_requested.set(true);
+        true
+    }
+
+    fn set_character_data(&mut self, key: DomKey, data: &str) -> bool {
+        let mut dom = self.dom.lock().unwrap();
+        if !matches!(
+            dom.get(key).map(|n| &n.kind),
+            Some(NodeKind::Text(_))
+        ) {
+            return false;
+        }
+        dom.set_text(key, data);
         dom.mark_dirty(key);
         self.render_requested.set(true);
         true
@@ -854,6 +881,65 @@ impl DomHost for BrowserDomHost {
         }
         eprintln!("[pluto] js error: {message}");
     }
+
+    // Stage 8 Rec 7: the mutation-observer registry lives in the
+    // `Dom` (see `pluto-html::observers`); this host only locks
+    // the arena and delegates.
+    fn observe_mutation(
+        &mut self,
+        observer_id: u64,
+        target: DomKey,
+        options: MutationObserverOptions,
+    ) -> bool {
+        self.dom
+            .lock()
+            .unwrap()
+            .observe_mutation(observer_id, target, options)
+    }
+
+    fn disconnect_mutation_observer(&mut self, observer_id: u64) {
+        self.dom
+            .lock()
+            .unwrap()
+            .disconnect_mutation_observer(observer_id);
+    }
+
+    fn take_mutation_records(&mut self, observer_id: u64) -> Vec<ObserverMutationRecord> {
+        self.dom
+            .lock()
+            .unwrap()
+            .take_mutation_records(observer_id)
+    }
+
+    fn pending_mutation_observers(&self) -> Vec<u64> {
+        self.dom.lock().unwrap().pending_mutation_observers()
+    }
+
+    fn take_pending_mutation_observers(&mut self) -> Vec<u64> {
+        self.dom
+            .lock()
+            .unwrap()
+            .take_pending_mutation_observers()
+    }
+
+    // Stage 8 Rec 8: the host-path content size is the border box
+    // (no padding data at this layer — the worker's rendering
+    // step supplies real content sizes from the layout tree).
+    fn content_size(&mut self, key: DomKey) -> Option<(f64, f64)> {
+        self.geometry(key).map(|g| (g.width, g.height))
+    }
+
+    fn depth(&self, key: DomKey) -> Option<usize> {
+        let dom = self.dom.lock().unwrap();
+        dom.get(key)?;
+        let mut depth = 0;
+        let mut cur = dom.get(key).and_then(|n| n.parent);
+        while let Some(parent) = cur {
+            depth += 1;
+            cur = dom.get(parent).and_then(|n| n.parent);
+        }
+        Some(depth)
+    }
 }
 
 impl BrowserDomHost {
@@ -923,6 +1009,9 @@ impl DomHost for SharedHost {
     }
     fn set_text_content(&mut self, key: DomKey, text: &str) -> bool {
         self.0.lock().unwrap().set_text_content(key, text)
+    }
+    fn set_character_data(&mut self, key: DomKey, data: &str) -> bool {
+        self.0.lock().unwrap().set_character_data(key, data)
     }
     fn get_attribute(&self, key: DomKey, name: &str) -> Option<String> {
         self.0.lock().unwrap().get_attribute(key, name)
@@ -1032,6 +1121,41 @@ impl DomHost for SharedHost {
     }
     fn report_error(&self, message: &str) {
         self.0.lock().unwrap().report_error(message)
+    }
+    fn observe_mutation(
+        &mut self,
+        observer_id: u64,
+        target: DomKey,
+        options: MutationObserverOptions,
+    ) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .observe_mutation(observer_id, target, options)
+    }
+    fn disconnect_mutation_observer(&mut self, observer_id: u64) {
+        self.0
+            .lock()
+            .unwrap()
+            .disconnect_mutation_observer(observer_id);
+    }
+    fn take_mutation_records(&mut self, observer_id: u64) -> Vec<ObserverMutationRecord> {
+        self.0.lock().unwrap().take_mutation_records(observer_id)
+    }
+    fn pending_mutation_observers(&self) -> Vec<u64> {
+        self.0.lock().unwrap().pending_mutation_observers()
+    }
+    fn take_pending_mutation_observers(&mut self) -> Vec<u64> {
+        self.0
+            .lock()
+            .unwrap()
+            .take_pending_mutation_observers()
+    }
+    fn content_size(&mut self, key: DomKey) -> Option<(f64, f64)> {
+        self.0.lock().unwrap().content_size(key)
+    }
+    fn depth(&self, key: DomKey) -> Option<usize> {
+        self.0.lock().unwrap().depth(key)
     }
 }
 

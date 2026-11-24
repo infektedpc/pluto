@@ -15,8 +15,13 @@ postcard.workspace = true
 rayon.workspace = true
 image.workspace = true
 pluto-layout.workspace = true
+pluto-css.workspace = true
 
 # Only the tests build example documents, so these stay dev-only.
 [dev-dependencies]
 pluto-html.workspace = true
 pluto-css.workspace = true
+naga.workspace = true
+# Stage 8 Rec 13 spike test only: blocks on wgpu's async adapter /
+# device requests without a runtime.
+futures-executor = "0.3"

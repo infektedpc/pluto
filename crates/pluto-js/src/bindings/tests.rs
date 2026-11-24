@@ -6,6 +6,7 @@
 //! JS-visible values (via `TabJs::eval_value`), so a passing test
 //! means the whole crossing works — not just the Rust side.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc;
@@ -13,6 +14,7 @@ use std::sync::mpsc;
 use crate::bindings::fetch::{FetchBackend, FetchCompletion, FetchError, FetchRequest, FetchResponse};
 use crate::bindings::test_host::TestHost;
 use crate::engine::JsValue;
+use crate::observers::ComputedIntersection;
 use crate::realm::RealmConfig;
 use crate::tab::TabJs;
 
@@ -820,4 +822,347 @@ fn geometry_reads_force_a_flush_and_return_the_box() {
     assert_eq!(read_str(&mut tab, "__rect"), "0,0,100,50,100,50");
     assert_eq!(read_num(&mut tab, "__ow"), 100.0);
     assert_eq!(read_num(&mut tab, "__oh"), 50.0);
+}
+
+// ---------------------------------------------------------------- MutationObserver (Stage 8 Rec 7)
+
+#[test]
+fn mutation_observer_records_in_order_one_callback_per_turn() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "globalThis.__calls = 0; globalThis.__recs = []; \
+         const app = document.getElementById('app'); \
+         const obs = new MutationObserver((recs) => { \
+           globalThis.__calls++; \
+           globalThis.__recs = recs; \
+         }); \
+         obs.observe(app, { childList: true, attributes: true, characterData: true, \
+           subtree: true, attributeOldValue: true, characterDataOldValue: true }); \
+         const p = document.createElement('p'); \
+         app.appendChild(p); \
+         app.setAttribute('class', 'changed'); \
+         const para = document.getElementById('para'); \
+         para.childNodes[0].data = 'Bye'; \
+         globalThis.__sync_calls = globalThis.__calls;",
+    );
+    // Nothing delivered synchronously, inside the script.
+    assert_eq!(read_num(&mut tab, "__sync_calls"), 0.0);
+    // One compound callback for the whole turn, with all three
+    // record kinds in mutation order.
+    assert_eq!(read_num(&mut tab, "__calls"), 1.0);
+    assert_eq!(read_num(&mut tab, "__recs.length"), 3.0);
+    assert_eq!(
+        read_str(&mut tab, "__recs.map(r => r.type).join(',')"),
+        "childList,attributes,characterData"
+    );
+    assert!(read_bool(&mut tab, "__recs[0].target === app"));
+    assert_eq!(read_num(&mut tab, "__recs[0].addedNodes.length"), 1.0);
+    assert!(read_bool(&mut tab, "__recs[0].addedNodes[0] === p"));
+    assert_eq!(read_str(&mut tab, "__recs[1].attributeName"), "class");
+    assert_eq!(read_str(&mut tab, "__recs[1].oldValue"), "root");
+    assert!(read_bool(&mut tab, "__recs[2].target === para.childNodes[0]"));
+    assert_eq!(read_str(&mut tab, "__recs[2].oldValue"), "Hello");
+    assert_eq!(read_str(&mut tab, "para.textContent"), "Bye");
+}
+
+#[test]
+fn mutation_observer_take_records_drains_and_disconnect_stops_delivery() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "globalThis.__calls = 0; \
+         const app = document.getElementById('app'); \
+         const obs = new MutationObserver(() => { globalThis.__calls++; }); \
+         obs.observe(app, { childList: true }); \
+         app.appendChild(document.createElement('span')); \
+         globalThis.__taken = obs.takeRecords(); \
+         globalThis.__taken_n = __taken.length;",
+    );
+    // takeRecords drained the queue synchronously: the callback
+    // never fires for those records.
+    assert_eq!(read_num(&mut tab, "__taken_n"), 1.0);
+    assert_eq!(read_num(&mut tab, "__calls"), 0.0);
+    run(
+        &mut tab,
+        "obs.disconnect(); \
+         app.appendChild(document.createElement('em')); \
+         globalThis.__after_disconnect_taken = obs.takeRecords().length;",
+    );
+    assert_eq!(read_num(&mut tab, "__calls"), 0.0);
+    assert_eq!(read_num(&mut tab, "__after_disconnect_taken"), 0.0);
+}
+
+#[test]
+fn mutation_observer_attribute_filter_and_options_validation() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "const app = document.getElementById('app'); \
+         globalThis.__seen = []; \
+         const obs = new MutationObserver((recs) => { globalThis.__seen = recs; }); \
+         obs.observe(app, { attributes: true, attributeFilter: ['id'] }); \
+         app.setAttribute('class', 'nope'); \
+         app.setAttribute('id', 'yes'); \
+         let err = ''; \
+         try { obs.observe(app, {}); } catch (e) { err = e.name; } \
+         globalThis.__err = err;",
+    );
+    // Only the `id` change was recorded.
+    assert_eq!(read_num(&mut tab, "__seen.length"), 1.0);
+    assert_eq!(read_str(&mut tab, "__seen[0].attributeName"), "id");
+    // Observing with no observation type throws TypeError.
+    assert_eq!(read_str(&mut tab, "__err"), "TypeError");
+}
+
+// ---------------------------------------------------------------- ResizeObserver (Stage 8 Rec 8)
+
+#[test]
+fn resize_observer_fires_initial_entry_then_stays_quiet() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "globalThis.__entries = []; \
+         const ro = new ResizeObserver((entries) => { \
+           for (const e of entries) globalThis.__entries.push(e); \
+         }); \
+         ro.observe(document.getElementById('app')); \
+         globalThis.__sync = globalThis.__entries.length;",
+    );
+    // No delivery until the rendering step runs.
+    assert_eq!(read_num(&mut tab, "__sync"), 0.0);
+    let outcome = tab.run_resize_observers();
+    assert!(outcome.delivered);
+    assert!(!outcome.loop_error);
+    assert_eq!(read_num(&mut tab, "__entries.length"), 1.0);
+    assert!(read_bool(
+        &mut tab,
+        "__entries[0].target === document.getElementById('app')"
+    ));
+    // TestHost geometry: 100×50 for every node.
+    assert_eq!(
+        read_num(&mut tab, "__entries[0].borderBoxSize[0].inlineSize"),
+        100.0
+    );
+    assert_eq!(
+        read_num(&mut tab, "__entries[0].borderBoxSize[0].blockSize"),
+        50.0
+    );
+    assert_eq!(
+        read_num(&mut tab, "__entries[0].contentBoxSize[0].inlineSize"),
+        100.0
+    );
+    assert_eq!(read_num(&mut tab, "__entries[0].contentRect.width"), 100.0);
+    assert_eq!(read_num(&mut tab, "__entries[0].contentRect.height"), 50.0);
+    // A second step with unchanged sizes delivers nothing.
+    let outcome2 = tab.run_resize_observers();
+    assert!(!outcome2.delivered);
+    assert_eq!(read_num(&mut tab, "__entries.length"), 1.0);
+}
+
+#[test]
+fn resize_observer_unobserve_disconnect_and_bad_options() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "globalThis.__n = 0; \
+         const ro = new ResizeObserver(() => { globalThis.__n++; }); \
+         const app = document.getElementById('app'); \
+         const btn = document.getElementById('btn'); \
+         ro.observe(app); \
+         ro.observe(btn); \
+         ro.unobserve(btn); \
+         let box_err = ''; \
+         try { ro.observe(app, { box: 'bogus' }); } catch (e) { box_err = e.name; } \
+         let el_err = ''; \
+         try { ro.observe(document.createTextNode('x')); } catch (e) { el_err = e.name; } \
+         globalThis.__box_err = box_err; \
+         globalThis.__el_err = el_err;",
+    );
+    assert_eq!(read_str(&mut tab, "__box_err"), "TypeError");
+    assert_eq!(read_str(&mut tab, "__el_err"), "TypeError");
+    let outcome = tab.run_resize_observers();
+    assert!(outcome.delivered);
+    assert_eq!(read_num(&mut tab, "__n"), 1.0, "only app observed");
+    run(&mut tab, "ro.disconnect();");
+    let outcome2 = tab.run_resize_observers();
+    assert!(!outcome2.delivered);
+    assert_eq!(read_num(&mut tab, "__n"), 1.0);
+}
+
+#[test]
+fn resize_observer_loop_error_when_sizes_keep_changing() {
+    // A host whose geometry grows on every read: the callback can
+    // never settle, so the step must stop with the resize-loop
+    // error instead of looping forever.
+    let mut host = TestHost::from_html(DOC);
+    host.geometry_growth.set(10.0);
+    let mut tab = TabJs::new(&RealmConfig::default()).unwrap();
+    tab.set_dom_host(Box::new(host));
+    run(
+        &mut tab,
+        "globalThis.__n = 0; \
+         const ro = new ResizeObserver(() => { globalThis.__n++; }); \
+         ro.observe(document.getElementById('app'));",
+    );
+    let outcome = tab.run_resize_observers();
+    assert!(outcome.loop_error, "expected the resize-loop error");
+    assert_eq!(outcome.rounds, 5);
+    assert_eq!(read_num(&mut tab, "__n"), 5.0, "one callback per round");
+    assert!(
+        tab.script_errors()
+            .iter()
+            .any(|e| e.contains("ResizeObserver loop completed")),
+        "loop error recorded: {:?}",
+        tab.script_errors()
+    );
+}
+
+
+// ---------------------------------------------------------------- IntersectionObserver (Stage 8 Rec 10)
+
+/// Geometry for one observed target, as the worker step would
+/// measure it: a 100×50 target fully inside a 1024×768 viewport root.
+fn full_geometry() -> ComputedIntersection {
+    ComputedIntersection {
+        target_rect: [0.0, 0.0, 100.0, 50.0],
+        root_bounds: [0.0, 0.0, 1024.0, 768.0],
+        intersection_rect: [0.0, 0.0, 100.0, 50.0],
+        ratio: 1.0,
+        is_intersecting: true,
+    }
+}
+
+#[test]
+fn intersection_observer_fires_initial_entry_after_paint_then_stays_quiet() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "globalThis.__entries = []; \
+         const io = new IntersectionObserver((entries) => { \
+           for (const e of entries) globalThis.__entries.push(e); \
+         }); \
+         io.observe(document.getElementById('app')); \
+         globalThis.__sync = globalThis.__entries.length;",
+    );
+    // No delivery until the rendering step runs.
+    assert_eq!(read_num(&mut tab, "__sync"), 0.0);
+    let targets = tab.intersection_observation_targets();
+    assert_eq!(targets.len(), 1);
+    let (id, target, root, _) = targets[0];
+    assert!(root.is_none(), "no root option means the viewport");
+    let mut geometry = HashMap::new();
+    geometry.insert((id, target), full_geometry());
+    tab.run_intersection_observers_with_geometry(&geometry, 42.0);
+    // Still nothing delivered: the callback is a queued task, after
+    // paint — it must not run inline in the step.
+    assert_eq!(read_num(&mut tab, "__entries.length"), 0.0);
+    // Drive the loop: the queued task runs.
+    tab.run_until_idle().unwrap();
+    assert_eq!(read_num(&mut tab, "__entries.length"), 1.0);
+    assert!(read_bool(
+        &mut tab,
+        "__entries[0].target === document.getElementById('app')"
+    ));
+    assert_eq!(read_num(&mut tab, "__entries[0].intersectionRatio"), 1.0);
+    assert!(read_bool(&mut tab, "__entries[0].isIntersecting"));
+    // `time` is the computation timestamp, not the delivery time.
+    assert_eq!(read_num(&mut tab, "__entries[0].time"), 42.0);
+    assert_eq!(
+        read_num(&mut tab, "__entries[0].boundingClientRect.width"),
+        100.0
+    );
+    assert_eq!(
+        read_num(&mut tab, "__entries[0].boundingClientRect.height"),
+        50.0
+    );
+    assert_eq!(read_num(&mut tab, "__entries[0].rootBounds.width"), 1024.0);
+    assert_eq!(
+        read_num(&mut tab, "__entries[0].intersectionRect.width"),
+        100.0
+    );
+    // A second step with unchanged geometry delivers nothing.
+    tab.run_intersection_observers_with_geometry(&geometry, 58.0);
+    tab.run_until_idle().unwrap();
+    assert_eq!(read_num(&mut tab, "__entries.length"), 1.0);
+}
+
+#[test]
+fn intersection_observer_options_validation_take_records_and_threshold() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "globalThis.__entries = []; \
+         const io = new IntersectionObserver((entries) => { \
+           for (const e of entries) globalThis.__entries.push(e); \
+         }); \
+         const app = document.getElementById('app'); \
+         let range_err = ''; \
+         try { io.observe(app, { threshold: 1.5 }); } catch (e) { range_err = e.name; } \
+         let margin_err = ''; \
+         try { io.observe(app, { rootMargin: '10em' }); } catch (e) { margin_err = e.name; } \
+         let el_err = ''; \
+         try { io.observe(document.createTextNode('x')); } catch (e) { el_err = e.name; } \
+         globalThis.__range_err = range_err; \
+         globalThis.__margin_err = margin_err; \
+         globalThis.__el_err = el_err; \
+         io.observe(app, { threshold: [0.5] });",
+    );
+    assert_eq!(read_str(&mut tab, "__range_err"), "RangeError");
+    assert_eq!(read_str(&mut tab, "__margin_err"), "TypeError");
+    assert_eq!(read_str(&mut tab, "__el_err"), "TypeError");
+    let targets = tab.intersection_observation_targets();
+    assert_eq!(targets.len(), 1, "only the valid observe() registered");
+    let (id, target, _, _) = targets[0];
+    // Out of view: the initial entry fires (ratio 0, not intersecting).
+    let mut out_of_view = full_geometry();
+    out_of_view.intersection_rect = [0.0, 0.0, 0.0, 0.0];
+    out_of_view.ratio = 0.0;
+    out_of_view.is_intersecting = false;
+    let mut geometry = HashMap::new();
+    geometry.insert((id, target), out_of_view);
+    tab.run_intersection_observers_with_geometry(&geometry, 0.0);
+    // takeRecords() returns the pending entry before the task runs,
+    // and the task then has nothing left to deliver. Read through
+    // `eval_value` (which drains microtasks but never runs tasks):
+    // a `run()` here would drive the loop and the delivery task —
+    // DomManipulation outranks Script — would deliver first.
+    assert_eq!(
+        read_num(
+            &mut tab,
+            "(globalThis.__taken = io.takeRecords()).length"
+        ),
+        1.0
+    );
+    assert_eq!(read_num(&mut tab, "__taken[0].intersectionRatio"), 0.0);
+    assert!(!read_bool(&mut tab, "__taken[0].isIntersecting"));
+    tab.run_until_idle().unwrap();
+    assert_eq!(read_num(&mut tab, "__entries.length"), 0.0, "taken, not delivered");
+    // 25% visible: isIntersecting flips, so an entry fires even
+    // though threshold 0.5 was not crossed.
+    let mut quarter = full_geometry();
+    quarter.intersection_rect = [0.0, 0.0, 100.0, 12.5];
+    quarter.ratio = 0.25;
+    geometry.insert((id, target), quarter);
+    tab.run_intersection_observers_with_geometry(&geometry, 16.0);
+    tab.run_until_idle().unwrap();
+    assert_eq!(read_num(&mut tab, "__entries.length"), 1.0);
+    assert_eq!(read_num(&mut tab, "__entries[0].intersectionRatio"), 0.25);
+    // 40%: same band, still intersecting — quiet.
+    let mut forty = full_geometry();
+    forty.intersection_rect = [0.0, 0.0, 100.0, 20.0];
+    forty.ratio = 0.4;
+    geometry.insert((id, target), forty);
+    tab.run_intersection_observers_with_geometry(&geometry, 32.0);
+    tab.run_until_idle().unwrap();
+    assert_eq!(read_num(&mut tab, "__entries.length"), 1.0);
+    // 60%: crosses 0.5 upward — fires.
+    let mut sixty = full_geometry();
+    sixty.intersection_rect = [0.0, 0.0, 100.0, 30.0];
+    sixty.ratio = 0.6;
+    geometry.insert((id, target), sixty);
+    tab.run_intersection_observers_with_geometry(&geometry, 48.0);
+    tab.run_until_idle().unwrap();
+    assert_eq!(read_num(&mut tab, "__entries.length"), 2.0);
+    assert_eq!(read_num(&mut tab, "__entries[1].intersectionRatio"), 0.6);
 }

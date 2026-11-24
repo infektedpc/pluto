@@ -4136,6 +4136,7 @@ dependencies = [
 name = "pluto-css"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "thiserror 2.0.21",
  "winnow 0.7.15",
 ]
@@ -4216,7 +4217,9 @@ dependencies = [
  "bytemuck",
  "cosmic-text",
  "fontdb",
+ "futures-executor",
  "image",
+ "naga",
  "pluto-css",
  "pluto-html",
  "pluto-layout",

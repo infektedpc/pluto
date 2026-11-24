@@ -27,12 +27,12 @@ use serde::{Deserialize, Serialize};
 /// The protocol version every encoded message carries. Bump on any
 /// breaking change to the enums below.
 ///
-/// v2 (Stage 5) froze `RequestResource` v1: destination, priority,
-/// mode, credentials, origin and top-level site, plus the streaming
-/// `ResourceEvent` reply and `CancelResource`. v1 bytes are rejected
-/// by [`decode_message`] — Pluto ships one binary, so a bump is a
-/// clean break, not a migration.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// v3 (Stage 8 Rec 9) reworks `InputEvent` (pointer/wheel/keyboard
+/// with position, modifiers, timestamp, pointer id, delta mode and
+/// gesture phase), adds `SetFocused` and `ScrollViewport`. v2 bytes
+/// are rejected by [`decode_message`] — Pluto ships one binary, so
+/// a bump is a clean break, not a migration.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// What went wrong decoding a versioned message.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -91,6 +91,18 @@ pub enum BrowserToRenderer {
     ResourceEvent(ResourceEvent),
     /// Shut the worker down. The shell sends this when the tab closes.
     Shutdown,
+    /// The tab's visibility changed (Stage 8 Rec 1). A hidden tab
+    /// runs no rAF callbacks, builds no display lists, and submits
+    /// nothing; JS timers keep running. Appended at the end so
+    /// existing variants keep their postcard discriminants — v2
+    /// bytes from before this variant still decode.
+    SetVisible { visible: bool },
+    /// The window's focus changed (Stage 8 Rec 9, v3). The worker
+    /// records it for `:focus` handling; the DOM focus itself is
+    /// untouched (browsers keep the focused element when the window
+    /// loses focus). Same single-window signal as `SetVisible` in
+    /// practice — the shell sends both on focus change.
+    SetFocused { focused: bool },
 }
 
 /// Messages from the renderer worker to the browser (shell).
@@ -131,6 +143,13 @@ pub enum RendererToBrowser {
     /// Cancel an in-flight `RequestResource`. The browser answers
     /// with a terminal `ResourceEvent::Cancelled` for that id.
     CancelResource { request_id: u64 },
+    /// The worker asks the shell to scroll the viewport (the page
+    /// itself) by page px (Stage 8 Rec 9, v3): the remainder of a
+    /// wheel / keyboard scroll after the nested scroll containers
+    /// under the cursor took what they could. The shell owns the
+    /// viewport scroll (shader uniform) and clamps it; the worker
+    /// never scrolls the viewport itself.
+    ScrollViewport { dx: f32, dy: f32 },
 }
 
 /// A resource ask, frozen as v1 in Stage 5. This is the payload of
@@ -311,15 +330,94 @@ pub enum ResourceEvent {
     Cancelled { request_id: u64 },
 }
 
-/// An input event for the page, in page coordinates.
+/// Modifier keys held during an input event (Stage 8 Rec 9, v3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Modifiers {
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub meta: bool,
+}
+
+/// What the pointer did (Stage 8 Rec 9, v3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PointerKind {
+    Move,
+    Down,
+    Up,
+}
+
+/// How a wheel delta is expressed (Stage 8 Rec 9, v3). The worker
+/// scales `Line` deltas (×16 px, the shell's line height) and
+/// `Page` deltas (× the viewport size on that axis); `Pixel`
+/// deltas pass through as-is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeltaMode {
+    Pixel,
+    Line,
+    Page,
+}
+
+/// Where a wheel event sits in its gesture (Stage 8 Rec 9, v3).
+/// The shell synthesises `Began`/`Changed` from idle time (iced
+/// reports no wheel phases); `Ended` is synthesised worker-side by
+/// timeout — the tab thread clears the gesture when no wheel has
+/// arrived for ~200 ms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WheelPhase {
+    Began,
+    Changed,
+    Ended,
+}
+
+/// An input event for the page (Stage 8 Rec 9, v3). Positions are
+/// page coordinates in layout px — the shell adds the viewport
+/// scroll offset before forwarding, so the worker hit-tests
+/// directly against its layout tree. `timestamp_ms` is monotonic
+/// milliseconds since the shell started (gesture/velocity timing
+/// and rAF timestamp alignment). Physical px are deliberately NOT
+/// sent: the shader widget's `update` has no scale factor, and the
+/// worker uses layout px only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InputEvent {
-    /// Mouse click at page coordinates.
-    Click { x: f32, y: f32 },
-    /// Mouse wheel scroll, in lines (dx, dy).
-    WheelScrolled { dx: f32, dy: f32 },
-    /// A key was pressed (key name as the shell reports it).
-    KeyPressed { key: String },
+    /// Pointer move / button down / button up at page coordinates.
+    /// `button` is the button that changed (`None` for a move):
+    /// 0 = left, 1 = middle, 2 = right. `buttons` is the bitmask
+    /// of buttons held down (bit 0 = left, 1 = middle, 2 = right).
+    /// `pointer_id` is 0 for the mouse, reserved for multi-pointer.
+    Pointer {
+        kind: PointerKind,
+        x: f32,
+        y: f32,
+        button: Option<u8>,
+        buttons: u16,
+        modifiers: Modifiers,
+        timestamp_ms: u64,
+        pointer_id: u64,
+    },
+    /// Mouse wheel scroll at the cursor's page coordinates.
+    Wheel {
+        x: f32,
+        y: f32,
+        dx: f32,
+        dy: f32,
+        delta_mode: DeltaMode,
+        phase: WheelPhase,
+        modifiers: Modifiers,
+        timestamp_ms: u64,
+    },
+    /// A key press or release. `key` is the logical key
+    /// ("Enter", "ArrowDown", "a"); `code` is the physical key
+    /// ("Enter", "ArrowDown", "KeyA"). `repeat` is true for OS
+    /// key-repeat events.
+    Key {
+        key: String,
+        code: String,
+        pressed: bool,
+        repeat: bool,
+        modifiers: Modifiers,
+        timestamp_ms: u64,
+    },
 }
 
 /// The in-process transport for the app -> worker direction: an
@@ -354,8 +452,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_two() {
-        assert_eq!(PROTOCOL_VERSION, 2);
+    fn protocol_version_is_three() {
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     #[test]
@@ -368,12 +466,58 @@ mod tests {
                 width: 800.0,
                 height: 600.0,
             },
-            BrowserToRenderer::InputEvent(InputEvent::Click { x: 10.0, y: 20.0 }),
-            BrowserToRenderer::InputEvent(InputEvent::WheelScrolled { dx: 0.0, dy: 3.0 }),
-            BrowserToRenderer::InputEvent(InputEvent::KeyPressed {
+            // Stage 8 Rec 9 (v3): pointer / wheel / key carry
+            // position, modifiers, timestamp, and (for wheel)
+            // delta mode + gesture phase.
+            BrowserToRenderer::InputEvent(InputEvent::Pointer {
+                kind: PointerKind::Move,
+                x: 10.0,
+                y: 20.0,
+                button: None,
+                buttons: 0,
+                modifiers: Modifiers::default(),
+                timestamp_ms: 1234,
+                pointer_id: 0,
+            }),
+            BrowserToRenderer::InputEvent(InputEvent::Pointer {
+                kind: PointerKind::Down,
+                x: 10.0,
+                y: 20.0,
+                button: Some(0),
+                buttons: 1,
+                modifiers: Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+                timestamp_ms: 1235,
+                pointer_id: 0,
+            }),
+            BrowserToRenderer::InputEvent(InputEvent::Wheel {
+                x: 10.0,
+                y: 20.0,
+                dx: 0.0,
+                dy: 3.0,
+                delta_mode: DeltaMode::Line,
+                phase: WheelPhase::Began,
+                modifiers: Modifiers::default(),
+                timestamp_ms: 1236,
+            }),
+            BrowserToRenderer::InputEvent(InputEvent::Key {
                 key: "Enter".to_string(),
+                code: "Enter".to_string(),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+                timestamp_ms: 1237,
             }),
             BrowserToRenderer::Shutdown,
+            // Stage 8 Rec 1: visibility rides the same channel; a
+            // hidden tab gets no rendering opportunities.
+            BrowserToRenderer::SetVisible { visible: false },
+            BrowserToRenderer::SetVisible { visible: true },
+            // Stage 8 Rec 9 (v3): window focus rides it too.
+            BrowserToRenderer::SetFocused { focused: false },
+            BrowserToRenderer::SetFocused { focused: true },
         ];
         for message in messages {
             let bytes = encode_message(&message);
@@ -460,6 +604,9 @@ mod tests {
                 upgrade_insecure_requests: false,
             }),
             RendererToBrowser::CancelResource { request_id: 7 },
+            // Stage 8 Rec 9 (v3): the worker asks the shell to
+            // scroll the viewport by the wheel remainder.
+            RendererToBrowser::ScrollViewport { dx: 0.0, dy: 48.0 },
         ] {
             let bytes = encode_message(&message);
             let _: RendererToBrowser = decode_message(&bytes).expect("renderer message decodes");
@@ -498,14 +645,15 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_version_one_bytes() {
-        // A v1 message (version prefix 1) must fail loudly, not be
-        // misread as v2: the shapes changed in the Stage 5 freeze.
-        let mut v1 = encode_message(&BrowserToRenderer::Shutdown);
-        v1[0] = 1;
+    fn decode_rejects_version_two_bytes() {
+        // A v2 message (version prefix 2) must fail loudly, not be
+        // misread as v3: the input events changed shape in the
+        // Stage 8 Rec 9 bump.
+        let mut v2 = encode_message(&BrowserToRenderer::Shutdown);
+        v2[0] = 2;
         assert_eq!(
-            decode_message::<BrowserToRenderer>(&v1),
-            Err(ProtocolError::UnsupportedVersion { found: 1 })
+            decode_message::<BrowserToRenderer>(&v2),
+            Err(ProtocolError::UnsupportedVersion { found: 2 })
         );
     }
 

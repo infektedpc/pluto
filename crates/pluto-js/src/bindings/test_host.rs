@@ -16,6 +16,9 @@
 //! cannot be adopted directly). Fragment `<script>` elements are
 //! cloned but inert — nothing here ever executes them.
 
+use std::cell::Cell;
+
+use pluto_html::observers::{MutationObserverOptions, ObserverMutationRecord};
 use pluto_html::{Dom, NodeId, NodeKind, parse, parse_fragment};
 
 use crate::host::{DomHost, DomHostError, DomKey, Geometry};
@@ -32,6 +35,12 @@ pub struct TestHost {
     pub errors: Vec<String>,
     /// Forced-flush counter (incremented by [`DomHost::geometry`]).
     pub flushes: u64,
+    /// Per-geometry-call width growth (test-only): `geometry()`
+    /// returns width `100 + growth * (calls - 1)`, so a
+    /// `ResizeObserver` step can be made to never settle (the
+    /// resize-loop-error test sets this). Default 0: geometry is
+    /// a fixed 100×50.
+    pub geometry_growth: Cell<f64>,
 }
 
 impl TestHost {
@@ -42,6 +51,7 @@ impl TestHost {
             writes: Vec::new(),
             errors: Vec::new(),
             flushes: 0,
+            geometry_growth: Cell::new(0.0),
         }
     }
 
@@ -294,6 +304,17 @@ impl DomHost for TestHost {
         true
     }
 
+    fn set_character_data(&mut self, key: DomKey, data: &str) -> bool {
+        if !matches!(
+            self.dom.get(key).map(|n| &n.kind),
+            Some(NodeKind::Text(_))
+        ) {
+            return false;
+        }
+        self.dom.set_text(key, data);
+        true
+    }
+
     fn get_attribute(&self, key: DomKey, name: &str) -> Option<String> {
         self.dom.attr(key, name).map(|s| s.to_string())
     }
@@ -512,12 +533,58 @@ impl DomHost for TestHost {
     fn geometry(&mut self, key: DomKey) -> Option<Geometry> {
         self.dom.get(key)?;
         self.flushes += 1;
+        let growth = self.geometry_growth.get();
         Some(Geometry {
             x: 0.0,
             y: 0.0,
-            width: 100.0,
+            width: 100.0 + growth * (self.flushes as f64 - 1.0),
             height: 50.0,
         })
+    }
+
+    fn content_size(&mut self, key: DomKey) -> Option<(f64, f64)> {
+        self.dom.get(key)?;
+        let growth = self.geometry_growth.get();
+        Some((
+            100.0 + growth * (self.flushes as f64 - 1.0).max(0.0),
+            50.0,
+        ))
+    }
+
+    fn depth(&self, key: DomKey) -> Option<usize> {
+        self.dom.get(key)?;
+        let mut depth = 0;
+        let mut cur = self.dom.get(key).and_then(|n| n.parent);
+        while let Some(parent) = cur {
+            depth += 1;
+            cur = self.dom.get(parent).and_then(|n| n.parent);
+        }
+        Some(depth)
+    }
+
+    fn observe_mutation(
+        &mut self,
+        observer_id: u64,
+        target: DomKey,
+        options: MutationObserverOptions,
+    ) -> bool {
+        self.dom.observe_mutation(observer_id, target, options)
+    }
+
+    fn disconnect_mutation_observer(&mut self, observer_id: u64) {
+        self.dom.disconnect_mutation_observer(observer_id);
+    }
+
+    fn take_mutation_records(&mut self, observer_id: u64) -> Vec<ObserverMutationRecord> {
+        self.dom.take_mutation_records(observer_id)
+    }
+
+    fn pending_mutation_observers(&self) -> Vec<u64> {
+        self.dom.pending_mutation_observers()
+    }
+
+    fn take_pending_mutation_observers(&mut self) -> Vec<u64> {
+        self.dom.take_pending_mutation_observers()
     }
 
     fn forced_flush_count(&self) -> u64 {

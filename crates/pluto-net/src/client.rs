@@ -85,6 +85,13 @@ pub fn tls_config() -> Result<rustls::ClientConfig, rustls::Error> {
 pub fn build_connector() -> Result<HttpsConnector<HttpConnector>, rustls::Error> {
     let mut http = HttpConnector::new();
     http.set_connect_timeout(Some(CONNECT_TIMEOUT));
+    // `HttpConnector::new()` enforces http-only URIs by default
+    // (`enforce_http: true`) and rejects https URIs with
+    // "invalid URL, scheme is not http" before opening a socket —
+    // which is exactly what `HttpsConnector` passes it for every
+    // https navigation. hyper-rustls's own `build()` disables it;
+    // a hand-built connector must do the same, or no site loads.
+    http.enforce_http(false);
     Ok(HttpsConnectorBuilder::new()
         .with_tls_config(tls_config()?)
         .https_or_http()

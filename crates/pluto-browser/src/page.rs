@@ -1052,6 +1052,9 @@ fn merge_sources(
             }
         }
     }
+    // The merge pushes rules by hand, so the pseudo-class index
+    // (Stage 8 Rec 9) is rebuilt here, not at parse time.
+    merged.rebuild_pseudo_class_index();
     merged
 }
 

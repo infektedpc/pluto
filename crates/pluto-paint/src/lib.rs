@@ -21,16 +21,23 @@
 //! vocabulary + renderer support for M3; no borders or color glyphs
 //! (emoji) yet.
 
+use pluto_css::{MAX_BOX_SHADOW_BLUR, ResolvedCorners, ResolvedShadow};
 use pluto_layout::LayoutTree;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub mod glyph_key;
 pub mod image;
+pub mod perf;
+pub mod raster_spike;
 pub mod renderer;
 
 pub use glyph_key::GlyphKey;
-pub use image::{DecodedImage, ImageCache, ImageError, decode_image, decode_images_parallel};
+pub use image::{
+    AnimatedImage, DecodedImage, IMAGE_CACHE_BYTE_CAP, ImageCache, ImageError, build_mip_chain,
+    decode_image, decode_images_parallel, downscale_rgba, mip_chain_bytes, mip_level_count_for,
+    mip_level_for_scale,
+};
 
 /// One paint operation, in paint order. A closed vocabulary: every
 /// variant is plain owned data, so a list is serialisable and a
@@ -74,19 +81,137 @@ pub enum DisplayItem {
         width: f32,
         height: f32,
     },
+    /// A solid rounded rectangle: a box background whose
+    /// `border-radius` is non-zero. The fill is the rounded-rect
+    /// SDF coverage in the renderer (Stage 8 Rec 4); a square box
+    /// still uses [`DisplayItem::FillRect`].
+    RoundedRect {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        radii: ResolvedCorners,
+        color: [f32; 4],
+    },
+    /// One `box-shadow` layer (Stage 8 Rec 4), resolved to used
+    /// pixels. The rect is the box's border box; the renderer
+    /// expands it by `spread`, translates it by the offsets, and
+    /// blurs it. `blur == 0` draws as an expanded rounded rect
+    /// behind the box; `blur > 0` uses the erf closed-form shader.
+    /// `inset` shadows draw after the background, before content
+    /// (the builder emits them in that position); outer shadows
+    /// draw before the background. Layers are emitted in reverse
+    /// author order so the first-listed layer paints on top.
+    BoxShadow {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        radii: ResolvedCorners,
+        offset_x: f32,
+        offset_y: f32,
+        blur: f32,
+        spread: f32,
+        color: [f32; 4],
+        inset: bool,
+    },
     /// Push a clip rect for a scroll container: every following item
     /// paints clipped to this rect until the matching `PopClip`.
     /// (R14, M2: the vocabulary gains the clip; the shader-side
     /// scissor itself is a Stage 8 follow-up — the renderer currently
     /// ignores these items, so they are data, not a visual change.)
+    /// Stage 8 Rec 3: the renderer honours these — rect clips via
+    /// `set_scissor_rect` (batched per scissor run, items outside
+    /// culled on the CPU, never a zero-size scissor) and rounded
+    /// clips (`radii: Some`) via an SDF discard in the fragment
+    /// shader. The clip rect is the container's padding box.
     PushClip {
         x: f32,
         y: f32,
         width: f32,
         height: f32,
+        radii: Option<ResolvedCorners>,
     },
     /// Pop the most recent `PushClip`.
     PopClip,
+}
+
+impl DisplayItem {
+    /// The item's bounds in layout space, when it has computable
+    /// ones: the rect the item paints (a shadow's bounds are the
+    /// shape expanded by `spread` and inflated by `~3σ` of blur,
+    /// the region its falloff can touch). `Glyphs` has no bounds
+    /// here — glyph quads need font metrics the list does not
+    /// carry — and `PopClip` has none. Used for the damage union
+    /// and for CPU culling in the renderer.
+    pub fn bounds(&self) -> Option<[f32; 4]> {
+        match self {
+            DisplayItem::FillRect {
+                x,
+                y,
+                width,
+                height,
+                ..
+            }
+            | DisplayItem::RoundedRect {
+                x,
+                y,
+                width,
+                height,
+                ..
+            }
+            | DisplayItem::Image {
+                x,
+                y,
+                width,
+                height,
+                ..
+            }
+            | DisplayItem::Blob {
+                x,
+                y,
+                width,
+                height,
+                ..
+            }
+            | DisplayItem::PushClip {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => Some([*x, *y, *width, *height]),
+            DisplayItem::BoxShadow {
+                x,
+                y,
+                width,
+                height,
+                offset_x,
+                offset_y,
+                blur,
+                spread,
+                inset,
+                ..
+            } => {
+                // The shadow's reach: the shape (expanded by spread,
+                // translated by the offset) plus the blur falloff.
+                // An inset shadow never leaves the box.
+                if *inset {
+                    Some([*x, *y, *width, *height])
+                } else {
+                    let falloff = 3.0 * (*blur / 2.0) + 1.0;
+                    let pad = *spread + falloff;
+                    Some([
+                        x + offset_x - pad,
+                        y + offset_y - pad,
+                        width + 2.0 * pad,
+                        height + 2.0 * pad,
+                    ])
+                }
+            }
+            DisplayItem::Glyphs { .. } | DisplayItem::PopClip => None,
+        }
+    }
 }
 
 /// One glyph: serialisable cache key + page position of its origin.
@@ -216,25 +341,104 @@ pub enum ValidationError {
     },
     #[error("image resource {id:?} exceeds {MAX_RESOURCE_BYTES} bytes")]
     ImageTooBig { id: ResourceId },
+    #[error("box-shadow blur {0}px exceeds the {MAX_BOX_SHADOW_BLUR}px cap")]
+    ShadowBlurTooLarge(f32),
     #[error("display list bytes do not decode: {0}")]
     Decode(String),
 }
 
-/// The ordered paint operations for one frame.
+/// The damaged region of one display list, in layout space (Stage 8
+/// Rec 5): the union of the invalidated item bounds. The worker
+/// attaches it to each list; the shell skips a list whose damage is
+/// empty (a clean skip, counted separately from deadline misses)
+/// and records the damage-area ratio against the viewport. A full
+/// rebuild invalidates everything it paints, so the damage of a
+/// built list is the union of its boxes' bounds; per-item damage
+/// (only the changed items) arrives with dirty-subtree layout.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DamageRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl DamageRect {
+    /// The union of two damage rects.
+    pub fn union(self, other: DamageRect) -> DamageRect {
+        let x0 = self.x.min(other.x);
+        let y0 = self.y.min(other.y);
+        let x1 = (self.x + self.width).max(other.x + other.width);
+        let y1 = (self.y + self.height).max(other.y + other.height);
+        DamageRect {
+            x: x0,
+            y: y0,
+            width: x1 - x0,
+            height: y1 - y0,
+        }
+    }
+
+    /// Union with a `[x, y, w, h]` rect.
+    pub fn union_rect(self, rect: [f32; 4]) -> DamageRect {
+        self.union(DamageRect {
+            x: rect[0],
+            y: rect[1],
+            width: rect[2],
+            height: rect[3],
+        })
+    }
+
+    /// Area in px², for the damage-area ratio.
+    pub fn area(self) -> f32 {
+        (self.width * self.height).max(0.0)
+    }
+
+    /// True when the rect covers nothing.
+    pub fn is_empty(self) -> bool {
+        self.width <= 0.0 || self.height <= 0.0
+    }
+}
+
+/// The ordered paint operations for one frame, plus the damage rect
+/// (Stage 8 Rec 5) the worker computed for it. `damage: None` means
+/// the list paints nothing new — the shell clean-skips it.
+///
+/// Wire note (Stage 8): adding the damage field (and the
+/// `PushClip` radii / new item variants) changes the postcard bytes,
+/// so bytes written by an older build do not decode under this one.
+/// Pluto ships one binary and the list is in-process today, so no
+/// runtime migration exists; `PROTOCOL_VERSION` stays 2 by the
+/// coordinator's decision (the v3 bump belongs to the wave that
+/// changes `InputEvent`), and this incompatibility is flagged for
+/// that wave.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct DisplayList(pub Vec<DisplayItem>);
+pub struct DisplayList(pub Vec<DisplayItem>, pub Option<DamageRect>);
 
 impl DisplayList {
     pub fn new() -> Self {
-        Self::default()
+        Self(Vec::new(), None)
     }
 
     pub fn push(&mut self, item: DisplayItem) {
+        // Keep the damage honest for lists extended after build:
+        // a pushed item with known bounds extends the union.
+        if let Some(bounds) = item.bounds() {
+            self.1 = Some(match self.1 {
+                Some(damage) => damage.union_rect(bounds),
+                None => DamageRect {
+                    x: bounds[0],
+                    y: bounds[1],
+                    width: bounds[2],
+                    height: bounds[3],
+                },
+            });
+        }
         self.0.push(item);
     }
 
     pub fn clear(&mut self) {
         self.0.clear();
+        self.1 = None;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -287,6 +491,55 @@ impl DisplayList {
                         }
                     }
                 }
+                DisplayItem::RoundedRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                    radii,
+                    color,
+                } => {
+                    check_coord(*x)?;
+                    check_coord(*y)?;
+                    check_size(*width)?;
+                    check_size(*height)?;
+                    check_radii(*radii)?;
+                    for c in color {
+                        if !c.is_finite() || !(0.0..=1.0).contains(c) {
+                            return Err(ValidationError::BadColor(*c));
+                        }
+                    }
+                }
+                DisplayItem::BoxShadow {
+                    x,
+                    y,
+                    width,
+                    height,
+                    radii,
+                    offset_x,
+                    offset_y,
+                    blur,
+                    spread,
+                    color,
+                    ..
+                } => {
+                    check_coord(*x)?;
+                    check_coord(*y)?;
+                    check_size(*width)?;
+                    check_size(*height)?;
+                    check_radii(*radii)?;
+                    check_coord(*offset_x)?;
+                    check_coord(*offset_y)?;
+                    if !blur.is_finite() || *blur < 0.0 || *blur > MAX_BOX_SHADOW_BLUR {
+                        return Err(ValidationError::ShadowBlurTooLarge(*blur));
+                    }
+                    check_size(*spread)?;
+                    for c in color {
+                        if !c.is_finite() || !(0.0..=1.0).contains(c) {
+                            return Err(ValidationError::BadColor(*c));
+                        }
+                    }
+                }
                 DisplayItem::Glyphs { color, glyphs: gs } => {
                     for c in color {
                         if !c.is_finite() || !(0.0..=1.0).contains(c) {
@@ -329,11 +582,15 @@ impl DisplayList {
                     y,
                     width,
                     height,
+                    radii,
                 } => {
                     check_coord(*x)?;
                     check_coord(*y)?;
                     check_size(*width)?;
                     check_size(*height)?;
+                    if let Some(radii) = radii {
+                        check_radii(*radii)?;
+                    }
                 }
                 DisplayItem::PopClip => {}
             }
@@ -344,11 +601,16 @@ impl DisplayList {
     /// Build the paint operations for one laid-out document. The canvas
     /// background (html/body background, or white by default) paints the
     /// whole viewport first — it is always item 0, which the renderer
-    /// relies on for the scroll-anchored canvas — then each box's
-    /// background, then its glyphs. Boxes inside a scroll container
-    /// carry a clip rect (`LayoutBox::clip`); when it changes, the
-    /// previous clip is popped and the new one pushed, so a container's
-    /// subtree paints clipped to the container's border box.
+    /// relies on for the scroll-anchored canvas — then, per box: its
+    /// outer box-shadows, its background (a rounded rect when the box
+    /// has a `border-radius`, a plain rect otherwise), its inset
+    /// box-shadows (above the background, below the content), then
+    /// its glyphs. Boxes inside a clipping ancestor carry a clip rect
+    /// (`LayoutBox::clip` + `clip_radii`); when it changes, the
+    /// previous clip is popped and the new one pushed, so a
+    /// container's subtree paints clipped to the container's padding
+    /// box. The list's damage is the union of the canvas and every
+    /// box's bounds (a full rebuild repaints everything it paints).
     pub fn build(layout: &LayoutTree) -> Self {
         let mut list = Self::new();
         let bg = layout.canvas_background;
@@ -359,30 +621,67 @@ impl DisplayList {
             height: layout.viewport.1,
             color: rgba(bg),
         });
-        let mut current_clip: Option<[f32; 4]> = None;
+        let mut current_clip: Option<([f32; 4], Option<ResolvedCorners>)> = None;
         for bx in layout.boxes() {
-            if bx.clip != current_clip {
+            let clip_key = bx.clip.map(|c| (c, bx.clip_radii));
+            if clip_key != current_clip {
                 if current_clip.is_some() {
                     list.push(DisplayItem::PopClip);
                 }
-                if let Some(c) = bx.clip {
+                if let Some((c, radii)) = clip_key {
                     list.push(DisplayItem::PushClip {
                         x: c[0],
                         y: c[1],
                         width: c[2],
                         height: c[3],
+                        radii,
                     });
                 }
-                current_clip = bx.clip;
+                current_clip = clip_key;
+            }
+            // Box-shadows, resolved once per box: outer layers before
+            // the background (they paint behind the box), inset
+            // layers after it (above the background, below the
+            // content). Each side is emitted in reverse author order
+            // so the first-listed layer paints on top.
+            let shadows: Vec<ResolvedShadow> = bx
+                .style
+                .box_shadow
+                .iter()
+                .map(|s| {
+                    s.resolve(
+                        bx.style.font_size,
+                        layout.root_font_size,
+                        layout.viewport,
+                        bx.style.color,
+                    )
+                })
+                .collect();
+            for shadow in shadows.iter().rev().filter(|s| !s.inset) {
+                list.push(shadow_item(bx, *shadow));
             }
             if let Some(bg) = bx.style.background {
-                list.push(DisplayItem::FillRect {
-                    x: bx.x,
-                    y: bx.y,
-                    width: bx.width,
-                    height: bx.height,
-                    color: rgba(bg),
-                });
+                if bx.radii.is_zero() {
+                    list.push(DisplayItem::FillRect {
+                        x: bx.x,
+                        y: bx.y,
+                        width: bx.width,
+                        height: bx.height,
+                        color: rgba(bg),
+                    });
+                } else {
+                    list.push(DisplayItem::RoundedRect {
+                        x: bx.x,
+                        y: bx.y,
+                        width: bx.width,
+                        height: bx.height,
+                        radii: bx.radii,
+                        color: rgba(bg),
+                    });
+                }
+            }
+            for shadow in shadows.iter().rev().filter(|s| s.inset) {
+                list.push(shadow_item(bx, *shadow));
             }
             if !bx.glyphs.is_empty() {
                 // Group consecutive glyphs of the same color into one item.
@@ -416,6 +715,23 @@ impl DisplayList {
         if current_clip.is_some() {
             list.push(DisplayItem::PopClip);
         }
+        // Damage: a full rebuild repaints everything — the canvas
+        // plus every box — so the damage is that union (glyph-only
+        // boxes contribute their box rects here, since glyph items
+        // carry no bounds of their own).
+        let mut damage = DamageRect {
+            x: 0.0,
+            y: 0.0,
+            width: layout.viewport.0,
+            height: layout.viewport.1,
+        };
+        for bx in layout.boxes() {
+            damage = damage.union_rect([bx.x, bx.y, bx.width, bx.height]);
+        }
+        list.1 = Some(match list.1 {
+            Some(pushed) => pushed.union(damage),
+            None => damage,
+        });
         list
     }
 }
@@ -432,6 +748,39 @@ fn check_size(v: f32) -> Result<(), ValidationError> {
         return Err(ValidationError::BadSize(v));
     }
     Ok(())
+}
+
+fn check_radii(radii: ResolvedCorners) -> Result<(), ValidationError> {
+    for (rx, ry) in [
+        radii.top_left,
+        radii.top_right,
+        radii.bottom_right,
+        radii.bottom_left,
+    ] {
+        check_size(rx)?;
+        check_size(ry)?;
+    }
+    Ok(())
+}
+
+/// One resolved shadow layer as a display item, for `box`'s border
+/// box. The renderer expands the rect by `spread` and translates it
+/// by the offsets; the item itself keeps the box's own rect and
+/// radii.
+fn shadow_item(bx: &pluto_layout::LayoutBox, shadow: ResolvedShadow) -> DisplayItem {
+    DisplayItem::BoxShadow {
+        x: bx.x,
+        y: bx.y,
+        width: bx.width,
+        height: bx.height,
+        radii: bx.radii,
+        offset_x: shadow.offset_x,
+        offset_y: shadow.offset_y,
+        blur: shadow.blur,
+        spread: shadow.spread,
+        color: shadow.color,
+        inset: shadow.inset,
+    }
 }
 
 fn rgba(c: [u8; 3]) -> [f32; 4] {
@@ -807,5 +1156,158 @@ mod tests {
             list.validate(&resources),
             Err(ValidationError::TooManyItems(MAX_DISPLAY_ITEMS + 1))
         );
+    }
+
+    #[test]
+    fn rounded_box_emits_rounded_rect_and_shadows_in_order() {
+        // Stage 8 Rec 4: a rounded box with an outer and an inset
+        // shadow paints outer shadow -> rounded background -> inset
+        // shadow, and the built list carries damage.
+        let dom = parse_html(
+            "<html><head></head><body><div class=\"r\">x</div></body></html>",
+        );
+        let sheet = Stylesheet::parse(
+            ".r { width: 100px; height: 50px; background-color: #ff0000; border-radius: 8px; \
+             box-shadow: 2px 3px 0 #000000, inset 0 0 4px #00ff00; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let list = DisplayList::build(&tree);
+        let pos = |pred: &dyn Fn(&DisplayItem) -> bool| {
+            list.0.iter().position(pred).expect("item present")
+        };
+        let outer = pos(&|i| matches!(i, DisplayItem::BoxShadow { inset: false, .. }));
+        let rounded = pos(&|i| matches!(i, DisplayItem::RoundedRect { .. }));
+        let inset = pos(&|i| matches!(i, DisplayItem::BoxShadow { inset: true, .. }));
+        assert!(outer < rounded && rounded < inset, "outer -> bg -> inset");
+        match &list.0[rounded] {
+            DisplayItem::RoundedRect { radii, color, .. } => {
+                assert_eq!(radii.top_left, (8.0, 8.0));
+                assert!((color[0] - 1.0).abs() < 0.001);
+            }
+            other => panic!("expected a rounded rect, got {other:?}"),
+        }
+        match &list.0[outer] {
+            DisplayItem::BoxShadow {
+                offset_x,
+                offset_y,
+                blur,
+                ..
+            } => assert_eq!((*offset_x, *offset_y, *blur), (2.0, 3.0, 0.0)),
+            other => panic!("expected an outer shadow, got {other:?}"),
+        }
+        // Damage covers the viewport (a full rebuild repaints it).
+        let damage = list.1.expect("built lists carry damage");
+        assert_eq!((damage.x, damage.y), (0.0, 0.0));
+        assert!(damage.width >= 800.0 && damage.height >= 600.0);
+        list.validate(&ResourceTable::new())
+            .expect("rounded + shadow list is valid");
+    }
+
+    #[test]
+    fn scroll_container_with_radius_emits_rounded_clip() {
+        // Stage 8 Rec 3: the clip a rounded scroll container pushes
+        // carries the container's resolved radii.
+        let dom = parse_html(
+            "<html><head></head><body><div class=\"scroll\"><div class=\"tall\">hello</div></div></body></html>",
+        );
+        let sheet = Stylesheet::parse(
+            ".scroll { overflow: hidden; height: 50px; width: 200px; border-radius: 10px; } \
+             .tall { height: 200px; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let list = DisplayList::build(&tree);
+        let radii = list.0.iter().find_map(|item| match item {
+            DisplayItem::PushClip { radii, .. } => Some(*radii),
+            _ => None,
+        });
+        assert!(
+            matches!(radii, Some(Some(r)) if r.top_left == (10.0, 10.0)),
+            "clip carries the 10px radii, got {radii:?}"
+        );
+        assert!(list.1.is_some(), "built lists carry damage");
+        list.validate(&ResourceTable::new())
+            .expect("list is valid");
+    }
+
+    #[test]
+    fn damage_rect_unions_and_push_clip_carries_radii() {
+        let a = DamageRect {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+        };
+        let b = DamageRect {
+            x: 5.0,
+            y: 5.0,
+            width: 10.0,
+            height: 10.0,
+        };
+        assert_eq!(
+            a.union(b),
+            DamageRect {
+                x: 0.0,
+                y: 0.0,
+                width: 15.0,
+                height: 15.0,
+            }
+        );
+        assert!((a.area() - 100.0).abs() < f32::EPSILON);
+        assert!(DamageRect {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 5.0,
+        }
+        .is_empty());
+        let radii = ResolvedCorners {
+            top_left: (8.0, 8.0),
+            top_right: (8.0, 8.0),
+            bottom_right: (8.0, 8.0),
+            bottom_left: (8.0, 8.0),
+        };
+        let mut list = DisplayList::new();
+        list.push(DisplayItem::PushClip {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 50.0,
+            radii: Some(radii),
+        });
+        list.push(DisplayItem::PopClip);
+        let back = DisplayList::from_bytes(&list.to_bytes()).expect("list decodes");
+        assert_eq!(back, list);
+        back.validate(&ResourceTable::new())
+            .expect("clip list is valid");
+    }
+
+    #[test]
+    fn validation_rejects_shadow_blur_above_the_cap() {
+        // Stage 8 Rec 4: blur above 64px is a validation error, not
+        // a silent clamp — the shell refuses the list.
+        let resources = ResourceTable::new();
+        let mut list = small_list();
+        list.push(DisplayItem::BoxShadow {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+            radii: ResolvedCorners::ZERO,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            blur: 100.0,
+            spread: 0.0,
+            color: [0.0, 0.0, 0.0, 1.0],
+            inset: false,
+        });
+        assert_eq!(
+            list.validate(&resources),
+            Err(ValidationError::ShadowBlurTooLarge(100.0))
+        );
+        // Exactly at the cap validates.
+        if let Some(DisplayItem::BoxShadow { blur, .. }) = list.0.last_mut() {
+            *blur = MAX_BOX_SHADOW_BLUR;
+        }
+        list.validate(&resources).expect("blur at the cap is valid");
     }
 }

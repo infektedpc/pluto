@@ -89,6 +89,11 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # fontdb 0.23 is the version cosmic-text 0.19 uses; pluto-paint names
 # it directly to resolve serialised glyph keys back to font ids.
 fontdb = "0.23"
+# naga 28 is wgpu 28's shader compiler; pluto-paint names it directly
+# as a dev-dependency so tests can validate the hand-written WGSL
+# without a GPU (Stage 8: every shader string parses + validates
+# under naga in `cargo test`).
+naga = "28"
 pluto-html = { path = "crates/pluto-html", version = "0.1.0" }
 pluto-css = { path = "crates/pluto-css", version = "0.1.0" }
 pluto-layout = { path = "crates/pluto-layout", version = "0.1.0" }
