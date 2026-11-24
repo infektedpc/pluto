@@ -4,14 +4,22 @@
 //!
 //! The worker is an iced subscription stream (the documented worker
 //! pattern): it creates the command channel, hands the sender to the
-//! shell as its first event, and then loops on commands. The fetch
-//! runs as an async task on the executor; parse and layout run on
-//! tokio's blocking pool (`spawn_blocking`), so the UI thread never
-//! waits on the worker and the worker never blocks the executor's
-//! async threads. The worker owns the retained [`Document`] and the
-//! layout viewport, so a resize re-lays out without refetching, and
-//! it stamps every submitted display list with a monotonically
-//! increasing epoch for the shell's compositor holder.
+//! shell as its first event, and then loops on commands.
+//!
+//! Stage 5 changed how the fetch runs. The old worker awaited each
+//! navigation inline in the command loop, so a slow fetch blocked
+//! resizes and a second navigation queued behind the first. Now the
+//! loop is a `tokio::select!` over commands and navigation outcomes:
+//! each navigation runs as a spawned task (fetch via the worker's
+//! `ResourceLoader` — one loader per worker, one shared hyper client
+//! for the browser — then parse), and its outcome comes back over a
+//! channel. A new `CommitNavigation` cancels the previous
+//! navigation's [`CancellationToken`] (Stage 5 #5) and bumps the
+//! navigation epoch; a stale outcome — a fetch that finished its
+//! parse after being cancelled — is discarded by epoch. Layout
+//! happens in the loop, at the *current* viewport, so a resize
+//! mid-fetch is honoured by the list that lands. The old page stays
+//! visible until the new list arrives (Stage 4 #2, unchanged).
 //!
 //! The worker speaks the [`pluto_ipc`] protocol throughout: it
 //! receives [`BrowserToRenderer`] commands and emits
@@ -26,8 +34,10 @@ use crate::page::{self, Document};
 use cosmic::iced::futures::SinkExt;
 use cosmic::iced::futures::channel::mpsc;
 use pluto_ipc::{BrowserToRenderer, CommandReceiver, RendererToBrowser};
+use pluto_net::ResourceLoader;
 use pluto_paint::{DisplayList, ResourceTable};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// The subscription that runs the worker. The shell's `Application`
 /// wires this in via `fn subscription`.
@@ -46,12 +56,20 @@ fn worker_stream() -> impl cosmic::iced::futures::stream::Stream<Item = crate::M
 }
 
 /// The worker's state: the retained document, the layout viewport,
-/// and the frame epoch.
+/// the frame epoch, the loader, and the in-flight navigation
+/// (its epoch and its cancellation token).
 struct WorkerState {
     document: Option<Document>,
     viewport: (f32, f32),
     epoch: u64,
+    loader: ResourceLoader,
+    nav_epoch: u64,
+    nav_cancel: Option<CancellationToken>,
 }
+
+/// What a spawned navigation task reports back: the epoch it was
+/// started under, and the fetch+parse outcome.
+type NavOutcome = Result<(Document, String), (String, String)>;
 
 /// Run the worker: read commands, run the pipeline, emit events.
 /// Ends when the command channel closes or `Shutdown` arrives.
@@ -60,25 +78,145 @@ pub async fn run_worker(mut commands: CommandReceiver, mut events: mpsc::Sender<
         document: None,
         viewport: page::DEFAULT_VIEWPORT,
         epoch: 0,
+        loader: ResourceLoader::new(),
+        nav_epoch: 0,
+        nav_cancel: None,
     };
-    while let Some(cmd) = commands.recv().await {
-        match cmd {
-            BrowserToRenderer::Shutdown => break,
-            BrowserToRenderer::CommitNavigation { url } => {
-                commit_navigation(&mut state, &mut events, url).await;
+    // Navigation outcomes come back over this channel, so the loop
+    // never awaits a fetch inline.
+    let (nav_tx, mut nav_rx) = tokio::sync::mpsc::channel::<(u64, NavOutcome)>(4);
+    loop {
+        tokio::select! {
+            cmd = commands.recv() => {
+                match cmd {
+                    None => break,
+                    Some(BrowserToRenderer::Shutdown) => {
+                        // Cancel any in-flight fetch before going
+                        // away, so its task ends instead of
+                        // finishing a load nobody will see.
+                        if let Some(token) = state.nav_cancel.take() {
+                            token.cancel();
+                        }
+                        break;
+                    }
+                    Some(BrowserToRenderer::CommitNavigation { url }) => {
+                        start_navigation(&mut state, &nav_tx, url);
+                    }
+                    Some(BrowserToRenderer::Resize { width, height }) => {
+                        resize(&mut state, &mut events, width, height).await;
+                    }
+                    Some(BrowserToRenderer::ResourceEvent(event)) => {
+                        // The M5 shape: the shell streams fetch
+                        // events back to the renderer. Today the
+                        // worker fetches through its own loader,
+                        // which consumes the events internally, so
+                        // nothing arrives here — ignore it if it
+                        // ever does.
+                        eprintln!("[pluto] ignoring ResourceEvent from shell: {event:?}");
+                    }
+                    Some(BrowserToRenderer::InputEvent(event)) => {
+                        // Hit-testing and focus land in M2; the worker takes
+                        // no action on input yet.
+                        eprintln!("[pluto] input event ignored (M2): {event:?}");
+                    }
+                }
             }
-            BrowserToRenderer::Resize { width, height } => {
-                resize(&mut state, &mut events, width, height).await;
-            }
-            BrowserToRenderer::InputEvent(event) => {
-                // Hit-testing and focus land in M2; the worker takes
-                // no action on input yet.
-                eprintln!("[pluto] input event ignored (M2): {event:?}");
+            Some((epoch, outcome)) = nav_rx.recv() => {
+                if epoch != state.nav_epoch {
+                    // Stale: superseded by a newer navigation.
+                    eprintln!("[pluto] discarding stale navigation outcome (epoch {epoch})");
+                    continue;
+                }
+                state.nav_cancel = None;
+                handle_nav_outcome(&mut state, &mut events, outcome).await;
             }
         }
         // The shell is gone: there is nobody left to report to.
         if events.is_closed() {
             break;
+        }
+    }
+}
+
+/// Start a navigation: cancel the previous one (its token, and its
+/// epoch — so a late outcome is discarded), then spawn the
+/// fetch+parse task. The fetch runs on the executor; parse runs
+/// inside the same task (it is fast; layout stays on the blocking
+/// pool in `layout_and_submit`).
+fn start_navigation(
+    state: &mut WorkerState,
+    nav_tx: &tokio::sync::mpsc::Sender<(u64, NavOutcome)>,
+    url: String,
+) {
+    if let Some(token) = state.nav_cancel.take() {
+        token.cancel();
+    }
+    state.nav_epoch += 1;
+    let epoch = state.nav_epoch;
+    let token = CancellationToken::new();
+    state.nav_cancel = Some(token.clone());
+    let loader = state.loader.clone();
+    let nav_tx = nav_tx.clone();
+    eprintln!("[pluto] worker fetching {url} (epoch {epoch})");
+    tokio::spawn(async move {
+        let outcome = match page::load_page_cancellable(&loader, url.clone(), token).await {
+            Ok((document, final_url)) => Ok((document, final_url)),
+            Err(reason) => Err((url, reason)),
+        };
+        let _ = nav_tx.send((epoch, outcome)).await;
+    });
+}
+
+/// A navigation finished: commit the document and lay it out at the
+/// current viewport (a resize mid-fetch is honoured here), or render
+/// the error page through the same pipeline and report the reason.
+async fn handle_nav_outcome(
+    state: &mut WorkerState,
+    events: &mut mpsc::Sender<crate::Message>,
+    outcome: NavOutcome,
+) {
+    match outcome {
+        Ok((document, final_url)) => {
+            eprintln!("[pluto] worker fetched {final_url}");
+            if !emit(
+                events,
+                RendererToBrowser::DidCommit {
+                    url: final_url.clone(),
+                    status: format!("Loaded {final_url}"),
+                },
+            )
+            .await
+            {
+                return;
+            }
+            state.document = Some(document);
+            layout_and_submit(state, events).await;
+        }
+        Err((url, reason)) => {
+            eprintln!("[pluto] worker fetch failed: {reason}");
+            let html = page::error_document(&url, &reason);
+            let viewport = state.viewport;
+            match tokio::task::spawn_blocking(move || page::build_display_list(&html, viewport))
+                .await
+            {
+                Ok((display, document)) => {
+                    state.document = Some(document);
+                    if !submit(state, events, display).await {
+                        return;
+                    }
+                }
+                Err(join_err) => {
+                    let _ = emit(
+                        events,
+                        RendererToBrowser::RendererCrashed {
+                            reason: format!("error-page layout task failed: {join_err}"),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            }
+            let _ = emit(events, RendererToBrowser::LoadFailed { url, reason }).await;
         }
     }
 }
@@ -147,61 +285,6 @@ async fn layout_and_submit(
     }
 }
 
-/// Load `url`: fetch (async) and parse, then commit and lay out.
-/// A failed fetch renders as an error page through the same
-/// pipeline, and the reason goes to the status line.
-async fn commit_navigation(
-    state: &mut WorkerState,
-    events: &mut mpsc::Sender<crate::Message>,
-    url: String,
-) {
-    eprintln!("[pluto] worker fetching {url}");
-    match page::load_page(url.clone()).await {
-        Ok((document, final_url)) => {
-            eprintln!("[pluto] worker fetched {final_url}");
-            if !emit(
-                events,
-                RendererToBrowser::DidCommit {
-                    url: final_url.clone(),
-                    status: format!("Loaded {final_url}"),
-                },
-            )
-            .await
-            {
-                return;
-            }
-            state.document = Some(document);
-            layout_and_submit(state, events).await;
-        }
-        Err(err) => {
-            eprintln!("[pluto] worker fetch failed: {err}");
-            let html = page::error_document(&url, &err);
-            let viewport = state.viewport;
-            match tokio::task::spawn_blocking(move || page::build_display_list(&html, viewport))
-                .await
-            {
-                Ok((display, document)) => {
-                    state.document = Some(document);
-                    if !submit(state, events, display).await {
-                        return;
-                    }
-                }
-                Err(join_err) => {
-                    let _ = emit(
-                        events,
-                        RendererToBrowser::RendererCrashed {
-                            reason: format!("error-page layout task failed: {join_err}"),
-                        },
-                    )
-                    .await;
-                    return;
-                }
-            }
-            let _ = emit(events, RendererToBrowser::LoadFailed { url, reason: err }).await;
-        }
-    }
-}
-
 /// A resize: record the viewport and re-lay out the retained
 /// document. Degenerate sizes carry no layout; a real size arrives
 /// when the window is restored.
@@ -230,6 +313,7 @@ mod tests {
     use cosmic::iced::futures::stream::StreamExt;
     use pluto_ipc::BrowserToRenderer;
     use pluto_paint::DisplayItem;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -262,7 +346,8 @@ mod tests {
 
     /// Local server returning the example document, same pattern as
     /// pluto-net's and page's tests. No internet needed (hyper has
-    /// no proxy support).
+    /// no proxy support). `/slow` answers after 500 ms, so a
+    /// navigation to it can be cancelled mid-flight.
     async fn serve(listener: TcpListener) {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
@@ -273,7 +358,17 @@ mod tests {
                 let Ok(n) = stream.read(&mut buf).await else {
                     return;
                 };
-                let _ = n;
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/");
+                if path == "/slow" {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
                 let body = EXAMPLE_COM;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -429,6 +524,41 @@ mod tests {
             }
             other => panic!("expected LoadFailed, got {other:?}"),
         }
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    #[tokio::test]
+    async fn worker_cancels_the_old_navigation_when_a_new_one_commits() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener));
+        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let slow = format!("http://127.0.0.1:{}/slow", addr.port());
+        let fast = format!("http://127.0.0.1:{}/", addr.port());
+        cmd_tx
+            .send(BrowserToRenderer::CommitNavigation { url: slow })
+            .expect("worker takes the command");
+        // Before the slow fetch lands (500 ms), commit the fast one.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cmd_tx
+            .send(BrowserToRenderer::CommitNavigation { url: fast.clone() })
+            .expect("worker takes the command");
+        // The only DidCommit is the fast URL: the slow navigation
+        // was cancelled by token, and any stale outcome it reports
+        // is discarded by epoch — the old page never commits.
+        match next_event(&mut event_rx).await {
+            RendererToBrowser::DidCommit { url: committed, .. } => {
+                assert_eq!(committed, fast);
+            }
+            other => panic!("expected DidCommit for the fast navigation, got {other:?}"),
+        }
+        assert!(matches!(
+            next_event(&mut event_rx).await,
+            RendererToBrowser::SubmitDisplayList { .. }
+        ));
         cmd_tx
             .send(BrowserToRenderer::Shutdown)
             .expect("worker takes Shutdown");

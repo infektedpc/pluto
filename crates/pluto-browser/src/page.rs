@@ -19,10 +19,13 @@
 
 use pluto_css::Stylesheet;
 use pluto_html::{Dom, NodeId};
+use pluto_ipc::ResourceRequest;
 use pluto_layout::LayoutTree;
 use pluto_net::ResourceLoader;
 use pluto_paint::DisplayList;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio_util::sync::CancellationToken;
 
 /// Startup guess for the layout viewport: the default window size (no
 /// `Settings::size()` in this libcosmic pin, so the window opens
@@ -59,15 +62,27 @@ pub fn normalize_url(input: &str) -> String {
 /// and parse the HTML. Layout happens separately in
 /// [`layout_document`], at the shell's current viewport, so a resize
 /// never refetches. Returns the parsed document and the final URL
-/// after redirects. The loader is fresh per navigation in M1 (no
-/// shared connection pool yet).
+/// after redirects. `loader` is the worker's loader (one per worker,
+/// shared client + scheduler — Stage 5): the old fresh-loader-per-
+/// navigation defeated pooling and resumption, so it is gone.
+/// Cancelling `cancel` aborts the fetch (Stage 5 #5 — the worker
+/// cancels the old navigation's token when a new one commits). The
+/// request is a top-level navigation (VeryHigh priority, Document
+/// destination) with the page's own URL as its origin, so the
+/// mixed-content gate never blocks it.
 ///
 /// Logs each stage to stderr: the terminal is the only window into a
 /// load that stalls (no logging framework is wired up yet).
-pub async fn load_page(url: String) -> Result<(Document, String), String> {
+pub async fn load_page_cancellable(
+    loader: &ResourceLoader,
+    url: String,
+    cancel: CancellationToken,
+) -> Result<(Document, String), String> {
+    static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+    let request =
+        ResourceRequest::navigate(NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed), 0, 0, &url);
     eprintln!("[pluto] fetching {url}");
-    let loader = ResourceLoader::new();
-    let response = match loader.fetch(&url).await {
+    let response = match loader.fetch_with(request, cancel).await {
         Ok(response) => response,
         Err(e) => {
             eprintln!("[pluto] fetch failed: {e}");
@@ -396,7 +411,11 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve(listener));
         let url = format!("http://127.0.0.1:{}/", addr.port());
-        let (doc, final_url) = load_page(url.clone()).await.expect("page loads");
+        let loader = ResourceLoader::new();
+        let (doc, final_url) =
+            load_page_cancellable(&loader, url.clone(), CancellationToken::new())
+                .await
+                .expect("page loads");
         assert_eq!(final_url, url);
         // Layout at a non-default viewport: the viewport flows
         // through the fetch path, and the canvas covers it exactly.
@@ -414,8 +433,15 @@ mod tests {
 
     #[tokio::test]
     async fn load_page_invalid_url_errors() {
-        assert!(load_page("ftp://example.com/".to_string())
+        let loader = ResourceLoader::new();
+        assert!(
+            load_page_cancellable(
+                &loader,
+                "ftp://example.com/".to_string(),
+                CancellationToken::new()
+            )
             .await
-            .is_err());
+            .is_err()
+        );
     }
 }

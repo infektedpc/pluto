@@ -25,7 +25,7 @@ older ones in early drafts.
 | Layer | Crates | Integration glue to write |
 | --- | --- | --- |
 | 1. Shell & Presentation | libcosmic / iced + wgpu | Custom `iced::widget::Shader` (or Canvas / offscreen `wgpu::Texture`) viewport inside the libcosmic window, so web pages render into a GPU texture composited directly inside the browser tab area. Lives in `pluto-browser/src/viewport.rs`. |
-| 2. Networking | hyper + rustls + tokio | `ResourceLoader` in `pluto-net`: fetches HTML, CSS, JS, and images over TLS 1.3 (rustls + webpki-roots), enforces CORS/redirects, and streams bytes to the parser. |
+| 2. Networking | hyper + rustls + tokio | `ResourceLoader` in `pluto-net`: one shared hyper client for the whole browser (explicit pool caps: 6 idle/host, 90 s idle timeout, timer set) + one shared rustls config (ALPN `[h2, http/1.1]`, shared resumption, 0-RTT off) over TLS 1.3 (rustls + webpki-roots); a scheduler (priority queue, 6 in-flight/origin, dedup, timeouts) streams `ResourceEvent`s (headers / chunks / done / error / cancelled) per `ResourceRequest`; gzip/deflate decoding, mixed-content gate, redirect audit (301/302/303/307/308, 5 hops, no https→http downgrade). No per-navigation client: the M1 fresh-loader-per-navigation defeated pooling and resumption. |
 | 3. Parsing & DOM | winnow + slotmap | winnow for fast, zero-copy CSS tokenization and HTML5 state-machine parsing into an arena-allocated DOM tree (`NodeId` handles instead of `Rc<RefCell<T>>` cycles). Lives in `pluto-html` / `pluto-css`. |
 | 4. Layout & Text | taffy + cosmic-text | `taffy::LayoutPartialTree` over the styled DOM nodes. For text leaf nodes, pass `cosmic_text::Buffer` shaping results inside Taffy's `measure_function` so line wrapping and intrinsic sizes match pixel-for-pixel. Lives in `pluto-layout`. |
 | 5. GPU Rendering | wgpu + cosmic-text (swash) | Walk the laid-out Taffy tree in paint order (z-index / stacking contexts) to emit quads (backgrounds, borders, images) and glyph atlases (via cosmic-text's `SwashCache`) into a wgpu render pass. Lives in `pluto-paint`; uploaded in `viewport.rs::Primitive::prepare`, drawn in `Primitive::render`. |
@@ -35,7 +35,10 @@ older ones in early drafts.
 
 ```
 Go pressed
-  -> pluto-net ResourceLoader::fetch(url)          (bytes)
+  -> worker: start_navigation cancels the old navigation's token,
+     spawns fetch+parse; outcome returns over a channel, stale
+     epochs discarded; layout runs in the loop at the current viewport
+  -> pluto-net Scheduler::submit(ResourceRequest)   (ResourceEvents)
   -> pluto-html parse -> Dom arena                (NodeIds)
   -> pluto-css parse + cascade -> styled tree     (computed styles)
   -> pluto-layout Taffy tree + measure_fn         (boxes)
@@ -50,6 +53,35 @@ Go pressed
   blank white quad (no display list yet).
 - Layers 2–6: crate stubs shaped around their glue points (see each
   crate's `src/lib.rs` header).
+- Stage 4 (browser architecture): `pluto-ipc` protocol crate
+  (PROTOCOL_VERSION 2 since Stage 5 — the message shape changed),
+  per-tab worker thread, epoch'd double-buffered compositor holder,
+  owned/serialisable validated `DisplayList`, rayon style, image
+  decode on the rayon pool. Rasterisation on a worker thread is NOT
+  implementable inside iced's Shader widget API — documented in
+  `compositor.rs`.
+- Stage 5 (networking, applied 2026-11-23): `RequestResource` v1
+  frozen (destination/priority/mode/credentials/origin/top-level-site/
+  epoch + streaming `ResourceEvent` reply + `CancelResource`); one
+  shared hyper client + one shared rustls config; scheduler with
+  priority queue, per-origin caps, dedup, timeouts; streaming-only
+  bodies with byte caps (Image 50 MiB, everything else 10 MiB);
+  cancellation by navigation epoch + `CancellationToken`; mixed-
+  content gate; redirect audit; gzip/deflate decoding. Correction
+  to the Stage 5 report: Pluto has NO dedicated tokio runtime — all
+  async work runs on the iced/libcosmic executor (tokio
+  multi-thread); the "stay in-process on a dedicated tokio runtime
+  through M5" departure is really "stay in-process on the iced
+  executor through M5; no network process". Scheduler state is
+  per-`ResourceLoader` (one per worker/tab today); the shared hyper
+  client is process-wide, so pooling/resumption are browser-wide
+  regardless. Deferred to their milestones: in-memory partitioned
+  LRU cache (M2), HSTS + preconnect + DNS TTL cache (M3), cookie jar
+  (M5 — evaluate `cookie_store` first pick vs rune-cookie/kekse),
+  disk cache + HTTPS-only (M5), CORS in pluto-net (M5), prefetch
+  (M5-ish; prerender deferred entirely), CSP + native content
+  blocker (M10), H3/DoH/0-RTT (post-M5, feature-gated, only after
+  measurement).
 
 ## Roadmap (Joel, 2026-11-23 — replaces the scratched vertical-slice plan)
 
@@ -59,7 +91,12 @@ Goal: type a URL into libcosmic, fetch it over HTTPS, parse basic
 HTML/CSS, and draw colored boxes and text on the GPU.
 
 - **pluto-net**: async HTTP/1.1 + HTTP/2 client (hyper + rustls +
-  webpki-roots) with redirect following (301/302/307/308).
+  webpki-roots) with redirect following (301/302/303/307/308, 5 hops,
+  no https→http downgrade), one shared client + shared rustls config
+  (pool caps, resumption, 0-RTT off), scheduler (priority queue,
+  per-origin caps, dedup, timeouts), streaming-only bodies with byte
+  caps, cancellation by navigation epoch + token, mixed-content gate,
+  gzip/deflate decoding.
 - **pluto-html & pluto-css**: winnow parsers for core HTML tags
   (`<html>`, `<head>`, `<body>`, `<div>`, `<h1>`–`<h6>`, `<p>`,
   `<span>`, `<a>`, `<style>`) into a slotmap DOM arena, plus basic CSS
@@ -86,6 +123,8 @@ Goal: usable for documentation, blogs, and simple multi-page sites.
 - **pluto-browser**: mouse wheel scrolling, hit-testing (mapping
   (x, y) clicks to DOM nodes), clickable `<a href="...">` links, and
   Back/Forward session history stacks.
+- **pluto-net**: in-memory partitioned LRU cache (deferred from
+  Stage 5 — build at M2, not before).
 - **Done criteria**: click links, scroll smoothly at 60+ FPS, browse
   real static sites (info.cern.ch, Hacker News, Rust docs).
 
@@ -99,6 +138,10 @@ Goal: visual pages with raster/vector images and standard tab management.
 - **pluto-browser**: multiple tabs (each owning its own TabState, DOM,
   layout tree, history), favicons, page `<title>` updates, loading
   progress indicator.
+- **pluto-net**: HSTS store + preconnect + DNS TTL cache (deferred
+  from Stage 5 — build at M3, not before). Multi-tab promotes the
+  loader to a shared handle; until then scheduler state (caps/dedup)
+  is per-tab.
 - **Done criteria**: pages with photos, icons, and multiple open tabs
   render cleanly without blocking the UI thread during image decoding.
 
@@ -128,6 +171,13 @@ Goal: log into websites, persistent state, crash-safe tab isolation.
   selection, keyboard focus management.
 - **Web storage & cookies**: Cookie jar persistence (Set-Cookie / Cookie
   headers), localStorage, sessionStorage backed by disk storage.
+  The jar is browser-side only and is evaluated at M5 (`cookie_store`
+  first pick vs rune-cookie/kekse — deferred from Stage 5, do not
+  build earlier). `Set-Cookie` is already stripped from the
+  `ResourceEvent` headers stream, so the renderer never sees it.
+- **pluto-net at M5**: CORS in pluto-net, disk cache + HTTPS-only
+  mode, prefetch (prerender deferred entirely) — all deferred from
+  Stage 5.
 - **Multi-process sandboxing**: split pluto-browser (UI, network,
   storage) from pluto-renderer worker processes over IPC, sharing
   display lists (and, later, rendered frames for video/canvas)
@@ -217,7 +267,11 @@ privacy controls, and extensibility.
 
 - **Web security model**: Same-Origin Policy (SOP), CORS preflight checks,
   Content Security Policy (CSP) headers, HTTPS-Only mode, OS-level
-  process sandboxing (seccomp on Linux).
+  process sandboxing (seccomp on Linux). CSP + the native content
+  blocker are deferred from Stage 5 to M10 (gate order when they
+  land: HSTS → blocker → CSP → CORS → cache → network).
+- **Post-M5 (Stage 5 #16, feature-gated, only after measurement)**:
+  HTTP/3, DNS-over-HTTPS, TLS 0-RTT — do not build before then.
 - **Browser features**: persistent bookmarks, full-text history search,
   download manager (pluto-net streaming to disk), find-in-page (Ctrl+F),
   zoom scaling (Ctrl+ / Ctrl-).

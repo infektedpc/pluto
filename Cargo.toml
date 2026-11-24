@@ -41,7 +41,12 @@ rquickjs = { version = "0.9", features = ["futures", "macro"] }
 # two providers and rustls panics at first TLS use. Defaults off, ring
 # is the only provider.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# Stage 5: pluto-net builds its rustls ClientConfig explicitly
+# (ring provider, webpki roots, resumption, 0-RTT off) instead of
+# relying on hyper-rustls's shorthand.
+webpki-roots = "1"
 hyper = { version = "1", features = ["client", "http1", "http2"] }
+http = "1"
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 # NOTE: `default-features = false` is load-bearing. hyper-rustls's default
 # features include `aws-lc-rs`, so requesting `ring` on top enables TWO
@@ -54,6 +59,12 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 http-body-util = "0.1"
 slotmap = "1"
 thiserror = "2"
+# Stage 5: CancellationToken (tokio-util sync) for cancelling
+# in-flight loads by navigation epoch; flate2 for gzip/deflate
+# decoding of response bodies (miniz_oxide backend, already in
+# the lock via transitive deps).
+tokio-util = "0.7"
+flate2 = "1"
 tracing = "0.1"
 # Stage 4: the browser<->renderer protocol (pluto-ipc) and the
 # serialisable display list (pluto-paint) are serde types; postcard is

@@ -4121,6 +4121,7 @@ dependencies = [
  "pluto-net",
  "pluto-paint",
  "tokio",
+ "tokio-util",
  "tracing",
  "wgpu",
 ]
@@ -4146,6 +4147,7 @@ dependencies = [
 name = "pluto-ipc"
 version = "0.1.0"
 dependencies = [
+ "http",
  "pluto-css",
  "pluto-html",
  "pluto-layout",
@@ -4183,14 +4185,19 @@ name = "pluto-net"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "flate2",
+ "http",
  "http-body-util",
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "pluto-ipc",
  "rustls",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]

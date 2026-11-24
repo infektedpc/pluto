@@ -215,13 +215,24 @@ impl Application for PlutoBrowser {
                     // M3 (multi-tab) reads the title; the shell
                     // ignores it for now.
                 }
+                RendererToBrowser::CancelResource { request_id } => {
+                    // The worker cancels its own fetches by token
+                    // (Stage 5 #5); the shell holds no loader, so
+                    // there is nothing to cancel here. At M5, when
+                    // the fetch lives browser-side behind
+                    // `RequestResource`, this is where the shell
+                    // cancels it on the scheduler.
+                    eprintln!(
+                        "[pluto] ignoring CancelResource {request_id} (no shell-side loader)"
+                    );
+                }
                 RendererToBrowser::RendererCrashed { reason } => {
                     eprintln!("[pluto] renderer crashed: {reason}");
                     self.status = format!("Renderer crashed: {reason}");
                     // The stale list stays visible; the next
                     // navigation recovers.
                 }
-                RendererToBrowser::RequestResource { .. } => {
+                RendererToBrowser::RequestResource(..) => {
                     // M2 (subresources) fetches these; ignored now.
                 }
             },
