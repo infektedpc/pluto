@@ -19,7 +19,7 @@ license = "MIT OR Apache-2.0"
 # Shared dependency versions. These are pinned to match what the libcosmic
 # pin below actually uses (see README.md "Version notes"):
 #   wgpu 28 / cosmic-text 0.19 / taffy 0.15 come from libcosmic rev ecc5fe4
-#   (Frost's Cargo.lock proves 28.0.0 / 0.19.0 / 0.15.1).
+#   (verified against the pin's lockfile: 28.0.0 / 0.19.0 / 0.15.1).
 # Using older majors here would pull a SECOND copy of each crate, and the
 # wgpu::Device/Queue handed out by libcosmic would be a different type
 # from the one pluto-paint sees. One version everywhere, or nothing works.
@@ -35,7 +35,7 @@ wgpu = "28"
 # time, but this VM's llvm18 sysroot ships libclang without the C headers
 # (bindgen dies on `stdbool.h: file not found`). rquickjs-sys falls back
 # to its pre-generated bindings, same API -- M4 needs nothing from bindgen.
-rquickjs = { version = "0.9", features = ["futures", "macro"] }
+rquickjs = { version = "0.14", features = ["futures", "macro"] }
 # NOTE: same trap as hyper-rustls below -- rustls 0.23's OWN default
 # features include `aws_lc_rs`, so a bare `"0.23"` plus `ring` enables
 # two providers and rustls panics at first TLS use. Defaults off, ring
@@ -70,6 +70,9 @@ url = "2"
 # the lock via transitive deps).
 tokio-util = "0.7"
 flate2 = "1"
+# Stage 7 (pluto-js): SHA-256 for the bytecode cache key (URL + content
+# hash). Already in the lock as a transitive dep; named directly here.
+sha2 = "0.11"
 tracing = "0.1"
 # Stage 4: the browser<->renderer protocol (pluto-ipc) and the
 # serialisable display list (pluto-paint) are serde types; postcard is
@@ -90,6 +93,7 @@ pluto-html = { path = "crates/pluto-html", version = "0.1.0" }
 pluto-css = { path = "crates/pluto-css", version = "0.1.0" }
 pluto-layout = { path = "crates/pluto-layout", version = "0.1.0" }
 pluto-net = { path = "crates/pluto-net", version = "0.1.0" }
+pluto-js = { path = "crates/pluto-js", version = "0.1.0" }
 
 [workspace.dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic"

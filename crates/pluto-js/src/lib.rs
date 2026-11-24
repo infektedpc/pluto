@@ -1,24 +1,55 @@
-//! Scripting (layer 6): rquickjs runtime + DOM bindings.
+//! Scripting (layer 6): the JS engine host for one tab.
 //!
-//! Runs an `rquickjs::AsyncRuntime` on the tab's event loop, exposing
-//! `NodeId`-backed host objects (`document.getElementById`,
-//! `addEventListener`, `fetch`) that mutate the DOM and trigger
-//! re-style/re-layout. The bindings land in the js round; this stub owns
-//! the runtime so the tab can already create (and drop) one.
+//! `pluto-js` owns the JS engine (rquickjs / QuickJS-NG), the
+//! host-owned event loop, and the binding boundary — but no DOM code:
+//! DOM access crosses through [`DomHost`] handles, and layout is
+//! reached through that trait, never by depending on `pluto-layout`
+//! directly.
+//!
+//! # The pieces (Stage 7, wave 1)
+//!
+//! * [`TabRealm`] — one rquickjs `AsyncRuntime` + `AsyncContext` per
+//!   tab, created on navigation on the worker thread, dropped on
+//!   navigation. Per-runtime memory limit + wall-clock interrupt
+//!   handler, plus a watchdog for scripts hung across `await`s.
+//! * [`TabJs`] — the event loop wired to a realm: per-source task
+//!   queues, one microtask queue, the timer wheel (5-level nesting /
+//!   4 ms clamp), rAF at rendering opportunities, the navigation
+//!   epoch. Host globals (`setTimeout`, `queueMicrotask`,
+//!   `requestAnimationFrame`, `performance.now`) are installed here.
+//! * [`JsEngine`] / [`JsValue`] — the engine trait boundary. No
+//!   QuickJS type appears in this crate's public API; an engine swap
+//!   changes [`realm`] and nothing else.
+//! * [`DomHost`] / [`DomKey`] — what the engine needs from the host
+//!   document, for wave 2 to implement against the slotmap DOM.
+//! * [`bindings`] — the hand-written DOM / WebIDL bindings (wave 2a):
+//!   `window`, `document`, `Node` / `Element`, `EventTarget`,
+//!   `fetch` / `Response` / `Headers`, plus the [`FetchBackend`]
+//!   trait the integration wave implements with `pluto-net`.
+//! * [`BytecodeCache`] — in-memory compiled-module cache (URL +
+//!   SHA-256 of source, bounded LRU).
+//! * [`probe::probe_engine`] — the feature checklist + Test262-style
+//!   subset that gates engine upgrades. Run it with
+//!   `cargo test -p pluto-js probe -- --nocapture`.
+//!
+//! See `crates/pluto-js/README.md` for the pinned engine version, the
+//! probe verdict, the public API surface, and the performance notes.
 
-/// The JS runtime for one tab.
-pub struct JsRuntime {
-    runtime: rquickjs::AsyncRuntime,
-}
+pub mod bytecode;
+pub mod bindings;
+pub mod engine;
+pub mod error;
+pub mod event_loop;
+pub mod host;
+pub mod probe;
+pub mod realm;
+pub mod tab;
 
-impl JsRuntime {
-    pub fn new() -> rquickjs::Result<Self> {
-        Ok(Self { runtime: rquickjs::AsyncRuntime::new()? })
-    }
-
-    /// Evaluate a script in the tab's global context. Bindings land in
-    /// the js round.
-    pub async fn eval(&self, _script: &str) -> rquickjs::Result<()> {
-        Ok(())
-    }
-}
+pub use bindings::{FetchBackend, FetchCompletion, FetchError, FetchRequest, FetchResponse};
+pub use bytecode::{BytecodeCache, CacheHit, CacheStats, CacheKey};
+pub use engine::{EvalKind, JsEngine, JsValue};
+pub use error::JsError;
+pub use event_loop::{FRAME_INTERVAL, TaskSource};
+pub use host::{DomHost, DomHostError, DomKey, Geometry};
+pub use realm::{DEFAULT_MEMORY_LIMIT_BYTES, DEFAULT_SCRIPT_BUDGET, RealmConfig, TabRealm};
+pub use tab::{TabJs, TurnOutcome};

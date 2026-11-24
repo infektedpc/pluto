@@ -36,10 +36,8 @@ Build notes:
   https://rustup.rs if it's missing). First build downloads the
   dependency tree including the libcosmic git pin, so allow a few
   minutes and a network connection.
-- System libraries: the same ones Frost needs (libcosmic/wayland/X11
-  stack). If Frost builds and runs on your box, Pluto should too — if
-  a build error names a missing system library, that's the one to
-  install.
+- System libraries: the libcosmic/Wayland/X11 stack. If a build error
+  names a missing system library, that's the one to install.
 - No libclang needed: `pluto-js` uses rquickjs with pre-generated
   bindings (the `bindgen` feature was dropped during bootstrap).
 - No gstreamer needed in M1: there is no media yet.
@@ -56,14 +54,13 @@ and a bare `https://github.com` libcosmic URL. All three were corrected
 during bootstrap, verified against the actual sources:
 
 - **libcosmic** is pinned to `pop-os/libcosmic` rev
-  `ecc5fe4164e1c9024b932382d24ea41f24147e75` — the exact pin Frost uses
-  and the one already cached in this VM, so the first build does not
-  re-fetch it. Unpinning to latest main is a one-line change in the root
+  `ecc5fe4164e1c9024b932382d24ea41f24147e75` — the pin already cached
+  in this VM, so the first build does not re-fetch it. Unpinning to latest main is a one-line change in the root
   `Cargo.toml`, but it moves wgpu/cosmic-text/taffy under you.
 - **wgpu 28, cosmic-text 0.19, taffy 0.15**: what that libcosmic pin's
-  iced actually uses (Frost's `Cargo.lock` proves 28.0.0 / 0.19.0 /
-  0.15.1). Older majors would pull second copies of each crate, and the
-  `wgpu::Device` from libcosmic would no longer be the same type
+  iced actually uses (verified against the pin's lockfile: 28.0.0 /
+  0.19.0 / 0.15.1). Older majors would pull second copies of each crate,
+  and the `wgpu::Device` from libcosmic would no longer be the same type
   `pluto-paint` sees.
 - **Shader widget path**: `cosmic::widget::shader` and
   `cosmic::iced_wgpu::wgpu` do not exist in this pin. The real paths are

@@ -69,6 +69,12 @@ pub enum DomEvent {
     SubtreeComplete { node: NodeId },
     /// A classic parser-blocking `<script>` just completed.
     ScriptPaused(crate::streaming::ScriptPaused),
+    /// An `async` script was discovered and queued for execution
+    /// as soon as its fetch arrives (arrival order, no order
+    /// guarantee). Stage 7: the fetch completion is reported
+    /// through the [`crate::scripts::AsyncQueue`], not an event —
+    /// the parser cannot see the network.
+    AsyncScriptQueued { script: NodeId, src: Option<String> },
     /// A `<link rel=stylesheet>` was created.
     StylesheetDiscovered { node: NodeId, href: String },
     /// A fetchable subresource was discovered on a created element.
@@ -103,6 +109,14 @@ pub struct ParseOutput {
     pub quirks_mode: QuirksMode,
     pub stats: SinkStats,
     pub events: Vec<DomEvent>,
+    /// True for a fragment parse ([`crate::parse_fragment`]):
+    /// `<script>` elements the fragment created are inert — they
+    /// must never execute. False for a whole-document parse.
+    /// The bindings layer's `set_inner_html` relies on this: it
+    /// may move the fragment's nodes into the live document, but
+    /// it must not route a fragment script through any script
+    /// queue.
+    pub scripts_inert: bool,
 }
 
 impl ParseOutput {
@@ -381,6 +395,7 @@ impl TreeBuilder {
                 processing_instructions: 0,
             },
             events: self.events,
+            scripts_inert: self.fragment,
         }
     }
 

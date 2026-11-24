@@ -122,6 +122,86 @@ Go pressed
   Stage 8 paint for clip (the renderer ignores `PushClip`/`PopClip`
   for now), Spineless Traversal (later swap), CORS (M5), CSP (M10),
   H3/DoH/0-RTT (post-M5).
+- Stage 7 application (JS engine + event loop, applied 2026-11-24):
+  rquickjs 0.14.0 pinned (QuickJS-NG, no JIT — a JIT is a whole
+  second compiler, multi-month baseline; engine swap to V8 stays the
+  later path). ES probe verdict: ES2020 floor, no Temporal /
+  decorators. Cheap perf win in: per-URL in-memory bytecode cache
+  (`pluto-js/src/bytecode.rs`); the `-Os` + LTO build of the
+  QuickJS C code was NOT landed (no profile/build flag for it
+  exists in the workspace yet). One realm per tab: a fresh
+  `AsyncRuntime` + `AsyncContext` per navigation, owned by the tab
+  worker thread, dropped on navigation; the event loop is
+  host-owned (HTML §8.1.7 shape: one task to completion, drain
+  microtasks, update-the-rendering only at a rendering
+  opportunity), task sources prioritised UserInteraction >
+  DomManipulation > Networking > Parser > Script > Timer, Rendering
+  never dispatched as a task. Bindings are hand-written (no
+  WebIDL/codegen in M4): `window` / `document` / `Element` /
+  `EventTarget` / `fetch` / `Response` / `Headers`, timers, rAF,
+  console, `document.write` / `open` / `close` (via the parser's
+  `DocumentWriter`, scripts inert in `innerHTML` and in written
+  fragments), geometry reads. Parser seams: parser-blocking
+  scripts execute at `ScriptPaused` (external fetched first,
+  stylesheet gate waited on, then parsing resumes), defer drains
+  in document order after the parse, then `DOMContentLoaded`;
+  async scripts run on arrival; modules dedup by URL and are
+  driven by the loop (`start_module` / `poll_module` — a module
+  top-level-awaiting a host event never goes through
+  `await_promise`, so it cannot poison the realm). Fetch is
+  promise-over-task, same-origin only: `PlutoFetchBackend`
+  (pluto-browser) builds a Stage-5 `RequestResource` (destination
+  Fetch, mode/credentials SameOrigin, epoch) over pluto-net,
+  honours epoch cancellation + the mixed-content gate, and sends
+  exactly one `FetchCompletion`; absolute cross-origin URLs fail
+  before any network access, with `TODO(M5)` CORS and `TODO(M10)`
+  CSP `connect-src` markers at that gate. Dirty-bit flow: a JS
+  mutation marks the Double Dirty Bit flags + `render_requested`
+  and returns with NO layout; the 16 ms frame tick re-lays out
+  and submits only when dirty or an rAF callback is pending;
+  geometry reads (`getBoundingClientRect` / `offsetWidth` /
+  `offsetHeight`) force a synchronous flush via the layout actor,
+  counted in a debug forced-flush counter (read/write loop: one
+  flush per iteration, by design; batched writes: one flush).
+  Full re-layout is the M4 fallback — dirty-subtree layout is
+  Stage 8, the bits are populated correctly so Stage 8 can trust
+  them. rAF runs inside update-the-rendering with one shared
+  frame timestamp; the cadence is a ~60 Hz timer on the tab thread
+  (the shell/compositor exposes no frame signal), and hidden tabs
+  get the same cadence in M4 — no visibility signal to throttle
+  on yet. Error isolation: a throwing script reports via
+  `window.onerror` (`onerror` returning `true` suppresses the
+  default report) and never blocks later scripts or the loop;
+  5 s script budget + 256 MiB memory limit + interrupt handler
+  (watchdog) in place. M4 done criteria met in worker tests
+  (local test server): counter click increments, accordion click
+  toggles, fetch-JSON loader updates the DOM, throwing script
+  does not kill later scripts or the loop, navigation cancels a
+  pending timer, module top-level-awaiting a fetch updates the
+  DOM, `document.write` inserts at parse, `set_inner_html`
+  keeps scripts inert, layout-thrash (5 flushes for a read/write
+  loop, +1 for batched writes). Departures from the Stage 7
+  report, each forced by the code: (1) the realm drives its
+  rquickjs futures with a synchronous poll loop (`block_on_sync`)
+  instead of owning a tokio runtime — a realm-owned runtime
+  panics on nested `block_on` when `TabJs` is called from inside
+  the tab thread's network `block_on`; (2) the tab thread runs an
+  async main loop (`LocalSet` + `spawn_local` load tasks, script
+  execution delegated from the load task to the main loop over
+  epoch-stamped `ExecMsg`) instead of running the load inline —
+  the inline design blocked the command loop, so a second
+  navigation could not cancel the first mid-flight; (3)
+  `ScriptHooks` methods are boxed futures and `parse_finished`
+  takes/returns the `Document` by value — `async fn` trait
+  methods are not dyn-compatible, and the load-task/main-loop
+  split needs the document to move; (4) the frame interval uses
+  `MissedTickBehavior::Delay` — `Burst` fired dozens of catch-up
+  ticks after the blocking post-parse drive and starved the
+  command channel for ~500 ms. Deferred, each with a one-line
+  `TODO(stage)` at its hook point: full WebIDL/codegen (M5),
+  workers (M5), Shadow DOM (M5), MutationObserver /
+  ResizeObserver / IntersectionObserver (M8), import maps (M5),
+  storage APIs (M5), full fetch/CORS (M5), CSP (M10).
 
 ## Roadmap (Joel, 2026-11-23 — replaces the scratched vertical-slice plan)
 

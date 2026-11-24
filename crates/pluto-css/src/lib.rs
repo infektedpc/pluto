@@ -1629,6 +1629,16 @@ fn split_top_level_keyword<'a>(s: &'a str, keyword: &str) -> Vec<&'a str> {
 /// Parse a selector list. ONE invalid complex selector invalidates
 /// the WHOLE list (CSS Syntax L3): returns `None` and records one
 /// error, and the caller drops the entire rule.
+/// Parse a selector list for `querySelector` (wave 2b): the same
+/// parser the stylesheet uses, without a sheet attached. ONE
+/// invalid complex selector invalidates the WHOLE list (CSS Syntax
+/// L3), so an invalid selector returns an empty list — the caller
+/// treats it as "no match", never as a partial match.
+pub fn parse_selectors(text: &str) -> Vec<Selector> {
+    let mut errors = Vec::new();
+    parse_selector_list(text, &mut errors).unwrap_or_default()
+}
+
 fn parse_selector_list(text: &str, errors: &mut Vec<String>) -> Option<Vec<Selector>> {
     let mut out = Vec::new();
     for item in split_top_level(text, ',') {

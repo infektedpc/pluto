@@ -1,0 +1,318 @@
+//! The host side of the binding boundary: what `pluto-js` needs from the
+//! DOM and the layout actor (Stage 7, Recommendation 5).
+//!
+//! Wave 2 implements [`DomHost`] against `pluto-html`'s `Dom` plus a
+//! channel to the layout actor. Nothing here mentions the JS engine:
+//! a binding holds a [`DomKey`], validates it on every crossing, and
+//! never holds a pointer or a GC root into the arena.
+//!
+//! # Safety model (from the Stage 7 report, §(c))
+//!
+//! * A JS wrapper holds only a [`DomKey`] — a generational slotmap key
+//!   into the arena. The arena owns the node; the key is just an index
+//!   plus a generation.
+//! * Every crossing validates the key against the live `Dom`. A removed
+//!   node (or a reused slot from a later node) fails validation:
+//!   getters return `None` (the binding surfaces `null`), setters are
+//!   no-ops or throw `TypeError` per WebIDL, never use-after-free.
+//! * Wrapper identity (`document.body === document.body`) is a
+//!   per-realm cache keyed by `DomKey`, built in wave 2 on top of this
+//!   trait — it is not needed to validate a key.
+
+use pluto_html::NodeId;
+
+/// A handle to a DOM node, as held by JS wrappers. This is
+/// `pluto-html`'s generational slotmap key: the index identifies the
+/// arena slot, the generation identifies which occupant of that slot.
+/// A key for a removed node never validates again, even if the slot is
+/// later reused by a different node.
+pub type DomKey = NodeId;
+
+/// A layout box, as returned by a forced synchronous layout flush.
+/// All values are CSS pixels in the document's coordinate space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Geometry {
+    /// X offset of the border box relative to the document origin.
+    pub x: f64,
+    /// Y offset of the border box relative to the document origin.
+    pub y: f64,
+    /// Border-box width.
+    pub width: f64,
+    /// Border-box height.
+    pub height: f64,
+}
+
+/// Why a host tree operation failed, so the binding can raise the
+/// right DOMException name (WebIDL: tree surgery throws
+/// `HierarchyRequestError` / `NotFoundError`, never a bare bool).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomHostError {
+    /// The key does not address a live node (stale / wrong document).
+    StaleKey,
+    /// The operation would break the tree (node into itself or one of
+    /// its descendants, a Document node as a child, …).
+    Hierarchy,
+    /// A named child (`old`, `sibling`) is not a child of `parent`.
+    NotFound,
+    /// The document is in a state that forbids the call (e.g.
+    /// `document.write` after the document was closed with no parser).
+    InvalidState,
+}
+
+/// What the JS engine needs from the host document. Implemented in wave
+/// 2 by the per-tab worker (which owns the `Dom` and talks to the
+/// layout actor). All methods are synchronous and run on the tab's
+/// worker thread — the only thread that ever touches the `Dom`.
+///
+/// TODO(M5): when the worker moves across IPC, this trait's implementor
+/// becomes a channel client; the trait itself does not change.
+///
+/// # Wave-2a extensions
+///
+/// The methods below the wave-1 block are additive (new methods only;
+/// no wave-1 signature changed). They carry default implementations
+/// that report "not present" so a minimal host still compiles; the
+/// production host (per-tab worker over `pluto-html`'s `Dom`, with
+/// `pluto-layout::selector_matches` for queries) must override them —
+/// a default that returns `None` / empty is a missing feature, not a
+/// correct answer, and the bindings document each one. The test host
+/// in `pluto-js/src/bindings/test_host.rs` overrides all of them.
+pub trait DomHost {
+    /// True if `key` still addresses a live node in this document.
+    /// Called on every crossing, before any other method.
+    fn validate(&self, key: DomKey) -> bool;
+
+    /// The document element (`<html>`), if the document has one.
+    fn document_element(&self) -> Option<DomKey>;
+
+    /// The `<body>` element, if the document has one.
+    fn body(&self) -> Option<DomKey>;
+
+    /// First element with this `id` in document order, or `None`.
+    fn get_element_by_id(&self, id: &str) -> Option<DomKey>;
+
+    /// The `textContent` of a node: for an element, the concatenation of
+    /// its descendant text; for a text node, its data. `None` if the key
+    /// is stale or the node has no text.
+    fn text_content(&self, key: DomKey) -> Option<String>;
+
+    /// Set `textContent` (replaces children with a single text node).
+    /// Returns false if the key is stale, in which case the binding
+    /// surfaces a `TypeError` or a no-op per WebIDL.
+    fn set_text_content(&mut self, key: DomKey, text: &str) -> bool;
+
+    /// A content attribute value, or `None` if absent / key stale.
+    fn get_attribute(&self, key: DomKey, name: &str) -> Option<String>;
+
+    /// Set a content attribute. Returns false if the key is stale.
+    /// Setting an attribute marks the node's dirty bits (style and
+    /// layout, self + subtree) — the write path is lazy, no layout
+    /// happens here.
+    fn set_attribute(&mut self, key: DomKey, name: &str, value: &str) -> bool;
+
+    /// Mark the subtree rooted at `key` as needing restyle and layout
+    /// (sets the Double Dirty Bit flags, self + subtree). This is the
+    /// write path: it records the dirt and returns immediately. The
+    /// actual restyle/layout happens at the next rendering opportunity.
+    fn request_restlye_and_layout(&mut self, key: DomKey);
+
+    /// Geometry of a node, forcing a synchronous layout flush first if
+    /// the layout tree is dirty. This is the ONLY sanctioned synchronous
+    /// cross-thread call in the design (worker thread blocks on the
+    /// layout actor), and it is bounded: the host flushes only the dirty
+    /// subtree needed for the query where it can, else the whole
+    /// document (wave 2 documents which one it ships). Returns `None`
+    /// if the key is stale.
+    ///
+    /// The host counts forced flushes; see
+    /// [`DomHost::forced_flush_count`]. A read/write loop that flushes
+    /// once per iteration is layout thrash by design — visible here,
+    /// not hidden.
+    fn geometry(&mut self, key: DomKey) -> Option<Geometry>;
+
+    /// How many forced synchronous layout flushes this document has
+    /// performed. A debug counter so layout thrash is measurable in
+    /// tests (wave 2 wires it to the layout actor).
+    fn forced_flush_count(&self) -> u64;
+
+    // --- Wave-2a extensions (additive; defaults report "not present") ---
+
+    /// The `Document` node itself (the root of the arena), if any.
+    /// The `document` wrapper holds this key.
+    fn document_node(&self) -> Option<DomKey> {
+        None
+    }
+
+    /// The `<head>` element, if the document has one.
+    fn head(&self) -> Option<DomKey> {
+        None
+    }
+
+    /// Parent of `key`, or `None` for the document root / stale key.
+    fn parent(&self, _key: DomKey) -> Option<DomKey> {
+        None
+    }
+
+    /// Children of `key` in document order (empty for stale keys).
+    fn children(&self, _key: DomKey) -> Vec<DomKey> {
+        Vec::new()
+    }
+
+    /// Element tag name as stored (lowercase from the parser), or
+    /// `None` for non-elements / stale keys. The binding uppercases
+    /// it for `tagName` per HTML.
+    fn tag_name(&self, _key: DomKey) -> Option<String> {
+        None
+    }
+
+    /// DOM `nodeType`: 1 element, 3 text, 8 comment, 9 document,
+    /// 10 doctype. `None` for stale keys.
+    fn node_type(&self, _key: DomKey) -> Option<u16> {
+        None
+    }
+
+    /// DOM `nodeName`: uppercase tag for elements, `#text` /
+    /// `#comment` / `#document`, doctype name. `None` for stale keys.
+    fn node_name(&self, _key: DomKey) -> Option<String> {
+        None
+    }
+
+    /// The document title (text of the first `<title>` in `<head>`),
+    /// or `None` if there is none.
+    fn title(&self) -> Option<String> {
+        None
+    }
+
+    /// Set the document title (creates/updates the `<title>` element).
+    /// Returns false if the document has no `<head>` / key is stale.
+    fn set_title(&mut self, _title: &str) -> bool {
+        false
+    }
+
+    /// Create a detached element node. `None` only on allocation
+    /// failure (never in practice); the tag is stored as given.
+    fn create_element(&mut self, _tag: &str) -> Option<DomKey> {
+        None
+    }
+
+    /// Create a detached text node.
+    fn create_text_node(&mut self, _data: &str) -> Option<DomKey> {
+        None
+    }
+
+    /// Append `child` under `parent` (detaching it first). The host
+    /// enforces the hierarchy rules and reports why it refused, so
+    /// the binding can raise the right DOMException.
+    fn append_child(&mut self, _parent: DomKey, _child: DomKey) -> Result<(), DomHostError> {
+        Err(DomHostError::StaleKey)
+    }
+
+    /// Insert `child` under `parent` before `sibling` (`None` =
+    /// append). `sibling` must be a child of `parent`.
+    fn insert_before(
+        &mut self,
+        _parent: DomKey,
+        _child: DomKey,
+        _sibling: Option<DomKey>,
+    ) -> Result<(), DomHostError> {
+        Err(DomHostError::StaleKey)
+    }
+
+    /// Detach `child` from `parent`. `child` must be a child of
+    /// `parent` (else `NotFound`).
+    fn remove_child(&mut self, _parent: DomKey, _child: DomKey) -> Result<(), DomHostError> {
+        Err(DomHostError::StaleKey)
+    }
+
+    /// Replace `old` with `new` under `parent`, keeping position.
+    fn replace_child(
+        &mut self,
+        _parent: DomKey,
+        _old: DomKey,
+        _new: DomKey,
+    ) -> Result<(), DomHostError> {
+        Err(DomHostError::StaleKey)
+    }
+
+    /// Remove a content attribute. Returns false if the key is stale
+    /// (removing an absent attribute is a silent success).
+    fn remove_attribute(&mut self, _key: DomKey, _name: &str) -> bool {
+        false
+    }
+
+    /// True if the element has a content attribute of this name.
+    fn has_attribute(&self, _key: DomKey, _name: &str) -> bool {
+        false
+    }
+
+    /// First element in `scope`'s subtree (including `scope` itself
+    /// if it is an element) matching `selector`, in document order.
+    /// The production host implements this with the Stage-6 selector
+    /// matcher (`pluto-layout::selector_matches` over the parsed
+    /// `pluto-css::Selector`); the binding never matches selectors
+    /// itself. An invalid selector returns `None` (the binding
+    /// surfaces `null` for `querySelector` — M4 departure: the spec
+    /// throws `SyntaxError` for an invalid selector; see the binding).
+    fn query_selector(&self, _scope: DomKey, _selector: &str) -> Option<DomKey> {
+        None
+    }
+
+    /// All elements in `scope`'s subtree matching `selector`, in
+    /// document order. Same matcher note as [`DomHost::query_selector`].
+    fn query_selector_all(&self, _scope: DomKey, _selector: &str) -> Vec<DomKey> {
+        Vec::new()
+    }
+
+    /// Serialised `innerHTML` of `key` (its children as markup).
+    /// `None` for stale keys.
+    fn inner_html(&self, _key: DomKey) -> Option<String> {
+        None
+    }
+
+    /// Parse `html` as a fragment in the context of `key` and replace
+    /// its children with the fragment's nodes. `<script>` elements the
+    /// fragment creates are inert (they never execute). Returns false
+    /// if the key is stale. The fragment parser is the parser-seams
+    /// agent's `parse_fragment` in `pluto-html`; this trait only
+    /// carries the call across the boundary.
+    fn set_inner_html(&mut self, _key: DomKey, _html: &str) -> bool {
+        false
+    }
+
+    /// `document.write(text)`: insert markup at the parser's insertion
+    /// point (parser agent's stack), or — with no active parser — the
+    /// implicit-`open()` path. Returns false when the document state
+    /// forbids the write; the binding raises `InvalidStateError`.
+    fn document_write(&mut self, _text: &str) -> bool {
+        false
+    }
+
+    /// `document.open()`: replace the document in place. Returns false
+    /// when called from a parser-inserted script (ignored per spec).
+    fn document_open(&mut self) -> bool {
+        false
+    }
+
+    /// `document.close()`: finish the document (emit EOF). Returns
+    /// false when there is nothing to close.
+    fn document_close(&mut self) -> bool {
+        false
+    }
+
+    /// The raw `style` attribute text of `key` (the CSSOM
+    /// `cssText`), or `None` for stale keys / no `style` attribute.
+    fn style_text(&self, _key: DomKey) -> Option<String> {
+        None
+    }
+
+    /// Set the raw `style` attribute text of `key`. Returns false if
+    /// the key is stale.
+    fn set_style_text(&mut self, _key: DomKey, _css: &str) -> bool {
+        false
+    }
+
+    /// A script/callback error surfaced to the host (the integration
+    /// wave wires this to `window.onerror` reporting / the shell log).
+    /// Default: ignore — `TabJs::script_errors` already records it.
+    fn report_error(&self, _message: &str) {}
+}

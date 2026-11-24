@@ -38,9 +38,36 @@
 //! references map surrogates, `0x00`, and values `> U+10FFFF` to
 //! U+FFFD (with the spec's C1 replacements for `0x80..=0x9F`).
 
+//! # Script execution seams (Stage 7)
+//!
+//! The parser never executes JavaScript, but it owns the state
+//! the event loop drives — see [`scripts`]:
+//!
+//! * [`scripts::classify_script`] routes every `<script>` to
+//!   parser-blocking, defer, async, or module;
+//! * [`scripts::ScriptQueues`] holds the defer queue (document
+//!   order, drained after the parse, before `DOMContentLoaded`)
+//!   and the async queue (arrival order), with module-URL dedup;
+//! * [`scripts::StylesheetGate`] is the pending-stylesheet gate
+//!   a parser-blocking script waits on — fed by the browser via
+//!   [`Parser::note_stylesheet_loaded`] /
+//!   [`Parser::note_stylesheet_failed`];
+//! * [`scripts::DocumentWriter`] is the `document.write` /
+//!   `open` / `close` state machine; the parser performs the
+//!   character insertion through [`Parser::document_write`].
+//!
+//! The streaming [`Parser`] is the live seam: `feed` pauses at
+//! parser-blocking scripts (`DomEvent::ScriptPaused`), queues
+//! defer/async/module scripts, and tracks the stylesheet gate;
+//! [`Parser::finish`] returns the queues in [`ParsedStream`].
+//! Fragment parses ([`parse_fragment`]) create inert scripts —
+//! they exist in the fragment DOM but must never execute
+//! (`ParseOutput::scripts_inert`).
+
 pub mod builder;
 pub mod entities;
 pub mod scanner;
+pub mod scripts;
 pub mod streaming;
 pub mod tokenizer;
 
@@ -51,6 +78,10 @@ use slotmap::{SlotMap, new_key_type};
 
 pub use builder::{DomEvent, QName, SinkStats};
 pub use scanner::{Destination, DiscoveredResource, Priority, resolve_url, scan};
+pub use scripts::{
+    AsyncQueue, CloseOutcome, DeferQueue, DocumentWriter, DynamicMarkupError, OpenOutcome,
+    QueuedScript, ScriptKind, ScriptQueues, StylesheetGate, WriteOutcome, classify_script,
+};
 pub use streaming::{Parser, ParsedStream, ScriptPaused};
 
 new_key_type! {
@@ -325,6 +356,30 @@ impl Dom {
             node.dirty = DirtyFlags::default();
         }
         self.dirty.clear();
+    }
+
+    /// Mark one node dirty (style + layout, self + subtree summary
+    /// bits) without recording a mutation. The integration wave uses
+    /// this when a JS mutation runs while the parser's
+    /// `suppress_records` privilege is on (parser-blocking scripts
+    /// mutate during a parse, and `note_mutation` silently skips
+    /// them then): the dirty bits must still be set, or a mutation
+    /// made mid-parse would never reach the layout pass.
+    pub fn mark_dirty(&mut self, id: NodeId) {
+        if let Some(n) = self.arena.get_mut(id) {
+            n.dirty.style_self = true;
+            n.dirty.layout_self = true;
+        }
+        self.dirty.style.insert(id);
+        self.dirty.layout.insert(id);
+        let mut cur = self.arena.get(id).and_then(|n| n.parent);
+        while let Some(parent) = cur {
+            if let Some(n) = self.arena.get_mut(parent) {
+                n.dirty.style_subtree = true;
+                n.dirty.layout_subtree = true;
+            }
+            cur = self.arena.get(parent).and_then(|n| n.parent);
+        }
     }
 
     pub(crate) fn set_suppress_records(&mut self, suppress: bool) {
@@ -642,6 +697,14 @@ pub fn parse_detailed_with_opts(html: &str, scripting_enabled: bool) -> ParseOut
 /// `None` for HTML). Returns the document plus the context element,
 /// with the fragment's top-level nodes under it — the `innerHTML`
 /// seam (Stage 7).
+///
+/// Scripts the fragment creates are **inert**: they exist as
+/// `<script>` elements in the fragment DOM, but they must never
+/// execute and are never routed to any script queue
+/// (`ParseOutput::scripts_inert` is true for fragment parses).
+/// The bindings layer's `set_inner_html` relies on this — it may
+/// move the fragment's nodes into the live document, but it must
+/// not execute a fragment script.
 pub fn parse_fragment(
     html: &str,
     context_tag: &str,
@@ -1002,6 +1065,29 @@ mod tests {
         // Fragment in a table context: foster parenting still applies.
         let (dom, ctx) = parse_fragment("<tr><td>cell</td></tr>", "table", None);
         assert!(find_tag(&dom, ctx, "td").is_some());
+    }
+
+    #[test]
+    fn fragment_scripts_are_inert() {
+        // innerHTML scripts exist in the fragment DOM but must
+        // never execute: no pause, no queue event, inert flag set.
+        let (out, ctx) =
+            parse_fragment_detailed("<script>alert(1)</script><p>after</p>", "div", None, true);
+        assert!(out.scripts_inert, "fragment parse marks its scripts inert");
+        let script = find_tag(&out.dom, ctx, "script").expect("script element exists");
+        assert_eq!(text_content(&out.dom, script), "alert(1)");
+        assert!(find_tag(&out.dom, ctx, "p").is_some());
+        assert!(
+            out.events.iter().all(|e| !matches!(
+                e,
+                DomEvent::ScriptPaused(_) | DomEvent::AsyncScriptQueued { .. }
+            )),
+            "fragment scripts surface no script events: {:?}",
+            out.events
+        );
+        // A whole-document parse is not inert.
+        let doc = parse_detailed("<p>x</p>");
+        assert!(!doc.scripts_inert);
     }
 
     #[test]

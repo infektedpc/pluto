@@ -139,6 +139,39 @@ impl Document {
     pub fn dom(&self) -> &Dom {
         &self.dom
     }
+
+    /// The merged author stylesheet of this document.
+    pub fn sheet(&self) -> &Stylesheet {
+        &self.sheet
+    }
+
+    /// The base URL relative URLs resolve against (final URL after
+    /// redirects).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// A copy of this document with `dom` swapped in (the wave-2b
+    /// integration re-syncs the `Document` from the host's live
+    /// `Dom` after scripts have mutated it).
+    pub fn with_dom(&self, dom: Dom) -> Document {
+        let mut doc = self.clone();
+        doc.dom = dom;
+        doc
+    }
+
+    /// A document from its parts (the JS host builds the document
+    /// the layout actor should lay out from the live `Dom`).
+    pub fn from_parts(dom: Dom, sheet: Stylesheet, base_url: &str) -> Document {
+        Document {
+            dom,
+            sheet,
+            base_url: base_url.to_string(),
+            defer_scripts: Vec::new(),
+            async_scripts: Vec::new(),
+            held_scripts: Vec::new(),
+        }
+    }
 }
 
 /// One script the streaming parse held: fetched bytes for an external
@@ -239,6 +272,70 @@ fn map_html_priority(p: HtmlPriority) -> Priority {
     }
 }
 
+/// The script-execution seams `StreamingLoad` calls into (wave 2b,
+/// Stage 7 Rec 6): the integration wave's runner implements this
+/// trait, and the load path calls it at each seam — a parser-blocking
+/// pause, an async script becoming ready, an encoding restart
+/// swapping the parser, and the end of the parse (defer drain +
+/// `DOMContentLoaded`). Nothing here executes JavaScript; the trait
+/// is the boundary between the parser (which knows *when* a script
+/// runs) and the engine (which knows *how*).
+///
+/// All methods are synchronous and run on the tab thread (the
+/// thread that owns the parser and the `TabJs`); the runner may
+/// drive the event loop from them.
+pub trait ScriptHooks {
+    /// A parser-blocking `<script>` paused the parse. `bytes` is
+    /// its fetched source (external) or its element text (inline);
+    /// the parser resumes when this returns. Async because execution
+    /// is delegated to the tab thread's main loop (the load runs as
+    /// a `spawn_local` task and cannot borrow the `TabJs` — see
+    /// `js_host::LoadHooks`). Boxed futures, not `async fn`: the
+    /// trait is used behind `Box<dyn ScriptHooks>`, and `async fn`
+    /// methods are not dyn-compatible.
+    fn paused_script<'a>(
+        &'a mut self,
+        parser: &'a std::rc::Rc<std::cell::RefCell<Parser>>,
+        paused: &'a pluto_html::ScriptPaused,
+        bytes: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>;
+
+    /// Async scripts whose fetches just completed, in arrival
+    /// order. `bytes_by_src` is the load's fetched-bytes cache.
+    fn async_ready<'a>(
+        &'a mut self,
+        parser: &'a std::rc::Rc<std::cell::RefCell<Parser>>,
+        ready: Vec<pluto_html::QueuedScript>,
+        bytes_by_src: &'a HashMap<String, Vec<u8>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>;
+
+    /// The load created the parser for this navigation (after the
+    /// fetch, so it carries the final URL): the runner must attach
+    /// the host to its shared `Dom` before the first chunk is fed,
+    /// or scripts see an empty document and `parse_finished` would
+    /// re-sync the finished document from that empty arena. The
+    /// load creates the parser — not the caller — because only the
+    /// load knows the final URL; the runner's own parser handle is
+    /// set here, never constructed separately (a second parser
+    /// would be fed nothing and its `Dom` would stay empty).
+    fn parser_created(&mut self, _parser: &std::rc::Rc<std::cell::RefCell<Parser>>) {}
+
+    /// An encoding restart replaced the parser (and its arena) with
+    /// a fresh one: the runner must re-point the host at it.
+    fn parser_restarted(&mut self, parser: &std::rc::Rc<std::cell::RefCell<Parser>>);
+
+    /// The parse finished: drain the defer queue in document order
+    /// from `document`, then fire `DOMContentLoaded`, then return
+    /// the document re-synced from the host's live `Dom` (JS
+    /// mutations made during the parse / defer drain live there).
+    /// By value in both directions so the load task can hand the
+    /// document to the tab thread's main loop and get it back.
+    fn parse_finished<'a>(
+        &'a mut self,
+        document: Document,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Document> + 'a>>;
+}
+
 /// Fetch `url` (owned, so the future is `'static` for `Task::perform`)
 /// and stream-parse the HTML. Layout happens separately in
 /// [`layout_document_with_state`], at the shell's current viewport, so a resize
@@ -260,10 +357,16 @@ fn map_html_priority(p: HtmlPriority) -> Priority {
 ///
 /// Logs each stage to stderr: the terminal is the only window into a
 /// load that stalls (no logging framework is wired up yet).
-pub async fn load_page_cancellable(
+/// Load a page, with an optional [`ScriptHooks`] runner attached:
+/// parser-blocking scripts execute at their pause, async scripts on
+/// arrival, defer scripts after the parse, and `DOMContentLoaded`
+/// fires once the defer queue drains. `None` keeps the old
+/// behaviour (scripts fetched and held, never executed).
+pub async fn load_page_cancellable_with_hooks(
     loader: &ResourceLoader,
     url: String,
     cancel: CancellationToken,
+    mut hooks: Option<Box<dyn ScriptHooks + '_>>,
 ) -> Result<(Document, String), String> {
     let request = ResourceRequest::navigate(next_request_id(), 0, 0, &url);
     eprintln!("[pluto] fetching {url}");
@@ -286,7 +389,18 @@ pub async fn load_page_cancellable(
     // network streaming (feed chunks as they arrive) is the
     // follow-up — see the module docs.
     fire_preloads(loader, &response.body, &final_url, cancel.clone());
-    let mut load = StreamingLoad::new(loader, cancel.clone(), final_url.clone());
+    // Wave 2b: the parser lives in an `Rc<RefCell>` so the script
+    // runner (via the host) can reach its `DocumentWriter` while
+    // the load drives it.
+    let parser = std::rc::Rc::new(std::cell::RefCell::new(Parser::with_document_url(
+        &final_url,
+    )));
+    // The runner attaches the host to this parser's shared `Dom`
+    // before the first chunk is fed (see `parser_created`).
+    if let Some(hooks) = hooks.as_mut() {
+        hooks.parser_created(&parser);
+    }
+    let mut load = StreamingLoad::new(loader, cancel.clone(), final_url.clone(), parser, hooks);
     for chunk in response.body.chunks(FEED_CHUNK_BYTES) {
         if cancel.is_cancelled() {
             return Err("navigation cancelled".to_string());
@@ -296,7 +410,14 @@ pub async fn load_page_cancellable(
     if cancel.is_cancelled() {
         return Err("navigation cancelled".to_string());
     }
-    let document = load.finish_document();
+    let mut hooks = load.take_hooks();
+    let mut document = load.finish_document();
+    // Wave 2b: with hooks attached, the defer drain +
+    // `DOMContentLoaded` happen here (scripts execute; the old
+    // "held, never executed" log below only applies without hooks).
+    if let Some(hooks) = hooks.as_mut() {
+        document = hooks.parse_finished(document).await;
+    }
     // Stage 7 reads these: the parse held the scripts (fetched,
     // never executed) and queued defer/async in document order.
     // Logged, not executed — there is no JS engine yet.
@@ -350,11 +471,17 @@ fn fire_preloads(
 /// The streaming load's mutable state: the parser, the caches that
 /// survive an encoding restart (so nothing is refetched), and the
 /// render-blocking deadline.
-struct StreamingLoad<'a> {
+struct StreamingLoad<'a, 'h> {
     loader: &'a ResourceLoader,
     cancel: CancellationToken,
     base_url: String,
-    parser: Parser,
+    /// The parser, shared with the script runner (via the host) so
+    /// a parser-blocking script's execution can raise the
+    /// `DocumentWriter` nesting level and `document.write` can
+    /// splice into the tokenizer.
+    parser: std::rc::Rc<std::cell::RefCell<Parser>>,
+    /// The script runner (wave 2b), if JS is attached to this load.
+    hooks: Option<Box<dyn ScriptHooks + 'h>>,
     /// Fetched stylesheet text by absolute URL (includes `@import`
     /// targets, fetched recursively when their parent sheet loaded).
     sheet_cache: HashMap<String, String>,
@@ -373,13 +500,20 @@ struct StreamingLoad<'a> {
     encoding_logged: bool,
 }
 
-impl<'a> StreamingLoad<'a> {
-    fn new(loader: &'a ResourceLoader, cancel: CancellationToken, base_url: String) -> Self {
+impl<'a, 'h> StreamingLoad<'a, 'h> {
+    fn new(
+        loader: &'a ResourceLoader,
+        cancel: CancellationToken,
+        base_url: String,
+        parser: std::rc::Rc<std::cell::RefCell<Parser>>,
+        hooks: Option<Box<dyn ScriptHooks + 'h>>,
+    ) -> Self {
         Self {
             loader,
             cancel,
             base_url: base_url.clone(),
-            parser: Parser::with_document_url(&base_url),
+            parser,
+            hooks,
             sheet_cache: HashMap::new(),
             sheet_attempted: HashSet::new(),
             script_bytes: HashMap::new(),
@@ -388,6 +522,13 @@ impl<'a> StreamingLoad<'a> {
             restarted: false,
             encoding_logged: false,
         }
+    }
+
+    /// Take the script hooks out (called before `finish_document`
+    /// consumes the load, so the caller can drain the defer queue
+    /// from the finished document).
+    fn take_hooks(&mut self) -> Option<Box<dyn ScriptHooks + 'h>> {
+        self.hooks.take()
     }
 
     /// Feed one chunk and handle every event it surfaces, resuming
@@ -406,7 +547,7 @@ impl<'a> StreamingLoad<'a> {
                 if self.cancel.is_cancelled() {
                     return Err("navigation cancelled".to_string());
                 }
-                let events = self.parser.feed(&bytes);
+                let events = self.parser.borrow_mut().feed(&bytes);
                 let mut resume = false;
                 for event in events {
                     match event {
@@ -414,32 +555,104 @@ impl<'a> StreamingLoad<'a> {
                             self.fetch_stylesheet(&href).await;
                         }
                         DomEvent::ResourceDiscovered(found) => {
-                            // Scripts are fetched + held (async/defer, and
+                            // Scripts are fetched (async/defer, and
                             // classic ones the pause below also reports).
                             // Everything else the preload scanner already
                             // fired off; the scheduler dedups the rest.
+                            // Wave 2b: an async script whose fetch just
+                            // completed becomes ready and executes now
+                            // (arrival order — the queue ordered it).
                             if found.destination == HtmlDestination::Script
                                 && !found.url.trim_start().starts_with("data:")
                             {
                                 self.fetch_script(&found.url, Priority::Medium).await;
+                                if let Some(hooks) = self.hooks.as_mut() {
+                                    let ready = self
+                                        .parser
+                                        .borrow_mut()
+                                        .async_queue_mut()
+                                        .mark_ready_by_src(&found.url);
+                                    if !ready.is_empty() {
+                                        hooks
+                                            .async_ready(
+                                                &self.parser,
+                                                ready,
+                                                &self.script_bytes,
+                                            )
+                                            .await;
+                                    }
+                                }
                             }
                         }
                         DomEvent::ScriptPaused(paused) => {
                             self.paused_scripts.push(paused.script);
+                            let mut bytes = Vec::new();
                             if let Some(src) = &paused.src
                                 && !src.trim_start().starts_with("data:")
                             {
                                 self.fetch_script(src, Priority::High).await;
+                                bytes = self
+                                    .script_bytes
+                                    .get(src)
+                                    .cloned()
+                                    .unwrap_or_default();
+                            } else if paused.src.is_none() {
+                                // Inline script: read its text from the
+                                // live Dom (the parser is paused at it,
+                                // so the element is complete).
+                                let dom = self.parser.borrow().shared_dom();
+                                let dom = dom.lock().unwrap();
+                                bytes = script_text(&dom, paused.script).into_bytes();
                             }
-                            // Inline scripts hold nothing to fetch; the
-                            // pause still ends here and parsing resumes.
+                            // Stylesheet gate (Rec 6): a
+                            // parser-blocking script must wait for
+                            // pending stylesheets. Sheets the parser
+                            // discovered are resolved by `drive` itself
+                            // (see `fetch_stylesheet`'s gate notes),
+                            // so the gate is normally clear here; a
+                            // sheet only the preload scanner knows
+                            // about can still hold it — wait a bounded
+                            // 500 ms, then execute and log (documented
+                            // gap in `pluto-html/src/scripts.rs`).
+                            if self.parser.borrow().stylesheets_pending() {
+                                let deadline =
+                                    tokio::time::Instant::now() + Duration::from_millis(500);
+                                while self.parser.borrow().stylesheets_pending()
+                                    && tokio::time::Instant::now() < deadline
+                                {
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                }
+                                if self.parser.borrow().stylesheets_pending() {
+                                    eprintln!(
+                                        "[pluto] stylesheet gate still pending at script pause; executing anyway"
+                                    );
+                                }
+                            }
+                            // Wave 2b: execute at the pause (or skip
+                            // a failed external script — empty bytes
+                            // under a `src`); without hooks the old
+                            // behaviour holds (scripts fetched and
+                            // held, never executed).
+                            if let Some(hooks) = self.hooks.as_mut() {
+                                let failed = paused.src.is_some() && bytes.is_empty();
+                                if !failed {
+                                    hooks
+                                        .paused_script(&self.parser, &paused, &bytes)
+                                        .await;
+                                }
+                            }
                             resume = true;
                         }
                         DomEvent::EncodingIndicator { label }
                             if self.maybe_restart(&label) =>
                         {
-                            input = self.parser.buffered_prefix().to_vec();
-                            self.parser = Parser::with_document_url(&self.base_url);
+                            let prefix = self.parser.borrow().buffered_prefix().to_vec();
+                            *self.parser.borrow_mut() =
+                                Parser::with_document_url(&self.base_url);
+                            if let Some(hooks) = self.hooks.as_mut() {
+                                hooks.parser_restarted(&self.parser);
+                            }
+                            input = prefix;
                             continue 'outer;
                         }
                         _ => {}
@@ -482,8 +695,14 @@ impl<'a> StreamingLoad<'a> {
                 .fetch_text(&url, Destination::Stylesheet, Priority::High)
                 .await
             else {
+                // Wave 2b: a failed / timed-out sheet no longer
+                // blocks parser-blocking scripts.
+                self.parser.borrow_mut().note_stylesheet_failed(&url);
                 continue;
             };
+            // Wave 2b: feed the parser's stylesheet gate — a
+            // parser-blocking script waits on this.
+            self.parser.borrow_mut().note_stylesheet_loaded(&url);
             let sheet = Stylesheet::parse(&text);
             for import in sheet.imports.iter().rev() {
                 if import.url.trim_start().starts_with("data:") {
@@ -569,9 +788,9 @@ impl<'a> StreamingLoad<'a> {
     /// — merged sheet from the finished DOM's style sources in
     /// document order (imports expanded from the fetch cache), plus
     /// the held scripts matched to their nodes.
-    fn finish_document(mut self) -> Document {
+    fn finish_document(self) -> Document {
         let parser = std::mem::replace(
-            &mut self.parser,
+            &mut *self.parser.borrow_mut(),
             Parser::with_document_url(&self.base_url),
         );
         let parsed = parser.finish();
@@ -635,7 +854,7 @@ fn held_scripts(
 }
 
 /// The text content of a `<script>` element (its inline source).
-fn script_text(dom: &Dom, id: NodeId) -> String {
+pub(crate) fn script_text(dom: &Dom, id: NodeId) -> String {
     let mut text = String::new();
     for &child in dom.children(id) {
         if let Some(t) = dom.text(child) {
@@ -1195,7 +1414,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{}/", addr.port());
         let loader = ResourceLoader::new();
         let (doc, final_url) =
-            load_page_cancellable(&loader, url.clone(), CancellationToken::new())
+            load_page_cancellable_with_hooks(&loader, url.clone(), CancellationToken::new(), None)
                 .await
                 .expect("page loads");
         assert_eq!(final_url, url);
@@ -1217,10 +1436,11 @@ mod tests {
     async fn load_page_invalid_url_errors() {
         let loader = ResourceLoader::new();
         assert!(
-            load_page_cancellable(
+            load_page_cancellable_with_hooks(
                 &loader,
                 "ftp://example.com/".to_string(),
-                CancellationToken::new()
+                CancellationToken::new(),
+                None,
             )
             .await
             .is_err()
@@ -1305,7 +1525,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{}/", addr.port());
         let loader = ResourceLoader::new();
         let (doc, _final_url) =
-            load_page_cancellable(&loader, url.clone(), CancellationToken::new())
+            load_page_cancellable_with_hooks(&loader, url.clone(), CancellationToken::new(), None)
                 .await
                 .expect("page loads");
         assert_eq!(doc.base_url, url);
@@ -1388,7 +1608,7 @@ mod tests {
         });
         let url = format!("http://127.0.0.1:{}/", addr.port());
         let loader = ResourceLoader::new();
-        let (doc, _) = load_page_cancellable(&loader, url, CancellationToken::new())
+        let (doc, _) = load_page_cancellable_with_hooks(&loader, url, CancellationToken::new(), None)
             .await
             .expect("page loads");
         // Both paragraphs rendered (the parser resumed past the
@@ -1453,7 +1673,7 @@ mod tests {
         });
         let url = format!("http://127.0.0.1:{}/", addr.port());
         let loader = ResourceLoader::new();
-        let (doc, _) = load_page_cancellable(&loader, url, CancellationToken::new())
+        let (doc, _) = load_page_cancellable_with_hooks(&loader, url, CancellationToken::new(), None)
             .await
             .expect("page loads despite the missing sheet");
         let display = layout_for(&doc, (800.0, 600.0));

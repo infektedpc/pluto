@@ -1,4 +1,5 @@
 mod compositor;
+mod js_host;
 mod page;
 mod renderer;
 mod viewport;

@@ -16,3 +16,4 @@ pluto-html.workspace = true
 pluto-css.workspace = true
 pluto-layout.workspace = true
 pluto-ipc.workspace = true
+pluto-js.workspace = true

@@ -192,6 +192,46 @@ impl Tokenizer {
         self.eof && self.pos >= self.input.len() && self.queued.is_empty()
     }
 
+    /// Current read position in the input buffer (index of the next
+    /// unconsumed character). The parser's insertion point at a
+    /// script pause: everything from here on is still network input
+    /// that has not been tokenised yet.
+    pub fn input_pos(&self) -> usize {
+        self.pos
+    }
+
+    /// Insert `text` into the input buffer at char index `at`
+    /// (clamped to the buffer end), ahead of any buffered input
+    /// not yet consumed. This is the `document.write` insertion
+    /// point: written markup is tokenised before the network bytes
+    /// that follow it. Returns the number of characters inserted
+    /// after input-stream normalisation (CRLF / CR → LF, as in
+    /// [`Tokenizer::feed_str`]).
+    ///
+    /// Caveat: a trailing CR in `text` normalises to LF at once,
+    /// so a CRLF split with its LF already sitting in the network
+    /// buffer would yield two newlines instead of one — a
+    /// pathological `document.write` ending in a bare CR.
+    pub fn insert_chars_at(&mut self, at: usize, text: &str) -> usize {
+        let mut chars = text.chars().peekable();
+        let mut norm = String::new();
+        while let Some(c) = chars.next() {
+            if c == '\r' {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                norm.push('\n');
+            } else {
+                norm.push(c);
+            }
+        }
+        let at = at.min(self.input.len());
+        let inserted: Vec<char> = norm.chars().collect();
+        let n = inserted.len();
+        self.input.splice(at..at, inserted);
+        n
+    }
+
     /// Seed the content model for a fragment parse from the
     /// context element's tag (spec: the tokenizer starts in the
     /// context element's content model, e.g. RCDATA for <title>).
