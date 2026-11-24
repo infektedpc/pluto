@@ -1,0 +1,130 @@
+# Pluto CI — test, lint, and docs on every push and pull request.
+#
+# The test job is the same gate used locally: `cargo test --workspace`.
+# Tests are headless (no GPU needed); the sandbox has no Vulkan ICDs
+# and the suite passes there, so it passes on a stock runner too.
+#
+# System libraries mirror the -dev set the workspace is known to
+# build against (Ubuntu 24.04): if a build error names a missing
+# library, add its -dev package to the apt list below.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push cancels the run before it: snapshot pushes come in
+# bursts and only the newest tree needs checking.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: cargo test --workspace
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.99
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99"
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shm0-dev \
+            libfontconfig-dev \
+            libfreetype-dev \
+            libssl-dev \
+            libudev-dev \
+            libasound2-dev \
+            libegl1-mesa-dev
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Run the full test suite
+        run: cargo test --workspace
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # Advisory for now, not blocking: the tree has 109 pre-existing
+    # warnings (pluto-html 74, pluto-layout 19, pluto-paint 16) plus
+    # one approx-const error in pluto-paint (renderer.rs, SQRT_2
+    # literal). A cleanup round fixes those, then this flips to
+    # blocking (`-D warnings` without continue-on-error). Do not
+    # flip it before the cleanup lands — it would go red on day one.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.99 with clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99"
+          components: clippy
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shm0-dev \
+            libfontconfig-dev \
+            libfreetype-dev \
+            libssl-dev \
+            libudev-dev \
+            libasound2-dev \
+            libegl1-mesa-dev
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Lint the workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  docs:
+    name: cargo doc
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.99
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99"
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shm0-dev \
+            libfontconfig-dev \
+            libfreetype-dev \
+            libssl-dev \
+            libudev-dev \
+            libasound2-dev \
+            libegl1-mesa-dev
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build API docs
+        run: cargo doc --workspace --no-deps
