@@ -67,7 +67,7 @@ impl Program<crate::Message> for WebViewport {
         state: &mut Self::State,
         event: &cosmic::iced::Event,
         bounds: Rectangle,
-        _cursor: mouse::Cursor,
+        cursor: mouse::Cursor,
     ) -> Option<shader::Action<crate::Message>> {
         if let cosmic::iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) = event {
             // A line is ~16px; pixel deltas pass through as-is.
@@ -76,6 +76,19 @@ impl Program<crate::Message> for WebViewport {
                 mouse::ScrollDelta::Pixels { x, y } => (*x, *y),
             };
             return Some(shader::Action::publish(crate::Message::Scrolled(dx, dy)));
+        }
+        // A left click publishes widget coordinates; the shell adds
+        // the scroll offset and forwards page coordinates to the
+        // worker, which hit-tests the retained layout tree (R15).
+        // Other buttons and releases are ignored by the page.
+        if let cosmic::iced::Event::Mouse(mouse::Event::ButtonPressed(button)) = event
+            && *button == mouse::Button::Left
+            && let Some(pos) = cursor.position()
+        {
+            return Some(shader::Action::publish(crate::Message::Clicked {
+                x: pos.x - bounds.x,
+                y: pos.y - bounds.y,
+            }));
         }
         let size = (bounds.width, bounds.height);
         if state.last_reported != Some(size) {

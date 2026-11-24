@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-winnow.workspace = true
 slotmap.workspace = true
 thiserror.workspace = true
+html5ever.workspace = true
+url.workspace = true

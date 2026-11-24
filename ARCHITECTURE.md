@@ -82,6 +82,38 @@ Go pressed
   (M5-ish; prerender deferred entirely), CSP + native content
   blocker (M10), H3/DoH/0-RTT (post-M5, feature-gated, only after
   measurement).
+- Stage 6 application (integration, applied 2026-11-24): html5ever
+  adoption — the tree-construction machine + tokenizer now come from
+  html5ever 0.40.1 (Servo-origin), adopted because the spike showed a
+  clean `TreeSink` mapping onto the slotmap `Dom` and a 1942/1973
+  html5lib-tests corpus pass; Pluto keeps its `Dom`, sink, streaming
+  driver, preload scanner, and everything downstream. This was within
+  the "apply the Stage 6 recommendations" approval, which included
+  R1's adopt-if-clean condition. Streaming parser (`feed` ->
+  `DomEvent`s, pause-at-script, encoding-restart buffering) drives
+  the worker load path; the preload scanner fires subresource fetches
+  (the Stage 5 scheduler dedups them); external `<link
+  rel="stylesheet">` + `@import` (serial, resolved against the
+  importing sheet, inserted in place, layer preserved) with
+  render-blocking (5 s total timeout — a failed or timed-out sheet is
+  skipped, never fatal) and full restyle on arrival; `media=""`
+  honoured as a condition evaluated at layout time; minimal session
+  history in the shell (back/forward stack; address-bar navigation
+  and link clicks push entries); click hit-testing against the
+  retained `LayoutTree` with `<a href>` navigation (new epoch, Stage
+  5 cancellation); nested scroll containers scroll via
+  `set_scroll_offset` + re-collect (no re-layout); dirty bits live on
+  DOM nodes (Double Dirty Bit data) and in `NodeStyle` hint/damage.
+  Deferred: true network streaming (feed chunks as they arrive — the
+  M2 simplification scans the whole fetched body post-fetch),
+  honouring non-UTF-8 encodings (needs an encoding crate), `:visited`
+  (no visited set in `ElementState` yet — that field lives in
+  pluto-layout), `:hover` restyle (no hover variant in the IPC
+  `InputEvent` — adding one is a protocol change), a cursor position
+  on wheel events for multi-container scroll targeting, scissor /
+  Stage 8 paint for clip (the renderer ignores `PushClip`/`PopClip`
+  for now), Spineless Traversal (later swap), CORS (M5), CSP (M10),
+  H3/DoH/0-RTT (post-M5).
 
 ## Roadmap (Joel, 2026-11-23 — replaces the scratched vertical-slice plan)
 

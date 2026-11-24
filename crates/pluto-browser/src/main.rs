@@ -7,7 +7,7 @@ use compositor::Compositor;
 use cosmic::app::{Core, Task};
 use cosmic::iced::{Alignment, Length};
 use cosmic::{Application, Element, executor, widget};
-use pluto_ipc::{BrowserToRenderer, CommandSender, RendererToBrowser};
+use pluto_ipc::{BrowserToRenderer, CommandSender, InputEvent, RendererToBrowser};
 use pluto_paint::DisplayList;
 use std::sync::Arc;
 use viewport::WebViewport;
@@ -31,6 +31,17 @@ pub struct PlutoBrowser {
     /// A navigation that arrived before the worker started (the
     /// first load), flushed on `RendererReady`.
     pending_url: Option<String>,
+    /// Minimal session history (R17): every committed URL, in order,
+    /// plus the index of the current entry. Address-bar navigation
+    /// and link clicks push entries (in `DidCommit`); Back/Forward
+    /// move the index and navigate with `history_nav` set, so the
+    /// commit they cause does not push a duplicate. `:visited` reads
+    /// this in a later stage — the matcher still answers false until
+    /// the visited set is threaded into `ElementState` (see
+    /// renderer.rs).
+    history: Vec<String>,
+    history_index: usize,
+    history_nav: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +60,10 @@ pub enum Message {
     ViewportResized(f32, f32),
     /// A wheel event in the viewport, in pixels.
     Scrolled(f32, f32),
+    /// A left click in the viewport, in widget coordinates (the page
+    /// area's top-left is the origin; the shell adds the scroll
+    /// offset before forwarding it to the worker as page coords).
+    Clicked { x: f32, y: f32 },
 }
 
 impl PlutoBrowser {
@@ -132,6 +147,9 @@ impl Application for PlutoBrowser {
             viewport: page::DEFAULT_VIEWPORT,
             renderer_tx: None,
             pending_url: Some(url),
+            history: Vec::new(),
+            history_index: 0,
+            history_nav: false,
         };
         (app, Task::none())
     }
@@ -170,8 +188,23 @@ impl Application for PlutoBrowser {
                 RendererToBrowser::DidCommit { url, status } => {
                     eprintln!("[pluto] page loaded: {url}");
                     self.active_url = url.clone();
-                    self.url_input = url;
+                    self.url_input = url.clone();
                     self.status = status;
+                    // History (R17): a back/forward commit only
+                    // moves the index (already done in Back/Forward);
+                    // any other commit — address bar, reload, link
+                    // click — pushes a new entry after truncating
+                    // the forward entries, unless it is the entry
+                    // we are already on (a reload).
+                    if self.history_nav {
+                        self.history_nav = false;
+                    } else if self.history.is_empty()
+                        || self.history[self.history_index] != url
+                    {
+                        self.history.truncate(self.history_index + 1);
+                        self.history.push(url);
+                        self.history_index = self.history.len() - 1;
+                    }
                 }
                 RendererToBrowser::SubmitDisplayList {
                     epoch,
@@ -254,10 +287,38 @@ impl Application for PlutoBrowser {
             Message::Scrolled(dx, dy) => {
                 // Wheel scrolling never touches layout: the holder
                 // stores the offset and the renderer subtracts it.
+                // The worker gets the same event for nested scroll
+                // containers (R14/R15 shell side); the viewport
+                // scroll above is the root/body propagation.
                 self.compositor.scroll_by(dx, dy);
+                self.send_command(BrowserToRenderer::InputEvent(
+                    InputEvent::WheelScrolled { dx, dy },
+                ));
             }
-            Message::Back | Message::Forward => {
-                // History lands in M2; no-op for now.
+            Message::Clicked { x, y } => {
+                // Widget coords -> page coords: add the viewport
+                // scroll offset, then let the worker hit-test.
+                let (sx, sy) = self.compositor.scroll();
+                self.send_command(BrowserToRenderer::InputEvent(InputEvent::Click {
+                    x: x + sx,
+                    y: y + sy,
+                }));
+            }
+            Message::Back => {
+                if self.history_index > 0 {
+                    self.history_index -= 1;
+                    self.history_nav = true;
+                    let url = self.history[self.history_index].clone();
+                    self.commit(url);
+                }
+            }
+            Message::Forward => {
+                if self.history_index + 1 < self.history.len() {
+                    self.history_index += 1;
+                    self.history_nav = true;
+                    let url = self.history[self.history_index].clone();
+                    self.commit(url);
+                }
             }
         }
         Task::none()

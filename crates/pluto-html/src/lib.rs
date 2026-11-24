@@ -1,28 +1,87 @@
-//! Parsing & DOM (layer 3): winnow HTML parser + arena DOM.
+//! Parsing & DOM (layer 3): WHATWG HTML tree construction over a
+//! slotmap arena DOM.
 //!
-//! The DOM lives in a slotmap arena. Nodes are addressed by `NodeId`
+//! # Scope flag — html5ever is adopted, not re-implemented
+//!
+//! The tree-construction machine itself — insertion modes, open-element
+//! stack, active formatting elements, adoption agency, foster
+//! parenting, implied end tags, quirks flag, raw-text/RCDATA handling —
+//! comes from **html5ever 0.40.1** (Servo-origin), driven through the
+//! [`sink::PlutoSink`] `TreeSink` in [`sink`]. The winnow tokenizer
+//! that used to live here has left the parse path entirely. What stays
+//! Pluto's: the slotmap [`Dom`], the sink, the streaming driver in
+//! [`streaming`] (feed / pause-at-script / encoding-restart), the
+//! preload scanner in [`scanner`], and everything downstream (CSS,
+//! layout, paint). See the spike report
+//! (`~/workspace/pluto-spike/SPIKE.md`): 1942/1973 vendored
+//! html5lib-tests tree-construction tests pass through this sink; the
+//! known misses are upstream html5ever divergences, not sink gaps.
+//!
+//! The DOM lives in a slotmap arena. Nodes are addressed by [`NodeId`]
 //! handles, never `Rc<RefCell<T>>`, so there are no reference cycles and
 //! the JS layer can hold a `NodeId` across a re-layout without keeping
-//! the node itself alive.
+//! the node itself alive. `Dom` is `Send + Sync` (there is a
+//! compile-time assertion for this in `pluto-layout`'s tests — do not
+//! break it: no `Rc`/`RefCell` in `Dom`, no `!Send` fields).
 //!
-//! M1 scope: tags `html head body div h1-h6 p span a style` (plus void
-//! elements `br img meta link input hr` and anything else spelled like a
-//! tag), attributes, text with entity decoding, comments and doctype
-//! skipped, `style`/`script` as raw text. The parser is lenient like a
-//! browser: a stray `<`, a mismatched close tag, or an unclosed element
-//! never fails the parse — the input is recovered as text or ignored.
-//! Full WHATWG tree construction (adoption agency, foster parenting,
-//! implied closes) is M7.
+//! # Parser privilege
+//!
+//! Parsing never fires mutation observers. The public mutators below
+//! record a [`MutationRecord`] and mark Double Dirty Bit flags —
+//! except while a parse is in progress, when the sink suppresses
+//! recording (see [`Dom::set_suppress_records`]). The tree surgery is
+//! the same single code path either way; only the recording wrapper is
+//! skipped, per spec ("DOM mutation events must not fire for changes
+//! caused by the UA parsing the document").
+//!
+//! # Entities
+//!
+//! Entity decoding is html5ever's job, not Pluto's. Its tokenizer
+//! (`tokenizer/char_ref`) decodes named references against
+//! `web_atoms::NAMED_ENTITIES` — a perfect-hash map generated from the
+//! WHATWG `entities.json` (re-exported via `markup5ever::data`) — and
+//! its numeric-reference path maps surrogates, `0x00`, and values
+//! `> U+10FFFF` to U+FFFD (with the spec's C1 replacements for
+//! `0x80..=0x9F`). Pluto keeps no entity table and asserts no count.
+//! The old hand-written [`decode_entities`] helper was removed with the
+//! winnow tokenizer: attribute values and text now arrive decoded from
+//! the tokenizer, and re-decoding them would double-decode `&amp;`.
 
+pub mod scanner;
+pub mod sink;
+pub mod streaming;
+
+use std::collections::HashSet;
+
+use html5ever::driver::ParseOpts;
+use html5ever::interface::tree_builder::{ElementFlags, TreeSink};
+use html5ever::tendril::TendrilSink;
+use html5ever::{LocalName, QualName, ns};
+use sink::{ParseOutput, PlutoSink};
 use slotmap::{SlotMap, new_key_type};
-use winnow::Parser;
-use winnow::error::ContextError;
-use winnow::stream::ContainsToken;
-use winnow::token::{literal, take_while};
+
+pub use scanner::{Destination, DiscoveredResource, Priority, resolve_url, scan};
+pub use sink::DomEvent;
+pub use streaming::{Parser, ParsedStream, ScriptPaused};
 
 new_key_type! {
     /// Handle to a node in the [`Dom`] arena.
     pub struct NodeId;
+}
+
+/// Quirks mode of a document, decided by the DOCTYPE (or its absence)
+/// during tree construction. Constrains selector matching (class/id
+/// matching is ASCII-case-insensitive in quirks mode) and CSS box
+/// behaviour later; almost nothing reads it yet in M2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuirksMode {
+    /// Conforming DOCTYPE.
+    #[default]
+    NoQuirks,
+    /// No DOCTYPE, or a non-conforming one.
+    Quirks,
+    /// Transitional DOCTYPEs (e.g. HTML 4.01 Transitional).
+    LimitedQuirks,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,17 +89,45 @@ pub enum NodeKind {
     Document,
     Element { tag: String },
     Text(String),
+    Comment(String),
+    Doctype {
+        name: String,
+        public_id: String,
+        system_id: String,
+    },
+    ProcessingInstruction {
+        target: String,
+        data: String,
+    },
+}
+
+/// Double Dirty Bit flags on one node: `*_self` marks the node itself
+/// dirty, `*_subtree` is the summary bit set on all ancestors of a
+/// dirty node, so a traversal can skip entire clean subtrees. Style
+/// and layout have separate pairs; the style/layout passes clear them
+/// (see [`Dom::clear_dirty`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DirtyFlags {
+    pub style_self: bool,
+    pub style_subtree: bool,
+    pub layout_self: bool,
+    pub layout_subtree: bool,
 }
 
 /// A node in the arena. Children are `NodeId`s; the parent link makes
-/// upward walks (style matching, event bubbling) cheap.
+/// upward walks (style matching, event bubbling) cheap. The node stays
+/// small on purpose: auxiliary per-node data (computed style, selector
+/// flags, …) belongs in a `SparseSecondaryMap` owned by the consumer,
+/// not here.
 #[derive(Debug, Clone)]
 pub struct Node {
     pub kind: NodeKind,
     pub parent: Option<NodeId>,
     pub children: Vec<NodeId>,
-    /// Attributes in source order; duplicate names keep the first value.
+    /// Attributes in source order; duplicate names keep the first value
+    /// (a *parse* rule — see [`Dom::set_attribute`], which replaces).
     pub attrs: Vec<(String, String)>,
+    pub dirty: DirtyFlags,
 }
 
 impl Node {
@@ -67,6 +154,79 @@ impl Node {
             _ => None,
         }
     }
+
+    /// Comment text, or `None` for non-comment nodes.
+    pub fn comment(&self) -> Option<&str> {
+        match &self.kind {
+            NodeKind::Comment(data) => Some(data.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// What changed, for one mutation. Style invalidation needs the
+/// *before* state (an element that no longer matches a rule after the
+/// change may still have matched it before — invalidating on the
+/// post-change match alone misses it), so attribute/structure changes
+/// carry a snapshot of the affected node's old class/id/attributes.
+#[derive(Debug, Clone)]
+pub struct MutationRecord {
+    pub node: NodeId,
+    pub kind: MutationKind,
+    pub before: Option<BeforeSnapshot>,
+}
+
+/// The pre-mutation state of the affected node.
+#[derive(Debug, Clone, Default)]
+pub struct BeforeSnapshot {
+    pub class: Option<String>,
+    pub id: Option<String>,
+    pub attrs: Vec<(String, String)>,
+}
+
+impl BeforeSnapshot {
+    fn capture(dom: &Dom, node: NodeId) -> BeforeSnapshot {
+        match dom.get(node) {
+            Some(n) => BeforeSnapshot {
+                class: n.attr("class").map(|s| s.to_string()),
+                id: n.attr("id").map(|s| s.to_string()),
+                attrs: n.attrs.clone(),
+            },
+            None => BeforeSnapshot::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum MutationKind {
+    ChildInserted { parent: NodeId },
+    ChildRemoved { parent: NodeId },
+    ChildReplaced { parent: NodeId },
+    ChildrenReparented { from: NodeId, to: NodeId },
+    AttributeChanged { name: String },
+    AttributeRemoved { name: String },
+    CharacterDataChanged,
+}
+
+/// The explicit dirty set (not just bits scanned by walking the
+/// tree): the nodes with `style_self` / `layout_self` set. Keeping the
+/// set alongside the bits is what lets a Spineless Traversal swap in
+/// later without changing every call site.
+#[derive(Debug, Clone, Default)]
+pub struct DirtySet {
+    pub style: HashSet<NodeId>,
+    pub layout: HashSet<NodeId>,
+}
+
+impl DirtySet {
+    pub fn is_empty(&self) -> bool {
+        self.style.is_empty() && self.layout.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.style.clear();
+        self.layout.clear();
+    }
 }
 
 /// The arena-allocated DOM tree for one document.
@@ -74,6 +234,15 @@ impl Node {
 pub struct Dom {
     arena: SlotMap<NodeId, Node>,
     root: Option<NodeId>,
+    quirks_mode: QuirksMode,
+    mutations: Vec<MutationRecord>,
+    dirty: DirtySet,
+    /// Parser privilege: while true, mutators still maintain
+    /// parent/child invariants but skip mutation records and dirty
+    /// bits. Set by the sink for the duration of a parse and cleared
+    /// by [`sink::PlutoSink::finish`]; JS-driven mutations always
+    /// record. This flag is internal state, not a public toggle.
+    suppress_records: bool,
 }
 
 impl Dom {
@@ -85,6 +254,7 @@ impl Dom {
             parent: None,
             children: Vec::new(),
             attrs: Vec::new(),
+            dirty: DirtyFlags::default(),
         });
         dom.root = Some(root);
         dom
@@ -121,6 +291,59 @@ impl Dom {
         self.arena.get(id).and_then(|n| n.attr(name))
     }
 
+    pub fn quirks_mode(&self) -> QuirksMode {
+        self.quirks_mode
+    }
+
+    pub fn set_quirks_mode(&mut self, mode: QuirksMode) {
+        self.quirks_mode = mode;
+    }
+
+    /// The `Doctype` child of the document root, if the document had
+    /// one. (The doctype node itself is also a plain child of the
+    /// root, in document order.)
+    pub fn doctype(&self) -> Option<NodeId> {
+        let root = self.root?;
+        self.children(root).iter().copied().find(|&c| {
+            matches!(self.get(c).map(|n| &n.kind), Some(NodeKind::Doctype { .. }))
+        })
+    }
+
+    /// Mutation records since the last [`Dom::take_mutations`] /
+    /// [`Dom::clear_mutations`]. Empty while a parse is in progress
+    /// (parser privilege — see module docs).
+    pub fn mutations(&self) -> &[MutationRecord] {
+        &self.mutations
+    }
+
+    pub fn take_mutations(&mut self) -> Vec<MutationRecord> {
+        std::mem::take(&mut self.mutations)
+    }
+
+    pub fn clear_mutations(&mut self) {
+        self.mutations.clear();
+    }
+
+    pub fn dirty_set(&self) -> &DirtySet {
+        &self.dirty
+    }
+
+    /// Clear every dirty flag on every node and empty the dirty set.
+    /// Called by the style/layout passes after they have consumed the
+    /// dirty nodes.
+    pub fn clear_dirty(&mut self) {
+        for (_, node) in self.arena.iter_mut() {
+            node.dirty = DirtyFlags::default();
+        }
+        self.dirty.clear();
+    }
+
+    pub(crate) fn set_suppress_records(&mut self, suppress: bool) {
+        self.suppress_records = suppress;
+    }
+
+    // --- node creation (allocation only; no tree mutation, no record) ---
+
     pub fn create_element(&mut self, tag: &str) -> NodeId {
         self.create_element_with_attrs(tag, Vec::new())
     }
@@ -137,6 +360,7 @@ impl Dom {
             parent: None,
             children: Vec::new(),
             attrs,
+            dirty: DirtyFlags::default(),
         })
     }
 
@@ -146,338 +370,353 @@ impl Dom {
             parent: None,
             children: Vec::new(),
             attrs: Vec::new(),
+            dirty: DirtyFlags::default(),
         })
     }
 
-    pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
+    pub fn create_comment(&mut self, data: &str) -> NodeId {
+        self.arena.insert(Node {
+            kind: NodeKind::Comment(data.to_string()),
+            parent: None,
+            children: Vec::new(),
+            attrs: Vec::new(),
+            dirty: DirtyFlags::default(),
+        })
+    }
+
+    pub fn create_doctype(&mut self, name: &str, public_id: &str, system_id: &str) -> NodeId {
+        self.arena.insert(Node {
+            kind: NodeKind::Doctype {
+                name: name.to_string(),
+                public_id: public_id.to_string(),
+                system_id: system_id.to_string(),
+            },
+            parent: None,
+            children: Vec::new(),
+            attrs: Vec::new(),
+            dirty: DirtyFlags::default(),
+        })
+    }
+
+    pub fn create_pi(&mut self, target: &str, data: &str) -> NodeId {
+        self.arena.insert(Node {
+            kind: NodeKind::ProcessingInstruction {
+                target: target.to_string(),
+                data: data.to_string(),
+            },
+            parent: None,
+            children: Vec::new(),
+            attrs: Vec::new(),
+            dirty: DirtyFlags::default(),
+        })
+    }
+
+    /// A bare `Document` node with no parent — used as a `<template>`
+    /// contents holder. It is not the document root.
+    pub fn create_document(&mut self) -> NodeId {
+        self.arena.insert(Node {
+            kind: NodeKind::Document,
+            parent: None,
+            children: Vec::new(),
+            attrs: Vec::new(),
+            dirty: DirtyFlags::default(),
+        })
+    }
+
+    // --- invariant-maintaining core (one path; all mutators go through it) ---
+
+    /// Detach `child` from its current parent, if any. Returns the old
+    /// parent.
+    fn detach(&mut self, child: NodeId) -> Option<NodeId> {
+        let parent = self.arena.get(child).and_then(|n| n.parent);
+        if let Some(parent) = parent {
+            if let Some(p) = self.arena.get_mut(parent) {
+                p.children.retain(|&c| c != child);
+            }
+            if let Some(c) = self.arena.get_mut(child) {
+                c.parent = None;
+            }
+        }
+        parent
+    }
+
+    /// Link `child` under `parent` at `pos` (`None` = append). Detaches
+    /// from any previous parent first, so a node is never listed under
+    /// two parents (adoption-agency moves depend on this).
+    fn link_at(&mut self, parent: NodeId, child: NodeId, pos: Option<usize>) {
+        self.detach(child);
         if let Some(node) = self.arena.get_mut(child) {
             node.parent = Some(parent);
         }
         if let Some(node) = self.arena.get_mut(parent) {
-            node.children.push(child);
+            match pos {
+                Some(p) if p <= node.children.len() => node.children.insert(p, child),
+                _ => node.children.push(child),
+            }
         }
+    }
+
+    /// Record a mutation and mark Double Dirty Bit flags — unless
+    /// recording is suppressed for a parse in progress. M2 marks both
+    /// the style and the layout pair on every mutation (the M2
+    /// invalidation rule is "full restyle on any mutation"); refining
+    /// which pair a mutation kind touches is Stage 7 work.
+    fn note_mutation(&mut self, node: NodeId, kind: MutationKind, before: Option<BeforeSnapshot>) {
+        if self.suppress_records {
+            return;
+        }
+        self.mutations.push(MutationRecord { node, kind, before });
+        if let Some(n) = self.arena.get_mut(node) {
+            n.dirty.style_self = true;
+            n.dirty.layout_self = true;
+        }
+        self.dirty.style.insert(node);
+        self.dirty.layout.insert(node);
+        let mut cur = self.arena.get(node).and_then(|n| n.parent);
+        while let Some(id) = cur {
+            if let Some(n) = self.arena.get_mut(id) {
+                n.dirty.style_subtree = true;
+                n.dirty.layout_subtree = true;
+            }
+            cur = self.arena.get(id).and_then(|n| n.parent);
+        }
+    }
+
+    // --- public mutators (the same path the parser and JS both use) ---
+
+    pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
+        let before = BeforeSnapshot::capture(self, child);
+        self.link_at(parent, child, None);
+        self.note_mutation(child, MutationKind::ChildInserted { parent }, Some(before));
+    }
+
+    /// Insert `child` as a child of `parent` immediately before
+    /// `sibling`. If `sibling` is not a child of `parent`, appends.
+    pub fn insert_before(&mut self, parent: NodeId, sibling: NodeId, child: NodeId) {
+        let before = BeforeSnapshot::capture(self, child);
+        let pos = self
+            .arena
+            .get(parent)
+            .and_then(|n| n.children.iter().position(|&c| c == sibling));
+        self.link_at(parent, child, pos);
+        self.note_mutation(child, MutationKind::ChildInserted { parent }, Some(before));
+    }
+
+    /// Detach `child` from `parent`. (Lenient: detaches wherever the
+    /// child currently lives.)
+    pub fn remove_child(&mut self, parent: NodeId, child: NodeId) {
+        let before = BeforeSnapshot::capture(self, child);
+        self.detach(child);
+        self.note_mutation(child, MutationKind::ChildRemoved { parent }, Some(before));
+    }
+
+    /// Detach `target` from whatever parent it has, if any.
+    pub fn remove_from_parent(&mut self, target: NodeId) {
+        let before = BeforeSnapshot::capture(self, target);
+        if let Some(parent) = self.detach(target) {
+            self.note_mutation(target, MutationKind::ChildRemoved { parent }, Some(before));
+        }
+    }
+
+    /// Replace `old` with `new` under `parent`, keeping `old`'s
+    /// position among its siblings.
+    pub fn replace_child(&mut self, parent: NodeId, old: NodeId, new: NodeId) {
+        let before = BeforeSnapshot::capture(self, old);
+        let pos = self
+            .arena
+            .get(parent)
+            .and_then(|n| n.children.iter().position(|&c| c == old));
+        self.detach(old);
+        self.link_at(parent, new, pos);
+        self.note_mutation(new, MutationKind::ChildReplaced { parent }, Some(before));
+    }
+
+    /// Move all children of `node` to `new_parent`, in order. (The
+    /// bulk move the adoption agency, foster parenting, and fragment
+    /// re-parenting need.)
+    pub fn reparent_children(&mut self, node: NodeId, new_parent: NodeId) {
+        if node == new_parent {
+            return;
+        }
+        let kids: Vec<NodeId> = self.children(node).to_vec();
+        for kid in kids {
+            self.link_at(new_parent, kid, None);
+        }
+        self.note_mutation(
+            new_parent,
+            MutationKind::ChildrenReparented { from: node, to: new_parent },
+            None,
+        );
+    }
+
+    /// Set an attribute, replacing any existing value. (First-
+    /// duplicate-wins is a *parse* rule, enforced by the tokenizer's
+    /// attribute list; the DOM API replaces.)
+    pub fn set_attribute(&mut self, id: NodeId, name: &str, value: &str) {
+        let before = BeforeSnapshot::capture(self, id);
+        if let Some(node) = self.arena.get_mut(id) {
+            match node.attrs.iter_mut().find(|(n, _)| n == name) {
+                Some((_, v)) => *v = value.to_string(),
+                None => node.attrs.push((name.to_string(), value.to_string())),
+            }
+        }
+        self.note_mutation(
+            id,
+            MutationKind::AttributeChanged { name: name.to_string() },
+            Some(before),
+        );
+    }
+
+    pub fn remove_attribute(&mut self, id: NodeId, name: &str) {
+        let before = BeforeSnapshot::capture(self, id);
+        let mut removed = false;
+        if let Some(node) = self.arena.get_mut(id) {
+            let before_len = node.attrs.len();
+            node.attrs.retain(|(n, _)| n != name);
+            removed = node.attrs.len() != before_len;
+        }
+        if removed {
+            self.note_mutation(
+                id,
+                MutationKind::AttributeRemoved { name: name.to_string() },
+                Some(before),
+            );
+        }
+    }
+
+    /// Add attributes that are not already present (by local name).
+    /// Used by the tree builder when a second `<html>` / `<body>` tag
+    /// carries new attributes.
+    pub fn add_attrs_if_missing(&mut self, target: NodeId, attrs: Vec<(String, String)>) {
+        let before = BeforeSnapshot::capture(self, target);
+        let mut added: Option<String> = None;
+        if let Some(node) = self.arena.get_mut(target) {
+            for (name, value) in attrs {
+                if !node.attrs.iter().any(|(n, _)| *n == name) {
+                    if added.is_none() {
+                        added = Some(name.clone());
+                    }
+                    node.attrs.push((name, value));
+                }
+            }
+        }
+        if let Some(name) = added {
+            self.note_mutation(target, MutationKind::AttributeChanged { name }, Some(before));
+        }
+    }
+
+    /// Replace a text node's data.
+    pub fn set_text(&mut self, id: NodeId, data: &str) {
+        let before = BeforeSnapshot::capture(self, id);
+        if let Some(Node { kind: NodeKind::Text(contents), .. }) = self.arena.get_mut(id) {
+            *contents = data.to_string();
+        }
+        self.note_mutation(id, MutationKind::CharacterDataChanged, Some(before));
+    }
+
+    /// Append to an existing text node (adjacent-text merging, per the
+    /// `TreeSink` contract: the builder hands the sink text in chunks).
+    pub fn append_to_text(&mut self, id: NodeId, data: &str) {
+        let before = BeforeSnapshot::capture(self, id);
+        if let Some(Node { kind: NodeKind::Text(contents), .. }) = self.arena.get_mut(id) {
+            contents.push_str(data);
+        }
+        self.note_mutation(id, MutationKind::CharacterDataChanged, Some(before));
     }
 }
 
-/// `take_while` pinned to `&str` input and `ContextError`, so call sites
-/// do not need a turbofish: the generic overload cannot infer its error
-/// type when the result is discarded with `.ok()?`.
-fn tw<'i>(
-    occurrences: std::ops::RangeFrom<usize>,
-    set: impl ContainsToken<char>,
-) -> impl Parser<&'i str, &'i str, ContextError> {
-    take_while(occurrences, set)
-}
-
-/// `literal` pinned the same way.
-fn lit(literal_str: &str) -> impl Parser<&str, &str, ContextError> {
-    literal::<_, _, ContextError>(literal_str)
-}
-
-/// Parse HTML text into a [`Dom`]. Lenient by design (see module docs):
-/// this never fails; malformed input is recovered as text or skipped.
+/// Parse HTML text into a [`Dom`]. Lenient by design: this never
+/// fails; malformed input is recovered per the WHATWG tree-construction
+/// algorithm and parse errors are recorded in the sink stats (see
+/// [`parse_detailed`]) rather than being fatal.
 pub fn parse(html: &str) -> Dom {
-    let mut dom = Dom::new();
-    let root = dom.root().expect("Dom::new always sets a root");
-    let mut input = html;
-    let mut stack: Vec<NodeId> = vec![root];
-    while !input.is_empty() {
-        if input.starts_with("<!--") {
-            skip_comment(&mut input);
-            continue;
-        }
-        if input.starts_with("<!") {
-            // doctype and other <!...> declarations
-            skip_decl(&mut input);
-            continue;
-        }
-        if input.starts_with("</") {
-            if let Some(name) = parse_close_tag(&mut input) {
-                close_element(&mut stack, &name, &dom);
-            }
-            continue;
-        }
-        if input.starts_with('<') {
-            match parse_open_tag(&mut input) {
-                Some((tag, attrs, explicit_self_closing)) => {
-                    let id = dom.create_element_with_attrs(&tag, attrs);
-                    let parent = *stack.last().expect("stack never empties");
-                    dom.append_child(parent, id);
-                    if !self_closing(&tag, explicit_self_closing) {
-                        if tag == "style" || tag == "script" {
-                            // Raw text until the matching close tag.
-                            let close = format!("</{tag}");
-                            let end = find_ci(input, &close).unwrap_or(input.len());
-                            let (raw, rest) = input.split_at(end);
-                            if !raw.is_empty() {
-                                let text = dom.create_text(raw);
-                                dom.append_child(id, text);
-                            }
-                            input = rest;
-                            if !input.is_empty() {
-                                parse_close_tag(&mut input);
-                            }
-                        } else {
-                            stack.push(id);
-                        }
-                    }
-                }
-                None => {
-                    // Stray '<': keep it as literal text and move on.
-                    push_text(&mut dom, &stack, "<");
-                    input = &input[1..];
-                }
-            }
-            continue;
-        }
-        // Text run up to the next '<' (or end of input).
-        let end = input.find('<').unwrap_or(input.len());
-        let (text, rest) = input.split_at(end);
-        input = rest;
-        push_text(&mut dom, &stack, text);
-    }
-    dom
+    parse_detailed(html).dom
 }
 
-/// Append a text node unless it is whitespace-only.
-fn push_text(dom: &mut Dom, stack: &[NodeId], raw: &str) {
-    let decoded = decode_entities(raw);
-    if decoded.trim().is_empty() {
+/// Like [`parse`], but also returns the sink side-maps the `Dom` shape
+/// itself cannot hold (qualified names, full namespaced attributes,
+/// `<template>` contents), the quirks mode, parse-error stats, and the
+/// [`DomEvent`]s observed during the parse.
+pub fn parse_detailed(html: &str) -> ParseOutput {
+    parse_detailed_with_opts(html, true)
+}
+
+/// Like [`parse_detailed`], with scripting on/off (controls
+/// `<noscript>` parsing; the html5lib-tests corpus runs each test in
+/// both modes unless restricted).
+pub fn parse_detailed_with_opts(html: &str, scripting_enabled: bool) -> ParseOutput {
+    let mut opts = ParseOpts::default();
+    opts.tree_builder.scripting_enabled = scripting_enabled;
+    html5ever::parse_document(PlutoSink::new(), opts).one(html)
+}
+
+/// Parse an HTML fragment in the context of an element named
+/// `context_tag` (namespace `context_ns`: `"svg"`, `"math"`/MathML, or
+/// `None` for HTML). Returns the document plus the context element,
+/// with the fragment's top-level nodes re-parented under it in one
+/// [`Dom::reparent_children`] call — the `innerHTML` seam (Stage 7).
+/// `html5ever`'s fragment builder leaves the nodes under a synthetic
+/// `<html>` root; the re-parent is what lands them on the real
+/// context element.
+pub fn parse_fragment(
+    html: &str,
+    context_tag: &str,
+    context_ns: Option<&str>,
+) -> (Dom, NodeId) {
+    let (out, ctx) = parse_fragment_detailed(html, context_tag, context_ns, true);
+    (out.dom, ctx)
+}
+
+/// Like [`parse_fragment`], with scripting control and full output.
+pub fn parse_fragment_detailed(
+    html: &str,
+    context_tag: &str,
+    context_ns: Option<&str>,
+    scripting_enabled: bool,
+) -> (ParseOutput, NodeId) {
+    let sink = PlutoSink::new();
+    let ns = match context_ns {
+        Some("svg") => ns!(svg),
+        // The `.dat` fragment line's name for MathML is "math".
+        Some("mathml") | Some("math") => ns!(mathml),
+        _ => ns!(html),
+    };
+    let name = QualName::new(None, ns, LocalName::from(context_tag));
+    let ctx = sink.create_element(name, Vec::new(), ElementFlags::default());
+    let mut opts = ParseOpts::default();
+    opts.tree_builder.scripting_enabled = scripting_enabled;
+    let mut out = html5ever::driver::parse_fragment_for_element(
+        sink, opts, ctx, scripting_enabled, None,
+    )
+    .one(html);
+    reparent_fragment(&mut out.dom, ctx);
+    (out, ctx)
+}
+
+/// Move a fragment parse's top-level nodes from the synthetic `<html>`
+/// root onto the real context element. The fragment builder leaves the
+/// fragment's top-level nodes as the direct children of the synthetic
+/// root (for an `html` context those nodes are `<head>` / `<body>` /
+/// `<frameset>` themselves; for a `div` context they are the `<p>`s) —
+/// so every child moves as-is, in order, with no hoisting.
+fn reparent_fragment(dom: &mut Dom, ctx: NodeId) {
+    let Some(root) = dom.root() else { return };
+    let Some(synthetic) = dom
+        .children(root)
+        .iter()
+        .copied()
+        .find(|&c| matches!(dom.get(c).map(|n| &n.kind), Some(NodeKind::Element { .. })))
+    else {
         return;
+    };
+    // The re-parent is part of parsing, not a JS mutation: suppress
+    // recording for it (same parser privilege as the sink).
+    dom.set_suppress_records(true);
+    let kids: Vec<NodeId> = dom.children(synthetic).to_vec();
+    for kid in kids {
+        dom.append_child(ctx, kid);
     }
-    let parent = *stack.last().expect("stack never empties");
-    let id = dom.create_text(&decoded);
-    dom.append_child(parent, id);
-}
-
-/// Pop the stack up to and including the matching open element.
-/// A close tag with no matching open element is ignored.
-fn close_element(stack: &mut Vec<NodeId>, name: &str, dom: &Dom) {
-    for (i, id) in stack.iter().enumerate().rev() {
-        if let Some(node) = dom.get(*id) {
-            if let NodeKind::Element { tag } = &node.kind {
-                if tag == name {
-                    stack.truncate(i);
-                    return;
-                }
-            }
-        }
-    }
-}
-
-fn skip_comment(input: &mut &str) {
-    match input.find("-->") {
-        Some(p) => *input = &input[p + 3..],
-        None => *input = "",
-    }
-}
-
-fn skip_decl(input: &mut &str) {
-    match input.find('>') {
-        Some(p) => *input = &input[p + 1..],
-        None => *input = "",
-    }
-}
-
-/// Parse `</name>`; always advances past the tag (malformed close tags
-/// are dropped through the next `>`). Returns the tag name on success.
-fn parse_close_tag(input: &mut &str) -> Option<String> {
-    let mut rest = *input;
-    let parsed: Option<String> = (|| {
-        lit("</").parse_next(&mut rest).ok()?;
-        let name: &str = tw(
-            1..,
-            |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_',
-        )
-        .parse_next(&mut rest)
-        .ok()?;
-        let _: &str =
-            tw(0.., |c: char| c.is_whitespace()).parse_next(&mut rest).ok()?;
-        if !rest.starts_with('>') {
-            return None;
-        }
-        rest = &rest[1..];
-        Some(name.to_ascii_lowercase())
-    })();
-    match parsed {
-        Some(name) => {
-            *input = rest;
-            Some(name)
-        }
-        None => {
-            match input.find('>') {
-                Some(p) => *input = &input[p + 1..],
-                None => *input = "",
-            }
-            None
-        }
-    }
-}
-
-/// Parse `<name attr="value" ...>` / `<name ... />` on a scratch copy of
-/// the input; the caller's input only moves on success. Returns
-/// `(tag, attributes, self_closing)`; `None` means "not a tag".
-fn parse_open_tag(input: &mut &str) -> Option<(String, Vec<(String, String)>, bool)> {
-    let mut rest = *input;
-    lit("<").parse_next(&mut rest).ok()?;
-    let name: &str = tw(
-        1..,
-        |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_',
-    )
-    .parse_next(&mut rest)
-    .ok()?;
-    if !name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
-        return None;
-    }
-    let tag = name.to_ascii_lowercase();
-    let mut attrs: Vec<(String, String)> = Vec::new();
-    loop {
-        let _: &str =
-            tw(0.., |c: char| c.is_whitespace()).parse_next(&mut rest).ok()?;
-        if rest.starts_with("/>") {
-            rest = &rest[2..];
-            *input = rest;
-            return Some((tag, attrs, true));
-        }
-        if rest.starts_with('>') {
-            rest = &rest[1..];
-            *input = rest;
-            return Some((tag, attrs, false));
-        }
-        if rest.is_empty() {
-            return None;
-        }
-        let attr_name: &str = tw(
-            1..,
-            |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'),
-        )
-        .parse_next(&mut rest)
-        .ok()?;
-        let _: &str =
-            tw(0.., |c: char| c.is_whitespace()).parse_next(&mut rest).ok()?;
-        let mut value = String::new();
-        if rest.starts_with('=') {
-            rest = &rest[1..];
-            let _: &str =
-                tw(0.., |c: char| c.is_whitespace()).parse_next(&mut rest).ok()?;
-            if let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') {
-                let after = &rest[1..];
-                match after.find(q) {
-                    Some(end) => {
-                        value = after[..end].to_string();
-                        rest = &after[end + 1..];
-                    }
-                    None => {
-                        // Unterminated quote: the rest of the tag is the value.
-                        value = after.to_string();
-                        rest = "";
-                    }
-                }
-            } else {
-                // Unquoted values run to whitespace or `>`; `/` is a
-                // legal value character (e.g. `src=/s.js`). A trailing
-                // `/` right before `>` is the self-closing marker, not
-                // part of the value (`<img src=x/>` means `x`).
-                let mut v: &str = tw(1.., |c: char| !c.is_whitespace() && c != '>')
-                    .parse_next(&mut rest)
-                    .ok()?;
-                if v.ends_with('/') && rest.starts_with('>') {
-                    v = &v[..v.len() - 1];
-                }
-                value = v.to_string();
-            }
-        }
-        // Browsers keep the first occurrence of a duplicate attribute.
-        let attr_name = attr_name.to_ascii_lowercase();
-        if !attrs.iter().any(|(n, _)| *n == attr_name) {
-            attrs.push((attr_name, decode_entities(&value)));
-        }
-    }
-}
-
-/// HTML void elements: never have children, never need a close tag.
-fn is_void(tag: &str) -> bool {
-    matches!(
-        tag,
-        "area"
-            | "base"
-            | "br"
-            | "col"
-            | "embed"
-            | "hr"
-            | "img"
-            | "input"
-            | "link"
-            | "meta"
-            | "source"
-            | "track"
-            | "wbr"
-    )
-}
-
-/// Decode `&amp; &lt; &gt; &quot; &apos; &nbsp;` and numeric
-/// `&#NN;` / `&#xHH;` references. Unknown entities are left as-is.
-pub fn decode_entities(s: &str) -> String {
-    if !s.contains('&') {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(amp) = rest.find('&') {
-        out.push_str(&rest[..amp]);
-        let after = &rest[amp + 1..];
-        match after.find(';') {
-            Some(semi) if semi <= 10 => {
-                let entity = &after[..semi];
-                let decoded: Option<char> = match entity {
-                    "amp" => Some('&'),
-                    "lt" => Some('<'),
-                    "gt" => Some('>'),
-                    "quot" => Some('"'),
-                    "apos" => Some('\''),
-                    "nbsp" => Some('\u{a0}'),
-                    _ if let Some(num) = entity.strip_prefix("#x").or_else(|| entity.strip_prefix("#X")) => {
-                        u32::from_str_radix(num, 16).ok().and_then(char::from_u32)
-                    }
-                    _ if let Some(num) = entity.strip_prefix('#') => {
-                        num.parse::<u32>().ok().and_then(char::from_u32)
-                    }
-                    _ => None,
-                };
-                match decoded {
-                    Some(c) => out.push(c),
-                    None => out.push_str(&rest[amp..amp + 1 + semi + 1]),
-                }
-                rest = &after[semi + 1..];
-            }
-            _ => {
-                out.push('&');
-                rest = after;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-/// Case-insensitive substring search (ASCII).
-fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
-    let hay = haystack.as_bytes();
-    let ndl = needle.as_bytes();
-    if ndl.is_empty() || hay.len() < ndl.len() {
-        return None;
-    }
-    (0..=hay.len() - ndl.len()).find(|&i| {
-        hay[i..i + ndl.len()]
-            .iter()
-            .zip(ndl.iter())
-            .all(|(a, b)| a.eq_ignore_ascii_case(b))
-    })
-}
-
-/// An element is closed when it self-closes (`/>`) or is a void element.
-fn self_closing(tag: &str, explicit: bool) -> bool {
-    explicit || is_void(tag)
+    dom.set_suppress_records(false);
 }
 
 #[cfg(test)]
@@ -517,6 +756,19 @@ mod tests {
             s.push_str(&text_content(dom, child));
         }
         s
+    }
+
+    fn assert_sync<T: Sync>() {}
+    fn assert_send<T: Send>() {}
+
+    #[test]
+    fn dom_is_send_and_sync() {
+        // The per-tab worker thread owns the parser while other
+        // threads read the Dom: Dom must stay Sync (the assertion
+        // also lives in pluto-layout's tests).
+        assert_sync::<Dom>();
+        assert_send::<Dom>();
+        assert_sync::<NodeId>();
     }
 
     const EXAMPLE_COM: &str = r#"<!doctype html>
@@ -576,6 +828,14 @@ mod tests {
         // <meta> is void: no children, and the title still follows it.
         let meta = find_tag(&dom, head, "meta").expect("meta");
         assert!(dom.children(meta).is_empty());
+        // Conforming doctype -> standards mode, and the doctype node
+        // itself is a child of the document.
+        assert_eq!(dom.quirks_mode(), QuirksMode::NoQuirks);
+        let dt = dom.doctype().expect("doctype node");
+        assert!(matches!(
+            dom.get(dt).map(|n| &n.kind),
+            Some(NodeKind::Doctype { name, .. }) if name == "html"
+        ));
     }
 
     #[test]
@@ -590,30 +850,57 @@ mod tests {
         assert!(dom.children(br).is_empty());
         let img = find_tag(&dom, root, "img").expect("img");
         assert_eq!(dom.attr(img, "src"), Some("x"));
+        // Comments are real nodes now (the old parser skipped them).
+        let body = find_tag(&dom, root, "body").unwrap();
+        assert!(
+            dom.children(body)
+                .iter()
+                .any(|&c| dom.get(c).and_then(|n| n.comment()) == Some(" a comment ")),
+            "comment node present under body"
+        );
     }
 
     #[test]
     fn entities_decoded() {
-        let dom = parse("<p>Fish &amp; Chips &lt;tag&gt; &#65;&#x42; &quot;q&quot;</p>");
+        let dom = parse("<p>Fish &amp; Chips &lt;tag&gt; &#65;&#x42; &quot;q&quot; &copy;</p>");
         let root = dom.root().unwrap();
         let p = find_tag(&dom, root, "p").unwrap();
-        assert_eq!(text_content(&dom, p), "Fish & Chips <tag> AB \"q\"");
+        assert_eq!(text_content(&dom, p), "Fish & Chips <tag> AB \"q\" ©");
+    }
+
+    #[test]
+    fn numeric_entities_validated_to_replacement() {
+        // html5ever's tokenizer (char_ref::finish_numeric) maps
+        // surrogates, NUL, and values > U+10FFFF to U+FFFD.
+        let dom = parse("<p>&#xD800;&#x110000;&#0;&#65;</p>");
+        let root = dom.root().unwrap();
+        let p = find_tag(&dom, root, "p").unwrap();
+        assert_eq!(text_content(&dom, p), "\u{fffd}\u{fffd}\u{fffd}A");
     }
 
     #[test]
     fn mismatched_close_ignored() {
+        // SPEC TRUTH (updated from the old parser's expectation): tree
+        // construction closes the <div> at `</div>`, so the second <p>
+        // is a sibling of the div under <body> — not a child of the
+        // document root.
         let dom = parse("<div><p>one</div><p>two</p>");
         let root = dom.root().unwrap();
+        let body = find_tag(&dom, root, "body").unwrap();
         let div = find_tag(&dom, root, "div").unwrap();
         let mut ps_in_div = Vec::new();
         find_all_tags(&dom, div, "p", &mut ps_in_div);
         assert_eq!(ps_in_div.len(), 1);
         assert_eq!(text_content(&dom, ps_in_div[0]), "one");
-        // The second <p> lands under the document, not inside the closed div.
         let mut all_ps = Vec::new();
         find_all_tags(&dom, root, "p", &mut all_ps);
         assert_eq!(all_ps.len(), 2);
         assert_eq!(text_content(&dom, all_ps[1]), "two");
+        assert_eq!(
+            dom.get(all_ps[1]).unwrap().parent,
+            Some(body),
+            "second <p> lands under <body>"
+        );
     }
 
     #[test]
@@ -654,14 +941,195 @@ mod tests {
             .collect();
         assert!(texts.is_empty(), "unexpected text nodes: {texts:?}");
 
-        // A trailing slash right before `>` is the self-closing
-        // marker, not part of the value.
+        // A trailing slash right before `>` in an UNQUOTED value is
+        // part of the value, per spec (the self-closing marker is only
+        // recognised between attributes, not inside a value):
+        // `<img src=/a/b.png/>` means src="/a/b.png/". The old
+        // hand-written parser stripped it; html5ever keeps it, which
+        // is spec truth — the expectation changed deliberately.
         let dom = parse("<img src=/a/b.png/><img src=x/>");
         let root = dom.root().unwrap();
         let mut imgs = Vec::new();
         find_all_tags(&dom, root, "img", &mut imgs);
         assert_eq!(imgs.len(), 2);
-        assert_eq!(dom.attr(imgs[0], "src"), Some("/a/b.png"));
-        assert_eq!(dom.attr(imgs[1], "src"), Some("x"));
+        assert_eq!(dom.attr(imgs[0], "src"), Some("/a/b.png/"));
+        assert_eq!(dom.attr(imgs[1], "src"), Some("x/"));
+    }
+
+    #[test]
+    fn misnested_formatting_adoption_agency() {
+        // <b><i></b></i> — AAA pops the stack; both stay in the tree,
+        // <i> inside <b> (no furthest block here, so no clone).
+        let dom = parse("<b><i></b></i>");
+        let root = dom.root().unwrap();
+        let body = find_tag(&dom, root, "body").unwrap();
+        let mut bs = Vec::new();
+        find_all_tags(&dom, body, "b", &mut bs);
+        let mut is = Vec::new();
+        find_all_tags(&dom, body, "i", &mut is);
+        assert_eq!(bs.len(), 1);
+        assert_eq!(is.len(), 1);
+        assert_eq!(dom.get(is[0]).unwrap().parent, Some(bs[0]));
+    }
+
+    #[test]
+    fn adoption_agency_clones_across_block() {
+        // <a><p></a></p> — AAA with a furthest block (<p>): the <a>
+        // is cloned inside the <p>; the original <a> stays empty.
+        let dom = parse("<a><p></a></p>");
+        let root = dom.root().unwrap();
+        let body = find_tag(&dom, root, "body").unwrap();
+        let kids = dom.children(body);
+        assert_eq!(kids.len(), 2, "body has <a> then <p>");
+        assert_eq!(dom.tag(kids[0]), Some("a"));
+        assert_eq!(dom.tag(kids[1]), Some("p"));
+        assert_eq!(dom.children(kids[1]).len(), 1);
+        assert_eq!(dom.tag(dom.children(kids[1])[0]), Some("a"));
+    }
+
+    #[test]
+    fn table_foster_parenting() {
+        // <table>B<tr>C</tr>D</table> — text that cannot live in a
+        // table is foster-parented BEFORE the table, merged into one
+        // text node. (The Stage 6 report writes "ABCD" for this input,
+        // but the input contains only B, C, D — "BCD" is correct.)
+        let dom = parse("<table>B<tr>C</tr>D</table>");
+        let root = dom.root().unwrap();
+        let body = find_tag(&dom, root, "body").unwrap();
+        let kids = dom.children(body);
+        assert_eq!(text_content(&dom, kids[0]), "BCD");
+        assert_eq!(dom.tag(kids[1]), Some("table"));
+        let table = kids[1];
+        assert_eq!(text_content(&dom, table), "");
+    }
+
+    #[test]
+    fn implied_closes_and_self_closing_non_void() {
+        let dom = parse("<p>one<p>two");
+        let root = dom.root().unwrap();
+        let body = find_tag(&dom, root, "body").unwrap();
+        let mut ps = Vec::new();
+        find_all_tags(&dom, body, "p", &mut ps);
+        assert_eq!(ps.len(), 2);
+        assert_eq!(text_content(&dom, ps[0]), "one");
+        assert_eq!(text_content(&dom, ps[1]), "two");
+        assert_eq!(
+            dom.get(ps[0]).unwrap().parent,
+            dom.get(ps[1]).unwrap().parent,
+            "implied close makes siblings"
+        );
+
+        // <span/> is a parse error and the self-closing flag is
+        // IGNORED: the span stays open, text lands inside it.
+        let out = parse_detailed("<div><span/>text</div>");
+        assert!(out.stats.parse_errors > 0, "self-closing non-void is a parse error");
+        let span = find_tag(&out.dom, out.dom.root().unwrap(), "span").unwrap();
+        assert_eq!(text_content(&out.dom, span), "text");
+    }
+
+    #[test]
+    fn quirks_modes() {
+        assert_eq!(parse("<!DOCTYPE html><p>x").quirks_mode(), QuirksMode::NoQuirks);
+        assert_eq!(parse("<p>x").quirks_mode(), QuirksMode::Quirks);
+        assert_eq!(
+            parse("<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\"><p>x")
+                .quirks_mode(),
+            QuirksMode::LimitedQuirks
+        );
+    }
+
+    #[test]
+    fn parse_never_fails_and_records_errors() {
+        // Malformed input is recovered, never fatal; errors recorded.
+        let out = parse_detailed("<div><span/>unclosed<p>&bogus; &#xZZ;");
+        assert!(out.stats.parse_errors > 0);
+        assert!(find_tag(&out.dom, out.dom.root().unwrap(), "div").is_some());
+    }
+
+    #[test]
+    fn fragment_parsing_reparents_under_context() {
+        let (dom, ctx) = parse_fragment("<p>one<p>two", "div", None);
+        assert_eq!(dom.tag(ctx), Some("div"));
+        let kids = dom.children(ctx);
+        assert_eq!(kids.len(), 2);
+        assert_eq!(dom.tag(kids[0]), Some("p"));
+        assert_eq!(text_content(&dom, kids[0]), "one");
+        assert_eq!(dom.tag(kids[1]), Some("p"));
+        assert_eq!(text_content(&dom, kids[1]), "two");
+
+        // Fragment in a table context: foster parenting still applies.
+        let (dom, ctx) = parse_fragment("<tr><td>cell</td></tr>", "table", None);
+        assert!(find_tag(&dom, ctx, "td").is_some());
+    }
+
+    #[test]
+    fn mutation_apis_record_and_mark_dirty() {
+        let mut dom = Dom::new();
+        let root = dom.root().unwrap();
+        let div = dom.create_element("div");
+        dom.append_child(root, div);
+        // One record for the insert; the node is style+layout dirty,
+        // and the root carries the subtree summary bits.
+        assert_eq!(dom.mutations().len(), 1);
+        assert!(dom.get(div).unwrap().dirty.style_self);
+        assert!(dom.get(div).unwrap().dirty.layout_self);
+        assert!(dom.get(root).unwrap().dirty.style_subtree);
+        assert!(dom.get(root).unwrap().dirty.layout_subtree);
+        assert!(dom.dirty_set().style.contains(&div));
+        assert!(dom.dirty_set().layout.contains(&div));
+
+        // Attribute change: snapshot holds the BEFORE state.
+        dom.set_attribute(div, "class", "red");
+        dom.set_attribute(div, "class", "blue");
+        let recs = dom.mutations();
+        let last = recs.last().unwrap();
+        assert!(matches!(last.kind, MutationKind::AttributeChanged { .. }));
+        assert_eq!(last.before.as_ref().unwrap().class.as_deref(), Some("red"));
+
+        // DOM API replaces (first-duplicate-wins is parse-only).
+        assert_eq!(dom.attr(div, "class"), Some("blue"));
+
+        // Text + structure mutations.
+        let text = dom.create_text("hello");
+        dom.append_child(div, text);
+        dom.set_text(text, "bye");
+        assert_eq!(dom.text(text), Some("bye"));
+        let span = dom.create_element("span");
+        dom.replace_child(div, text, span);
+        assert_eq!(dom.children(div), &[span]);
+        assert!(dom.get(text).unwrap().parent.is_none());
+        dom.remove_child(div, span);
+        assert!(dom.children(div).is_empty());
+
+        // reparent_children moves in order.
+        let a = dom.create_element("a");
+        let b = dom.create_element("b");
+        dom.append_child(div, a);
+        dom.append_child(div, b);
+        let section = dom.create_element("section");
+        dom.append_child(root, section);
+        dom.reparent_children(div, section);
+        assert_eq!(dom.children(section), &[a, b]);
+        assert!(dom.children(div).is_empty());
+
+        // The clear pass resets bits and the set.
+        dom.clear_dirty();
+        assert!(dom.dirty_set().is_empty());
+        assert!(!dom.get(div).unwrap().dirty.style_self);
+        assert!(!dom.get(root).unwrap().dirty.style_subtree);
+        // …and draining the log empties it.
+        assert!(!dom.take_mutations().is_empty());
+        assert!(dom.mutations().is_empty());
+    }
+
+    #[test]
+    fn parser_mutations_do_not_record() {
+        // Parser privilege: a parse leaves no mutation log and no
+        // dirty bits behind (the initial tree is the baseline).
+        let dom = parse("<div class=x><p>one<p>two</div>");
+        assert!(dom.mutations().is_empty());
+        assert!(dom.dirty_set().is_empty());
+        let root = dom.root().unwrap();
+        assert!(!dom.get(root).unwrap().dirty.style_subtree);
     }
 }

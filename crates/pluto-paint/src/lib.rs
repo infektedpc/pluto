@@ -74,6 +74,19 @@ pub enum DisplayItem {
         width: f32,
         height: f32,
     },
+    /// Push a clip rect for a scroll container: every following item
+    /// paints clipped to this rect until the matching `PopClip`.
+    /// (R14, M2: the vocabulary gains the clip; the shader-side
+    /// scissor itself is a Stage 8 follow-up — the renderer currently
+    /// ignores these items, so they are data, not a visual change.)
+    PushClip {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    },
+    /// Pop the most recent `PushClip`.
+    PopClip,
 }
 
 /// One glyph: serialisable cache key + page position of its origin.
@@ -311,6 +324,18 @@ impl DisplayList {
                         return Err(ValidationError::MissingResource(*resource));
                     }
                 }
+                DisplayItem::PushClip {
+                    x,
+                    y,
+                    width,
+                    height,
+                } => {
+                    check_coord(*x)?;
+                    check_coord(*y)?;
+                    check_size(*width)?;
+                    check_size(*height)?;
+                }
+                DisplayItem::PopClip => {}
             }
         }
         Ok(())
@@ -320,7 +345,10 @@ impl DisplayList {
     /// background (html/body background, or white by default) paints the
     /// whole viewport first — it is always item 0, which the renderer
     /// relies on for the scroll-anchored canvas — then each box's
-    /// background, then its glyphs.
+    /// background, then its glyphs. Boxes inside a scroll container
+    /// carry a clip rect (`LayoutBox::clip`); when it changes, the
+    /// previous clip is popped and the new one pushed, so a container's
+    /// subtree paints clipped to the container's border box.
     pub fn build(layout: &LayoutTree) -> Self {
         let mut list = Self::new();
         let bg = layout.canvas_background;
@@ -331,7 +359,22 @@ impl DisplayList {
             height: layout.viewport.1,
             color: rgba(bg),
         });
+        let mut current_clip: Option<[f32; 4]> = None;
         for bx in layout.boxes() {
+            if bx.clip != current_clip {
+                if current_clip.is_some() {
+                    list.push(DisplayItem::PopClip);
+                }
+                if let Some(c) = bx.clip {
+                    list.push(DisplayItem::PushClip {
+                        x: c[0],
+                        y: c[1],
+                        width: c[2],
+                        height: c[3],
+                    });
+                }
+                current_clip = bx.clip;
+            }
             if let Some(bg) = bx.style.background {
                 list.push(DisplayItem::FillRect {
                     x: bx.x,
@@ -369,6 +412,9 @@ impl DisplayList {
                     });
                 }
             }
+        }
+        if current_clip.is_some() {
+            list.push(DisplayItem::PopClip);
         }
         list
     }
@@ -487,13 +533,15 @@ mod tests {
             other => panic!("first item should be the canvas fill, got {other:?}"),
         }
         // The div's own background (#fdfdff) is painted as its own rect.
+        // Content-box sizing (M2): width 600 + 2×32 padding = 664.
         assert!(list.0.iter().any(|item| matches!(
             item,
             DisplayItem::FillRect { width, color, .. }
-            if *width == 600.0 && (color[0] - 253.0 / 255.0).abs() < 0.001
+            if *width == 664.0 && (color[0] - 253.0 / 255.0).abs() < 0.001
         )));
-        // Text is present as glyph runs, including the link (UA default
-        // blue: the stylesheet's `a:link` rule is M2, see the layout test).
+        // Text is present as glyph runs, including the link — in the
+        // author `a:link` color #38488f now (blue 143/255), not the
+        // UA default blue (238/255) the old expectation assumed.
         let glyph_items: Vec<&DisplayItem> = list
             .0
             .iter()
@@ -502,7 +550,7 @@ mod tests {
         assert!(!glyph_items.is_empty());
         assert!(glyph_items.iter().any(|i| match i {
             DisplayItem::Glyphs { color, glyphs } => {
-                !glyphs.is_empty() && (color[2] - 238.0 / 255.0).abs() < 0.01
+                !glyphs.is_empty() && (color[2] - 143.0 / 255.0).abs() < 0.01
             }
             _ => false,
         }));
@@ -582,9 +630,17 @@ mod tests {
             DisplayItem::Glyphs { glyphs, .. } => acc + glyphs.len(),
             _ => acc,
         });
-        // 155 paragraph glyphs (non-space chars). If the script tag
-        // leaked into text there would be 18 more.
-        assert_eq!(glyph_total, 155);
+        // 154 paragraph glyphs at this viewport (132 non-space chars,
+        // constant across wraps, + 22 surviving spaces): `max-width:
+        // 26em` is honoured now, so the paragraph wraps at 416px and
+        // two spaces are consumed at line breaks (the old 155 predates
+        // max-width). A range, not an exact wrap-dependent count: any
+        // other wrap still lands near 132 non-space glyphs, while a
+        // script tag leaking into text would add 18 more (out of range).
+        assert!(
+            (150..=160).contains(&glyph_total),
+            "glyph total {glyph_total} outside the expected wrap range"
+        );
     }
 
     fn small_list() -> DisplayList {

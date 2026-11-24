@@ -9,5 +9,6 @@ taffy.workspace = true
 cosmic-text.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
+slotmap.workspace = true
 pluto-html.workspace = true
 pluto-css.workspace = true
