@@ -14,7 +14,7 @@
 //! (If that ever proves untrue on a machine, the fix is to hand the
 //! renderer's `FontSystem` to layout instead of building a second one.)
 
-use crate::{DisplayItem, DisplayList};
+use crate::{DisplayItem, DisplayList, PaintGlyph};
 use cosmic_text::{FontSystem, SwashCache, SwashContent};
 use std::collections::HashMap;
 use wgpu::util::DeviceExt;
@@ -239,6 +239,34 @@ fn upload_glyph(
             depth_or_array_layers: 1,
         },
     );
+}
+
+/// Top-left corner and size of one glyph's quad, in y-down page
+/// coordinates. Pure: unit-tested against the `with_pixels` oracle.
+///
+/// `glyph.x`/`glyph.y` is the glyph origin on the baseline: layout's
+/// `physical()` call already folds the run's `line_y` into it (see
+/// `shape_leaf` in pluto-layout), so no `line_y` is added here —
+/// adding it again would shift every glyph a line down.
+/// `placement.top` is the distance from the baseline *up* to the
+/// bitmap's top scanline (Swash/zeno y-up convention, same as
+/// FreeType's `bitmap_top`), so it is *subtracted* in y-down page
+/// space. cosmic-text's own `with_pixels` does exactly this: it
+/// enumerates the bitmap's first pixel at
+/// `(placement.left, -placement.top)` relative to the origin.
+/// `placement.left` may be negative (overhanging glyphs like `f`/`j`)
+/// and must not be clamped. (Stage 1 research: the old code added
+/// `placement.top` here, displacing each glyph down by `2 * top` —
+/// most for overshooting round letters like O/S.)
+fn glyph_quad(glyph: &PaintGlyph, placement: cosmic_text::Placement) -> (f32, f32, f32, f32) {
+    let x0 = glyph.x + placement.left as f32;
+    let y0 = glyph.y - placement.top as f32;
+    (
+        x0,
+        y0,
+        x0 + placement.width as f32,
+        y0 + placement.height as f32,
+    )
 }
 
 pub struct PaintRenderer {
@@ -554,14 +582,7 @@ impl PaintRenderer {
                     (rect.x + rect.w) as f32 / ATLAS_SIZE as f32,
                     (rect.y + rect.h) as f32 / ATLAS_SIZE as f32,
                 );
-                let (x0, y0) = (
-                    glyph.x + placement.left as f32,
-                    glyph.y + placement.top as f32,
-                );
-                let (x1, y1) = (
-                    x0 + placement.width as f32,
-                    y0 + placement.height as f32,
-                );
+                let (x0, y0, x1, y1) = glyph_quad(glyph, placement);
                 let c = *color;
                 glyph_vertices.extend([
                     GlyphVertex { pos: [x0, y0], uv: [u0, v0], color: c },
@@ -699,5 +720,86 @@ mod tests {
         let mut big = keys[0];
         big.glyph_id = big.glyph_id.wrapping_add(1);
         assert!(pack(&mut rows, &mut map, big, 2000, 2000).is_none());
+    }
+
+    /// Stage 1 regression: a glyph quad's top-left must be
+    /// `origin + (placement.left, -placement.top)`, pinned against
+    /// cosmic-text's own `with_pixels` oracle. The old code added
+    /// `placement.top`, pushing each glyph down by `2 * top` — most
+    /// for overshooting round letters (O/S) — and making spacing
+    /// look lumpy. The string covers flat caps (H), overshooting
+    /// round caps (O S C A), x-height (x o), overhanging glyphs
+    /// (f j, negative `left`), and descenders (g y p).
+    #[test]
+    fn glyph_quad_matches_with_pixels_oracle() {
+        let text = "HOSCAxo fj gyp";
+        for size in [16.0f32, 24.0] {
+            let mut font_system = FontSystem::new();
+            let mut swash = SwashCache::new();
+            let mut buffer = Buffer::new(&mut font_system, Metrics::new(size, size * 1.2));
+            buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
+            buffer.set_size(None, None);
+            buffer.shape_until_scroll(&mut font_system, false);
+            let mut glyphs_seen = 0;
+            for run in buffer.layout_runs() {
+                for g in run.glyphs {
+                    // Same anchor as layout: offset carries the run's
+                    // baseline, so physical.y IS the baseline.
+                    let physical = g.physical((0.0, run.line_y), 1.0);
+                    let Some(image) = swash
+                        .get_image(&mut font_system, physical.cache_key)
+                        .as_ref()
+                    else {
+                        continue;
+                    };
+                    if image.content != SwashContent::Mask {
+                        continue;
+                    }
+                    let placement = image.placement;
+                    if placement.width == 0 || placement.height == 0 {
+                        continue;
+                    }
+                    glyphs_seen += 1;
+                    let glyph = PaintGlyph {
+                        cache_key: physical.cache_key,
+                        x: physical.x as f32,
+                        y: physical.y as f32,
+                    };
+                    let (x0, y0, x1, y1) = glyph_quad(&glyph, placement);
+                    // Headline formula: top-left = origin + (left, -top).
+                    assert_eq!(x0, glyph.x + placement.left as f32);
+                    assert_eq!(y0, glyph.y - placement.top as f32);
+                    assert_eq!(x1, x0 + placement.width as f32);
+                    assert_eq!(y1, y0 + placement.height as f32);
+                    // The quad must straddle the baseline the right
+                    // way round (top at/above it, bottom at/below it,
+                    // within a pixel of hinting slack).
+                    assert!(y0 <= glyph.y + 1.0, "quad top above baseline");
+                    assert!(y1 >= glyph.y - 1.0, "quad bottom below baseline");
+                    // Oracle: with_pixels enumerates the bitmap's
+                    // first pixel at (left, -top) relative to the
+                    // origin — it must land exactly on the quad's
+                    // top-left corner.
+                    let mut first: Option<(i32, i32)> = None;
+                    swash.with_pixels(
+                        &mut font_system,
+                        physical.cache_key,
+                        cosmic_text::Color::rgb(0, 0, 0),
+                        |px, py, _| {
+                            if first.is_none() {
+                                first = Some((px, py));
+                            }
+                        },
+                    );
+                    let (fx, fy) = first.expect("with_pixels enumerates the bitmap");
+                    assert_eq!((fx, fy), (placement.left, -placement.top));
+                    assert_eq!((glyph.x + fx as f32, glyph.y + fy as f32), (x0, y0));
+                }
+            }
+            assert!(
+                glyphs_seen >= 11,
+                "expected most of {text:?} shaped at {size}px, saw {glyphs_seen}"
+            );
+        }
     }
 }
