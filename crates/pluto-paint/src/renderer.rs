@@ -141,7 +141,7 @@ fn erf_approx(x: f32) -> f32 {
 "#;
 
 const RECT_WGSL_BODY: &str = r#"
-@group(1) @binding(0)
+@group(0) @binding(1)
 var<uniform> clip: ClipUniform;
 
 struct Uniforms {
@@ -189,7 +189,7 @@ fn rect_fs(in: RectOut) -> @location(0) vec4<f32> {
 "#;
 
 const GLYPH_WGSL_BODY: &str = r#"
-@group(2) @binding(0)
+@group(0) @binding(1)
 var<uniform> clip: ClipUniform;
 
 struct Uniforms {
@@ -249,7 +249,7 @@ fn glyph_fs(in: GlyphOut) -> @location(0) vec4<f32> {
 /// groups as the mask glyph pipeline, so colour and mask glyphs
 /// share one vertex buffer and differ only by pipeline + atlas.
 const COLOUR_GLYPH_WGSL_BODY: &str = r#"
-@group(2) @binding(0)
+@group(0) @binding(1)
 var<uniform> clip: ClipUniform;
 
 struct Uniforms {
@@ -303,7 +303,7 @@ fn glyph_fs(in: GlyphOut) -> @location(0) vec4<f32> {
 "#;
 
 const IMAGE_WGSL_BODY: &str = r#"
-@group(2) @binding(0)
+@group(0) @binding(1)
 var<uniform> clip: ClipUniform;
 
 struct Uniforms {
@@ -358,7 +358,7 @@ fn image_fs(in: ImageOut) -> @location(0) vec4<f32> {
 /// colour × coverage (1 px AA). The clip SDF applies on top, so a
 /// rounded fill inside a rounded clip stays correct.
 const ROUNDED_WGSL_BODY: &str = r#"
-@group(1) @binding(0)
+@group(0) @binding(1)
 var<uniform> clip: ClipUniform;
 
 struct Uniforms {
@@ -424,7 +424,7 @@ fn rounded_fs(in: RoundedOut) -> @location(0) vec4<f32> {
 /// An inset shadow inverts the profile against the shape and clips
 /// to the padding box.
 const SHADOW_WGSL_BODY: &str = r#"
-@group(1) @binding(0)
+@group(0) @binding(1)
 var<uniform> clip: ClipUniform;
 
 struct Uniforms {
@@ -1923,11 +1923,14 @@ pub struct PaintRenderer {
     /// blur profile of the shape SDF (sharp branch at blur 0).
     shadow_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
-    uniform_bind_group: wgpu::BindGroup,
-    /// The shared clip bind-group layout (binding 0, fragment
-    /// uniform): one layout object, used by every pipeline, so a
-    /// clip bind group built for one pipeline works for all.
-    clip_bind_group_layout: wgpu::BindGroupLayout,
+    /// The shared group-0 layout (binding 0: viewport/scroll
+    /// uniform, vertex; binding 1: clip uniform, fragment): one
+    /// layout object, used by every pipeline. Group 0 is built
+    /// per clip in `prepare` (uniform buffer + clip buffer), so
+    /// no pipeline needs more than two bind groups — some devices
+    /// (Haswell) cap `max_bind_groups` at 2, and the old
+    /// three-group glyph layout panicked at creation there.
+    uniform_clip_bind_group_layout: wgpu::BindGroupLayout,
     atlas_texture: wgpu::Texture,
     atlas_bind_group: wgpu::BindGroup,
     /// The colour atlas texture + bind group (Stage 8 Rec 11):
@@ -2007,47 +2010,42 @@ impl PaintRenderer {
             contents: bytemuck::cast_slice(&[1.0f32, 1.0, 0.0, 0.0]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        // Group 0 carries the viewport/scroll uniform (binding
+        // 0, vertex) AND the clip uniform (binding 1, fragment).
+        // The clip used to live in its own group — group 1 for
+        // rect/rounded/shadow, group 2 for glyph/image — which
+        // made the glyph layout three groups and panicked at
+        // creation on devices whose `max_bind_groups` is 2
+        // (Haswell: "Bind group layout count 3 exceeds device bind
+        // group limit 2"). Merging it here keeps every pipeline
+        // at two groups or fewer. Group 0 is built per clip in
+        // `prepare` (uniform buffer + clip buffer); there is no
+        // single uniform bind group anymore.
         let uniform_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("pluto uniform layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                label: Some("pluto uniform + clip layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
-            });
-        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pluto uniform bind group"),
-            layout: &uniform_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
-
-        // The clip uniform layout (Stage 8 Rec 3): one layout
-        // object shared by every pipeline, so a clip bind group
-        // built for one pipeline is valid for all of them. The
-        // clip lives at group 1 for rect/rounded/shadow and group 2
-        // for glyph/image (their group 1 is the texture/sampler).
-        let clip_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("pluto clip layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                ],
             });
 
         let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -2143,28 +2141,22 @@ impl PaintRenderer {
             ],
         });
 
-        // The glyph/image layout: uniform, texture/sampler, clip
-        // (group 2, matching the GLYPH/IMAGE shader bodies).
+        // The glyph/image layout: group 0 is uniform + clip,
+        // group 1 is texture/sampler. Two groups at most: some
+        // devices (Haswell) cap `max_bind_groups` at 2, and the
+        // old three-group layout ([uniform, atlas, clip]) panicked
+        // at creation there.
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pluto pipeline layout"),
-            bind_group_layouts: &[
-                &uniform_bind_group_layout,
-                &atlas_bind_group_layout,
-                &clip_bind_group_layout,
-            ],
+            bind_group_layouts: &[&uniform_bind_group_layout, &atlas_bind_group_layout],
             immediate_size: 0,
         });
-        // The rect pipeline needs the uniform and the clip. Built
-        // with the shared two-group layout, wgpu demands bind group
-        // 1 be set at draw time even though the rect shader never
-        // uses it — a validation panic that only surfaced once a
-        // FillRect actually drew (the white canvas default). The
-        // rounded and shadow pipelines share this layout: their
-        // clip is at group 1 too.
+        // The rect pipeline needs only group 0 (uniform + clip).
+        // The rounded and shadow pipelines share this layout.
         let rect_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("pluto rect pipeline layout"),
-                bind_group_layouts: &[&uniform_bind_group_layout, &clip_bind_group_layout],
+                bind_group_layouts: &[&uniform_bind_group_layout],
                 immediate_size: 0,
             });
         // Each shader is the shared clip snippet (SDF + erf
@@ -2345,7 +2337,7 @@ impl PaintRenderer {
         });
         // Images sample a texture like glyphs do, so the image
         // pipeline reuses the glyph pipeline's two-group layout
-        // (uniform + texture/sampler); each image texture gets its
+        // (uniform + clip, texture/sampler); each image texture gets its
         // own bind group built against the atlas layout.
         let image_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("pluto image pipeline"),
@@ -2555,8 +2547,7 @@ impl PaintRenderer {
             rounded_pipeline,
             shadow_pipeline,
             uniform_buffer,
-            uniform_bind_group,
-            clip_bind_group_layout,
+            uniform_clip_bind_group_layout: uniform_bind_group_layout,
             atlas_texture,
             atlas_bind_group,
             colour_atlas_texture,
@@ -2706,18 +2697,24 @@ impl PaintRenderer {
         let empty_data = ClipUniformData::empty();
         clip_data.push(empty_data);
         clip_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pluto clip bind group"),
-            layout: &self.clip_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::Buffer::as_entire_binding(
-                    &device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("pluto clip uniform"),
-                        contents: bytemuck::cast_slice(&[empty_data]),
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    }),
-                ),
-            }],
+            label: Some("pluto uniform + clip bind group"),
+            layout: &self.uniform_clip_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::Buffer::as_entire_binding(
+                        &device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("pluto clip uniform"),
+                            contents: bytemuck::cast_slice(&[empty_data]),
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        }),
+                    ),
+                },
+            ],
         }));
         let mut culled: u64 = 0;
         let mut atlas_uploads: u64 = 0;
@@ -2765,21 +2762,27 @@ impl PaintRenderer {
                             clip_data.push(data);
                             clip_groups.push(device.create_bind_group(
                                 &wgpu::BindGroupDescriptor {
-                                    label: Some("pluto clip bind group"),
-                                    layout: &self.clip_bind_group_layout,
-                                    entries: &[wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: wgpu::Buffer::as_entire_binding(
-                                            &device.create_buffer_init(
-                                                &wgpu::util::BufferInitDescriptor {
-                                                    label: Some("pluto clip uniform"),
-                                                    contents: bytemuck::cast_slice(&[data]),
-                                                    usage: wgpu::BufferUsages::UNIFORM
-                                                        | wgpu::BufferUsages::COPY_DST,
-                                                },
+                                    label: Some("pluto uniform + clip bind group"),
+                                    layout: &self.uniform_clip_bind_group_layout,
+                                    entries: &[
+                                        wgpu::BindGroupEntry {
+                                            binding: 0,
+                                            resource: self.uniform_buffer.as_entire_binding(),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: 1,
+                                            resource: wgpu::Buffer::as_entire_binding(
+                                                &device.create_buffer_init(
+                                                    &wgpu::util::BufferInitDescriptor {
+                                                        label: Some("pluto clip uniform"),
+                                                        contents: bytemuck::cast_slice(&[data]),
+                                                        usage: wgpu::BufferUsages::UNIFORM
+                                                            | wgpu::BufferUsages::COPY_DST,
+                                                    },
+                                                ),
                                             ),
-                                        ),
-                                    }],
+                                        },
+                                    ],
                                 },
                             ));
                             idx
@@ -2806,21 +2809,27 @@ impl PaintRenderer {
                             clip_data.push(data);
                             clip_groups.push(device.create_bind_group(
                                 &wgpu::BindGroupDescriptor {
-                                    label: Some("pluto clip bind group"),
-                                    layout: &self.clip_bind_group_layout,
-                                    entries: &[wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: wgpu::Buffer::as_entire_binding(
-                                            &device.create_buffer_init(
-                                                &wgpu::util::BufferInitDescriptor {
-                                                    label: Some("pluto clip uniform"),
-                                                    contents: bytemuck::cast_slice(&[data]),
-                                                    usage: wgpu::BufferUsages::UNIFORM
-                                                        | wgpu::BufferUsages::COPY_DST,
-                                                },
+                                    label: Some("pluto uniform + clip bind group"),
+                                    layout: &self.uniform_clip_bind_group_layout,
+                                    entries: &[
+                                        wgpu::BindGroupEntry {
+                                            binding: 0,
+                                            resource: self.uniform_buffer.as_entire_binding(),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: 1,
+                                            resource: wgpu::Buffer::as_entire_binding(
+                                                &device.create_buffer_init(
+                                                    &wgpu::util::BufferInitDescriptor {
+                                                        label: Some("pluto clip uniform"),
+                                                        contents: bytemuck::cast_slice(&[data]),
+                                                        usage: wgpu::BufferUsages::UNIFORM
+                                                            | wgpu::BufferUsages::COPY_DST,
+                                                    },
+                                                ),
                                             ),
-                                        ),
-                                    }],
+                                        },
+                                    ],
                                 },
                             ));
                             idx
@@ -3322,8 +3331,7 @@ impl PaintRenderer {
                         continue;
                     };
                     pass.set_pipeline(&self.rect_pipeline);
-                    pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                    pass.set_bind_group(1, &self.clip_groups[run.clip], &[]);
+                    pass.set_bind_group(0, &self.clip_groups[run.clip], &[]);
                     pass.set_vertex_buffer(0, buffer.slice(..));
                     pass.draw(range, 0..1);
                 }
@@ -3332,9 +3340,8 @@ impl PaintRenderer {
                         continue;
                     };
                     pass.set_pipeline(&self.glyph_pipeline);
-                    pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                    pass.set_bind_group(0, &self.clip_groups[run.clip], &[]);
                     pass.set_bind_group(1, &self.atlas_bind_group, &[]);
-                    pass.set_bind_group(2, &self.clip_groups[run.clip], &[]);
                     pass.set_vertex_buffer(0, buffer.slice(..));
                     pass.draw(range, 0..1);
                 }
@@ -3343,9 +3350,8 @@ impl PaintRenderer {
                         continue;
                     };
                     pass.set_pipeline(&self.colour_glyph_pipeline);
-                    pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                    pass.set_bind_group(0, &self.clip_groups[run.clip], &[]);
                     pass.set_bind_group(1, &self.colour_atlas_bind_group, &[]);
-                    pass.set_bind_group(2, &self.clip_groups[run.clip], &[]);
                     pass.set_vertex_buffer(0, buffer.slice(..));
                     pass.draw(range, 0..1);
                 }
@@ -3357,9 +3363,8 @@ impl PaintRenderer {
                         continue;
                     };
                     pass.set_pipeline(&self.image_pipeline);
-                    pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                    pass.set_bind_group(0, &self.clip_groups[run.clip], &[]);
                     pass.set_bind_group(1, bind_group, &[]);
-                    pass.set_bind_group(2, &self.clip_groups[run.clip], &[]);
                     pass.set_vertex_buffer(0, buffer.slice(..));
                     pass.draw(range, 0..1);
                 }
@@ -3368,8 +3373,7 @@ impl PaintRenderer {
                         continue;
                     };
                     pass.set_pipeline(&self.rounded_pipeline);
-                    pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                    pass.set_bind_group(1, &self.clip_groups[run.clip], &[]);
+                    pass.set_bind_group(0, &self.clip_groups[run.clip], &[]);
                     pass.set_vertex_buffer(0, buffer.slice(..));
                     pass.draw(range, 0..1);
                 }
@@ -3378,8 +3382,7 @@ impl PaintRenderer {
                         continue;
                     };
                     pass.set_pipeline(&self.shadow_pipeline);
-                    pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                    pass.set_bind_group(1, &self.clip_groups[run.clip], &[]);
+                    pass.set_bind_group(0, &self.clip_groups[run.clip], &[]);
                     pass.set_vertex_buffer(0, buffer.slice(..));
                     pass.draw(range, 0..1);
                 }
@@ -3842,6 +3845,42 @@ mod tests {
                 glyphs_seen >= 11,
                 "expected most of {text:?} shaped at {size}px, saw {glyphs_seen}"
             );
+        }
+    }
+
+    /// Regression test for the Haswell crash (2026-11-24): the
+    /// glyph pipeline's three-group layout ([uniform, atlas, clip])
+    /// panicked at creation with "Bind group layout count 3 exceeds
+    /// device bind group limit 2". Every shader must parse under
+    /// naga and use only bind groups 0-1, so the fix (clip merged
+    /// into group 0) cannot regress silently — the sandbox has no
+    /// GPU, so this is the only automated check that the layout
+    /// fits a 2-group device.
+    #[test]
+    fn shaders_parse_and_use_at_most_two_bind_groups() {
+        let sources = [
+            ("rect", format!("{CLIP_WGSL}{RECT_WGSL_BODY}")),
+            ("glyph", format!("{CLIP_WGSL}{GLYPH_WGSL_BODY}")),
+            (
+                "colour glyph",
+                format!("{CLIP_WGSL}{COLOUR_GLYPH_WGSL_BODY}"),
+            ),
+            ("image", format!("{CLIP_WGSL}{IMAGE_WGSL_BODY}")),
+            ("rounded", format!("{CLIP_WGSL}{ROUNDED_WGSL_BODY}")),
+            ("shadow", format!("{CLIP_WGSL}{SHADOW_WGSL_BODY}")),
+        ];
+        for (name, src) in sources {
+            let module = naga::front::wgsl::parse_str(&src)
+                .unwrap_or_else(|e| panic!("{name} shader must parse: {e:?}"));
+            for (_, var) in module.global_variables.iter() {
+                if let Some(binding) = var.binding {
+                    assert!(
+                        binding.group < 2,
+                        "{name} shader uses bind group {}, above the 2-group cap",
+                        binding.group
+                    );
+                }
+            }
         }
     }
 }
