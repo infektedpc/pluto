@@ -148,13 +148,16 @@ impl Application for PlutoBrowser {
         .width(Length::Fill)
         .height(Length::Fill);
 
-        let status = widget::text(&self.status).size(12);
+        // The status line sits at the bottom of the window, below the
+        // page — like a browser status bar — not under the nav bar.
+        let status = widget::row([widget::text(&self.status).size(12).into()]).padding(4);
 
         widget::column([
             nav_bar.into(),
             widget::divider::horizontal::default().into(),
-            status.into(),
             web_view.into(),
+            widget::divider::horizontal::default().into(),
+            status.into(),
         ])
         .into()
     }
