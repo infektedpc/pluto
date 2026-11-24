@@ -1,0 +1,33 @@
+# Dependency audit — checks the locked dependency tree against the
+# RustSec advisory database. Runs weekly, on pushes to main, and on
+# demand. A failure here means a dependency has a known vulnerability
+# and needs upgrading or replacing; it does not block landing code
+# by itself (the job is advisory), but it should never be ignored.
+name: Audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**/Cargo.toml"
+  schedule:
+    # Mondays, 09:00 UTC.
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+      - name: Audit the locked tree
+        run: cargo audit
