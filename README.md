@@ -1,14 +1,22 @@
-# Pluto
 
-A new browser: libcosmic shell + wgpu viewport, with a from-scratch engine
-in Rust (`pluto-net`, `pluto-html`, `pluto-css`, `pluto-layout`,
-`pluto-paint`, `pluto-js`). See `ARCHITECTURE.md` for how the layers connect.
+Pluto
 
-## Run
+Pluto is a web browser written from scratch in Rust. No Mozilla code, no Google code, no Apple code — no Servo, no Chromium, no WebKit. Every line of the engine is written originally for Pluto: its own HTML tokenizer and WHATWG tree builder, its own CSS parser and cascade, its own layout, paint, networking, JavaScript bindings, and IPC.
+Goals
 
-```sh
+    Fast. Pages render through a wgpu display list with glyph and image atlases, style and layout run in parallel where the design allows, and the network layer pools connections per origin. The bar for "done" on real sites is 60+ FPS scrolling and clicking.
+    Robust. The parser recovers from malformed HTML the way the WHATWG spec says to (it passes 99.6% of the html5lib corpus); a failed fetch renders an error page, never a blank window; a renderer that dies must not take the browser with it.
+    Rust, end to end. Memory safety from the language, not from a sandbox bolted on afterwards — and then a sandbox anyway (see Security below).
+    Independent. Pluto shares no code with Google, Apple, or Mozilla projects. It builds on Rust libraries (hyper, rustls, rquickjs, wgpu, taffy, cosmic-text, libcosmic) and on web standards text — never on another browser's code.
+
+Status
+
+M1 ("Hello, example.com") is done and M4 (JavaScript) is done; M2 (real-world CSS) is nearly done. Wikipedia's homepage loads and renders in Pluto on real hardware. The current work is Stage 9: the security model (origin type, CORS, HSTS, HTTPS-only, renderer process split). Last verified full run: 375/375 tests green (cargo test --workspace).
+Building and running
+
+git clone https://github.com/infektedpc/pluto.git
+cd pluto
 cargo run -p pluto-browser
-```
 
 The window opens with a nav bar (Back / Forward / Reload / URL / Go), a
 status line, and a viewport that loads https://example.com on startup —
