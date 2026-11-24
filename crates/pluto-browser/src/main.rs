@@ -107,14 +107,16 @@ impl Application for PlutoBrowser {
     fn view(&self) -> Element<'_, Self::Message> {
         // NOTE: in this iced pin, `row()`/`column()` take their children
         // as an argument (no zero-arg builder + `.push()` chain).
+        // Round icon buttons (ButtonClass::Icon), not the pill-shaped
+        // text buttons — the glyphs render oval in a text button.
         let nav_bar = widget::row([
-            widget::button::text("←")
+            widget::button::icon(widget::icon::from_name("go-previous-symbolic"))
                 .on_press(Message::Back)
                 .into(),
-            widget::button::text("→")
+            widget::button::icon(widget::icon::from_name("go-next-symbolic"))
                 .on_press(Message::Forward)
                 .into(),
-            widget::button::text("↻")
+            widget::button::icon(widget::icon::from_name("view-refresh-symbolic"))
                 .on_press(Message::Reload)
                 .into(),
             widget::text_input("Enter URL...", &self.url_input)
