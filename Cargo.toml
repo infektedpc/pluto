@@ -59,15 +59,10 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 http-body-util = "0.1"
 slotmap = "1"
 thiserror = "2"
-# Stage 6 (pluto-html): html5ever 0.40.1 + markup5ever 0.40.0 — the
-# WHATWG tree-construction machine + tokenizer (Servo-origin). Pluto
-# keeps its slotmap Dom, the TreeSink, the streaming driver, and
-# everything downstream; the winnow tokenizer leaves the parse path.
-# Scope flag: the tree builder + tokenizer now come from a
-# Servo-origin crate (see pluto-html docs). url 2.5.9 was already in
-# the lock as a transitive dep; pluto-html names it directly for
+# Stage 6 (pluto-html): Pluto's own WHATWG tree-construction machine
+# + tokenizer (see crates/pluto-html). url 2.5.9 was already in the
+# lock as a transitive dep; pluto-html names it directly for
 # base-URL resolution in the preload scanner / streaming driver.
-html5ever = "0.40"
 url = "2"
 # Stage 5: CancellationToken (tokio-util sync) for cancelling
 # in-flight loads by navigation epoch; flate2 for gzip/deflate

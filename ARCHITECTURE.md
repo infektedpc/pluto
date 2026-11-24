@@ -26,7 +26,7 @@ older ones in early drafts.
 | --- | --- | --- |
 | 1. Shell & Presentation | libcosmic / iced + wgpu | Custom `iced::widget::Shader` (or Canvas / offscreen `wgpu::Texture`) viewport inside the libcosmic window, so web pages render into a GPU texture composited directly inside the browser tab area. Lives in `pluto-browser/src/viewport.rs`. |
 | 2. Networking | hyper + rustls + tokio | `ResourceLoader` in `pluto-net`: one shared hyper client for the whole browser (explicit pool caps: 6 idle/host, 90 s idle timeout, timer set) + one shared rustls config (ALPN `[h2, http/1.1]`, shared resumption, 0-RTT off) over TLS 1.3 (rustls + webpki-roots); a scheduler (priority queue, 6 in-flight/origin, dedup, timeouts) streams `ResourceEvent`s (headers / chunks / done / error / cancelled) per `ResourceRequest`; gzip/deflate decoding, mixed-content gate, redirect audit (301/302/303/307/308, 5 hops, no https→http downgrade). No per-navigation client: the M1 fresh-loader-per-navigation defeated pooling and resumption. |
-| 3. Parsing & DOM | winnow + slotmap | winnow for fast, zero-copy CSS tokenization and HTML5 state-machine parsing into an arena-allocated DOM tree (`NodeId` handles instead of `Rc<RefCell<T>>` cycles). Lives in `pluto-html` / `pluto-css`. |
+| 3. Parsing & DOM | Pluto's own WHATWG parser + slotmap | Pluto's own tokenizer + tree-construction machine (WHATWG, `pluto-html`) parses HTML5 into an arena-allocated DOM tree (`NodeId` handles instead of `Rc<RefCell<T>>` cycles); winnow remains for CSS tokenization only. Lives in `pluto-html` / `pluto-css`. |
 | 4. Layout & Text | taffy + cosmic-text | `taffy::LayoutPartialTree` over the styled DOM nodes. For text leaf nodes, pass `cosmic_text::Buffer` shaping results inside Taffy's `measure_function` so line wrapping and intrinsic sizes match pixel-for-pixel. Lives in `pluto-layout`. |
 | 5. GPU Rendering | wgpu + cosmic-text (swash) | Walk the laid-out Taffy tree in paint order (z-index / stacking contexts) to emit quads (backgrounds, borders, images) and glyph atlases (via cosmic-text's `SwashCache`) into a wgpu render pass. Lives in `pluto-paint`; uploaded in `viewport.rs::Primitive::prepare`, drawn in `Primitive::render`. |
 | 6. Scripting | rquickjs | `rquickjs::AsyncRuntime` on the tab's event loop, exposing `NodeId`-backed host objects (`document.getElementById`, `addEventListener`, `fetch`) that mutate the DOM and trigger re-style/re-layout. Lives in `pluto-js`. |
@@ -82,14 +82,22 @@ Go pressed
   (M5-ish; prerender deferred entirely), CSP + native content
   blocker (M10), H3/DoH/0-RTT (post-M5, feature-gated, only after
   measurement).
-- Stage 6 application (integration, applied 2026-11-24): html5ever
-  adoption — the tree-construction machine + tokenizer now come from
-  html5ever 0.40.1 (Servo-origin), adopted because the spike showed a
-  clean `TreeSink` mapping onto the slotmap `Dom` and a 1942/1973
-  html5lib-tests corpus pass; Pluto keeps its `Dom`, sink, streaming
-  driver, preload scanner, and everything downstream. This was within
-  the "apply the Stage 6 recommendations" approval, which included
-  R1's adopt-if-clean condition. Streaming parser (`feed` ->
+- Stage 6 application (integration, applied 2026-11-24): Pluto's
+  own WHATWG parser — the tree-construction machine + tokenizer are
+  Pluto's own (`crates/pluto-html/src/tokenizer.rs` +
+  `builder.rs`, vendored WHATWG `entities.json` with a build-time
+  generated table), written after Joel overruled the html5ever
+  0.40.1 adoption on 2026-11-24 ("write Pluto's own, do not adopt
+  Servo's"). No Servo-origin code remains in the build:
+  html5ever/markup5ever/tendril/web_atoms are out of the workspace
+  `Cargo.toml`, pluto-html's `Cargo.toml`, and `Cargo.lock`, and
+  `sink.rs` (the html5ever `TreeSink` adapter) is deleted;
+  `DomEvent` moved from `pluto_html::sink` to `pluto_html` (a
+  one-line import fix in `page.rs`). html5lib-tests
+  tree-construction corpus: 1965/1973 (99.6%) — the 8 misses are 6
+  scripted tests (need JS) + 2 `<search>`; up from 1942/1973 with
+  html5ever. Pluto keeps its `Dom`, streaming driver, preload
+  scanner, and everything downstream. Streaming parser (`feed` ->
   `DomEvent`s, pause-at-script, encoding-restart buffering) drives
   the worker load path; the preload scanner fires subresource fetches
   (the Stage 5 scheduler dedups them); external `<link
@@ -252,9 +260,11 @@ responsive sites without layout breakage.
 Goal: eliminate parsing failures on messy real-world HTML and unlock
 charts, icons, and 2D web graphics.
 
-- **pluto-html**: upgrade the winnow parser to full WHATWG HTML5
-  tree-construction rules (adoption agency algorithm, foster parenting,
-  implicit tag closing, malformed markup recovery) plus HTML entities.
+- **pluto-html**: full WHATWG HTML5 tree construction landed in Stage 6
+  (Pluto's own tokenizer + tree builder, adoption agency, foster
+  parenting, implicit tag closing, malformed markup recovery, entities);
+  M7 keeps parser polish only (scripted-corpus gaps need JS, `<search>`
+  special-element support).
 - **Inline `<svg>` & 2D `<canvas>`**: pure-Rust vector path tessellator
   (lyon or vello / custom wgpu triangle shaders) to render inline `<svg>`
   icons/illustrations and expose the HTML5 `CanvasRenderingContext2D` API

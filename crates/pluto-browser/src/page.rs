@@ -73,7 +73,7 @@
 //! resolve against.
 
 use pluto_css::{MediaCondition, Stylesheet};
-use pluto_html::sink::DomEvent;
+use pluto_html::DomEvent;
 use pluto_html::{
     Dom, NodeId, Parser, resolve_url, scan as preload_scan,
 };

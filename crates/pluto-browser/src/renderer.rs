@@ -26,8 +26,8 @@
 //!
 //! * Navigation tasks run on a dedicated OS thread with a
 //!   current-thread tokio runtime. The streaming parser
-//!   (`pluto_html::Parser`, html5ever `Tokenizer`/`TreeBuilder` full
-//!   of `Cell`/`RefCell` and `NonAtomic` tendrils) is single-threaded
+//!   (`pluto_html::Parser`, Pluto's own tokenizer/tree-builder, full
+//!   of `Cell`/`RefCell`) is single-threaded
 //!   by construction and cannot be held across an await in a
 //!   `tokio::spawn`d future — so the whole load (fetch + streaming
 //!   parse + subresource fetches) runs on that thread, and only the
@@ -325,7 +325,7 @@ pub async fn run_worker(mut commands: CommandReceiver, mut events: mpsc::Sender<
 /// Start a navigation: cancel the previous one (its token, and its
 /// epoch — so a late outcome is discarded), then run the fetch+parse
 /// on a dedicated OS thread with a current-thread runtime. The load
-/// future is `!Send` (the streaming parser holds html5ever's
+/// future is `!Send` (the streaming parser holds Pluto's own
 /// `!Send` tokenizer/tree-builder state across awaits), so it cannot
 /// be `tokio::spawn`d; the thread owns the load end to end, and only
 /// the `Send` outcome crosses back, via `blocking_send`. Layout

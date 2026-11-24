@@ -3436,7 +3436,7 @@ mod tests {
         );
         let (parallel, serial) = resolve_both(&dom, &sheet);
         assert_same_styles(&parallel, &serial);
-        // html + head + body + div.wrap + 200 p + 200 span: html5ever's
+        // html + head + body + div.wrap + 200 p + 200 span: Pluto's
         // parse_document synthesises html/head/body around the input,
         // so the head is a real (if empty) element in the style map.
         assert_eq!(parallel.len(), 404);
@@ -3458,7 +3458,7 @@ mod tests {
 
     #[test]
     fn parallel_and_serial_styles_match_fragment() {
-        // No <html> in the input: html5ever's parse_document
+        // No <html> in the input: Pluto's parse_document
         // synthesises html/head/body around the fragment, and the
         // style pass collects those too.
         let dom = parse_html(
@@ -3469,7 +3469,7 @@ mod tests {
         assert_same_styles(&parallel, &serial);
         // Both divs and both paragraphs are collected even though
         // the first subtree is `display: none` (computed, unused) —
-        // plus html/head/body, which html5ever's parse_document
+        // plus html/head/body, which Pluto's parse_document
         // synthesises around the fragment (7 total, not 4).
         assert_eq!(parallel.len(), 7);
         let hide = find_by_class(&dom, dom.root().unwrap(), "hide").unwrap();
@@ -3877,7 +3877,7 @@ mod tests {
             .unwrap()
             .clone();
         // The tall child is clipped to the scroll container's rect.
-        // The container sits at (8,8), not (0,0): html5ever's
+        // The container sits at (8,8), not (0,0): Pluto's
         // parse_document synthesises a <body> around the fragment,
         // and the UA stylesheet gives it its 8px margin.
         assert_eq!(tall_before.clip, Some([8.0, 8.0, 200.0, 50.0]));

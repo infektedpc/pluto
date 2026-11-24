@@ -1,21 +1,16 @@
 //! Parsing & DOM (layer 3): WHATWG HTML tree construction over a
 //! slotmap arena DOM.
 //!
-//! # Scope flag — html5ever is adopted, not re-implemented
+//! # Pluto's own parser — no Servo-origin parser code
 //!
 //! The tree-construction machine itself — insertion modes, open-element
 //! stack, active formatting elements, adoption agency, foster
 //! parenting, implied end tags, quirks flag, raw-text/RCDATA handling —
-//! comes from **html5ever 0.40.1** (Servo-origin), driven through the
-//! [`sink::PlutoSink`] `TreeSink` in [`sink`]. The winnow tokenizer
-//! that used to live here has left the parse path entirely. What stays
-//! Pluto's: the slotmap [`Dom`], the sink, the streaming driver in
-//! [`streaming`] (feed / pause-at-script / encoding-restart), the
-//! preload scanner in [`scanner`], and everything downstream (CSS,
-//! layout, paint). See the spike report
-//! (`~/workspace/pluto-spike/SPIKE.md`): 1942/1973 vendored
-//! html5lib-tests tree-construction tests pass through this sink; the
-//! known misses are upstream html5ever divergences, not sink gaps.
+//! is Pluto's own code in [`builder`], driven by Pluto's own
+//! tokenizer in [`tokenizer`]. The DOM is the slotmap [`Dom`]; the
+//! builder drives it directly through its mutators. The streaming
+//! driver lives in [`streaming`] (feed / pause-at-script /
+//! encoding-restart) and the preload scanner in [`scanner`].
 //!
 //! The DOM lives in a slotmap arena. Nodes are addressed by [`NodeId`]
 //! handles, never `Rc<RefCell<T>>`, so there are no reference cycles and
@@ -28,7 +23,7 @@
 //!
 //! Parsing never fires mutation observers. The public mutators below
 //! record a [`MutationRecord`] and mark Double Dirty Bit flags —
-//! except while a parse is in progress, when the sink suppresses
+//! except while a parse is in progress, when the builder suppresses
 //! recording (see [`Dom::set_suppress_records`]). The tree surgery is
 //! the same single code path either way; only the recording wrapper is
 //! skipped, per spec ("DOM mutation events must not fire for changes
@@ -36,32 +31,26 @@
 //!
 //! # Entities
 //!
-//! Entity decoding is html5ever's job, not Pluto's. Its tokenizer
-//! (`tokenizer/char_ref`) decodes named references against
-//! `web_atoms::NAMED_ENTITIES` — a perfect-hash map generated from the
-//! WHATWG `entities.json` (re-exported via `markup5ever::data`) — and
-//! its numeric-reference path maps surrogates, `0x00`, and values
-//! `> U+10FFFF` to U+FFFD (with the spec's C1 replacements for
-//! `0x80..=0x9F`). Pluto keeps no entity table and asserts no count.
-//! The old hand-written [`decode_entities`] helper was removed with the
-//! winnow tokenizer: attribute values and text now arrive decoded from
-//! the tokenizer, and re-decoding them would double-decode `&amp;`.
+//! Named character references come from the vendored WHATWG
+//! `entities.json` (see `crates/pluto-html/entities.json`), generated
+//! into a table at build time by `build.rs` ([`entities`]). No count
+//! is asserted — published sources disagree on the total. Numeric
+//! references map surrogates, `0x00`, and values `> U+10FFFF` to
+//! U+FFFD (with the spec's C1 replacements for `0x80..=0x9F`).
 
+pub mod builder;
+pub mod entities;
 pub mod scanner;
-pub mod sink;
 pub mod streaming;
+pub mod tokenizer;
 
 use std::collections::HashSet;
 
-use html5ever::driver::ParseOpts;
-use html5ever::interface::tree_builder::{ElementFlags, TreeSink};
-use html5ever::tendril::TendrilSink;
-use html5ever::{LocalName, QualName, ns};
-use sink::{ParseOutput, PlutoSink};
+use builder::ParseOutput;
 use slotmap::{SlotMap, new_key_type};
 
+pub use builder::{DomEvent, QName, SinkStats};
 pub use scanner::{Destination, DiscoveredResource, Priority, resolve_url, scan};
-pub use sink::DomEvent;
 pub use streaming::{Parser, ParsedStream, ScriptPaused};
 
 new_key_type! {
@@ -239,8 +228,8 @@ pub struct Dom {
     dirty: DirtySet,
     /// Parser privilege: while true, mutators still maintain
     /// parent/child invariants but skip mutation records and dirty
-    /// bits. Set by the sink for the duration of a parse and cleared
-    /// by [`sink::PlutoSink::finish`]; JS-driven mutations always
+    /// bits. Set by the builder for the duration of a parse and cleared
+    /// when the builder finishes; JS-driven mutations always
     /// record. This flag is internal state, not a public toggle.
     suppress_records: bool,
 }
@@ -614,8 +603,8 @@ impl Dom {
         self.note_mutation(id, MutationKind::CharacterDataChanged, Some(before));
     }
 
-    /// Append to an existing text node (adjacent-text merging, per the
-    /// `TreeSink` contract: the builder hands the sink text in chunks).
+    /// Append to an existing text node (adjacent-text merging: the
+    /// builder hands the tree text in chunks).
     pub fn append_to_text(&mut self, id: NodeId, data: &str) {
         let before = BeforeSnapshot::capture(self, id);
         if let Some(Node { kind: NodeKind::Text(contents), .. }) = self.arena.get_mut(id) {
@@ -627,13 +616,13 @@ impl Dom {
 
 /// Parse HTML text into a [`Dom`]. Lenient by design: this never
 /// fails; malformed input is recovered per the WHATWG tree-construction
-/// algorithm and parse errors are recorded in the sink stats (see
+/// algorithm and parse errors are recorded in the builder stats (see
 /// [`parse_detailed`]) rather than being fatal.
 pub fn parse(html: &str) -> Dom {
     parse_detailed(html).dom
 }
 
-/// Like [`parse`], but also returns the sink side-maps the `Dom` shape
+/// Like [`parse`], but also returns the side maps the `Dom` shape
 /// itself cannot hold (qualified names, full namespaced attributes,
 /// `<template>` contents), the quirks mode, parse-error stats, and the
 /// [`DomEvent`]s observed during the parse.
@@ -645,19 +634,14 @@ pub fn parse_detailed(html: &str) -> ParseOutput {
 /// `<noscript>` parsing; the html5lib-tests corpus runs each test in
 /// both modes unless restricted).
 pub fn parse_detailed_with_opts(html: &str, scripting_enabled: bool) -> ParseOutput {
-    let mut opts = ParseOpts::default();
-    opts.tree_builder.scripting_enabled = scripting_enabled;
-    html5ever::parse_document(PlutoSink::new(), opts).one(html)
+    builder::parse_document_with(html, scripting_enabled)
 }
 
 /// Parse an HTML fragment in the context of an element named
 /// `context_tag` (namespace `context_ns`: `"svg"`, `"math"`/MathML, or
 /// `None` for HTML). Returns the document plus the context element,
-/// with the fragment's top-level nodes re-parented under it in one
-/// [`Dom::reparent_children`] call — the `innerHTML` seam (Stage 7).
-/// `html5ever`'s fragment builder leaves the nodes under a synthetic
-/// `<html>` root; the re-parent is what lands them on the real
-/// context element.
+/// with the fragment's top-level nodes under it — the `innerHTML`
+/// seam (Stage 7).
 pub fn parse_fragment(
     html: &str,
     context_tag: &str,
@@ -674,49 +658,7 @@ pub fn parse_fragment_detailed(
     context_ns: Option<&str>,
     scripting_enabled: bool,
 ) -> (ParseOutput, NodeId) {
-    let sink = PlutoSink::new();
-    let ns = match context_ns {
-        Some("svg") => ns!(svg),
-        // The `.dat` fragment line's name for MathML is "math".
-        Some("mathml") | Some("math") => ns!(mathml),
-        _ => ns!(html),
-    };
-    let name = QualName::new(None, ns, LocalName::from(context_tag));
-    let ctx = sink.create_element(name, Vec::new(), ElementFlags::default());
-    let mut opts = ParseOpts::default();
-    opts.tree_builder.scripting_enabled = scripting_enabled;
-    let mut out = html5ever::driver::parse_fragment_for_element(
-        sink, opts, ctx, scripting_enabled, None,
-    )
-    .one(html);
-    reparent_fragment(&mut out.dom, ctx);
-    (out, ctx)
-}
-
-/// Move a fragment parse's top-level nodes from the synthetic `<html>`
-/// root onto the real context element. The fragment builder leaves the
-/// fragment's top-level nodes as the direct children of the synthetic
-/// root (for an `html` context those nodes are `<head>` / `<body>` /
-/// `<frameset>` themselves; for a `div` context they are the `<p>`s) —
-/// so every child moves as-is, in order, with no hoisting.
-fn reparent_fragment(dom: &mut Dom, ctx: NodeId) {
-    let Some(root) = dom.root() else { return };
-    let Some(synthetic) = dom
-        .children(root)
-        .iter()
-        .copied()
-        .find(|&c| matches!(dom.get(c).map(|n| &n.kind), Some(NodeKind::Element { .. })))
-    else {
-        return;
-    };
-    // The re-parent is part of parsing, not a JS mutation: suppress
-    // recording for it (same parser privilege as the sink).
-    dom.set_suppress_records(true);
-    let kids: Vec<NodeId> = dom.children(synthetic).to_vec();
-    for kid in kids {
-        dom.append_child(ctx, kid);
-    }
-    dom.set_suppress_records(false);
+    builder::parse_fragment_with(html, context_tag, context_ns, scripting_enabled)
 }
 
 #[cfg(test)]
@@ -870,7 +812,7 @@ mod tests {
 
     #[test]
     fn numeric_entities_validated_to_replacement() {
-        // html5ever's tokenizer (char_ref::finish_numeric) maps
+        // Pluto's tokenizer (entities::numeric_char) maps
         // surrogates, NUL, and values > U+10FFFF to U+FFFD.
         let dom = parse("<p>&#xD800;&#x110000;&#0;&#65;</p>");
         let root = dom.root().unwrap();
@@ -945,7 +887,7 @@ mod tests {
         // part of the value, per spec (the self-closing marker is only
         // recognised between attributes, not inside a value):
         // `<img src=/a/b.png/>` means src="/a/b.png/". The old
-        // hand-written parser stripped it; html5ever keeps it, which
+        // hand-written parser stripped it; the spec keeps it, which
         // is spec truth — the expectation changed deliberately.
         let dom = parse("<img src=/a/b.png/><img src=x/>");
         let root = dom.root().unwrap();

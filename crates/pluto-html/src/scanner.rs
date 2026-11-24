@@ -1,4 +1,4 @@
-//! The preload scanner (R4): a scan-only mode of the SAME html5ever
+//! The preload scanner (R4): a scan-only mode of the SAME Pluto
 //! tokenizer the main parser uses.
 //!
 //! While the main parser is blocked (script fetch, stylesheet wait, or
@@ -12,7 +12,7 @@
 //!
 //! The scanner shares two code paths with the main parser, so the two
 //! cannot disagree: attribute values arrive entity-decoded from the
-//! same html5ever `Tokenizer` (see `crate` docs on entities), and URL
+//! same Pluto `Tokenizer` (see `crate` docs on entities), and URL
 //! resolution goes through the same [`resolve_url`] + first-`<base>`-
 //! wins rule the streaming parser uses. Dedup is the Stage 5
 //! scheduler's job — the scanner just emits; a speculative fetch of a
@@ -50,10 +50,7 @@
 //!   treats noscript content as raw text while the scanner may
 //!   over-fetch from it. Wasted bandwidth, not a correctness bug.
 
-use html5ever::tendril::StrTendril;
-use html5ever::tokenizer::{BufferQueue, Tag, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts};
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::tokenizer::{Token, Tokenizer};
 
 /// What kind of resource a discovery is asking for.
 ///
@@ -396,99 +393,6 @@ pub fn classify_element(
     out
 }
 
-#[derive(Default)]
-struct ScanState {
-    discoveries: Vec<DiscoveredResource>,
-    /// First `<base href>` wins (spec); resolved against the document
-    /// URL when seen. `None` until a `<base>` is scanned.
-    base: Option<String>,
-    template_depth: usize,
-    picture_depth: usize,
-    media_depth: usize,
-}
-
-/// The scan-only `TokenSink`: records fetchable attributes, builds no
-/// tree. Single-threaded by construction (the `Tokenizer` is too), so
-/// `RefCell` state behind an `Rc` is the right interior mutability —
-/// nothing here needs to be `Send`.
-struct ScanSink {
-    state: Rc<RefCell<ScanState>>,
-    document_url: String,
-}
-
-impl ScanSink {
-    fn project_attrs(tag: &Tag) -> Vec<(String, String)> {
-        // Project StrTendril values to owned String immediately:
-        // StrTendril is !Send/!Sync and must never be retained.
-        tag.attrs
-            .iter()
-            .map(|a| (a.name.local.to_string(), a.value.to_string()))
-            .collect()
-    }
-
-    fn effective_base(state: &ScanState, document_url: &str) -> String {
-        state.base.clone().unwrap_or_else(|| document_url.to_string())
-    }
-}
-
-impl TokenSink for ScanSink {
-    type Handle = ();
-
-    fn process_token(&self, token: Token, _line_number: u64) -> TokenSinkResult<()> {
-        let Token::TagToken(tag) = token else {
-            return TokenSinkResult::Continue;
-        };
-        let name = tag.name.to_string();
-        let mut state = self.state.borrow_mut();
-        match tag.kind {
-            TagKind::StartTag => {
-                // Depth counters first: a discovery inside <template>
-                // is skipped, and <source> needs its parent context.
-                match name.as_str() {
-                    "template" => state.template_depth += 1,
-                    "picture" => state.picture_depth += 1,
-                    "video" | "audio" => state.media_depth += 1,
-                    _ => {}
-                }
-                if name == "base" {
-                    // First <base href> wins; later ones are ignored.
-                    if state.base.is_none() {
-                        let attrs = Self::project_attrs(&tag);
-                        if let Some(href) = attr(&attrs, "href") {
-                            if !href.trim().is_empty() {
-                                let base = resolve_url(&self.document_url, href);
-                                state.base = Some(base);
-                            }
-                        }
-                    }
-                    return TokenSinkResult::Continue;
-                }
-                if state.template_depth == 0 {
-                    let attrs = Self::project_attrs(&tag);
-                    let in_picture = state.picture_depth > 0;
-                    let in_media = state.media_depth > 0;
-                    let base = Self::effective_base(&state, &self.document_url);
-                    for raw in classify_element(&name, &attrs, in_picture, in_media) {
-                        state.discoveries.push(DiscoveredResource {
-                            url: resolve_url(&base, &raw.url),
-                            destination: raw.destination,
-                            priority: raw.priority,
-                            from: raw.from,
-                        });
-                    }
-                }
-            }
-            TagKind::EndTag => match name.as_str() {
-                "template" => state.template_depth = state.template_depth.saturating_sub(1),
-                "picture" => state.picture_depth = state.picture_depth.saturating_sub(1),
-                "video" | "audio" => state.media_depth = state.media_depth.saturating_sub(1),
-                _ => {}
-            },
-        }
-        TokenSinkResult::Continue
-    }
-}
-
 /// Scan buffered HTML bytes for fetchable subresources, resolved
 /// against `document_url` (and any `<base href>` in the scanned
 /// prefix). Best-effort: undecodable bytes become U+FFFD (the
@@ -499,25 +403,62 @@ impl TokenSink for ScanSink {
 /// 5 scheduler dedups by URL + destination + epoch).
 pub fn scan(bytes: &[u8], document_url: &str) -> Vec<DiscoveredResource> {
     let text = String::from_utf8_lossy(bytes);
-    let state = Rc::new(RefCell::new(ScanState::default()));
-    let sink = ScanSink {
-        state: Rc::clone(&state),
-        document_url: document_url.to_string(),
+    let mut tokenizer = Tokenizer::new();
+    tokenizer.feed_str(&text);
+    tokenizer.set_eof();
+    let mut discoveries: Vec<DiscoveredResource> = Vec::new();
+    let mut base: Option<String> = None;
+    let mut template_depth: usize = 0;
+    let mut picture_depth: usize = 0;
+    let mut media_depth: usize = 0;
+    let effective_base = |base: &Option<String>| -> String {
+        base.clone().unwrap_or_else(|| document_url.to_string())
     };
-    let tokenizer = Tokenizer::new(sink, TokenizerOpts::default());
-    let queue = BufferQueue::default();
-    queue.push_back(StrTendril::from(text.as_ref()));
-    // The tokenizer may suspend on Script / EncodingIndicator; the
-    // scanner has nothing to do at those points — just keep draining.
-    loop {
-        match tokenizer.feed(&queue) {
-            html5ever::TokenizerResult::Done => break,
-            _ => continue,
+    while let Some(token) = tokenizer.next_token() {
+        match token {
+            Token::Eof => break,
+            Token::StartTag(tag) => {
+                let name = tag.name.clone();
+                match name.as_str() {
+                    "template" => template_depth += 1,
+                    "picture" => picture_depth += 1,
+                    "video" | "audio" => media_depth += 1,
+                    _ => {}
+                }
+                if name == "base" {
+                    if base.is_none() {
+                        if let Some(href) = attr(&tag.attrs, "href") {
+                            if !href.trim().is_empty() {
+                                base = Some(resolve_url(document_url, href));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if template_depth == 0 {
+                    let in_picture = picture_depth > 0;
+                    let in_media = media_depth > 0;
+                    let b = effective_base(&base);
+                    for raw in classify_element(&name, &tag.attrs, in_picture, in_media) {
+                        discoveries.push(DiscoveredResource {
+                            url: resolve_url(&b, &raw.url),
+                            destination: raw.destination,
+                            priority: raw.priority,
+                            from: raw.from,
+                        });
+                    }
+                }
+            }
+            Token::EndTag(tag) => match tag.name.as_str() {
+                "template" => template_depth = template_depth.saturating_sub(1),
+                "picture" => picture_depth = picture_depth.saturating_sub(1),
+                "video" | "audio" => media_depth = media_depth.saturating_sub(1),
+                _ => {}
+            },
+            _ => {}
         }
     }
-    tokenizer.end();
-    let state = state.borrow();
-    state.discoveries.clone()
+    discoveries
 }
 
 #[cfg(test)]

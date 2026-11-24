@@ -8,22 +8,17 @@
 //! `html5lib/html5lib-tests` repo no longer carries it). No git
 //! involved.
 //!
-//! Known misses (all upstream html5ever divergences or JS-dependent
-//! tests, per the spike report — none is a sink-mapping problem):
-//! 6 `scripted_*` tests need a JS engine; 5 `search-element.dat`
-//! tests need `<search>` in html5ever's special-element set; 6
-//! `template.dat` tests hit html5ever clearing `frameset_ok` on
-//! `<template>` insert; 4 `webkit02.dat` tests need
-//! `<selectedcontent>` cloning on implicit closes; 9 are
-//! EOF/corner-tokenizer edges (`processing-instructions.dat`,
-//! `tests1/16/26.dat`, `tests_innerHTML_1.dat` — no "in select"
-//! insertion mode in html5ever).
+//! Known misses (per the spike report and the Pluto builder's own
+//! conformance run — see the final summary for the current list):
+//! `scripted_*` tests need a JS engine; a few are upstream-style
+//! divergences in Pluto's own builder (e.g. `<selectedcontent>`
+//! cloning on implicit closes) or EOF/corner-tokenizer edges.
 //!
 //! Run with `cargo test -p pluto-html --test html5lib -- --nocapture`
 //! to see the per-file table.
 
-use pluto_html::sink::ParseOutput;
-use pluto_html::{NodeId, NodeKind, parse_detailed_with_opts, parse_fragment_detailed};
+use pluto_html::builder::ParseOutput;
+use pluto_html::{NodeId, NodeKind, QName, parse_detailed_with_opts, parse_fragment_detailed};
 use std::path::{Path, PathBuf};
 
 /// One test case from a `.dat` file.
@@ -72,10 +67,12 @@ pub fn parse_dat_file(text: &str) -> Vec<DatTest> {
 
     let mut flush = |cur: &mut Option<DatTest>, data_lines: &mut Vec<&str>| {
         if let Some(mut t) = cur.take() {
-            let mut d = data_lines.join("\n");
-            if d.ends_with('\n') {
-                d.pop();
-            }
+            // NOTE: do NOT strip a trailing newline here. A blank
+            // line at the end of the data section IS the input's
+            // trailing newline (the reference runs feed it: e.g.
+            // tests16 #194's input is "<table>\n", EOF at (2,0),
+            // and its expected tree has the "\n" text node).
+            let d = data_lines.join("\n");
             t.data = d;
             data_lines.clear();
             while t.expected.last().map(|l| l.is_empty()).unwrap_or(false) {
@@ -154,7 +151,7 @@ fn ns_short(ns: &str) -> Option<&'static str> {
     }
 }
 
-fn attr_display((name, value): &(html5ever::QualName, String)) -> String {
+fn attr_display((name, value): &(QName, String)) -> String {
     if name.ns.is_empty() {
         format!("{}=\"{}\"", name.local, value)
     } else {
