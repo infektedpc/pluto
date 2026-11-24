@@ -1,3 +1,4 @@
+# registered 2026-11-24 — Actions now enabled
 # Dependency audit — checks the locked dependency tree against the
 # RustSec advisory database. Runs weekly, on pushes to main, and on
 # demand. A failure here means a dependency has a known vulnerability
