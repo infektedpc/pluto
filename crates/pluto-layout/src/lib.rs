@@ -546,20 +546,15 @@ fn shape_leaf(font_system: &mut FontSystem, bx: &LayoutBox) -> Vec<ShapedGlyph> 
     }
 
     let mut glyphs = Vec::new();
-    // Bytes consumed within each source line, so wrapped runs are located
-    // after the runs that precede them on the same line.
-    let mut line_cursor: HashMap<usize, usize> = HashMap::new();
     for run in buffer.layout_runs() {
-        let line_text = full_text.split('\n').nth(run.line_i).unwrap_or("");
-        let cursor = line_cursor.entry(run.line_i).or_insert(0);
-        let rel = line_text[*cursor..]
-            .find(run.text)
-            .map(|i| *cursor + i)
-            .unwrap_or(*cursor);
-        *cursor = rel + run.text.len();
+        // `run.text` is the whole source line in cosmic-text 0.19,
+        // not the visual line's substring — do not slice or search
+        // it. Each glyph carries its own byte offset within the
+        // source line (`LayoutGlyph.start`), which is what locates
+        // the glyph for its span color.
         let line_start = line_starts.get(run.line_i).copied().unwrap_or(0);
         for g in run.glyphs {
-            let abs = line_start + rel + g.start;
+            let abs = line_start + g.start;
             let color = ranges
                 .iter()
                 .find(|(r, _)| r.contains(&abs))

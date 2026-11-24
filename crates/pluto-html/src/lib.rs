@@ -34,7 +34,7 @@ pub enum NodeKind {
 
 /// A node in the arena. Children are `NodeId`s; the parent link makes
 /// upward walks (style matching, event bubbling) cheap.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Node {
     pub kind: NodeKind,
     pub parent: Option<NodeId>,
@@ -70,7 +70,7 @@ impl Node {
 }
 
 /// The arena-allocated DOM tree for one document.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Dom {
     arena: SlotMap<NodeId, Node>,
     root: Option<NodeId>,

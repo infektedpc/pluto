@@ -28,9 +28,44 @@ pub struct WebViewport {
     pub display: Arc<DisplayList>,
 }
 
-impl<Message> Program<Message> for WebViewport {
-    type State = ();
+/// State the viewport widget keeps across frames: the last widget
+/// bounds reported to the app, so a bounds change is published once.
+#[derive(Debug, Default)]
+pub struct ViewportState {
+    last_reported: Option<(f32, f32)>,
+}
+
+impl Program<crate::Message> for WebViewport {
+    type State = ViewportState;
     type Primitive = WebPrimitive;
+
+    /// Report the widget's bounds to the app when they change. The
+    /// bounds are the page area (window minus chrome) — the true
+    /// layout viewport. iced calls this on every event, including the
+    /// `RedrawRequested` that follows a resize's relayout, so the
+    /// bounds here are current (the resize event itself still sees
+    /// the pre-resize layout, but it publishes nothing: the bounds
+    /// are unchanged from the last report then). Publishing only on
+    /// change means one message per frame during a drag-resize, and
+    /// nothing at all for mouse moves with unchanged bounds. The app
+    /// re-lays out from the retained document and skips the message
+    /// entirely if the size is unchanged.
+    fn update(
+        &self,
+        state: &mut Self::State,
+        _event: &cosmic::iced::Event,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Option<shader::Action<crate::Message>> {
+        let size = (bounds.width, bounds.height);
+        if state.last_reported != Some(size) {
+            state.last_reported = Some(size);
+            return Some(shader::Action::publish(crate::Message::ViewportResized(
+                size.0, size.1,
+            )));
+        }
+        None
+    }
 
     fn draw(
         &self,

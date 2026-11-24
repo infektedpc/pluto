@@ -14,6 +14,13 @@ pub struct PlutoBrowser {
     active_url: String,
     display: Arc<DisplayList>,
     status: String,
+    /// The parsed page, retained so a resize re-lays out without
+    /// refetching. `None` until the first load lands.
+    document: Option<page::Document>,
+    /// Last laid-out viewport (CSS px, logical — the page area of
+    /// the window). Starts at the default window size; the viewport
+    /// widget corrects it on the first frame.
+    viewport: (f32, f32),
 }
 
 #[derive(Debug, Clone)]
@@ -23,8 +30,11 @@ pub enum Message {
     Back,
     Forward,
     Reload,
-    PageLoaded(Arc<DisplayList>, String),
+    PageLoaded(page::Document, String),
     PageFailed(String),
+    /// The viewport widget's bounds changed (window resize, or the
+    /// first frame reporting the real page area).
+    ViewportResized(f32, f32),
 }
 
 /// Start loading `url` in the background; the result arrives as
@@ -32,9 +42,7 @@ pub enum Message {
 /// `Action<Message>`, so the mapper wraps the message in `Action::App`.
 fn load_task(url: String) -> Task<Message> {
     Task::perform(page::load_page(url), |result| match result {
-        Ok((display, final_url)) => {
-            cosmic::Action::App(Message::PageLoaded(display, final_url))
-        }
+        Ok((document, final_url)) => cosmic::Action::App(Message::PageLoaded(document, final_url)),
         Err(err) => cosmic::Action::App(Message::PageFailed(err)),
     })
 }
@@ -69,6 +77,8 @@ impl Application for PlutoBrowser {
             active_url: url.clone(),
             display: Arc::new(DisplayList::new()),
             status: format!("Loading {url}…"),
+            document: None,
+            viewport: page::DEFAULT_VIEWPORT,
         };
         (app, load_task(url))
     }
@@ -81,18 +91,27 @@ impl Application for PlutoBrowser {
                 self.active_url = url.clone();
                 self.url_input = url.clone();
                 self.display = Arc::new(DisplayList::new());
+                // Drop the old page: a resize mid-load must not
+                // re-lay out stale content while the new one fetches.
+                self.document = None;
                 self.status = format!("Loading {url}…");
                 return load_task(url);
             }
             Message::Reload => {
                 let url = self.active_url.clone();
                 self.display = Arc::new(DisplayList::new());
+                self.document = None;
                 self.status = format!("Loading {url}…");
                 return load_task(url);
             }
-            Message::PageLoaded(display, final_url) => {
+            Message::PageLoaded(document, final_url) => {
                 eprintln!("[pluto] page loaded: {final_url}");
-                self.display = display;
+                // Layout at the current viewport, not the one the load
+                // started with — a resize mid-load must not leave a
+                // stale layout behind.
+                self.display = page::layout_document(&document, self.viewport);
+                eprintln!("[pluto] display list ready: {} items", self.display.0.len());
+                self.document = Some(document);
                 self.active_url = final_url.clone();
                 self.url_input = final_url.clone();
                 self.status = format!("Loaded {final_url}");
@@ -100,9 +119,35 @@ impl Application for PlutoBrowser {
             Message::PageFailed(err) => {
                 eprintln!("[pluto] page failed: {err}");
                 // Render the failure as a page; the status line says why.
-                self.display =
-                    page::build_display_list(&page::error_document(&self.active_url, &err));
+                // The error document is retained like a real one, so a
+                // later resize re-lays it out too.
+                let (display, document) = page::build_display_list(
+                    &page::error_document(&self.active_url, &err),
+                    self.viewport,
+                );
+                self.display = display;
+                self.document = Some(document);
                 self.status = format!("Failed: {err}");
+            }
+            Message::ViewportResized(width, height) => {
+                // Degenerate sizes (minimised window) carry no layout;
+                // a real size arrives when the window is restored.
+                if width < 1.0 || height < 1.0 {
+                    return Task::none();
+                }
+                // Skip when nothing changed: the widget only publishes
+                // on a bounds change, and the layout is deterministic
+                // at a fixed size, so a repeat would be pure waste.
+                // (Compare against the last *laid-out* size, not the
+                // last event — the two can differ mid-load.)
+                if (width, height) == self.viewport {
+                    return Task::none();
+                }
+                self.viewport = (width, height);
+                if let Some(document) = &self.document {
+                    eprintln!("[pluto] viewport resized to {width}x{height}, re-layout");
+                    self.display = page::layout_document(document, self.viewport);
+                }
             }
             Message::Back | Message::Forward => {
                 // History lands in M2; no-op for now.
