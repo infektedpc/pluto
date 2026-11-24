@@ -178,11 +178,13 @@ fn use_client_decorations() -> bool {
         // X11 window managers draw the frame (KWin, Mutter, Xfwm...).
         "x11" => false,
         "wayland" => {
-            // GNOME is the holdout; KDE, sway, Hyprland, COSMIC and
-            // other wlroots compositors offer server-side decorations.
-            // An unknown compositor falls back to libcosmic drawing.
+            // GNOME is the holdout; KDE, Xfce (its Wayland session runs
+            // on labwc), sway, Hyprland, COSMIC and other wlroots
+            // compositors offer server-side decorations. An unknown
+            // compositor falls back to libcosmic drawing.
             desktop.contains("gnome")
                 || !(desktop.contains("kde")
+                    || desktop.contains("xfce")
                     || desktop.contains("sway")
                     || desktop.contains("hyprland")
                     || desktop.contains("cosmic")
