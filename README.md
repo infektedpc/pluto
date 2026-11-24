@@ -9,7 +9,7 @@ Goals
 ```sh
 git clone https://github.com/infektedpc/pluto.git
 cd pluto
-cargo run -p pluto-browse`r
+cargo run -p pluto-browser
 ```
 
 The window opens with a nav bar (Back / Forward / Reload / URL / Go), a
