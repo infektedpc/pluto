@@ -20,3 +20,12 @@ color (white on the dark nav bar).
 (`freedesktop/scalable/actions/`), licensed
 [CC-BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
 Unmodified.
+
+## Nav-feature icons (hand-drawn, same style)
+
+`star-symbolic.svg` (outline star), `star-filled-symbolic.svg`
+(filled star), `open-menu-symbolic.svg` (hamburger) — drawn for
+Pluto in the same 16x16, single `#232323` fill style so the
+symbolic tint paints them like the Cosmic icons. The outline star
+is a filled even-odd path (outer star + inner star cut out), not
+a stroke, so the tint applies to it the same way.

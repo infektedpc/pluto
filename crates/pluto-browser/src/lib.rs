@@ -1,3 +1,4 @@
+mod bookmarks;
 mod compositor;
 mod js_host;
 mod page;
@@ -20,6 +21,7 @@ mod viewport;
 #[cfg(test)]
 pub(crate) static TEST_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+use bookmarks::{BookmarkStore, load_bookmarks, save_bookmarks};
 use compositor::Compositor;
 use cosmic::app::{Core, Task};
 use cosmic::iced::{Alignment, Length};
@@ -65,6 +67,16 @@ pub struct PlutoBrowser {
     history: Vec<String>,
     history_index: usize,
     history_nav: bool,
+    /// The persisted bookmarks (nav feature): toggled by the
+    /// star, listed in the hamburger menu's Bookmarks panel.
+    bookmarks: BookmarkStore,
+    /// Whether the hamburger menu is open. Opening a list panel
+    /// closes the menu; the menu never shows alongside a panel.
+    menu_open: bool,
+    /// The open Bookmarks/History list panel, if any. The lists
+    /// read the real stores: bookmarks from the profile store,
+    /// history from the session history above.
+    panel: Option<Panel>,
     /// The modifier keys currently held, as of the last key event
     /// (Stage 8 Rec 9): pointer/wheel messages carry no modifiers
     /// of their own, so the shell tracks them here and stamps
@@ -88,6 +100,23 @@ pub enum Message {
     Back,
     Forward,
     Reload,
+    /// The bookmark star: toggle a bookmark for the current page.
+    ToggleBookmark,
+    /// The hamburger button: open/close the menu.
+    ToggleMenu,
+    /// Menu: open the Bookmarks list panel.
+    ShowBookmarks,
+    /// Menu: open the History list panel.
+    ShowHistory,
+    /// Close the open list panel.
+    ClosePanel,
+    /// Navigate to a URL picked from a list panel (a bookmark or
+    /// a history entry — already a committed URL).
+    NavigateTo(String),
+    /// Remove a bookmark from the Bookmarks panel.
+    RemoveBookmark(String),
+    /// Menu: open a second Pluto window (a new process).
+    NewWindow,
     /// The worker subscription started: this is its command sender.
     RendererReady(CommandSender),
     /// One event from the worker (commit, display list, failure...).
@@ -174,6 +203,138 @@ impl PlutoBrowser {
             self.pending_url = Some(url);
         }
     }
+
+    /// The hamburger menu panel: one text button per working
+    /// item (see `menu_items`). It renders in-column below the
+    /// nav bar while open — the same list with the same actions
+    /// a floating popover would show.
+    fn menu_panel(&self) -> Element<'_, Message> {
+        widget::column([
+            widget::button::text("Bookmarks")
+                .on_press(Message::ShowBookmarks)
+                .width(Length::Fill)
+                .into(),
+            widget::button::text("History")
+                .on_press(Message::ShowHistory)
+                .width(Length::Fill)
+                .into(),
+            widget::button::text("New Window")
+                .on_press(Message::NewWindow)
+                .width(Length::Fill)
+                .into(),
+        ])
+        .spacing(4)
+        .padding(8)
+        .into()
+    }
+
+    /// The open Bookmarks/History list panel: a header row plus
+    /// one row per entry. Bookmark rows navigate on click and
+    /// carry a Remove button; history rows navigate on click
+    /// (most recent first, capped — the session history itself
+    /// is unbounded). An empty list says so instead of showing
+    /// a blank panel.
+    fn list_panel(&self, panel: Panel) -> Element<'_, Message> {
+        let title = match panel {
+            Panel::Bookmarks => "Bookmarks",
+            Panel::History => "History",
+        };
+        let mut children: Vec<Element<'_, Message>> = vec![
+            widget::row([
+                widget::text(title).into(),
+                widget::button::text("Close")
+                    .on_press(Message::ClosePanel)
+                    .into(),
+            ])
+            .spacing(8)
+            .padding(4)
+            .into(),
+        ];
+        match panel {
+            Panel::Bookmarks => {
+                if self.bookmarks.bookmarks().is_empty() {
+                    children.push(
+                        widget::text("No bookmarks yet — use the star to save this page.")
+                            .into(),
+                    );
+                }
+                for bookmark in self.bookmarks.bookmarks() {
+                    let url = bookmark.url.clone();
+                    children.push(
+                        widget::row([
+                            widget::button::text(bookmark.title.clone())
+                                .on_press(Message::NavigateTo(url.clone()))
+                                .width(Length::Fill)
+                                .into(),
+                            widget::button::text("Remove")
+                                .on_press(Message::RemoveBookmark(url))
+                                .into(),
+                        ])
+                        .spacing(8)
+                        .into(),
+                    );
+                }
+            }
+            Panel::History => {
+                if self.history.is_empty() {
+                    children.push(
+                        widget::text("No history yet — pages you visit will appear here.")
+                            .into(),
+                    );
+                }
+                for url in self.history.iter().rev().take(HISTORY_PANEL_LIMIT) {
+                    children.push(
+                        widget::button::text(url.clone())
+                            .on_press(Message::NavigateTo(url.clone()))
+                            .width(Length::Fill)
+                            .into(),
+                    );
+                }
+            }
+        }
+        widget::column(children).spacing(4).padding(8).into()
+    }
+}
+
+/// Which list panel the hamburger menu opened, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Panel {
+    Bookmarks,
+    History,
+}
+
+/// Most history entries the History panel shows (most recent
+/// first): the session history is unbounded in memory, but the
+/// panel is a plain list, so it caps at the newest 50.
+pub const HISTORY_PANEL_LIMIT: usize = 50;
+
+/// The hamburger menu's items, in order. The menu lists ONLY
+/// items with a working backend behind them (Joel's rule): each
+/// entry here names an action the shell really performs —
+/// Bookmarks opens the persistent bookmark list, History opens
+/// the session-history list, New Window spawns a second Pluto
+/// process. Nothing else from the reference screenshot qualifies
+/// (no multi-tab shell for New Tab, no download-prompt UI, no
+/// settings / zoom / find / sync / profiles / passwords /
+/// extensions / print / save-page / translate backend, and Porn
+/// Mode is M12, not built), so none of it is listed. No
+/// shortcuts are shown next to the items: none of the
+/// screenshot's shortcuts are wired.
+pub fn menu_items() -> &'static [&'static str] {
+    &["Bookmarks", "History", "New Window"]
+}
+
+/// The command a New Window spawns: this executable, with no
+/// arguments — a bare launch opens the default start page in its
+/// own window. A separate process is a real second window, not a
+/// tab (multi-tab is M3, not built).
+fn new_window_command() -> std::io::Result<std::process::Command> {
+    Ok(std::process::Command::new(std::env::current_exe()?))
+}
+
+/// Spawn a new Pluto window (see `new_window_command`).
+fn spawn_new_window() -> std::io::Result<()> {
+    new_window_command()?.spawn().map(|_| ())
 }
 
 /// A bundled toolbar icon: a Cosmic symbolic SVG, tinted by the
@@ -350,6 +511,9 @@ impl Application for PlutoBrowser {
             history: Vec::new(),
             history_index: 0,
             history_nav: false,
+            bookmarks: load_bookmarks(),
+            menu_open: false,
+            panel: None,
             modifiers: pluto_ipc::Modifiers::default(),
             buttons_held: 0,
             last_wheel: None,
@@ -668,6 +832,50 @@ impl Application for PlutoBrowser {
                     self.commit(url);
                 }
             }
+            Message::ToggleBookmark => {
+                // The star toggles a bookmark for the current
+                // page and persists it at once (the profile
+                // pattern: save on every mutation).
+                if !self.active_url.is_empty() {
+                    let url = self.active_url.clone();
+                    self.bookmarks.toggle(&url, &url);
+                    save_bookmarks(&self.bookmarks);
+                }
+            }
+            Message::ToggleMenu => {
+                self.menu_open = !self.menu_open;
+                if self.menu_open {
+                    self.panel = None;
+                }
+            }
+            Message::ShowBookmarks => {
+                self.menu_open = false;
+                self.panel = Some(Panel::Bookmarks);
+            }
+            Message::ShowHistory => {
+                self.menu_open = false;
+                self.panel = Some(Panel::History);
+            }
+            Message::ClosePanel => {
+                self.panel = None;
+            }
+            Message::NavigateTo(url) => {
+                self.menu_open = false;
+                self.panel = None;
+                self.commit(url);
+            }
+            Message::RemoveBookmark(url) => {
+                if self.bookmarks.remove(&url) {
+                    save_bookmarks(&self.bookmarks);
+                }
+            }
+            Message::NewWindow => {
+                self.menu_open = false;
+                if let Err(e) = spawn_new_window() {
+                    eprintln!("[pluto] could not open a new window: {e}");
+                    self.status = format!("Could not open a new window: {e}");
+                }
+            }
         }
         Task::none()
     }
@@ -680,6 +888,19 @@ impl Application for PlutoBrowser {
         // The icons are bundled SVGs (see `bundled_icon`): a
         // `from_name` lookup only searches the Cosmic icon theme and
         // draws a blank button where that theme is not installed.
+        // The bookmark star (filled when the current page is
+        // bookmarked) and the hamburger menu, both right after
+        // Go. Round icon buttons like the other nav icons; Go
+        // stays a text button.
+        let star = if self.bookmarks.is_bookmarked(&self.active_url) {
+            widget::button::icon(bundled_icon(include_bytes!(
+                "../assets/icons/star-filled-symbolic.svg"
+            )))
+        } else {
+            widget::button::icon(bundled_icon(include_bytes!(
+                "../assets/icons/star-symbolic.svg"
+            )))
+        };
         let nav_bar = widget::row([
             widget::button::icon(bundled_icon(include_bytes!(
                 "../assets/icons/go-previous-symbolic.svg"
@@ -704,6 +925,12 @@ impl Application for PlutoBrowser {
             widget::button::suggested("Go")
                 .on_press(Message::Navigate)
                 .into(),
+            star.on_press(Message::ToggleBookmark).into(),
+            widget::button::icon(bundled_icon(include_bytes!(
+                "../assets/icons/open-menu-symbolic.svg"
+            )))
+            .on_press(Message::ToggleMenu)
+            .into(),
         ])
         .spacing(8)
         .padding(8)
@@ -724,14 +951,25 @@ impl Application for PlutoBrowser {
         // page — like a browser status bar — not under the nav bar.
         let status = widget::row([widget::text(&self.status).size(12).into()]).padding(4);
 
-        widget::column([
+        // The menu and list panels render in-column below the
+        // nav bar while open; the web view and status line sit
+        // below them.
+        let mut children: Vec<Element<'_, Self::Message>> = vec![
             nav_bar.into(),
             widget::divider::horizontal::default().into(),
-            web_view.into(),
-            widget::divider::horizontal::default().into(),
-            status.into(),
-        ])
-        .into()
+        ];
+        if self.menu_open {
+            children.push(self.menu_panel());
+            children.push(widget::divider::horizontal::default().into());
+        }
+        if let Some(panel) = self.panel {
+            children.push(self.list_panel(panel));
+            children.push(widget::divider::horizontal::default().into());
+        }
+        children.push(web_view.into());
+        children.push(widget::divider::horizontal::default().into());
+        children.push(status.into());
+        widget::column(children).into()
     }
 }
 
@@ -832,10 +1070,13 @@ mod tests {
     /// the theme lookup it replaced.
     #[test]
     fn bundled_nav_icons_are_valid_single_color_svgs() {
-        let icons: [&[u8]; 3] = [
+        let icons: [&[u8]; 6] = [
             include_bytes!("../assets/icons/go-previous-symbolic.svg") as &[u8],
             include_bytes!("../assets/icons/go-next-symbolic.svg") as &[u8],
             include_bytes!("../assets/icons/view-refresh-symbolic.svg") as &[u8],
+            include_bytes!("../assets/icons/star-symbolic.svg") as &[u8],
+            include_bytes!("../assets/icons/star-filled-symbolic.svg") as &[u8],
+            include_bytes!("../assets/icons/open-menu-symbolic.svg") as &[u8],
         ];
         for bytes in icons {
             let text = std::str::from_utf8(bytes).expect("icon is UTF-8");
@@ -862,5 +1103,61 @@ mod tests {
             // And the handle builds without panicking.
             let _handle = bundled_icon(bytes);
         }
+    }
+
+    #[test]
+    fn menu_lists_only_working_items() {
+        // The exact menu contents — and the exclusion list: every
+        // screenshot item whose backend does not exist. If a new
+        // backend lands, this test is the place that grows the
+        // menu (add the item to `menu_items` and the case here).
+        assert_eq!(menu_items(), &["Bookmarks", "History", "New Window"]);
+        for forbidden in [
+            "Sync and save data",
+            "Profiles",
+            "New Tab",
+            "Porn Mode",
+            "Downloads",
+            "Passwords",
+            "Extensions and Themes",
+            "Print",
+            "Save Page As",
+            "Find in Page",
+            "Translate Page",
+            "Zoom",
+            "Settings",
+        ] {
+            assert!(
+                !menu_items().contains(&forbidden),
+                "menu must not list {forbidden} (no working backend)"
+            );
+        }
+    }
+
+    #[test]
+    fn new_window_spawns_this_executable() {
+        // The New Window action spawns this binary with no args
+        // (a bare launch opens the start page in its own window).
+        // The test checks the command, not the spawn itself —
+        // spawning would open a real window.
+        let cmd = new_window_command().expect("current exe resolves");
+        assert_eq!(
+            cmd.get_program(),
+            std::env::current_exe().expect("current exe resolves")
+        );
+        assert_eq!(cmd.get_args().count(), 0);
+    }
+
+    #[test]
+    fn history_panel_is_capped_and_most_recent_first() {
+        // The panel's slice logic, over a 60-entry session
+        // history: the newest 50, newest first.
+        let history: Vec<String> = (0..60)
+            .map(|i| format!("https://example.com/{i}"))
+            .collect();
+        let shown: Vec<&String> = history.iter().rev().take(HISTORY_PANEL_LIMIT).collect();
+        assert_eq!(shown.len(), HISTORY_PANEL_LIMIT);
+        assert_eq!(shown[0], "https://example.com/59");
+        assert_eq!(shown[49], "https://example.com/10");
     }
 }
