@@ -101,6 +101,15 @@ pub const RESPONSE_SYMBOL: &str = "pluto.response";
 /// `Symbol.for("pluto.headers")` — the per-Headers id property.
 pub const HEADERS_SYMBOL: &str = "pluto.headers";
 
+/// `Symbol.for("pluto.request")` — the per-Request id property.
+pub const REQUEST_SYMBOL: &str = "pluto.request";
+
+/// `Symbol.for("pluto.abortSignal")` — the per-AbortSignal id property.
+pub const ABORT_SIGNAL_SYMBOL: &str = "pluto.abortSignal";
+
+/// `Symbol.for("pluto.url")` — the per-URL / per-URLSearchParams id property.
+pub const URL_SYMBOL: &str = "pluto.url";
+
 /// `window`'s target id in the listener registry (the window has no
 /// `DomKey`).
 pub const WINDOW_TARGET_ID: u64 = u64::MAX;
@@ -186,6 +195,36 @@ pub struct BindingState {
     /// `PermissionStatus` id → (feature, sysex), so a state
     /// change can dispatch `onchange` to the right statuses.
     pub permission_status_features: HashMap<u64, (PermissionName, bool)>,
+    /// `console.count` counters, by label (Stage 12 Rec 10).
+    pub console_counts: HashMap<String, u64>,
+    /// `console.time` timers, by label: when the timer started.
+    pub console_timers: HashMap<String, std::time::Instant>,
+    /// `console.group` nesting depth: captured lines are indented
+    /// by two spaces per level.
+    pub console_group_depth: usize,
+    /// Next `Request` id.
+    pub next_request_id: u64,
+    /// `Request` data, by id (url / method / headers / body /
+    /// signal). The JS object holds only the id.
+    pub requests: HashMap<u64, fetch::StoredRequest>,
+    /// Pending-fetch id → `AbortSignal` id that can cancel it.
+    pub fetch_signals: HashMap<u64, u64>,
+    /// `AbortSignal` state, by id (aborted flag + the fetch ids
+    /// registered on it).
+    pub abort_signals: HashMap<u64, fetch::AbortSignalState>,
+    /// Next `AbortSignal` id.
+    pub next_signal_id: u64,
+    /// Next `URL` / `URLSearchParams` id.
+    pub next_url_id: u64,
+    /// `URL` / `URLSearchParams` data, by id.
+    pub url_entries: HashMap<u64, dom::UrlEntry>,
+    /// Response URL + `redirected`, by body id (set by
+    /// `make_response`; read by the `url` / `redirected` accessors
+    /// and by `Response.clone()`).
+    pub response_urls: HashMap<u64, (String, bool)>,
+    /// `Image()` / `<img>` load state, by node key: whether the
+    /// current `src` has loaded, and its intrinsic size.
+    pub image_states: HashMap<DomKey, dom::ImageLoadState>,
 }
 
 impl BindingState {
@@ -212,6 +251,18 @@ impl BindingState {
             permissions_backend: std::sync::Arc::new(MemoryPermissionsBackend::new()),
             next_permission_status_id: 1,
             permission_status_features: HashMap::new(),
+            console_counts: HashMap::new(),
+            console_timers: HashMap::new(),
+            console_group_depth: 0,
+            next_request_id: 1,
+            requests: HashMap::new(),
+            fetch_signals: HashMap::new(),
+            abort_signals: HashMap::new(),
+            next_signal_id: 1,
+            next_url_id: 1,
+            url_entries: HashMap::new(),
+            response_urls: HashMap::new(),
+            image_states: HashMap::new(),
         }
     }
 }
@@ -263,6 +314,15 @@ pub fn registry<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
         // here while its top-level await waits on a host event; the
         // loop polls it by id (see `TabRealm::poll_module`).
         "modules",
+        // Stage 12 Rec 7: cached per-element `dataset` objects, by
+        // wrapper id (like `classLists` / `styles` above).
+        "datasets",
+        // Stage 12 Rec 7: the cached `searchParams` object per
+        // `URL`, by URL id (`URL.searchParams` is `===`-stable).
+        "urlSearchParams",
+        // Stage 12 Rec 8: live `AbortSignal` objects, by id, so a
+        // `Request.signal` read returns the same object.
+        "abortSignals",
     ] {
         let map: Object = ctx.eval("new Map()")?;
         reg.set(name, map)?;
@@ -516,6 +576,9 @@ fn install_bindings_in<'js>(
     dom::install_prototypes(&ctx, bindings).map_err(|e| format!("install prototypes: {e}"))?;
     dom::install_window(&ctx, bindings).map_err(|e| format!("install window: {e}"))?;
     dom::install_console(&ctx, bindings).map_err(|e| format!("install console: {e}"))?;
+    dom::install_url(&ctx, bindings).map_err(|e| format!("install URL: {e}"))?;
+    dom::install_dataset_helpers(&ctx, bindings)
+        .map_err(|e| format!("install dataset helpers: {e}"))?;
     fetch::install_fetch(&ctx, state, bindings, fetch_tx).map_err(|e| format!("install fetch: {e}"))?;
     storage::install_storage(&ctx, bindings).map_err(|e| format!("install storage: {e}"))?;
     permissions::install_permissions(&ctx, bindings).map_err(|e| format!("install permissions: {e}"))?;
@@ -523,16 +586,66 @@ fn install_bindings_in<'js>(
     Ok(())
 }
 
-/// Call `window.onerror` (if the page set one) with `message`.
+/// Install `Symbol.iterator` on `proto` as a function returning a
+/// plain `{ next() }` iterator over `this.entries()`.
+///
+/// The `entries` method itself returns an Array, which is iterable
+/// but not an iterator: `for..of` calls `.next()` on the value the
+/// `@@iterator` method returns, so wiring `@@iterator` straight to
+/// `entries` throws `TypeError: not a function` on the first step.
+/// This wrapper closes over the entries array and hands out one
+/// `{ value, done }` pair per step.
+pub fn install_entries_iterator<'js>(
+    ctx: &Ctx<'js>,
+    proto: &Object<'js>,
+) -> rquickjs::Result<()> {
+    // Pure-JS install (no Rust closure capturing a JS value):
+    // a Rust `Function::new` closure holding a `Function<'js>` is a
+    // GC-invisible root — the captured object survives to
+    // `JS_FreeRuntime` and aborts the process. The JS closure below
+    // captures only the entries array, which the GC can trace.
+    let install: Function = ctx.eval(
+        "(proto) => { proto[Symbol.iterator] = function() { const entries = this.entries(); let i = 0; return { next() { return i < entries.length ? { value: entries[i++], done: false } : { value: undefined, done: true }; } }; }; }",
+    )?;
+    let _: Value = install.call((proto.clone(),))?;
+    Ok(())
+}
+
+/// Build an `Error` value with `name` / `message` without throwing
+/// it (for promise rejections such as `AbortError`, where the error
+/// is a value, not a throw).
+pub fn make_dom_error<'js>(ctx: &Ctx<'js>, name: &str, msg: &str) -> rquickjs::Result<Value<'js>> {
+    ctx.eval(format!(
+        "(() => {{ const e = new Error({msg:?}); e.name = {name:?}; return e; }})()"
+    ))
+}
+
+/// Call `window.onerror` (if the page set one) with
+/// `(message, source, lineno, colno, error)`.
 /// Returns `true` when the handler returned `true` (suppress the
 /// default report). Called from `TabJs::record_or_propagate`.
 /// A throwing `onerror` is reported, never fatal.
+///
+/// Stage 12 Rec 9: `source` / `lineno` / `colno` come from the
+/// throwing script's stack (parsed by the loop out of the
+/// `JsError` string — the realm stringifies the caught exception
+/// with its stack attached); they are `None` (→ `undefined`) when
+/// the error carries no location (interrupted / OOM / module
+/// rejection). The `error` argument is still `undefined`: the
+/// error object itself does not survive the realm boundary (the
+/// realm keeps only its string form), so there is no value to
+/// pass — a later wave that keeps the caught value in the realm
+/// can fill it in.
 pub fn call_onerror(
     realm: &mut TabRealm,
     bindings: &Rc<RefCell<BindingState>>,
     message: &str,
+    source: Option<&str>,
+    lineno: Option<u32>,
+    colno: Option<u32>,
 ) -> bool {
     let message = message.to_string();
+    let source = source.map(|s| s.to_string());
     let bindings = Rc::clone(bindings);
     realm.with_ctx(|ctx| {
         let globals = ctx.globals();
@@ -547,15 +660,25 @@ pub fn call_onerror(
             Ok(f) => f,
             Err(_) => return false,
         };
-        // onerror(message, source, lineno, colno, error). M4 passes
-        // only the message; source/line are undefined (the loop does
-        // not track them yet — a later wave can fill them in).
+        // onerror(message, source, lineno, colno, error).
+        let source_value: Value = match &source {
+            Some(s) => js(&ctx, s.clone()),
+            None => js(&ctx, rquickjs::Undefined),
+        };
+        let lineno_value: Value = match lineno {
+            Some(n) => js(&ctx, n as f64),
+            None => js(&ctx, rquickjs::Undefined),
+        };
+        let colno_value: Value = match colno {
+            Some(n) => js(&ctx, n as f64),
+            None => js(&ctx, rquickjs::Undefined),
+        };
         let result: rquickjs::Result<Value> = func.call((
             This(globals),
             message,
-            rquickjs::Undefined,
-            rquickjs::Undefined,
-            rquickjs::Undefined,
+            source_value,
+            lineno_value,
+            colno_value,
             rquickjs::Undefined,
         ));
         match result {

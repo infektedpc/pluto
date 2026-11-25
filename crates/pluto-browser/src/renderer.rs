@@ -67,7 +67,7 @@ use pluto_ipc::{
 };
 use pluto_ipc::transport::{recv_browser_message, Transport};
 use pluto_js::TabJs;
-use pluto_layout::{ElementState, ImageMap, LayoutTree, OverscrollBehavior};
+use pluto_layout::{ElementState, ImageMap, LayoutTree, OverscrollBehavior, RelayoutKind};
 use pluto_net::{ResourceLoader, SharedLoader};
 use pluto_paint::{DisplayList, Resource, ResourceId, ResourceTable, perf};
 use std::cell::Cell;
@@ -341,19 +341,32 @@ pub(crate) enum LayoutJob {
         /// incremental attempt falls back to a full rebuild
         /// either way.
         ///
-        /// The incremental path does NOT take an image map (Stage
-        /// 11 Rec 2, deferred): it re-lays out the retained tree,
-        /// whose images are already current — the tab thread only
-        /// sends `incremental: true` when no image arrived since
-        /// the last layout, so the retained map is never stale.
-        /// `images` is used on the full-rebuild path only.
+        /// The incremental path takes an image map only when one
+        /// arrived since the last layout (Stage 12 Rec 5): the tab
+        /// thread sends `images_dirty` with the fresh map, and the
+        /// actor hands it to `relayout_incremental`, which treats
+        /// the changed `<img>` nodes as damage. Without the flag
+        /// the retained map is current. `images` is used on the
+        /// full-rebuild path always.
         incremental: bool,
+        /// Whether `images` is fresh (an image arrived since the
+        /// last layout). The actor passes the map to the
+        /// incremental path only when this is set.
+        images_dirty: bool,
         /// The decoded-image map for this layout pass (Stage 11
         /// Rec 1/2): per-`<img>` intrinsic sizes + background
         /// images, built by the tab thread from its `ImageStore`.
-        /// Ignored on the incremental path (see above).
+        /// Passed to the incremental path only when `images_dirty`
+        /// is set (see above); used on the full-rebuild path always.
         images: ImageMap,
-        reply: oneshot::Sender<()>,
+        /// Which path the layout took (Stage 12 Rec 3): the actor
+        /// reports the [`RelayoutKind`] — `ColdBuild` for a fresh
+        /// tree, the incremental outcome's kind, or `FullLayout`
+        /// when the incremental attempt failed or was not
+        /// attempted against a retained tree — so the tab thread
+        /// can record it in the frame-time histogram and the
+        /// fallback rate is measured, not guessed.
+        reply: oneshot::Sender<RelayoutKind>,
     },
     /// Build the display list from the actor's retained tree
     /// (after the ResizeObserver step has run).
@@ -619,13 +632,14 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                 offsets,
                 incremental,
                 images,
+                images_dirty,
                 reply,
             } => {
                 if let Some(doc) = *new_document {
                     document = Some(doc);
                 }
                 let Some(doc) = document.as_ref() else {
-                    let _ = reply.send(());
+                    let _ = reply.send(RelayoutKind::NothingToDo);
                     continue;
                 };
                 // Stage 8 Rec 6: a dirty tick / resize hands the
@@ -640,7 +654,18 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                 // attempt discards the retained tree and rebuilds
                 // from scratch — never a stale or half-updated
                 // tree.
+                //
+                // Stage 12 Rec 3: the kind is reported back so the
+                // tab thread can record it. `ColdBuild` is the
+                // default (a fresh tree with no retained tree to
+                // be incremental against); a retained tree that
+                // was rebuilt without attempting the incremental
+                // path (resize / flush) is a `FullLayout` fallback,
+                // and a failed incremental attempt is one too —
+                // the fallback rate counts exactly the layouts
+                // that could have been incremental but were not.
                 let mut built_fresh = true;
+                let mut kind = RelayoutKind::ColdBuild;
                 if incremental
                     && let Some(retained) = tree.as_mut()
                 {
@@ -650,20 +675,29 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                         viewport.0,
                         viewport.1,
                         &state,
+                        // Stage 12 Rec 5: the fresh map rides the
+                        // incremental path only when an image
+                        // arrived; otherwise the retained map is
+                        // current and `None` keeps it untouched.
+                        if images_dirty { Some(&images) } else { None },
                     ) {
                         Ok(outcome) => {
                             eprintln!(
                                 "[pluto] incremental layout: {:?} ({})",
                                 outcome.kind, outcome.reason
                             );
+                            kind = outcome.kind;
                             built_fresh = false;
                         }
                         Err(e) => {
                             eprintln!(
                                 "[pluto] incremental layout failed ({e}), full rebuild"
                             );
+                            kind = RelayoutKind::FullLayout;
                         }
                     }
+                } else if tree.is_some() {
+                    kind = RelayoutKind::FullLayout;
                 }
                 if built_fresh {
                     // Hand the retained tree's FontSystem to the
@@ -689,7 +723,7 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                         }
                     }
                 }
-                let _ = reply.send(());
+                let _ = reply.send(kind);
             }
             LayoutJob::CollectDisplayList { reply } => {
                 let display = tree
@@ -872,14 +906,18 @@ pub(crate) const FRAME_TIME_SAMPLES: usize = 240;
 /// `collect` is the ResizeObserver / IntersectionObserver steps
 /// plus the display-list collect; `submit` is the postcard encode
 /// + send. Wheel scrolls re-collect without re-laying out, so
-/// their samples carry `layout_ms: 0.0` — a scroll frame's cost
-/// is its collect, which is exactly the hot spot to watch.
+/// their samples carry `layout_ms: 0.0` and
+/// `layout_kind: NothingToDo` — a scroll frame's cost is its
+/// collect, which is exactly the hot spot to watch. `layout_kind`
+/// is the path the layout took (Stage 12 Rec 3): the histogram
+/// counts kinds so the fallback rate is measured.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct FrameSample {
     pub total_ms: f32,
     pub layout_ms: f32,
     pub collect_ms: f32,
     pub submit_ms: f32,
+    pub layout_kind: RelayoutKind,
 }
 
 /// Which phase of a [`FrameSample`] a percentile reads.
@@ -925,6 +963,13 @@ pub(crate) struct FrameTimeHistogram {
     len: usize,
     total_recorded: u64,
     over_budget: u64,
+    /// Frames recorded per [`RelayoutKind`] (indexed by
+    /// `RelayoutKind::as_index`), cumulative since the tab
+    /// started — the widening metric (Stage 12 Rec 3). The ring
+    /// holds the last 240 samples; these counters keep the whole
+    /// session, so the fallback rate does not forget the early
+    /// frames that rolled off.
+    layout_kinds: [u64; RelayoutKind::COUNT],
 }
 
 impl Default for FrameTimeHistogram {
@@ -935,6 +980,7 @@ impl Default for FrameTimeHistogram {
             len: 0,
             total_recorded: 0,
             over_budget: 0,
+            layout_kinds: [0; RelayoutKind::COUNT],
         }
     }
 }
@@ -956,6 +1002,29 @@ impl FrameTimeHistogram {
         self.total_recorded += 1;
         if sample.total_ms > perf::FRAME_BUDGET_MS {
             self.over_budget += 1;
+        }
+        self.layout_kinds[sample.layout_kind.as_index()] += 1;
+    }
+
+    /// Frames recorded with this layout kind, since the tab
+    /// started (Stage 12 Rec 3).
+    pub(crate) fn layout_kind_count(&self, kind: RelayoutKind) -> u64 {
+        self.layout_kinds[kind.as_index()]
+    }
+
+    /// Share of layout-taking frames that fell back to a full
+    /// rebuild: `FullLayout / (SubtreeLayout + FullLayout)`.
+    /// `ColdBuild` frames are excluded — a fresh tree is not a
+    /// fallback — and `None` means no layout-taking frame has
+    /// been recorded yet. The number the Rec 4 widening is judged
+    /// by: it should fall as the safe-root predicate widens.
+    pub(crate) fn fallback_rate(&self) -> Option<f32> {
+        let full = self.layout_kind_count(RelayoutKind::FullLayout);
+        let subtree = self.layout_kind_count(RelayoutKind::SubtreeLayout);
+        if full + subtree == 0 {
+            None
+        } else {
+            Some(full as f32 / (full + subtree) as f32)
         }
     }
 
@@ -1042,8 +1111,14 @@ impl FrameTimeHistogram {
                 fmt(self.max(phase))
             )
         };
+        // Stage 12 Rec 3: the layout-kind counts and the fallback
+        // rate ride on the same line, so the widening verdict is
+        // visible in the periodic log without a second channel.
+        let fallback = self
+            .fallback_rate()
+            .map_or("-".to_string(), |r| format!("{:.1}%", r * 100.0));
         format!(
-            "frames n={} total_recorded={} over_budget={} ({:.1}%) | {} | {} | {} | {}",
+            "frames n={} total_recorded={} over_budget={} ({:.1}%) | {} | {} | {} | {} | layout cold={} subtree={} full={} paint={} pos={} nothing={} fallback={}",
             self.len,
             self.total_recorded,
             self.over_budget,
@@ -1052,6 +1127,13 @@ impl FrameTimeHistogram {
             pct(FramePhase::Layout),
             pct(FramePhase::Collect),
             pct(FramePhase::Submit),
+            self.layout_kind_count(RelayoutKind::ColdBuild),
+            self.layout_kind_count(RelayoutKind::SubtreeLayout),
+            self.layout_kind_count(RelayoutKind::FullLayout),
+            self.layout_kind_count(RelayoutKind::PaintOnly),
+            self.layout_kind_count(RelayoutKind::PositionOnly),
+            self.layout_kind_count(RelayoutKind::NothingToDo),
+            fallback,
         )
     }
 }
@@ -2103,9 +2185,14 @@ fn start_navigation(state: &mut TabState, url: String) {
     // Stage 11 Rec 1/9: the load reports image discoveries and
     // document-fetch progress to the tab thread's sinks; the tab
     // thread owns the image pipeline, the shell owns the bar.
+    // Stage 12 Rec 1: the load also pre-fetches module import
+    // graphs into the fresh realm's store (`navigate()` above
+    // replaced it — grab it after, not before).
+    let module_sources = state.tab_js().module_sources();
     let sinks = page::LoadSinks {
         images: Some(state.image_request_tx.clone()),
         progress: Some(state.progress_tx.clone()),
+        module_sources: Some(module_sources),
     };
     let tab_id = state.tab_id;
     let viewport = state.viewport;
@@ -2431,18 +2518,19 @@ async fn layout_and_submit(
     // document's links before the state is cloned into the
     // layout job, so `:visited` is fresh for every pass.
     refresh_visited(state);
-    // Stage 11 Rec 1/2: an image arrival forces a FULL rebuild
-    // with a fresh image map — the incremental path cannot take
-    // one (its retained tree keeps its old map). The map is built
-    // from the document this pass lays out (or the retained one
-    // on a resize, where `document` is `None`), and the dirty
-    // flag is consumed here: an image that lands mid-layout sets
-    // it again, and the next tick rebuilds.
-    let mut incremental = incremental;
-    let images = if incremental && !state.images.images_dirty {
-        ImageMap::new()
-    } else {
-        incremental = false;
+    // Stage 11 Rec 1/2, wired for the incremental path by Stage 12
+    // Rec 5: an image arrival no longer forces a FULL rebuild with
+    // a fresh image map — the fresh map rides the layout job with
+    // its dirty flag, and the actor hands it to the incremental
+    // path, which treats the changed `<img>` nodes as damage. The
+    // map is built from the document this pass lays out (or the
+    // retained one on a resize, where `document` is `None`) whenever
+    // the actor will need it — an image arrival, or any
+    // non-incremental pass (a fresh tree builds with the map, never
+    // empty). The dirty flag is consumed here: an image that lands
+    // mid-layout sets it again, and the next tick rebuilds.
+    let images_dirty = state.images.images_dirty;
+    let images = if images_dirty || !incremental {
         state.images.images_dirty = false;
         let doc = document.as_ref().or(state.document.as_ref());
         match doc {
@@ -2455,8 +2543,10 @@ async fn layout_and_submit(
             ),
             None => ImageMap::new(),
         }
+    } else {
+        ImageMap::new()
     };
-    if !incremental {
+    if images_dirty || !incremental {
         state.last_image_map = images.clone();
     }
     // Stage 11 Rec 8: read the title BEFORE the document moves
@@ -2485,6 +2575,7 @@ async fn layout_and_submit(
         offsets: state.scroll_offsets.clone(),
         incremental,
         images,
+        images_dirty,
         reply: tree_tx,
     };
     if state.layout_tx.send(job).is_err() {
@@ -2496,15 +2587,20 @@ async fn layout_and_submit(
         )
         .await;
     }
-    if tree_rx.await.is_err() {
-        return emit_tab(
-            events,
-            RendererToBrowser::RendererCrashed {
-                reason: "layout actor reply lost".to_string(),
-            },
-        )
-        .await;
-    }
+    // Stage 12 Rec 3: the actor reports which path the layout
+    // took; the frame sample carries it into the histogram.
+    let layout_kind = match tree_rx.await {
+        Ok(kind) => kind,
+        Err(_) => {
+            return emit_tab(
+                events,
+                RendererToBrowser::RendererCrashed {
+                    reason: "layout actor reply lost".to_string(),
+                },
+            )
+            .await;
+        }
+    };
     state.has_document = true;
     // Follow-up 2 (Stage 10): the viewport scroll mirror goes
     // stale when a resize shrinks the page — re-clamp it to the
@@ -2586,11 +2682,14 @@ async fn layout_and_submit(
             // Stage 10 Rec 7: one ring write per submitted
             // frame — total is tick-to-submit (the caller's
             // clock), phases are layout / collect / submit.
+            // Stage 12 Rec 3: the kind rides along, so the
+            // histogram counts layout paths per frame.
             state.frame_times.record(FrameSample {
                 total_ms: started.elapsed().as_secs_f32() * 1000.0,
                 layout_ms,
                 collect_ms,
                 submit_ms: submit_started.elapsed().as_secs_f32() * 1000.0,
+                layout_kind,
             });
             submitted
         }
@@ -3315,6 +3414,8 @@ async fn apply_scrolls(
                 layout_ms: 0.0,
                 collect_ms,
                 submit_ms: submit_started.elapsed().as_secs_f32() * 1000.0,
+                // No layout ran on a scroll frame (Stage 12 Rec 3).
+                layout_kind: RelayoutKind::NothingToDo,
             });
             submitted
         }
@@ -5636,6 +5737,7 @@ mod tests {
                 layout_ms: v as f32 * 0.5,
                 collect_ms: v as f32 * 0.25,
                 submit_ms: 0.1,
+                layout_kind: RelayoutKind::NothingToDo,
             });
         }
         assert_eq!(hist.count(), 10);
@@ -5660,18 +5762,21 @@ mod tests {
             layout_ms: 20.0,
             collect_ms: 0.0,
             submit_ms: 0.0,
+            layout_kind: RelayoutKind::NothingToDo,
         });
         hist.record(FrameSample {
             total_ms: f32::NAN,
             layout_ms: 0.0,
             collect_ms: 0.0,
             submit_ms: 0.0,
+            layout_kind: RelayoutKind::NothingToDo,
         });
         hist.record(FrameSample {
             total_ms: -1.0,
             layout_ms: 0.0,
             collect_ms: 0.0,
             submit_ms: 0.0,
+            layout_kind: RelayoutKind::NothingToDo,
         });
         assert_eq!(hist.count(), 11);
         assert_eq!(hist.total_recorded(), 11);
@@ -5690,11 +5795,12 @@ mod tests {
         assert_eq!(FRAME_TIME_SAMPLES, 240, "four seconds at 60 Hz");
         let mut hist = FrameTimeHistogram::new();
         assert_eq!(hist.capacity(), 240);
-        // The whole histogram is the ring plus four counters:
-        // 240 samples × 16 bytes, no heap allocation to grow.
+        // The whole histogram is the ring plus four counters and
+        // six per-kind counters (Stage 12 Rec 3): 240 samples ×
+        // 20 bytes, no heap allocation to grow.
         assert_eq!(
             std::mem::size_of::<FrameTimeHistogram>(),
-            FRAME_TIME_SAMPLES * std::mem::size_of::<FrameSample>() + 32
+            FRAME_TIME_SAMPLES * std::mem::size_of::<FrameSample>() + 80
         );
         for v in 0..1000 {
             hist.record(FrameSample {
@@ -5702,6 +5808,7 @@ mod tests {
                 layout_ms: 0.0,
                 collect_ms: 0.0,
                 submit_ms: 0.0,
+                layout_kind: RelayoutKind::NothingToDo,
             });
         }
         assert_eq!(hist.count(), 240, "the ring caps at capacity");
@@ -5728,6 +5835,7 @@ mod tests {
             layout_ms: 12.0,
             collect_ms: 7.0,
             submit_ms: 1.0,
+            layout_kind: RelayoutKind::ColdBuild,
         });
         let line = hist.summary();
         assert!(line.contains("frames n=1"), "summary: {line}");
@@ -5736,6 +5844,71 @@ mod tests {
         assert!(line.contains("layout p50=12.00"), "summary: {line}");
         assert!(line.contains("collect p50=7.00"), "summary: {line}");
         assert!(line.contains("submit p50=1.00"), "summary: {line}");
+    }
+
+    /// Stage 12 Rec 3: the histogram counts layout kinds per
+    /// frame, and the fallback rate is FullLayout /
+    /// (SubtreeLayout + FullLayout) — cold builds excluded, so a
+    /// fresh navigation does not read as a fallback. The summary
+    /// line carries the counts and the rate, and renders `-` for
+    /// the rate when no layout-taking frame exists yet.
+    #[test]
+    fn frame_time_histogram_layout_kinds_and_fallback_rate() {
+        let empty = FrameTimeHistogram::new();
+        assert_eq!(empty.fallback_rate(), None);
+        assert_eq!(empty.layout_kind_count(RelayoutKind::FullLayout), 0);
+        assert!(
+            empty.summary().contains("fallback=-"),
+            "empty summary: {}",
+            empty.summary()
+        );
+        let mut hist = FrameTimeHistogram::new();
+        let sample = |kind: RelayoutKind| FrameSample {
+            total_ms: 10.0,
+            layout_ms: 5.0,
+            collect_ms: 3.0,
+            submit_ms: 1.0,
+            layout_kind: kind,
+        };
+        // Two cold builds (first layouts), three subtree layouts,
+        // one full fallback, one paint-only, one position-only,
+        // one scroll frame (nothing-to-do).
+        for _ in 0..2 {
+            hist.record(sample(RelayoutKind::ColdBuild));
+        }
+        for _ in 0..3 {
+            hist.record(sample(RelayoutKind::SubtreeLayout));
+        }
+        hist.record(sample(RelayoutKind::FullLayout));
+        hist.record(sample(RelayoutKind::PaintOnly));
+        hist.record(sample(RelayoutKind::PositionOnly));
+        hist.record(sample(RelayoutKind::NothingToDo));
+        assert_eq!(hist.count(), 9);
+        assert_eq!(hist.layout_kind_count(RelayoutKind::ColdBuild), 2);
+        assert_eq!(hist.layout_kind_count(RelayoutKind::SubtreeLayout), 3);
+        assert_eq!(hist.layout_kind_count(RelayoutKind::FullLayout), 1);
+        assert_eq!(hist.layout_kind_count(RelayoutKind::PaintOnly), 1);
+        assert_eq!(hist.layout_kind_count(RelayoutKind::PositionOnly), 1);
+        assert_eq!(hist.layout_kind_count(RelayoutKind::NothingToDo), 1);
+        // 1 full out of 1 + 3 layout-taking frames — the cold
+        // builds do not count on either side.
+        assert!((hist.fallback_rate().unwrap() - 0.25).abs() < 0.001);
+        let line = hist.summary();
+        assert!(line.contains("cold=2"), "summary: {line}");
+        assert!(line.contains("subtree=3"), "summary: {line}");
+        assert!(line.contains("full=1"), "summary: {line}");
+        assert!(line.contains("fallback=25.0%"), "summary: {line}");
+        // Ignored samples (non-finite total) never reach the kind
+        // counters either.
+        hist.record(FrameSample {
+            total_ms: f32::NAN,
+            layout_ms: 0.0,
+            collect_ms: 0.0,
+            submit_ms: 0.0,
+            layout_kind: RelayoutKind::FullLayout,
+        });
+        assert_eq!(hist.layout_kind_count(RelayoutKind::FullLayout), 1);
+        assert_eq!(hist.total_recorded(), 9);
     }
 
     /// Stage 10 Rec 7: the instrumented paths still function —
@@ -5776,6 +5949,14 @@ mod tests {
         );
         assert_eq!(state.frame_times().count(), 1);
         assert_eq!(state.frame_times().total_recorded(), 1);
+        // Stage 12 Rec 3: the first layout is a cold build (no
+        // retained tree), and the recorded kind says so — not a
+        // fallback, so the fallback rate stays undefined.
+        assert_eq!(
+            state.frame_times().layout_kind_count(RelayoutKind::ColdBuild),
+            1
+        );
+        assert_eq!(state.frame_times().fallback_rate(), None);
         let p50 = state
             .frame_times()
             .p50(FramePhase::Total)
@@ -5793,6 +5974,17 @@ mod tests {
         let scrolled = apply_scrolls(&mut state, &events_tx, vec![]).await;
         assert!(scrolled, "the instrumented scroll still submits");
         assert_eq!(state.frame_times().count(), 2);
+        // Stage 12 Rec 3: the scroll frame records NothingToDo
+        // (no layout ran), and the summary carries the kinds.
+        assert_eq!(
+            state.frame_times().layout_kind_count(RelayoutKind::NothingToDo),
+            1
+        );
+        assert!(
+            state.frame_times().summary().contains("cold=1"),
+            "summary: {}",
+            state.frame_times().summary()
+        );
         assert_eq!(
             state.frame_times().p50(FramePhase::Layout),
             Some(0.0),

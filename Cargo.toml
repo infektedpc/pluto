@@ -35,7 +35,7 @@ wgpu = "28"
 # time, but this VM's llvm18 sysroot ships libclang without the C headers
 # (bindgen dies on `stdbool.h: file not found`). rquickjs-sys falls back
 # to its pre-generated bindings, same API -- M4 needs nothing from bindgen.
-rquickjs = { version = "0.14", features = ["futures", "macro"] }
+rquickjs = { version = "0.14", features = ["futures", "macro", "loader"] }
 # NOTE: same trap as hyper-rustls below -- rustls 0.23's OWN default
 # features include `aws_lc_rs`, so a bare `"0.23"` plus `ring` enables
 # two providers and rustls panics at first TLS use. Defaults off, ring
@@ -111,6 +111,28 @@ git = "https://github.com/pop-os/libcosmic"
 rev = "ecc5fe4164e1c9024b932382d24ea41f24147e75"
 default-features = false
 features = ["wgpu", "tokio", "wayland", "x11"]
+
+# Stage 12 Rec 2: QuickJS's C core must not run at -O0 in dev
+# builds (what Joel actually runs with `cargo run`). Cargo sets
+# OPT_LEVEL from the profile and rquickjs-sys's build script (plain
+# `cc::Build`) follows it, so `opt-level = "s"` compiles the C
+# with -Os in BOTH profiles without touching Rust codegen
+# anywhere else. LTO is NOT shipped: Cargo forbids `lto` in a
+# per-package profile (verified: "`lto` may not be specified in a
+# `package` profile"), a workspace-wide `[profile.release] lto`
+# would change Rust codegen for every crate (out of scope for
+# this recommendation), and C-level LTO is not reachable through
+# Cargo at all (`cc` takes no -flto from the profile; touching
+# the vendored build script would be an engine fork, which Stage
+# 12 forbids). `-Os` alone is the report's own fallback. Measured
+# with the fixed workload in `pluto-js`'s
+# `js_workload_benchmark_reports_timing` test: dev median
+# 1625.8 ms before, see ARCHITECTURE.md for the after number.
+[profile.dev.package.rquickjs-sys]
+opt-level = "s"
+
+[profile.release.package.rquickjs-sys]
+opt-level = "s"
 
 [workspace.dependencies.pluto-paint]
 path = "crates/pluto-paint"

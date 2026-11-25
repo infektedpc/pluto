@@ -134,9 +134,15 @@ Go pressed
   second compiler, multi-month baseline; engine swap to V8 stays the
   later path). ES probe verdict: ES2020 floor, no Temporal /
   decorators. Cheap perf win in: per-URL in-memory bytecode cache
-  (`pluto-js/src/bytecode.rs`); the `-Os` + LTO build of the
-  QuickJS C code was NOT landed (no profile/build flag for it
-  exists in the workspace yet). One realm per tab: a fresh
+  (`pluto-js/src/bytecode.rs`); `-Os` for the QuickJS C build
+  landed in Stage 12 (per-package profile overrides scoped to
+  `rquickjs-sys`, dev + release — measured ~3.4x on a fixed JS
+  workload: dev median 1625.8 ms → 479.3 ms, same result). LTO
+  did NOT land: Cargo forbids `lto` in a per-package profile, a
+  workspace-wide `[profile.release] lto` would change Rust
+  codegen for every crate, and C-level LTO is not reachable
+  through Cargo without touching the vendored build script (an
+  engine fork, forbidden). One realm per tab: a fresh
   `AsyncRuntime` + `AsyncContext` per navigation, owned by the tab
   worker thread, dropped on navigation; the event loop is
   host-owned (HTML §8.1.7 shape: one task to completion, drain
@@ -377,6 +383,86 @@ Goal: client-side JS that reads and modifies the live page.
   on the next frame.
 - **Done criteria**: interactive JS widgets (counters, accordions,
   client-side `fetch()` JSON loaders, dynamic DOM apps) work in real time.
+- **Built — Stage 12 (2026-11-25)**: all 12 Stage 12 recommendations
+  applied (M4 leftovers — the JS engine core was Stage 7). Module
+  loader (Rec 1): `set_loader` on the realm; the load task
+  pre-fetches the whole import graph through the existing loader
+  (same Stage 9 gates — no second fetch path), sources land in a
+  per-navigation `ModuleSources` map, the loader serves from it and
+  rejects a miss cleanly; relative/root-absolute/absolute specifiers
+  resolve against the importing module's URL; bare specifiers and
+  `data:` are rejected (import maps stay M5); dynamic `import()` with
+  a string literal goes through the same loader; no loader-side
+  bytecode cache (the engine dedups loaded modules by resolved name
+  per realm, so a loader cache could never get a second hit).
+  `-Os` for the QuickJS C build (Rec 2, see the Stage 7 entry —
+  dev median 1625.8 ms → 479.3 ms on the fixed workload test).
+  Layout-kind measurement (Rec 3): the layout actor reports its
+  `RelayoutKind` (`ColdBuild` for a fresh tree, `FullLayout` when the
+  incremental path was not attempted or failed), every submitted
+  frame records it in the frame-time histogram, and the periodic
+  stderr summary carries the kind counts plus the fallback rate
+  (`FullLayout / (SubtreeLayout + FullLayout)`, cold builds
+  excluded). Safe-root widening (Rec 4), in stages: definite-width
+  auto-height blocks are safe roots now (a height change propagates
+  through taffy's recursive `mark_dirty` up the ancestor chain, and
+  siblings whose available space changed miss taffy's cache and are
+  re-measured), and the margin-collapse guard is gone (taffy
+  recomputes the collapse for every dirty ancestor); the debug
+  incremental==cold assertion is the tripwire at every step. Image
+  map into the incremental path (Rec 5): an image arrival no longer
+  forces a full rebuild — the fresh map rides the layout job, the
+  changed `<img>` nodes become extra damage, and the subtree path
+  runs with the new sizes (a changed background still forces a full
+  rebuild — the map is keyed by URL and cannot name its boxes); the
+  full-rebuild and debug-cold paths build with the retained map,
+  never an empty one. Subtree restyle (Rec 6): the dirty LCA's
+  subtree only, seeded from the retained parent style and root font
+  size — the merged maps are identical to the whole-document pass
+  (pinned by test). rAF stays on the 16 ms timer — there is no
+  shell vsync signal to drive it (Rec 11a) — and the geometry-flush
+  count now routes into the perf summary (Rec 11b;
+  `flushes_found_nothing_dirty` stays 0 by design — the host never
+  flushes a clean tree). Engine tracking (Rec 12): no fork — the ES
+  gaps (Temporal, decorators) close only via an engine upgrade;
+  re-run the ES probe when a newer rquickjs crate lands; Zipp stays
+  a watch-candidate; the V8 swap stays the later path. Bindings
+  batch (Rec 7): `window.location` (live getters, `assign` /
+  `replace` / `reload` via `DomHost::request_navigation`), `URL` /
+  `URLSearchParams` (full API, `===`-stable `searchParams`),
+  `dataset` (live `Proxy`, `data-foo-bar` ↔ `fooBar`),
+  `cloneNode(deep)`, `matches` / `closest`, `getElementsByTagName`
+  / `getElementsByClassName` / `getElementsByName` (snapshots, not
+  live collections), `document.images`, `Image()` +
+  `HTMLImageElement` (`src` / `currentSrc` / `complete` /
+  `naturalWidth` / `naturalHeight`, `load` / `error` via
+  `fire_image_event`), typed events (`KeyboardEvent` with `key` /
+  `code`, `MouseEvent` with `clientX` / `clientY` / `button`,
+  `InputEvent` with `data` / `inputType`) via
+  `TabJs::dispatch_typed_event`. Fetch surface (Rec 8): `Request`
+  (usable as `fetch()` input), `AbortController` / `AbortSignal`
+  (cancels backend fetches, rejects pending promises with
+  `AbortError`), `Response.url` / `.redirected` / `.blob()` /
+  `.arrayBuffer()` / `.clone()`, `Headers.delete` + iteration
+  (insertion order — M4 order, not spec's sorted order).
+  `window.onerror` (Rec 9) now receives source/line/col (parsed
+  from the first stack frame; the `error` argument stays
+  `undefined` — it does not survive the realm boundary). Console
+  (Rec 10) extends to `trace` / `assert` / `count` / `time` /
+  `dir` / `table` / `group`, all landing in `console_lines` and
+  tracing. Shell-side wiring still owed after Stage 12 (the
+  production host does not yet override the new defaulted
+  `DomHost` methods — `document_url`, `request_navigation`,
+  `attribute_names`, `clone_node`, `request_image` — so in
+  production `location` reads `about:blank`, `cloneNode` returns
+  `null`, `dataset` reads/writes nothing, and `Image().src` never
+  loads; the renderer still dispatches plain `click` where it
+  should call `dispatch_typed_event` for keyboard/mouse/input;
+  and the `ImageStore` must call `notify_image_loaded` /
+  `notify_image_failed` when a JS-created image resolves).
+  Deferred: dirty-subtree re-layout is still not the path for
+  image arrivals that change a background; per-tab history is still
+  single-file.
 
 ### Milestone 5: HTML Forms, Storage & Process Isolation
 

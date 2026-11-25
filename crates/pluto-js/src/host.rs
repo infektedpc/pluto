@@ -325,6 +325,49 @@ pub trait DomHost {
     /// Default: ignore — `TabJs::script_errors` already records it.
     fn report_error(&self, _message: &str) {}
 
+    // --- Stage 12 Rec 7: binding-batch host hooks (defaults are
+    // "not present"; the production host overrides them, the test
+    // host implements them — a default here is a missing feature,
+    // not a correct answer) ---
+
+    /// The document's URL (the `window.location` base), if the host
+    /// tracks one. `None` means the realm cannot know the URL and
+    /// `location` reads as `about:blank`.
+    fn document_url(&self) -> Option<String> {
+        None
+    }
+
+    /// Ask the shell to navigate to `url` (`replace` = `location.replace`
+    /// semantics, no new history entry). The realm never navigates
+    /// itself: the shell performs the navigation and the next
+    /// document's `document_url` reflects it. Default: ignore.
+    fn request_navigation(&mut self, _url: &str, _replace: bool) {}
+
+    /// Attribute names of `key`, in source order (empty for stale
+    /// keys). Backs `dataset` (which needs the `data-*` subset) and
+    /// `cloneNode` (which copies attributes).
+    fn attribute_names(&self, _key: DomKey) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Deep- (`deep` = true) or shallow-clone `key` into a detached
+    /// node: same tag / text / attributes, children copied only
+    /// when `deep`. `None` for stale keys. The binding wraps the
+    /// result; the clone is not inserted anywhere.
+    fn clone_node(&mut self, _key: DomKey, _deep: bool) -> Option<DomKey> {
+        None
+    }
+
+    /// Ask the shell to fetch + decode an image at `url` (resolved
+    /// against the document base `base_url`), for an `Image()`
+    /// object or an `<img>` whose `src` was set from JS. The shell
+    /// routes this through the Stage 11 image store (same gates as
+    /// the preload scanner: mixed content, blocker, HTTP cache)
+    /// and reports back via `TabJs::notify_image_loaded` /
+    /// `notify_image_failed`, which fire `load` / `error` on the
+    /// element. Default: ignore (the image never loads).
+    fn request_image(&mut self, _url: &str, _base_url: &str) {}
+
     // --- Stage 8 Rec 7: MutationObserver (DOM-side registry) ---
 
     /// Register a mutation observer on `target`. Returns false when

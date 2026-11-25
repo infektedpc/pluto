@@ -42,12 +42,17 @@ pub mod engine;
 pub mod error;
 pub mod event_loop;
 pub mod host;
+pub mod module_loader;
 pub mod probe;
 pub mod realm;
 pub mod tab;
 
 pub use bindings::{FetchBackend, FetchCompletion, FetchError, FetchRequest, FetchResponse, ResponseType};
 pub use bytecode::{BytecodeCache, CacheHit, CacheStats, CacheKey};
+pub use module_loader::{
+    ModuleSources, PlutoLoader, PlutoResolver, is_bare_specifier, resolve_module_specifier,
+    scan_module_imports,
+};
 pub use engine::{EvalKind, JsEngine, JsValue};
 pub use error::JsError;
 pub use event_loop::{FRAME_INTERVAL, TaskSource};

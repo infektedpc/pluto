@@ -82,6 +82,7 @@ use pluto_html::{Destination as HtmlDestination, Priority as HtmlPriority};
 use pluto_ipc::{
     CredentialsMode, Destination, Priority, RequestMode, ResourceRequest, origin_of,
 };
+use pluto_js::ModuleSources;
 use pluto_layout::{ElementState, LayoutTree};
 use pluto_net::ResourceLoader;
 use pluto_paint::DisplayList;
@@ -104,6 +105,11 @@ use tokio_util::sync::CancellationToken;
 pub struct LoadSinks {
     pub images: Option<UnboundedSender<ImageRequest>>,
     pub progress: Option<UnboundedSender<(u64, Option<u64>)>>,
+    /// Stage 12 Rec 1: the tab's shared pre-fetched module
+    /// sources. The load fills it while fetching module scripts
+    /// (see `StreamingLoad::fetch_module_graph`); the realm's
+    /// loader reads from it. `None` when no JS is attached.
+    pub module_sources: Option<ModuleSources>,
 }
 
 impl LoadSinks {
@@ -136,6 +142,12 @@ pub const RENDER_BLOCKING_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum `@import` nesting followed while loading stylesheets.
 /// Cycles and pathological chains stop here instead of looping.
 pub const MAX_IMPORT_DEPTH: usize = 5;
+
+/// Maximum module import-graph depth followed while pre-fetching
+/// (Stage 12 Rec 1). Module graphs run deeper than CSS `@import`
+/// chains, so this is its own, larger cap; cycles and pathological
+/// graphs stop here instead of looping.
+pub const MAX_MODULE_IMPORT_DEPTH: usize = 16;
 
 /// Bytes per streaming-parser feed: the first chunk of a real
 /// document is typically ~14 KiB (TCP initcwnd); 4 KiB feeds exercise
@@ -807,6 +819,11 @@ struct StreamingLoad<'a, 'h> {
     sheet_attempted: HashSet<String>,
     /// Fetched script bytes by resolved `src`.
     script_bytes: HashMap<String, Vec<u8>>,
+    /// Module import URLs already attempted (loaded or failed),
+    /// keyed by absolute URL (Stage 12 Rec 1): the same module
+    /// imported from several spellings / several parents is
+    /// fetched once, and circular imports terminate.
+    module_attempted: HashSet<String>,
     /// Classic parser-blocking `<script>` nodes, in pause order.
     paused_scripts: Vec<NodeId>,
     /// Render-blocking deadline (navigation start + timeout).
@@ -840,6 +857,7 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
             sheet_cache: HashMap::new(),
             sheet_attempted: HashSet::new(),
             script_bytes: HashMap::new(),
+            module_attempted: HashSet::new(),
             paused_scripts: Vec::new(),
             blocking_deadline: tokio::time::Instant::now() + RENDER_BLOCKING_TIMEOUT,
             restarted: false,
@@ -928,6 +946,7 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
                                     // already carries it too, and
                                     // the scheduler dedups the two.
                                     found.integrity.clone(),
+                                    found.is_module,
                                 )
                                 .await;
                                 if let Some(hooks) = self.hooks.as_mut() {
@@ -959,7 +978,8 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
                                 // request for the same `src` already
                                 // carries it, and the scheduler dedups
                                 // this fetch to it.
-                                self.fetch_script(src, Priority::High, None).await;
+                                self.fetch_script(src, Priority::High, None, paused.is_module)
+                                    .await;
                                 bytes = self
                                     .script_bytes
                                     .get(src)
@@ -1120,11 +1140,16 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
     /// `ScriptPaused` both ask, but only the first downloads.
     /// Script fetches are NOT render-blocking — the scheduler's own
     /// timeouts bound them, so no deadline applies here.
+    /// Stage 12 Rec 1: when `is_module`, the entry module's import
+    /// graph is pre-fetched into the shared module sources (same
+    /// loader, same Stage 9 gates — no second fetch path), so the
+    /// realm's loader can serve imports synchronously at link time.
     async fn fetch_script(
         &mut self,
         src: &str,
         priority: Priority,
         integrity: Option<String>,
+        is_module: bool,
     ) {
         if self.script_bytes.contains_key(src) {
             return;
@@ -1141,13 +1166,99 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
         );
         match self.loader.fetch_with(request, self.cancel.clone()).await {
             Ok(response) => {
-                self.script_bytes.insert(src.to_string(), response.body);
+                let final_url = response.final_url.to_string();
+                let bytes = response.body;
+                self.script_bytes.insert(src.to_string(), bytes.clone());
+                if is_module {
+                    let source = String::from_utf8_lossy(&bytes).into_owned();
+                    self.fetch_module_graph(&final_url, &source).await;
+                }
             }
             Err(e) => {
                 eprintln!("[pluto] script fetch failed ({src}): {e}");
                 // Record the miss so a re-feed after an encoding
                 // restart does not retry a failing URL forever.
                 self.script_bytes.insert(src.to_string(), Vec::new());
+            }
+        }
+    }
+
+    /// Pre-fetch a module's import graph into the shared module
+    /// sources (Stage 12 Rec 1). `entry_url` / `entry_source` are
+    /// the already-fetched entry module (absolute URL). Worklist,
+    /// iterative like `fetch_stylesheet`'s `@import` walk:
+    /// specifiers resolve against the importing module's URL, bare
+    /// specifiers are skipped (no import maps in M4 — the loader
+    /// rejects them at link time), and every fetched source is
+    /// scanned for its own imports. A failed import fetch is
+    /// logged and skipped — the importing module rejects at link
+    /// time with a loader-miss error. No-op when no module store
+    /// is attached (no JS on this load).
+    async fn fetch_module_graph(&mut self, entry_url: &str, entry_source: &str) {
+        let Some(store) = self.sinks.module_sources.clone() else {
+            return;
+        };
+        store.insert(entry_url, entry_source.to_string());
+        // The entry itself counts as attempted, so a circular
+        // import back to it terminates instead of refetching.
+        self.module_attempted.insert(entry_url.to_string());
+        let mut stack = vec![(entry_url.to_string(), entry_source.to_string(), 0usize)];
+        while let Some((url, source, depth)) = stack.pop() {
+            if depth >= MAX_MODULE_IMPORT_DEPTH {
+                eprintln!(
+                    "[pluto] module import depth exceeded at {url}, skipping deeper imports"
+                );
+                continue;
+            }
+            for spec in pluto_js::scan_module_imports(&source) {
+                let Ok(resolved) = pluto_js::resolve_module_specifier(&url, &spec) else {
+                    // Bare / data: specifier — the loader rejects
+                    // it at link time with the reason; nothing to
+                    // fetch.
+                    continue;
+                };
+                if !self.module_attempted.insert(resolved.clone()) {
+                    continue;
+                }
+                if store.contains(&resolved) {
+                    continue;
+                }
+                let Some((final_url, text)) = self.fetch_module_source(&resolved).await else {
+                    continue;
+                };
+                if final_url != resolved && store.contains(&final_url) {
+                    // A redirect landed on a module already walked.
+                    continue;
+                }
+                store.insert(&final_url, text.clone());
+                stack.push((final_url, text, depth + 1));
+            }
+        }
+    }
+
+    /// Fetch one module source as text (same loader, same Stage 9
+    /// gates as every other subresource). `None` on any failure.
+    /// Returns the final URL (after redirects) with the source.
+    async fn fetch_module_source(&self, url: &str) -> Option<(String, String)> {
+        let request = subresource_request(
+            url,
+            Destination::Script,
+            Priority::Medium,
+            &self.base_url,
+            false,
+            None,
+            self.tab_id,
+            self.epoch,
+        );
+        match self.loader.fetch_with(request, self.cancel.clone()).await {
+            Ok(response) => {
+                let final_url = response.final_url.to_string();
+                let text = String::from_utf8_lossy(&response.body).into_owned();
+                Some((final_url, text))
+            }
+            Err(e) => {
+                eprintln!("[pluto] module import fetch failed ({url}): {e}");
+                None
             }
         }
     }
@@ -1977,6 +2088,7 @@ mod tests {
         let sinks = LoadSinks {
             images: Some(img_tx),
             progress: Some(prog_tx),
+            module_sources: None,
         };
         let (_, _) = load_page_cancellable_with_hooks(
             &loader,

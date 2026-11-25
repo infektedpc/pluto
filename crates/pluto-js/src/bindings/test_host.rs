@@ -17,11 +17,25 @@
 //! cloned but inert — nothing here ever executes them.
 
 use std::cell::Cell;
+use std::sync::{Arc, Mutex};
 
 use pluto_html::observers::{MutationObserverOptions, ObserverMutationRecord};
 use pluto_html::{Dom, NodeId, NodeKind, parse, parse_fragment};
 
 use crate::host::{DomHost, DomHostError, DomKey, Geometry};
+
+/// Host-visible side effects the test host records (navigation +
+/// image requests), shared with the test through an `Arc` so the
+/// test can read them after the host has moved into the tab.
+#[derive(Debug, Default)]
+pub struct TestHostLog {
+    /// Navigation requests from `location.assign` / `replace` /
+    /// `reload`, as `(url, replace)` in order.
+    pub navigation_requests: Vec<(String, bool)>,
+    /// Image requests from `Image()` / `<img>.src`, as
+    /// `(url, base_url)` in order.
+    pub image_requests: Vec<(String, String)>,
+}
 
 // ------------------------------------------------------------------ host
 
@@ -41,17 +55,29 @@ pub struct TestHost {
     /// resize-loop-error test sets this). Default 0: geometry is
     /// a fixed 100×50.
     pub geometry_growth: Cell<f64>,
+    /// The document's URL (Stage 12 Rec 7: `window.location` base).
+    pub document_url: String,
+    /// Shared side-effect log (navigation + image requests).
+    pub log: Arc<Mutex<TestHostLog>>,
 }
 
 impl TestHost {
     /// A host over a parsed document.
     pub fn from_html(html: &str) -> Self {
+        Self::from_html_with_log(html, Arc::new(Mutex::new(TestHostLog::default())))
+    }
+
+    /// A host over a parsed document, recording side effects into
+    /// `log` (shared with the test).
+    pub fn from_html_with_log(html: &str, log: Arc<Mutex<TestHostLog>>) -> Self {
         Self {
             dom: parse(html),
             writes: Vec::new(),
             errors: Vec::new(),
             flushes: 0,
             geometry_growth: Cell::new(0.0),
+            document_url: "https://example.com/".to_string(),
+            log,
         }
     }
 
@@ -148,8 +174,7 @@ impl TestHost {
     /// Deep-clone a node from a fragment `Dom` into this `Dom`,
     /// returning the new key. `<script>` elements are cloned like any
     /// other element — they are inert (never executed).
-    fn clone_from(&mut self, frag: &Dom, id: NodeId) -> Option<DomKey> {
-        let node = frag.get(id)?;
+    fn clone_from(&mut self, frag: &Dom, id: NodeId) -> Option<DomKey> {        let node = frag.get(id)?;
         let new_key = match &node.kind {
             NodeKind::Element { tag } => self
                 .dom
@@ -168,6 +193,42 @@ impl TestHost {
         for kid in kids {
             if let Some(cloned) = self.clone_from(frag, kid) {
                 self.dom.append_child(new_key, cloned);
+            }
+        }
+        Some(new_key)
+    }
+
+    /// Clone a node of *this* `Dom` (Stage 12 Rec 7 `cloneNode`):
+    /// same kind / tag / attributes / text; children copied only
+    /// when `deep`. The clone is detached (no parent).
+    fn clone_within(&mut self, id: NodeId, deep: bool) -> Option<DomKey> {
+        // Clone the kind + attributes first: creating the new node
+        // mutates the arena, so no borrow of the old node may live
+        // across the match.
+        let (kind, attrs) = match self.dom.get(id) {
+            Some(n) => (n.kind.clone(), n.attrs.clone()),
+            None => return None,
+        };
+        let new_key = match &kind {
+            NodeKind::Element { tag } => self
+                .dom
+                .create_element_with_attrs(tag, attrs),
+            NodeKind::Text(data) => self.dom.create_text(data),
+            NodeKind::Comment(data) => self.dom.create_comment(data),
+            NodeKind::Doctype { name, public_id, system_id } => {
+                self.dom.create_doctype(name, public_id, system_id)
+            }
+            NodeKind::ProcessingInstruction { target, data } => {
+                self.dom.create_pi(target, data)
+            }
+            NodeKind::Document => self.dom.create_document(),
+        };
+        if deep {
+            let kids: Vec<NodeId> = self.dom.children(id).to_vec();
+            for kid in kids {
+                if let Some(cloned) = self.clone_within(kid, true) {
+                    self.dom.append_child(new_key, cloned);
+                }
             }
         }
         Some(new_key)
@@ -595,6 +656,40 @@ impl DomHost for TestHost {
         // `&self` only — the test host cannot push without interior
         // mutability; errors are visible via `TabJs::script_errors`.
         let _ = message;
+    }
+
+    fn document_url(&self) -> Option<String> {
+        Some(self.document_url.clone())
+    }
+
+    fn request_navigation(&mut self, url: &str, replace: bool) {
+        self.log
+            .lock()
+            .unwrap()
+            .navigation_requests
+            .push((url.to_string(), replace));
+    }
+
+    fn attribute_names(&self, key: DomKey) -> Vec<String> {
+        self.dom
+            .get(key)
+            .map(|n| n.attrs.iter().map(|(name, _)| name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    fn clone_node(&mut self, key: DomKey, deep: bool) -> Option<DomKey> {
+        if self.dom.get(key).is_none() {
+            return None;
+        }
+        self.clone_within(key, deep)
+    }
+
+    fn request_image(&mut self, url: &str, base_url: &str) {
+        self.log
+            .lock()
+            .unwrap()
+            .image_requests
+            .push((url.to_string(), base_url.to_string()));
     }
 }
 

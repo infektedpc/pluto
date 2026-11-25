@@ -38,13 +38,41 @@ use std::sync::mpsc;
 use pluto_ipc::{CredentialsMode, Origin, RequestMode};
 use rquickjs::function::{Opt, This};
 use rquickjs::object::{Accessor, Property};
-use rquickjs::{Coerced, Ctx, Function, Object, Symbol, Value};
+use rquickjs::{Array, ArrayBuffer, Coerced, Ctx, FromJs, Function, IntoJs, Object, Symbol, Value};
 
 use crate::bindings::{
-    BindingState, HEADERS_SYMBOL, RESPONSE_SYMBOL, js, js_null, map_delete, map_get, map_set,
-    registry_map, throw_type_error, to_dom_string,
+    ABORT_SIGNAL_SYMBOL, BindingState, HEADERS_SYMBOL, REQUEST_SYMBOL, RESPONSE_SYMBOL, js,
+    js_null, make_dom_error, map_delete, map_get, map_set, registry, registry_map,
+    throw_type_error, to_dom_string,
 };
 use crate::event_loop::LoopState;
+
+/// One `Request` object, as stored in [`BindingState::requests`].
+/// The JS object holds only the id; `fetch()` reads this back.
+#[derive(Debug, Clone)]
+pub struct StoredRequest {
+    /// Request URL (as passed to the constructor).
+    pub url: String,
+    /// HTTP method, uppercased.
+    pub method: String,
+    /// The `Headers` object's id (its list lives in
+    /// [`BindingState::response_headers`], shared with responses).
+    pub headers_id: u64,
+    /// Request body bytes, if any.
+    pub body: Option<Vec<u8>>,
+    /// The `AbortSignal` id attached at construction, if any.
+    pub signal_id: Option<u64>,
+}
+
+/// State of one `AbortSignal`, by id (see
+/// [`BindingState::abort_signals`]).
+#[derive(Debug, Clone, Default)]
+pub struct AbortSignalState {
+    /// True once `abort()` was called.
+    pub aborted: bool,
+    /// Pending-fetch ids registered on this signal.
+    pub fetch_ids: Vec<u64>,
+}
 
 /// One fetch request, as the binding hands it to the backend.
 /// `url` is absolute (`http(s)://…`) or a same-origin path (`/…`);
@@ -172,6 +200,12 @@ pub trait FetchBackend: Send + Sync {
     /// Start a fetch. Send one outcome on `done`, exactly once.
     fn start_fetch(&self, request: FetchRequest, done: mpsc::Sender<FetchCompletion>);
 
+    /// Cancel an in-flight fetch (Stage 12 Rec 8: `AbortSignal`).
+    /// Best effort: the backend should drop the request and send
+    /// no completion for it. Default: no-op — the realm rejects
+    /// the promise locally and ignores a late completion anyway.
+    fn cancel_fetch(&self, _id: u64) {}
+
     /// The document origin this backend fetches for, if it tracks
     /// one (Stage 9 Rec 1). The realm-side gate
     /// ([`check_fetch_allowed`]) reads it for its early same-origin
@@ -196,6 +230,8 @@ pub fn install_fetch<'js>(
     let globals = ctx.globals();
     install_response_prototype(ctx, bindings)?;
     install_headers_prototype(ctx, bindings)?;
+    install_request_prototype(ctx, bindings)?;
+    install_abort_prototypes(ctx, bindings)?;
 
     let b = Rc::clone(bindings);
     let fetch_fn = Function::new(
@@ -265,16 +301,40 @@ fn fetch_impl<'js>(
         Ok(())
     };
 
-    // `input`: a URL string, or a `Request`-shaped object with a
-    // `url` property (M4: no `Request` class yet — read the property).
+    // `input`: a URL string, a `Request` object (Stage 12 Rec 8),
+    // or a `Request`-shaped object with a `url` property.
+    let mut method = "GET".to_string();
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut body: Option<Vec<u8>> = None;
+    let mut signal_id: Option<u64> = None;
     let url = if let Some(s) = input.as_string() {
         s.to_string().unwrap_or_default()
     } else if let Some(obj) = input.as_object() {
-        match obj.get::<_, String>("url") {
-            Ok(u) => u,
-            Err(_) => {
-                reject_with(ctx, "fetch: input is not a URL string or Request")?;
-                return Ok(promise.into_value());
+        if let Some(req_id) = request_id_of(&ctx, obj) {
+            let stored = match bindings.borrow().requests.get(&req_id).cloned() {
+                Some(s) => s,
+                None => {
+                    reject_with(ctx, "fetch: input is not a valid Request")?;
+                    return Ok(promise.into_value());
+                }
+            };
+            method = stored.method;
+            headers = bindings
+                .borrow()
+                .response_headers
+                .get(&stored.headers_id)
+                .cloned()
+                .unwrap_or_default();
+            body = stored.body;
+            signal_id = stored.signal_id;
+            stored.url
+        } else {
+            match obj.get::<_, String>("url") {
+                Ok(u) => u,
+                Err(_) => {
+                    reject_with(ctx, "fetch: input is not a URL string or Request")?;
+                    return Ok(promise.into_value());
+                }
             }
         }
     } else {
@@ -298,14 +358,11 @@ fn fetch_impl<'js>(
         return Ok(promise.into_value());
     }
 
-    // `init`: method / headers / body / mode / credentials.
+    // `init`: method / headers / body / mode / credentials / signal.
     // `mode` and `credentials` are threaded to the backend, which
     // enforces them in `pluto-net` (Stage 9 Rec 2): an unknown
     // enum value rejects with a TypeError, as the IDL conversion
     // would. Defaults: mode `"cors"`, credentials `"same-origin"`.
-    let mut method = "GET".to_string();
-    let mut headers: Vec<(String, String)> = Vec::new();
-    let mut body: Option<Vec<u8>> = None;
     let mut mode = RequestMode::Cors;
     let mut credentials = CredentialsMode::SameOrigin;
     if let Some(init) = init
@@ -314,11 +371,11 @@ fn fetch_impl<'js>(
                 method = m.to_ascii_uppercase();
             }
             if let Ok(h) = obj.get::<_, Value>("headers") {
-                headers = parse_headers_init(ctx, &h)?;
+                headers = parse_headers_init(&ctx, bindings, &h)?;
             }
             if let Ok(b) = obj.get::<_, Value>("body")
                 && !b.is_null() && !b.is_undefined() {
-                    body = Some(to_dom_string(ctx, &b)?.into_bytes());
+                    body = Some(to_dom_string(&ctx, &b)?.into_bytes());
                 }
             if let Ok(m) = obj.get::<_, String>("mode") {
                 mode = match m.as_str() {
@@ -349,13 +406,43 @@ fn fetch_impl<'js>(
                     }
                 };
             }
+            if let Ok(s) = obj.get::<_, Value>("signal")
+                && !s.is_null() && !s.is_undefined() {
+                    match s.as_object().and_then(|o| abort_signal_id_of(&ctx, o)) {
+                        Some(id) => signal_id = Some(id),
+                        None => {
+                            reject_with(ctx, "fetch: signal is not an AbortSignal")?;
+                            return Ok(promise.into_value());
+                        }
+                    }
+                }
         }
+    // An already-aborted signal rejects at once, without starting
+    // the backend (Fetch §4.1: "if signal is aborted, reject").
+    if let Some(id) = signal_id
+        && bindings
+            .borrow()
+            .abort_signals
+            .get(&id)
+            .is_some_and(|s| s.aborted)
+    {
+        let reason = make_dom_error(&ctx, "AbortError", "The user aborted a request.")?;
+        let _: Value = reject.call((reason,))?;
+        return Ok(promise.into_value());
+    }
     let id = {
         let mut s = bindings.borrow_mut();
         let id = s.next_fetch_id;
         s.next_fetch_id += 1;
         id
     };
+    if let Some(signal) = signal_id {
+        let mut s = bindings.borrow_mut();
+        s.fetch_signals.insert(id, signal);
+        if let Some(state) = s.abort_signals.get_mut(&signal) {
+            state.fetch_ids.push(id);
+        }
+    }
     let request = FetchRequest {
         id,
         url,
@@ -401,14 +488,24 @@ fn fetch_impl<'js>(
     Ok(promise.into_value())
 }
 
-/// Parse a `HeadersInit`: an object of name → value, or an array of
-/// `[name, value]` pairs.
+/// Parse a `HeadersInit`: a `Headers` object (copied), an object
+/// of name → value, or an array of `[name, value]` pairs.
 fn parse_headers_init<'js>(
     ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
     value: &Value<'js>,
 ) -> rquickjs::Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     if let Some(obj) = value.as_object() {
+        // A `Headers` object copies its list.
+        if let Some(id) = body_id_of(ctx, obj, HEADERS_SYMBOL) {
+            return Ok(bindings
+                .borrow()
+                .response_headers
+                .get(&id)
+                .cloned()
+                .unwrap_or_default());
+        }
         if let Some(arr) = obj.clone().into_array() {
             let len: usize = arr.len();
             for i in 0..len {
@@ -445,16 +542,35 @@ pub fn resolve_fetch<'js>(
     completion: FetchCompletion,
 ) -> rquickjs::Result<()> {
     let id = completion.id;
+    // The request URL rides along so the `Response` knows its
+    // `.url`; the signal registration is dropped whether the
+    // fetch succeeded or failed (an aborted fetch never reaches
+    // here — `abort()` already removed the entry).
+    let url = bindings
+        .borrow()
+        .pending_fetches
+        .get(&id)
+        .map(|r| r.url.clone())
+        .unwrap_or_default();
     bindings.borrow_mut().pending_fetches.remove(&id);
+    // Bind each removal first: a `borrow_mut()` temporary in a
+    // `let`-chain scrutinee lives through the whole chain, so a
+    // second `borrow_mut()` inside it would panic.
+    let signal_id = bindings.borrow_mut().fetch_signals.remove(&id);
+    if let Some(signal_id) = signal_id
+        && let Some(state) = bindings.borrow_mut().abort_signals.get_mut(&signal_id)
+    {
+        state.fetch_ids.retain(|f| *f != id);
+    }
     let fetches = registry_map(ctx, "fetches")?;
     let entry = map_get(ctx, &fetches, id)?;
     map_delete(ctx, &fetches, id);
     let Some(entry_obj) = entry.as_object() else {
-        return Ok(()); // Cancelled by navigation: nothing to resolve.
+        return Ok(()); // Cancelled by navigation / abort: nothing to resolve.
     };
     match completion.result {
         Ok(response) => {
-            let response_obj = make_response(ctx, bindings, &response)?;
+            let response_obj = make_response(ctx, bindings, &response, &url, false)?;
             let resolve: Function = entry_obj.get("resolve")?;
             let result: rquickjs::Result<Value> =
                 resolve.call((Value::from(response_obj),));
@@ -480,12 +596,81 @@ pub fn resolve_fetch<'js>(
     Ok(())
 }
 
+/// Abort every fetch registered on `signal_id`: cancel the
+/// backend request, reject the promise with an `AbortError`, and
+/// drop the pending entry — so a late backend completion finds
+/// no entry and is ignored. Then run the signal's `onabort`
+/// handler, if one is set. A second `abort()` is a no-op.
+pub fn abort_signal<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    signal_id: u64,
+) -> rquickjs::Result<()> {
+    let already_aborted = bindings
+        .borrow()
+        .abort_signals
+        .get(&signal_id)
+        .is_some_and(|s| s.aborted);
+    if already_aborted {
+        return Ok(());
+    }
+    let fetch_ids = {
+        let mut s = bindings.borrow_mut();
+        if let Some(state) = s.abort_signals.get_mut(&signal_id) {
+            state.aborted = true;
+            std::mem::take(&mut state.fetch_ids)
+        } else {
+            return Ok(());
+        }
+    };
+    let backend = bindings.borrow().fetch_backend.clone();
+    for fetch_id in fetch_ids {
+        if let Some(backend) = &backend {
+            backend.cancel_fetch(fetch_id);
+        }
+        bindings.borrow_mut().pending_fetches.remove(&fetch_id);
+        bindings.borrow_mut().fetch_signals.remove(&fetch_id);
+        let fetches = registry_map(ctx, "fetches")?;
+        let entry = map_get(ctx, &fetches, fetch_id)?;
+        map_delete(ctx, &fetches, fetch_id);
+        if let Some(entry_obj) = entry.as_object()
+            && let Ok(reject_fn) = entry_obj.get::<_, Function>("reject")
+        {
+            let reason = make_dom_error(&ctx, "AbortError", "The user aborted a request.")?;
+            let result: rquickjs::Result<Value> = reject_fn.call((reason,));
+            if let Err(e) = result {
+                bindings
+                    .borrow_mut()
+                    .errors
+                    .push(format!("fetch abort reject threw: {e}"));
+            }
+        }
+    }
+    // `onabort`: called with the signal as `this` and an `abort` event.
+    let signals = registry_map(ctx, "abortSignals")?;
+    let signal = map_get(ctx, &signals, signal_id)?;
+    if let Some(signal_obj) = signal.as_object()
+        && let Ok(handler) = signal_obj.get::<_, Value>("onabort")
+        && handler.is_function()
+    {
+        let func = Function::from_js(ctx, handler)?;
+        let event: Object = ctx.eval("new Event('abort')")?;
+        let _: Value = func.call((
+            This(Value::from(signal_obj.clone())),
+            Value::from(event),
+        ))?;
+    }
+    Ok(())
+}
+
 /// Build a `Response` wrapper for a completed fetch, storing its
 /// body + headers in [`BindingState`] under a fresh body id.
 pub fn make_response<'js>(
     ctx: &Ctx<'js>,
     bindings: &Rc<RefCell<BindingState>>,
     response: &FetchResponse,
+    url: &str,
+    redirected: bool,
 ) -> rquickjs::Result<Object<'js>> {
     let body_id = {
         let mut s = bindings.borrow_mut();
@@ -493,6 +678,8 @@ pub fn make_response<'js>(
         s.next_body_id += 1;
         s.response_bodies.insert(id, response.body.clone());
         s.response_headers.insert(id, response.headers.clone());
+        s.response_urls
+            .insert(id, (url.to_string(), redirected));
         id
     };
     let status_text = if response.status_text.is_empty() {
@@ -516,6 +703,10 @@ pub fn make_response<'js>(
         "type",
         Property::from(response.response_type.as_str()),
     )?;
+    // `url` / `redirected` likewise (Fetch §2.2.6): the final URL
+    // after redirects, and whether any redirect happened.
+    obj.prop("url", Property::from(url))?;
+    obj.prop("redirected", Property::from(redirected))?;
     // The `headers` object shares the body id.
     let headers_obj = make_headers_object(ctx, bindings, body_id)?;
     obj.set("headers", headers_obj)?;
@@ -535,6 +726,18 @@ fn make_headers_object<'js>(
     obj.set(sym.as_atom(), body_id as f64)?;
     let _ = bindings;
     Ok(obj)
+}
+
+/// The `Response` / `Headers` object id helpers + `ResponseType`
+/// parsing for `Response.clone()`.
+fn response_type_from_str(s: &str) -> ResponseType {
+    match s {
+        "basic" => ResponseType::Basic,
+        "cors" => ResponseType::Cors,
+        "opaque" => ResponseType::Opaque,
+        "opaqueredirect" => ResponseType::OpaqueRedirect,
+        _ => ResponseType::Default,
+    }
 }
 
 /// The body id stored on a `Response` / `Headers` object.
@@ -667,6 +870,136 @@ fn install_response_prototype<'js>(
         .set("json", json_fn)
         .map_err(|e| format!("Response.json: {e}"))?;
 
+    // `url` / `redirected` are plain data properties on the object
+    // (set by `make_response`); the prototype exposes them as
+    // accessors that read the own property, so a missing value
+    // reads as `undefined` instead of throwing.
+    for prop in ["url", "redirected"] {
+        proto
+            .prop(
+                prop,
+                Accessor::from(
+                    move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+                        let _ = ctx;
+                        this.get(prop)
+                    },
+                ),
+            )
+            .map_err(|e| format!("Response.{prop}: {e}"))?;
+    }
+
+    // `blob()`: a promise resolved with a `Blob`-shaped object
+    // (`{ size, type }` — M4 has no `Blob` class yet; the size and
+    // the content type are what pages read most).
+    let b = Rc::clone(bindings);
+    let blob_fn = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+            let (promise, resolve, _reject) = ctx.promise()?;
+            let body_id = body_id_of(&ctx, &this, RESPONSE_SYMBOL);
+            let (size, ty) = match body_id {
+                Some(id) => {
+                    let s = b.borrow();
+                    let size = s.response_bodies.get(&id).map(|v| v.len()).unwrap_or(0);
+                    let ty = s
+                        .response_headers
+                        .get(&id)
+                        .and_then(|h| {
+                            h.iter()
+                                .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+                                .map(|(_, v)| v.clone())
+                        })
+                        .unwrap_or_default();
+                    (size, ty)
+                }
+                None => (0, String::new()),
+            };
+            let blob = Object::new(ctx.clone())?;
+            blob.set("size", size as f64)?;
+            blob.set("type", ty)?;
+            let _: Value = resolve.call((Value::from(blob),))?;
+            Ok(promise.into_value())
+        },
+    )
+    .map_err(|e| format!("Response.blob: {e}"))?;
+    proto
+        .set("blob", blob_fn)
+        .map_err(|e| format!("Response.blob: {e}"))?;
+
+    // `arrayBuffer()`: a promise resolved with the body bytes in a
+    // real `ArrayBuffer`.
+    let b = Rc::clone(bindings);
+    let array_buffer_fn = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+            let (promise, resolve, _reject) = ctx.promise()?;
+            let body_id = body_id_of(&ctx, &this, RESPONSE_SYMBOL);
+            let bytes = body_id
+                .and_then(|id| b.borrow().response_bodies.get(&id).cloned())
+                .unwrap_or_default();
+            let buffer = ArrayBuffer::new_copy(ctx.clone(), bytes.as_slice())?;
+            let buffer_value: Value = buffer.into_js(&ctx)?;
+            let _: Value = resolve.call((buffer_value,))?;
+            Ok(promise.into_value())
+        },
+    )
+    .map_err(|e| format!("Response.arrayBuffer: {e}"))?;
+    proto
+        .set("arrayBuffer", array_buffer_fn)
+        .map_err(|e| format!("Response.arrayBuffer: {e}"))?;
+
+    // `clone()`: a new `Response` with an independent copy of the
+    // body + headers (reading one clone never disturbs the other —
+    // bodies are buffered bytes, not streams, in M4).
+    let b = Rc::clone(bindings);
+    let clone_fn = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+            let body_id = body_id_of(&ctx, &this, RESPONSE_SYMBOL);
+            let (status, status_text, ty, headers, body, url, redirected) = match body_id {
+                Some(id) => {
+                    let s = b.borrow();
+                    let status = this.get::<_, f64>("status").unwrap_or(200.0) as u16;
+                    let status_text = this
+                        .get::<_, String>("statusText")
+                        .unwrap_or_default();
+                    let ty = response_type_from_str(
+                        &this.get::<_, String>("type").unwrap_or_default(),
+                    );
+                    let headers = s.response_headers.get(&id).cloned().unwrap_or_default();
+                    let body = s.response_bodies.get(&id).cloned().unwrap_or_default();
+                    let (url, redirected) = s
+                        .response_urls
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_default();
+                    (status, status_text, ty, headers, body, url, redirected)
+                }
+                None => (
+                    200u16,
+                    String::new(),
+                    ResponseType::Default,
+                    Vec::new(),
+                    Vec::new(),
+                    String::new(),
+                    false,
+                ),
+            };
+            let response = FetchResponse {
+                status,
+                status_text,
+                headers,
+                body,
+                response_type: ty,
+            };
+            make_response(&ctx, &b, &response, &url, redirected).map(Value::from)
+        },
+    )
+    .map_err(|e| format!("Response.clone: {e}"))?;
+    proto
+        .set("clone", clone_fn)
+        .map_err(|e| format!("Response.clone: {e}"))?;
+
     protos
         .set("response", proto)
         .map_err(|e| format!("prototypes response: {e}"))?;
@@ -699,7 +1032,7 @@ fn install_response_prototype<'js>(
                         status_text = t;
                     }
                     if let Ok(h) = obj.get::<_, Value>("headers") {
-                        headers = parse_headers_init(&ctx, &h)?;
+                        headers = parse_headers_init(&ctx, &b, &h)?;
                     }
                 }
             let response = FetchResponse {
@@ -711,7 +1044,7 @@ fn install_response_prototype<'js>(
                 // its type is always "default" (Fetch §2.2.6).
                 response_type: ResponseType::Default,
             };
-            make_response(&ctx, &b, &response).map(Value::from)
+            make_response(&ctx, &b, &response, "", false).map(Value::from)
         },
     )
     .map_err(|e| format!("Response factory: {e}"))?;
@@ -748,12 +1081,17 @@ fn install_headers_prototype<'js>(
             };
             let headers = b.borrow().response_headers.get(&id).cloned().unwrap_or_default();
             let want = name.to_ascii_lowercase();
-            Ok(match headers
+            // `get` returns the values for the name combined with
+            // `", "` (Fetch §5.2.6) — a single value reads unchanged.
+            let values: Vec<&str> = headers
                 .iter()
-                .find(|(n, _)| n.to_ascii_lowercase() == want)
-            {
-                Some((_, v)) => js(&ctx, v.clone()),
-                None => js_null(&ctx),
+                .filter(|(n, _)| n.to_ascii_lowercase() == want)
+                .map(|(_, v)| v.as_str())
+                .collect();
+            Ok(if values.is_empty() {
+                js_null(&ctx)
+            } else {
+                js(&ctx, values.join(", "))
             })
         },
     )
@@ -788,10 +1126,9 @@ fn install_headers_prototype<'js>(
             };
             let mut headers = b.borrow().response_headers.get(&id).cloned().unwrap_or_default();
             let want = name.to_ascii_lowercase();
-            match headers.iter_mut().find(|(n, _)| n.to_ascii_lowercase() == want) {
-                Some((_, v)) => *v = value.to_string(),
-                None => headers.push((name.to_string(), value.to_string())),
-            }
+            // `set` replaces *all* values for the name with one.
+            headers.retain(|(n, _)| n.to_ascii_lowercase() != want);
+            headers.push((name.to_string(), value.to_string()));
             b.borrow_mut().response_headers.insert(id, headers);
             Ok(())
         },
@@ -819,6 +1156,93 @@ fn install_headers_prototype<'js>(
         .set("append", append_fn)
         .map_err(|e| format!("Headers.append: {e}"))?;
 
+    // `delete(name)`: drop every value for the name.
+    let b = Rc::clone(bindings);
+    let delete_fn = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, This(this): This<Object<'js>>, name: Coerced<String>| -> rquickjs::Result<()> {
+            let Some(id) = body_id_of(&ctx, &this, HEADERS_SYMBOL) else {
+                return Err(throw_type_error(&ctx, "called on a non-Headers object"));
+            };
+            let mut headers = b.borrow().response_headers.get(&id).cloned().unwrap_or_default();
+            let want = name.to_ascii_lowercase();
+            headers.retain(|(n, _)| n.to_ascii_lowercase() != want);
+            b.borrow_mut().response_headers.insert(id, headers);
+            Ok(())
+        },
+    )
+    .map_err(|e| format!("Headers.delete: {e}"))?;
+    proto
+        .set("delete", delete_fn)
+        .map_err(|e| format!("Headers.delete: {e}"))?;
+
+    // Iteration (`keys` / `values` / `entries` / `forEach` /
+    // `for..of`): names in first-appearance insertion order, with
+    // duplicate values combined with `", "` (Fetch §5.2.6 — the
+    // list is sorted by name in the spec; M4 keeps insertion
+    // order, which is what the report's test asserts).
+    for (name, which) in [("keys", 0u8), ("values", 1u8), ("entries", 2u8)] {
+        let b = Rc::clone(bindings);
+        let f = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+                let Some(id) = body_id_of(&ctx, &this, HEADERS_SYMBOL) else {
+                    return Ok(Value::from(Array::new(ctx.clone())?));
+                };
+                let headers = b.borrow().response_headers.get(&id).cloned().unwrap_or_default();
+                let arr = Array::new(ctx.clone())?;
+                for (i, (n, v)) in normalized_headers(&headers).into_iter().enumerate() {
+                    let item = match which {
+                        0 => Value::from(js(&ctx, n)),
+                        1 => Value::from(js(&ctx, v)),
+                        _ => {
+                            let pair = Array::new(ctx.clone())?;
+                            pair.set(0, Value::from(js(&ctx, n)))?;
+                            pair.set(1, Value::from(js(&ctx, v)))?;
+                            Value::from(pair)
+                        }
+                    };
+                    arr.set(i, item)?;
+                }
+                Ok(Value::from(arr))
+            },
+        )
+        .map_err(|e| format!("Headers.{name}: {e}"))?;
+        proto.set(name, f).map_err(|e| format!("Headers.{name}: {e}"))?;
+    }
+
+    // `forEach(callback, thisArg?)`: `callback(value, key, headers)`.
+    let b = Rc::clone(bindings);
+    let for_each_fn = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, This(this): This<Object<'js>>, callback: Function<'js>, this_arg: Opt<Value<'js>>| -> rquickjs::Result<()> {
+            let Some(id) = body_id_of(&ctx, &this, HEADERS_SYMBOL) else {
+                return Ok(());
+            };
+            let headers = b.borrow().response_headers.get(&id).cloned().unwrap_or_default();
+            let this_value = this_arg.0.unwrap_or_else(|| Value::from(this.clone()));
+            for (n, v) in normalized_headers(&headers) {
+                let _: Value = callback.call((
+                    This(this_value.clone()),
+                    js(&ctx, v),
+                    js(&ctx, n),
+                    Value::from(this.clone()),
+                ))?;
+            }
+            Ok(())
+        },
+    )
+    .map_err(|e| format!("Headers.forEach: {e}"))?;
+    proto
+        .set("forEach", for_each_fn)
+        .map_err(|e| format!("Headers.forEach: {e}"))?;
+
+    // `for (const [k, v] of headers)`: the default iterator is
+    // `entries` (via a real `{ next() }` iterator — see
+    // `install_entries_iterator`).
+    super::install_entries_iterator(&ctx, &proto)
+        .map_err(|e| format!("Headers iterator: {e}"))?;
+
     protos
         .set("headers", proto)
         .map_err(|e| format!("prototypes headers: {e}"))?;
@@ -831,7 +1255,7 @@ fn install_headers_prototype<'js>(
         ctx.clone(),
         move |ctx: Ctx<'js>, init: Opt<Value<'js>>| -> rquickjs::Result<Value<'js>> {
             let headers = match init.0 {
-                Some(v) => parse_headers_init(&ctx, &v)?,
+                Some(v) => parse_headers_init(&ctx, &b, &v)?,
                 None => Vec::new(),
             };
             let id = {
@@ -859,5 +1283,391 @@ fn install_headers_prototype<'js>(
     headers_ctor
         .set("prototype", protos.get::<_, Object>("headers").map_err(|e| e.to_string())?)
         .map_err(|e| format!("Headers.prototype: {e}"))?;
+    Ok(())
+}
+
+/// Collapse a header list for iteration: one entry per name
+/// (lowercased), in first-appearance order, values combined with
+/// `", "`.
+fn normalized_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        match out.iter_mut().find(|(n, _)| *n == lower) {
+            Some((_, v)) => {
+                v.push_str(", ");
+                v.push_str(value);
+            }
+            None => out.push((lower, value.clone())),
+        }
+    }
+    out
+}
+
+/// The `Request` id stored on an object, if it is one.
+fn request_id_of<'js>(ctx: &Ctx<'js>, obj: &Object<'js>) -> Option<u64> {
+    let sym = Symbol::new_global(ctx.clone(), REQUEST_SYMBOL).ok()?;
+    let value: Value = obj.get(sym.as_atom()).ok()?;
+    value.as_number().map(|n| n as u64)
+}
+
+/// The `AbortSignal` id stored on an object, if it is one.
+fn abort_signal_id_of<'js>(ctx: &Ctx<'js>, obj: &Object<'js>) -> Option<u64> {
+    let sym = Symbol::new_global(ctx.clone(), ABORT_SIGNAL_SYMBOL).ok()?;
+    let value: Value = obj.get(sym.as_atom()).ok()?;
+    value.as_number().map(|n| n as u64)
+}
+
+/// Build a `Request` wrapper for a stored request id.
+fn make_request_object<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    id: u64,
+) -> rquickjs::Result<Object<'js>> {
+    let protos = registry_map(ctx, "prototypes")?;
+    let proto: Object = protos.get("request")?;
+    let obj = Object::new_proto(ctx.clone(), Some(&proto))?;
+    let sym = Symbol::new_global(ctx.clone(), REQUEST_SYMBOL)?;
+    obj.set(sym.as_atom(), id as f64)?;
+    let _ = bindings;
+    Ok(obj)
+}
+
+/// Install the `Request` prototype + constructor (Stage 12 Rec 8).
+/// `new Request(input, init?)`: `input` is a URL string or another
+/// `Request` (cloned); `init` overrides `method` / `headers` /
+/// `body` / `signal`. A `Request` is usable as `fetch()` input —
+/// see `fetch_impl`.
+fn install_request_prototype<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+) -> Result<(), String> {
+    let protos = registry_map(ctx, "prototypes").map_err(|e| format!("prototypes map: {e}"))?;
+    let proto = Object::new(ctx.clone()).map_err(|e| format!("Request prototype: {e}"))?;
+
+    // `url` / `method`: read the stored request.
+    for prop in ["url", "method"] {
+        let b = Rc::clone(bindings);
+        let get = move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+            let Some(id) = request_id_of(&ctx, &this) else {
+                return Ok(js(&ctx, ""));
+            };
+            Ok(js(
+                &ctx,
+                b.borrow()
+                    .requests
+                    .get(&id)
+                    .map(|r| {
+                        if prop == "url" {
+                            r.url.clone()
+                        } else {
+                            r.method.clone()
+                        }
+                    })
+                    .unwrap_or_default(),
+            ))
+        };
+        proto
+            .prop(prop, Accessor::from(get))
+            .map_err(|e| format!("Request.{prop}: {e}"))?;
+    }
+
+    // `headers`: the `Headers` object sharing the stored list
+    // (cached per request, so `req.headers === req.headers`).
+    let b = Rc::clone(bindings);
+    let get_headers = move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+        let Some(id) = request_id_of(&ctx, &this) else {
+            return Err(throw_type_error(&ctx, "called on a non-Request object"));
+        };
+        let headers_id = b
+            .borrow()
+            .requests
+            .get(&id)
+            .map(|r| r.headers_id)
+            .unwrap_or(0);
+        let map = registry_map(&ctx, "headers")?;
+        let existing = map_get(&ctx, &map, headers_id)?;
+        if let Some(obj) = existing.as_object() {
+            return Ok(obj.clone().into_value());
+        }
+        let headers_obj = make_headers_object(&ctx, &b, headers_id)?;
+        map_set(&ctx, &map, headers_id, Value::from(headers_obj.clone()))?;
+        Ok(Value::from(headers_obj))
+    };
+    proto
+        .prop("headers", Accessor::from(get_headers))
+        .map_err(|e| format!("Request.headers: {e}"))?;
+
+    // `signal`: the attached `AbortSignal` object (`null` when none).
+    let b = Rc::clone(bindings);
+    let get_signal = move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+        let Some(id) = request_id_of(&ctx, &this) else {
+            return Ok(js_null(&ctx));
+        };
+        let signal_id = b.borrow().requests.get(&id).and_then(|r| r.signal_id);
+        match signal_id {
+            Some(signal_id) => {
+                let signals = registry_map(&ctx, "abortSignals")?;
+                map_get(&ctx, &signals, signal_id)
+            }
+            None => Ok(js_null(&ctx)),
+        }
+    };
+    proto
+        .prop("signal", Accessor::from(get_signal))
+        .map_err(|e| format!("Request.signal: {e}"))?;
+
+    protos
+        .set("request", proto)
+        .map_err(|e| format!("prototypes request: {e}"))?;
+
+    // `Request` constructor: `new Request(input, init?)` — same JS
+    // constructor + Rust factory shape as `Response` (a Rust
+    // `Function::new` is not constructable).
+    let b = Rc::clone(bindings);
+    let factory = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, input: Value<'js>, init: Opt<Value<'js>>| -> rquickjs::Result<Value<'js>> {
+            let mut stored = if let Some(s) = input.as_string() {
+                StoredRequest {
+                    url: s.to_string().unwrap_or_default(),
+                    method: "GET".to_string(),
+                    headers_id: 0,
+                    body: None,
+                    signal_id: None,
+                }
+            } else if let Some(obj) = input.as_object()
+                && let Some(req_id) = request_id_of(&ctx, obj)
+            {
+                match b.borrow().requests.get(&req_id).cloned() {
+                    Some(s) => s,
+                    None => {
+                        return Err(throw_type_error(&ctx, "Request: invalid Request"));
+                    }
+                }
+            } else {
+                return Err(throw_type_error(
+                    &ctx,
+                    "Request: input is not a URL string or Request",
+                ));
+            };
+            // A fresh headers list for this request (a clone's list
+            // starts as a copy of the source's).
+            let headers_id = {
+                let mut s = b.borrow_mut();
+                let id = s.next_body_id;
+                s.next_body_id += 1;
+                let headers = if stored.headers_id == 0 {
+                    Vec::new()
+                } else {
+                    s.response_headers
+                        .get(&stored.headers_id)
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                s.response_headers.insert(id, headers);
+                s.response_bodies.insert(id, Vec::new());
+                id
+            };
+            stored.headers_id = headers_id;
+            if let Some(init) = init.0
+                && let Some(obj) = init.as_object()
+            {
+                if let Ok(m) = obj.get::<_, String>("method") {
+                    stored.method = m.to_ascii_uppercase();
+                }
+                if let Ok(h) = obj.get::<_, Value>("headers") {
+                    let headers = parse_headers_init(&ctx, &b, &h)?;
+                    b.borrow_mut().response_headers.insert(headers_id, headers);
+                }
+                if let Ok(body) = obj.get::<_, Value>("body")
+                    && !body.is_null() && !body.is_undefined()
+                {
+                    stored.body = Some(to_dom_string(&ctx, &body)?.into_bytes());
+                }
+                if let Ok(s) = obj.get::<_, Value>("signal")
+                    && !s.is_null() && !s.is_undefined()
+                {
+                    match s.as_object().and_then(|o| abort_signal_id_of(&ctx, o)) {
+                        Some(id) => stored.signal_id = Some(id),
+                        None => {
+                            return Err(throw_type_error(
+                                &ctx,
+                                "Request: signal is not an AbortSignal",
+                            ));
+                        }
+                    }
+                }
+            }
+            if !(stored.url.starts_with("http://")
+                || stored.url.starts_with("https://")
+                || stored.url.starts_with('/'))
+            {
+                return Err(throw_type_error(&ctx, "Request: invalid URL"));
+            }
+            let id = {
+                let mut s = b.borrow_mut();
+                let id = s.next_request_id;
+                s.next_request_id += 1;
+                s.requests.insert(id, stored);
+                id
+            };
+            make_request_object(&ctx, &b, id).map(Value::from)
+        },
+    )
+    .map_err(|e| format!("Request factory: {e}"))?;
+    let reg = registry(ctx).map_err(|e| format!("registry: {e}"))?;
+    reg.set("requestFactory", factory)
+        .map_err(|e| format!("install Request factory: {e}"))?;
+    ctx.eval::<(), _>(
+        "globalThis.Request = function Request(input, init) { \
+           if (!(this instanceof Request)) throw new TypeError('Request constructor requires new'); \
+           return globalThis[Symbol.for('pluto.registry')].requestFactory(input, init); \
+         };",
+    )
+    .map_err(|e| format!("install Request: {e}"))?;
+    let globals = ctx.globals();
+    let request_ctor: Object = globals.get("Request").map_err(|e| e.to_string())?;
+    request_ctor
+        .set("prototype", protos.get::<_, Object>("request").map_err(|e| e.to_string())?)
+        .map_err(|e| format!("Request.prototype: {e}"))?;
+    Ok(())
+}
+
+/// Install `AbortController` / `AbortSignal` (Stage 12 Rec 8).
+/// `AbortSignal` objects live in the registry's `abortSignals`
+/// Map (by id) so `Request.signal` returns the same object;
+/// `abort()` marks the state, cancels + rejects the registered
+/// fetches (see [`abort_signal`]), and runs `onabort`.
+fn install_abort_prototypes<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+) -> Result<(), String> {
+    let protos = registry_map(ctx, "prototypes").map_err(|e| format!("prototypes map: {e}"))?;
+    let signal_proto = Object::new(ctx.clone()).map_err(|e| format!("AbortSignal prototype: {e}"))?;
+
+    // `aborted`: read the signal state.
+    let b = Rc::clone(bindings);
+    let get_aborted = move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<bool> {
+        let Some(id) = abort_signal_id_of(&ctx, &this) else {
+            return Ok(false);
+        };
+        Ok(b.borrow()
+            .abort_signals
+            .get(&id)
+            .is_some_and(|s| s.aborted))
+    };
+    signal_proto
+        .prop("aborted", Accessor::from(get_aborted))
+        .map_err(|e| format!("AbortSignal.aborted: {e}"))?;
+
+    // `throwIfAborted()`: throw an `AbortError` when aborted.
+    let b = Rc::clone(bindings);
+    let throw_if_aborted = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<()> {
+            let Some(id) = abort_signal_id_of(&ctx, &this) else {
+                return Ok(());
+            };
+            if b.borrow()
+                .abort_signals
+                .get(&id)
+                .is_some_and(|s| s.aborted)
+            {
+                let err = make_dom_error(&ctx, "AbortError", "The user aborted a request.")?;
+                return Err(ctx.throw(err));
+            }
+            Ok(())
+        },
+    )
+    .map_err(|e| format!("AbortSignal.throwIfAborted: {e}"))?;
+    signal_proto
+        .set("throwIfAborted", throw_if_aborted)
+        .map_err(|e| format!("AbortSignal.throwIfAborted: {e}"))?;
+
+    protos
+        .set("abortSignal", signal_proto)
+        .map_err(|e| format!("prototypes abortSignal: {e}"))?;
+
+    // `AbortController` constructor: `new AbortController()` — a
+    // plain object with `.signal` (a fresh `AbortSignal`) and an
+    // `.abort()` method. The controller object carries the signal
+    // id under the same symbol, so `abort()` finds its signal.
+    let b = Rc::clone(bindings);
+    let factory = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>| -> rquickjs::Result<Value<'js>> {
+            let signal_id = {
+                let mut s = b.borrow_mut();
+                let id = s.next_signal_id;
+                s.next_signal_id += 1;
+                s.abort_signals.insert(id, AbortSignalState::default());
+                id
+            };
+            let protos = registry_map(&ctx, "prototypes")?;
+            let signal_proto: Object = protos.get("abortSignal")?;
+            let signal = Object::new_proto(ctx.clone(), Some(&signal_proto))?;
+            let sym = Symbol::new_global(ctx.clone(), ABORT_SIGNAL_SYMBOL)?;
+            signal.set(sym.as_atom(), signal_id as f64)?;
+            // `onabort` starts as `null` (an IDL event-handler attribute).
+            signal.set("onabort", js_null(&ctx))?;
+            let signals = registry_map(&ctx, "abortSignals")?;
+            map_set(&ctx, &signals, signal_id, Value::from(signal.clone()))?;
+
+            let controller = Object::new(ctx.clone())?;
+            controller.set("signal", Value::from(signal))?;
+            controller.set(sym.as_atom(), signal_id as f64)?;
+            let b2 = Rc::clone(&b);
+            let abort_fn = Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<()> {
+                    let Some(id) = abort_signal_id_of(&ctx, &this) else {
+                        return Ok(());
+                    };
+                    abort_signal(&ctx, &b2, id)
+                },
+            )?;
+            controller.set("abort", abort_fn)?;
+            Ok(Value::from(controller))
+        },
+    )
+    .map_err(|e| format!("AbortController factory: {e}"))?;
+    let reg = registry(ctx).map_err(|e| format!("registry: {e}"))?;
+    reg.set("abortControllerFactory", factory)
+        .map_err(|e| format!("install AbortController factory: {e}"))?;
+    ctx.eval::<(), _>(
+        "globalThis.AbortController = function AbortController() { \
+           if (!(this instanceof AbortController)) throw new TypeError('AbortController constructor requires new'); \
+           return globalThis[Symbol.for('pluto.registry')].abortControllerFactory(); \
+         };",
+    )
+    .map_err(|e| format!("install AbortController: {e}"))?;
+    let globals = ctx.globals();
+    let controller_ctor: Object = globals
+        .get("AbortController")
+        .map_err(|e| e.to_string())?;
+    // `AbortController.prototype` is a plain object (only `abort`
+    // lives on the instance); `AbortSignal` is exposed as a
+    // constructor-shaped object whose prototype is the signal
+    // prototype, so `signal instanceof AbortSignal` holds — but
+    // `new AbortSignal()` itself throws (spec: no public constructor).
+    let controller_proto = Object::new(ctx.clone())
+        .map_err(|e| format!("AbortController prototype: {e}"))?;
+    controller_ctor
+        .set("prototype", controller_proto)
+        .map_err(|e| format!("AbortController.prototype: {e}"))?;
+    ctx.eval::<(), _>(
+        "globalThis.AbortSignal = function AbortSignal() { \
+           throw new TypeError('AbortSignal constructor requires new'); \
+         };",
+    )
+    .map_err(|e| format!("install AbortSignal: {e}"))?;
+    let signal_ctor: Object = globals.get("AbortSignal").map_err(|e| e.to_string())?;
+    signal_ctor
+        .set(
+            "prototype",
+            protos.get::<_, Object>("abortSignal").map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("AbortSignal.prototype: {e}"))?;
     Ok(())
 }

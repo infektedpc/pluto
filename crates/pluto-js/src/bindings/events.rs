@@ -73,7 +73,31 @@ pub fn install_events<'js>(
            this.detail = (eventInit && 'detail' in eventInit) ? eventInit.detail : null; \
          }; \
          CustomEvent.prototype = Object.create(Event.prototype); \
-         CustomEvent.prototype.constructor = CustomEvent;",
+         CustomEvent.prototype.constructor = CustomEvent; \
+         globalThis.KeyboardEvent = function KeyboardEvent(type, eventInit) { \
+           Event.call(this, type, eventInit); \
+           this.key = (eventInit && 'key' in eventInit) ? String(eventInit.key) : ''; \
+           this.code = (eventInit && 'code' in eventInit) ? String(eventInit.code) : ''; \
+           this.repeat = !!(eventInit && eventInit.repeat); \
+         }; \
+         KeyboardEvent.prototype = Object.create(Event.prototype); \
+         KeyboardEvent.prototype.constructor = KeyboardEvent; \
+         globalThis.MouseEvent = function MouseEvent(type, eventInit) { \
+           Event.call(this, type, eventInit); \
+           this.clientX = (eventInit && 'clientX' in eventInit) ? Number(eventInit.clientX) : 0; \
+           this.clientY = (eventInit && 'clientY' in eventInit) ? Number(eventInit.clientY) : 0; \
+           this.button = (eventInit && 'button' in eventInit) ? Number(eventInit.button) : 0; \
+           this.buttons = (eventInit && 'buttons' in eventInit) ? Number(eventInit.buttons) : 0; \
+         }; \
+         MouseEvent.prototype = Object.create(Event.prototype); \
+         MouseEvent.prototype.constructor = MouseEvent; \
+         globalThis.InputEvent = function InputEvent(type, eventInit) { \
+           Event.call(this, type, eventInit); \
+           this.data = (eventInit && 'data' in eventInit) ? eventInit.data : null; \
+           this.inputType = (eventInit && 'inputType' in eventInit) ? String(eventInit.inputType) : ''; \
+         }; \
+         InputEvent.prototype = Object.create(Event.prototype); \
+         InputEvent.prototype.constructor = InputEvent;",
     )
     .map_err(|e| format!("install Event: {e}"))?;
 
@@ -658,6 +682,80 @@ pub fn dispatch_external<'js>(
     let event: Object = ctx.eval::<Object, _>(format!(
         "new Event({ty:?}, {{ bubbles: {bubbles}, cancelable: true }})"
     ))?;
+    dispatch_to_target(ctx, state, id, &event, ty)?;
+    Ok(())
+}
+
+/// The typed payload of a shell-dispatched event: which `Event`
+/// subclass to construct, and its fields. `TabJs` builds one of
+/// these from the shell's input event; the shell call-site wiring
+/// (renderer input dispatch) is outside `pluto-js` — see
+/// `TabJs::dispatch_typed_event`.
+#[derive(Debug, Clone)]
+pub enum TypedEventKind {
+    /// `KeyboardEvent`: `key` (e.g. `"a"`, `"Enter"`) and `code`
+    /// (e.g. `"KeyA"`).
+    Keyboard {
+        key: String,
+        code: String,
+    },
+    /// `MouseEvent`: viewport coordinates and the button pressed.
+    Mouse {
+        client_x: f64,
+        client_y: f64,
+        button: i64,
+    },
+    /// `InputEvent`: the inserted text (`None` = `null`, e.g. a
+    /// deletion). Listeners read the value off `event.target`
+    /// (an `<input>`'s `value` is M5 form work — the event itself
+    /// carries `data` here).
+    Input { data: Option<String> },
+}
+
+/// Dispatch an external *typed* event to a node: builds the right
+/// `Event` subclass (`KeyboardEvent` / `MouseEvent` / `InputEvent`)
+/// with its fields and runs the dispatch walk. Called from a
+/// `UserInteraction`-source Host task via
+/// `TabJs::dispatch_typed_event`.
+pub fn dispatch_typed_external<'js>(
+    ctx: &Ctx<'js>,
+    state: &Rc<RefCell<BindingState>>,
+    target: DomKey,
+    ty: &str,
+    bubbles: bool,
+    kind: &TypedEventKind,
+) -> rquickjs::Result<()> {
+    let existing = state.borrow().wrapper_ids.get(&target).copied();
+    let id = match existing {
+        Some(id) => id,
+        None => {
+            let id = mint_wrapper_id(state);
+            state.borrow_mut().wrapper_keys.insert(id, target);
+            state.borrow_mut().wrapper_ids.insert(target, id);
+            id
+        }
+    };
+    let event: Object = match kind {
+        TypedEventKind::Keyboard { key, code } => ctx.eval::<Object, _>(format!(
+            "new KeyboardEvent({ty:?}, {{ bubbles: {bubbles}, cancelable: true, key: {key:?}, code: {code:?} }})"
+        ))?,
+        TypedEventKind::Mouse {
+            client_x,
+            client_y,
+            button,
+        } => ctx.eval::<Object, _>(format!(
+            "new MouseEvent({ty:?}, {{ bubbles: {bubbles}, cancelable: true, clientX: {client_x}, clientY: {client_y}, button: {button} }})"
+        ))?,
+        TypedEventKind::Input { data } => {
+            let data_js = match data {
+                Some(d) => format!("{d:?}"),
+                None => "null".to_string(),
+            };
+            ctx.eval::<Object, _>(format!(
+                "new InputEvent({ty:?}, {{ bubbles: {bubbles}, cancelable: false, data: {data_js} }})"
+            ))?
+        }
+    };
     dispatch_to_target(ctx, state, id, &event, ty)?;
     Ok(())
 }

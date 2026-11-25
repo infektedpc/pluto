@@ -38,6 +38,7 @@ use pluto_js::{
 };
 use pluto_layout::{ElementState, selector_matches};
 use pluto_net::ResourceLoader;
+use pluto_paint::perf;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -174,6 +175,13 @@ impl BrowserDomHost {
     /// `Document` it hands to the layout actor from this).
     pub fn dom_snapshot(&self) -> Dom {
         self.dom.lock().unwrap().clone()
+    }
+
+    /// The document base URL (final URL after redirects): an
+    /// inline module's imports resolve against this (Stage 12
+    /// Rec 1 — "inline.js" is not a URL).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// The inline source text of a `<script>` element in the live
@@ -843,6 +851,17 @@ impl DomHost for BrowserDomHost {
         let (tx, rx) = mpsc::channel();
         if dirty {
             self.forced_flushes += 1;
+            // Stage 12 Rec 11: the host count routes into the
+            // process-wide perf counters too, so the perf summary
+            // prints the flush count (the field existed, but
+            // nothing outside perf.rs ever wrote it). The clean
+            // path below never flushes — it is answered from the
+            // retained tree — so `flushes_found_nothing_dirty`
+            // stays 0 by design: a flush that found nothing dirty
+            // cannot happen through this host.
+            if let Ok(mut counters) = perf::global().lock() {
+                counters.forced_flushes += 1;
+            }
             let document = self.current_document();
             if self
                 .layout_tx
@@ -1787,11 +1806,19 @@ impl ScriptExecutor {
             // here (defer scripts run after the parse).
             self.host.lock().unwrap().inline_script_text(node)
         };
-        let url = src.unwrap_or_else(|| "inline.js".to_string());
         let is_module = {
             let dom = self.host.lock().unwrap().dom_snapshot();
             dom.attr(node, "type")
                 .is_some_and(|t| t.eq_ignore_ascii_case("module"))
+        };
+        // An inline module's imports resolve against the document
+        // URL (Stage 12 Rec 1) — "inline.js" is not a URL, so the
+        // resolver could never join against it. A classic inline
+        // script keeps the friendly name (it only labels errors).
+        let url = match src {
+            Some(src) => src,
+            None if is_module => self.host.lock().unwrap().base_url().to_string(),
+            None => "inline.js".to_string(),
         };
         if is_module {
             if let Err(e) = tab.start_module_async(&url, &source) {
@@ -1883,6 +1910,14 @@ mod tests {
     #[test]
     fn layout_thrash_read_write_loop_flushes_per_iteration() {
         let (mut tab, host) = thrash_setup();
+        // Stage 12 Rec 11: the host count routes into the
+        // process-wide perf counters too — the delta across these
+        // scripts matches the host count exactly. (The global is
+        // process-wide; this is the only test in this binary that
+        // drives a geometry flush, so the delta is deterministic
+        // here. A future flush-driving test must take its own
+        // baseline the same way.)
+        let perf_before = perf::global().lock().unwrap().forced_flushes;
         tab.eval_script(
             "const box = document.getElementById('box'); \
              for (let i = 0; i < 5; i++) { box.textContent = 'x' + i; box.getBoundingClientRect(); }",
@@ -1906,6 +1941,13 @@ mod tests {
             host.lock().unwrap().forced_flush_count(),
             6,
             "batched writes flush once, on the single read"
+        );
+        // Stage 12 Rec 11: the perf global saw the same six
+        // flushes the host counted.
+        assert_eq!(
+            perf::global().lock().unwrap().forced_flushes - perf_before,
+            6,
+            "perf global tracks the host's forced flushes"
         );
         // The flushed rect is real geometry, not the zero fallback:
         // the div holds text, so it has a positive width.

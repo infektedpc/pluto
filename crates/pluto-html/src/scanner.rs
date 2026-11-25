@@ -118,6 +118,10 @@ pub struct DiscoveredResource {
     /// the elements the HTML spec gives integrity metadata to);
     /// every other discovery has `None`.
     pub integrity: Option<String>,
+    /// Stage 12 Rec 1: the discovery is a `type="module"` script.
+    /// Carried through from [`RawDiscovery::is_module`]; `false`
+    /// for every other destination.
+    pub is_module: bool,
 }
 
 /// Resolve `raw` against `base` (RFC 3986 join). Absolute URLs pass
@@ -161,6 +165,11 @@ pub struct RawDiscovery {
     /// 14, SRI) — `Some` only for `img` / `script` / `link`
     /// elements, `None` otherwise.
     pub integrity: Option<String>,
+    /// Stage 12 Rec 1: the discovery is a `type="module"` script.
+    /// The loader pre-fetches a module's import graph; classic
+    /// scripts never get the treatment. `false` for every other
+    /// destination.
+    pub is_module: bool,
 }
 
 fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -612,8 +621,9 @@ pub fn classify_element(
         "script" => {
             if let Some(src) = attr(attrs, "src") {
                 if !src.trim().is_empty() && !src.trim_start().starts_with("data:") {
-                    let blocking = !has("async") && !has("defer")
-                        && !matches!(attr(attrs, "type"), Some("module"));
+                    let is_module = attr(attrs, "type")
+                        .is_some_and(|t| t.eq_ignore_ascii_case("module"));
+                    let blocking = !has("async") && !has("defer") && !is_module;
                     out.push(RawDiscovery {
                         url: src.to_string(),
                         destination: Destination::Script,
@@ -623,6 +633,7 @@ pub fn classify_element(
                         ),
                         from: "script[src]",
                         integrity: integrity.clone(),
+                        is_module,
                     });
                 }
             }
@@ -656,6 +667,7 @@ pub fn classify_element(
                         // never auto-upgrades.
                         from: "imageset",
                         integrity: integrity.clone(),
+                    is_module: false,
                     });
                 } else if let Some(src) = attr(attrs, "src") {
                     if !src.trim().is_empty() && !src.trim_start().starts_with("data:") {
@@ -665,6 +677,7 @@ pub fn classify_element(
                             priority: fetch_priority(attrs, Priority::Low),
                             from: "img[src]",
                             integrity: integrity.clone(),
+                        is_module: false,
                         });
                     }
                 }
@@ -676,6 +689,7 @@ pub fn classify_element(
                         priority: fetch_priority(attrs, Priority::Low),
                         from: "img[src]",
                         integrity: integrity.clone(),
+                    is_module: false,
                     });
                 }
             }
@@ -690,6 +704,7 @@ pub fn classify_element(
                             priority: Priority::Low,
                             from: "source[src]",
                             integrity: integrity.clone(),
+                        is_module: false,
                         });
                     }
                 }
@@ -712,6 +727,7 @@ pub fn classify_element(
                             // image fetch.
                             from: "source[src]",
                             integrity: integrity.clone(),
+                        is_module: false,
                         });
                     }
                 }
@@ -723,6 +739,7 @@ pub fn classify_element(
                             priority: fetch_priority(attrs, Priority::Low),
                             from: "imageset",
                             integrity: integrity.clone(),
+                        is_module: false,
                         });
                     }
                 }
@@ -741,6 +758,7 @@ pub fn classify_element(
                             priority: fetch_priority(attrs, Priority::High),
                             from: "link[rel=stylesheet]",
                             integrity: integrity.clone(),
+                        is_module: false,
                         });
                     } else if rels.contains(&"preload") {
                         let dest = match attr(attrs, "as") {
@@ -757,6 +775,7 @@ pub fn classify_element(
                             priority: fetch_priority(attrs, Priority::High),
                             from: "link[rel=preload]",
                             integrity: integrity.clone(),
+                        is_module: false,
                         });
                         if let Some(srcset) = attr(attrs, "imagesrcset") {
                             // Stage 11 Rec 10: one selected
@@ -778,6 +797,7 @@ pub fn classify_element(
                                     // `imageset` initiator (L2 §3.1).
                                     from: "imageset",
                                     integrity: integrity.clone(),
+                                is_module: false,
                                 });
                             }
                         }
@@ -788,6 +808,7 @@ pub fn classify_element(
                             priority: fetch_priority(attrs, Priority::Medium),
                             from: "link[rel=modulepreload]",
                             integrity: integrity.clone(),
+                        is_module: false,
                         });
                     } else if rels.contains(&"icon")
                         || rels.contains(&"apple-touch-icon")
@@ -799,6 +820,7 @@ pub fn classify_element(
                             priority: Priority::VeryLow,
                             from: "link[rel=icon]",
                             integrity: integrity.clone(),
+                        is_module: false,
                         });
                     }
                     // preconnect / dns-prefetch are not fetches; no
@@ -816,6 +838,7 @@ pub fn classify_element(
                         priority: Priority::Low,
                         from: "video[poster]",
                         integrity: integrity.clone(),
+                    is_module: false,
                     });
                 }
             }
@@ -835,6 +858,7 @@ pub fn classify_element(
                         priority: Priority::Low,
                         from: "embed[src]",
                         integrity: integrity.clone(),
+                    is_module: false,
                     });
                 }
             }
@@ -848,6 +872,7 @@ pub fn classify_element(
                         priority: Priority::Low,
                         from: "object[data]",
                         integrity: integrity.clone(),
+                    is_module: false,
                     });
                 }
             }
@@ -862,6 +887,7 @@ pub fn classify_element(
                             priority: Priority::Low,
                             from: "input[type=image][src]",
                             integrity: integrity.clone(),
+                        is_module: false,
                         });
                     }
                 }
@@ -1021,6 +1047,7 @@ pub fn scan_with_viewport(
                                 priority: Priority::Low,
                                 from: if is_imageset { "imageset" } else { "img[src]" },
                                 integrity,
+                                is_module: false,
                             });
                         }
                         continue;
@@ -1039,6 +1066,7 @@ pub fn scan_with_viewport(
                             priority: raw.priority,
                             from: raw.from,
                             integrity: raw.integrity.clone(),
+                            is_module: raw.is_module,
                         });
                     }
                 }

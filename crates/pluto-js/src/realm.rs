@@ -185,6 +185,24 @@ impl TabRealm {
         })
     }
 
+    /// Install the ES module loader (Stage 12 Rec 1): URL
+    /// resolution + pre-fetched sources served from `sources`.
+    /// One install per realm: a fresh realm has no loader, so
+    /// `TabJs` calls this from `new` and from `navigate`, after
+    /// the realm is created. The loader closures are `'static`
+    /// (they hold `Arc`s), so they outlive this call and die with
+    /// the realm.
+    pub fn install_module_loader(
+        &mut self,
+        sources: crate::module_loader::ModuleSources,
+    ) -> Result<(), JsError> {
+        self.check_usable()?;
+        let resolver = crate::module_loader::PlutoResolver;
+        let loader = crate::module_loader::PlutoLoader::new(sources);
+        block_on_sync(self.runtime.set_loader(resolver, loader));
+        Ok(())
+    }
+
     /// The budget applied to each evaluation.
     pub fn script_budget(&self) -> Duration {
         self.script_budget
@@ -715,7 +733,19 @@ fn make_rejection_tracker(sender: mpsc::Sender<String>) -> rquickjs::runtime::Re
 
 /// Map a plain rquickjs error (no pending JS exception to catch) to a
 /// message string.
-fn map_plain_error(_ctx: &Ctx<'_>, err: rquickjs::Error) -> String {
+fn map_plain_error(ctx: &Ctx<'_>, err: rquickjs::Error) -> String {
+    // A failed evaluation usually leaves the thrown JS value on
+    // the context (loader/resolver failures, throws, syntax
+    // errors), and that value carries the real message — the Rust
+    // error alone stringifies to a generic "Exception generated
+    // by QuickJS", which hides the cause (Stage 12 Rec 1: a
+    // missing import must name the module). Prefer the caught
+    // value when one is pending; fall back to the Rust error
+    // when none is (OOM / allocation failures).
+    let caught = ctx.catch();
+    if !caught.is_undefined() && !caught.is_null() {
+        return crate::bindings::format_console_arg(ctx, &caught);
+    }
     err.to_string()
 }
 

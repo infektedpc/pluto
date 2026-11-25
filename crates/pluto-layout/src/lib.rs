@@ -89,15 +89,18 @@
 //! `incremental`): `LayoutTree::relayout_incremental` consumes the
 //! DOM dirty set Stage 7 populated, classifies the damage
 //! (paint-only / position-only / layout / reconstruct), re-lays out
-//! only a proven-safe subtree when it can (definite size,
-//! `contain: layout`, replaced element, or fixed-size leaf, with no
-//! margin collapse, float intrusion, or percentage resolution
-//! escaping the root), translates position-only moves without
-//! touching taffy, and falls back to a full rebuild for anything
-//! unsafe. In debug builds every incremental result is asserted
-//! equal to a cold full layout. Style re-resolution stays
-//! whole-document in v1 (the parallel pass is cheap; the serial
-//! taffy pass is where incrementality pays).
+//! only a proven-safe subtree when it can (definite width — the
+//! height may be auto — `contain: layout`, replaced element, or
+//! fixed-size leaf, with no float intrusion or percentage
+//! resolution escaping the root; margin collapse is recomputed by
+//! taffy for the dirty ancestors, so it needs no predicate guard),
+//! translates position-only moves without touching taffy, and
+//! falls back to a full rebuild for anything unsafe. In debug
+//! builds every incremental result is asserted equal to a cold
+//! full layout. Style re-resolution is subtree-only since Stage 12
+//! Rec 6 (the dirty LCA's subtree, seeded from the retained
+//! styles above it); the whole-document pass runs only for cold
+//! builds.
 
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, Weight};
 use pluto_css::{
@@ -497,6 +500,42 @@ pub struct ImageMap {
 impl ImageMap {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Nodes whose per-`<img>` entry differs from `old` — a new
+    /// image, a changed intrinsic size, a newly-broken (or
+    /// newly-fixed) image, or a vanished entry. An image arrival
+    /// dirties exactly these nodes for layout (Stage 12 Rec 5):
+    /// the incremental path takes them as extra damage, so an
+    /// image landing inside a safe subtree re-lays out that
+    /// subtree instead of forcing a full rebuild.
+    pub fn changed_node_ids(&self, old: &ImageMap) -> Vec<DomId> {
+        let mut out: Vec<DomId> = Vec::new();
+        for (&id, info) in &self.by_node {
+            if old.by_node.get(&id) != Some(info) && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        for &id in old.by_node.keys() {
+            if !self.by_node.contains_key(&id) && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        for &id in self.broken.symmetric_difference(&old.broken) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    /// Whether any background-image entry differs from `old`.
+    /// Backgrounds are keyed by URL, not node, so a change cannot
+    /// name the boxes that use it — the caller must full-rebuild
+    /// (the boxes carry the resource id + intrinsic size from the
+    /// map they were built with).
+    pub fn backgrounds_changed(&self, old: &ImageMap) -> bool {
+        self.backgrounds != old.backgrounds
     }
 }
 
@@ -2180,15 +2219,18 @@ fn collect_boxes(
 /// subtrees are collected too: their styles are computed and unused,
 /// which keeps collection independent of style values. Which nodes get
 /// boxes is unchanged; the builder still skips `display: none`.
+/// A root may carry its parent (a subtree restyle, Stage 12 Rec 6:
+/// the root's parent style is seeded from the retained map); roots
+/// without one resolve against the initial style.
 fn collect_style_levels(
     dom: &Dom,
-    roots: &[DomId],
+    roots: &[(DomId, Option<DomId>)],
 ) -> Vec<Vec<(DomId, Option<DomId>)>> {
     let mut levels: Vec<Vec<(DomId, Option<DomId>)>> = Vec::new();
     let mut frontier: Vec<(DomId, Option<DomId>)> = roots
         .iter()
-        .filter(|&&id| dom.tag(id).is_some())
-        .map(|&id| (id, None))
+        .filter(|&&(id, _)| dom.tag(id).is_some())
+        .copied()
         .collect();
     while !frontier.is_empty() {
         let mut next: Vec<(DomId, Option<DomId>)> = Vec::new();
@@ -2352,6 +2394,13 @@ struct StyleCtx<'a> {
 /// path is the same code path and a real fallback, not a comment.
 /// Returns the owned map from element to its (immutable, `Arc`-shared)
 /// computed style, plus the per-node `NodeStyle` secondary map.
+/// `seed_parent_style` / `root_font_size_seed` serve a subtree
+/// restyle (Stage 12 Rec 6): level 0's parent style comes from the
+/// retained map (its parent sits above the subtree), and `rem`
+/// resolves against the retained root font size. Both are `None` /
+/// 16.0 for a whole-document pass, and the seed only ever applies
+/// at level 0 — a deeper level's parent must be in the map being
+/// built, or the levels are malformed.
 fn resolve_styles(
     dom: &Dom,
     index: &RuleIndex,
@@ -2359,13 +2408,15 @@ fn resolve_styles(
     parallel: bool,
     viewport: (f32, f32),
     state: &ElementState,
+    seed_parent_style: Option<Arc<ComputedStyle>>,
+    root_font_size_seed: f32,
 ) -> (
     HashMap<DomId, Arc<ComputedStyle>>,
     SparseSecondaryMap<DomId, NodeStyle>,
 ) {
     let mut resolved: HashMap<DomId, Arc<ComputedStyle>> = HashMap::new();
     let mut node_styles: SparseSecondaryMap<DomId, NodeStyle> = SparseSecondaryMap::new();
-    let mut root_font_size = 16.0f32;
+    let mut root_font_size = root_font_size_seed;
     for (level_no, level) in levels.iter().enumerate() {
         // Parent computed styles first (serial, cheap): the parallel
         // closure then only reads `&Dom` / `&Stylesheet` plus its own
@@ -2376,8 +2427,15 @@ fn resolve_styles(
                 let parent_style = match parent {
                     Some(p) => resolved
                         .get(&p)
-                        .expect("parent style resolved in an earlier level")
-                        .clone(),
+                        .cloned()
+                        .or_else(|| {
+                            if level_no == 0 {
+                                seed_parent_style.clone()
+                            } else {
+                                None
+                            }
+                        })
+                        .expect("parent style resolved in an earlier level"),
                     None => Arc::new(ComputedStyle::initial()),
                 };
                 (id, parent_style)
@@ -2446,18 +2504,89 @@ fn resolve_document_styles(
     SparseSecondaryMap<DomId, NodeStyle>,
 ) {
     let root = dom.root().expect("Dom always has a root node");
-    let roots: Vec<DomId> = match find_element(dom, root, "html") {
-        Some(html) => vec![html],
+    let roots: Vec<(DomId, Option<DomId>)> = match find_element(dom, root, "html") {
+        Some(html) => vec![(html, None)],
         None => dom
             .children(root)
             .iter()
             .copied()
             .filter(|&id| dom.tag(id).is_some())
+            .map(|id| (id, None))
             .collect(),
     };
     let levels = collect_style_levels(dom, &roots);
     let index = RuleIndex::build(ua, sheet, viewport);
-    resolve_styles(dom, &index, &levels, parallel, viewport, state)
+    resolve_styles(dom, &index, &levels, parallel, viewport, state, None, 16.0)
+}
+
+/// Resolve styles for one subtree only (Stage 12 Rec 6): the dirty
+/// LCA's subtree, seeded with the root's parent style and the root
+/// font size from the retained map. Sound because the parents above
+/// the root are not dirty, so their styles are unchanged; sibling
+/// and `nth-child` effects stay inside the LCA subtree (an insertion
+/// marks the parent dirty, pulling the LCA up to cover the siblings);
+/// and `:has()` is stubbed/inert, so no descendant change can
+/// restyle an ancestor. Returns the FULL merged maps — retained
+/// entries outside the subtree kept (`Arc` values, so the merge is
+/// pointer clones; the resolution/matching work is what is skipped)
+/// — so every caller that reads the whole map keeps working
+/// unchanged.
+pub(crate) fn resolve_subtree_styles(
+    dom: &Dom,
+    ua: &Stylesheet,
+    sheet: &Stylesheet,
+    parallel: bool,
+    viewport: (f32, f32),
+    state: &ElementState,
+    root: DomId,
+    retained: &SparseSecondaryMap<DomId, NodeStyle>,
+) -> (
+    HashMap<DomId, Arc<ComputedStyle>>,
+    SparseSecondaryMap<DomId, NodeStyle>,
+) {
+    // The root's parent style seeds level 0 (its parent sits above
+    // the subtree); a root with no element parent resolves against
+    // the initial style, as in the document pass.
+    let seed_parent_style = parent_element(dom, root)
+        .and_then(|p| retained.get(p))
+        .map(|ns| ns.computed.clone());
+    // `rem` resolves against the `<html>` font size. When the root
+    // IS `<html>`, its own size is being resolved in level 0, so the
+    // seed is the initial 16.0 (the level-0 update then sets it from
+    // the fresh style, exactly as in the document pass); otherwise
+    // the retained `<html>` size is the basis.
+    let root_font_size_seed = if dom.tag(root) == Some("html") {
+        16.0
+    } else {
+        dom.root()
+            .and_then(|r| find_element(dom, r, "html"))
+            .and_then(|html| retained.get(html))
+            .map(|ns| ns.computed.font_size)
+            .unwrap_or(16.0)
+    };
+    let levels = collect_style_levels(dom, &[(root, parent_element(dom, root))]);
+    let index = RuleIndex::build(ua, sheet, viewport);
+    let (sub_styles, sub_node_styles) = resolve_styles(
+        dom,
+        &index,
+        &levels,
+        parallel,
+        viewport,
+        state,
+        seed_parent_style,
+        root_font_size_seed,
+    );
+    let mut styles: HashMap<DomId, Arc<ComputedStyle>> =
+        HashMap::with_capacity(retained.len() + sub_styles.len());
+    for (id, ns) in retained.iter() {
+        styles.insert(id, ns.computed.clone());
+    }
+    styles.extend(sub_styles);
+    let mut node_styles = retained.clone();
+    for (id, ns) in sub_node_styles.iter() {
+        node_styles.insert(id, ns.clone());
+    }
+    (styles, node_styles)
 }
 
 // ---- selector matching (right-to-left) ----
@@ -4333,7 +4462,7 @@ mod tests {
         // Levels are parent-before-children: every entry's parent
         // appears in an earlier level.
         let html = find_element(&dom, dom.root().unwrap(), "html").unwrap();
-        let levels = collect_style_levels(&dom, &[html]);
+        let levels = collect_style_levels(&dom, &[(html, None)]);
         let mut seen: Vec<DomId> = Vec::new();
         for level in &levels {
             for &(id, parent) in level {
@@ -4414,6 +4543,71 @@ mod tests {
         assert_eq!(parallel.len(), 7);
         let hide = find_by_class(&dom, dom.root().unwrap(), "hide").unwrap();
         assert_eq!(parallel[&hide].display, DisplayKind::None);
+    }
+
+    #[test]
+    fn subtree_restyle_matches_whole_document_styles() {
+        // Stage 12 Rec 6: restyling one subtree — rooted at
+        // <html> itself, at a middle <div>, and at a deep <p> —
+        // must produce exactly the whole-document styles for every
+        // element. The document exercises the seeding paths:
+        // descendant selectors (`.wrap p`), `nth-child`, inherited
+        // color, `em`/`rem` font sizes, and a class rule that only
+        // the subtree's parent carries.
+        let dom = parse_html(
+            r#"<html><body><div class="wrap"><p class="a">one</p><p class="b">two</p><p class="c">three <span>inner</span></p></div><div class="after"><p>below</p></div></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(
+            "html { font-size: 20px; } \
+             .wrap { color: #112233; font-size: 1rem; } \
+             .wrap p { margin: 1em; } \
+             .wrap p:nth-child(2) { color: #ff0000; } \
+             .b { font-size: 150%; } \
+             span { color: #00ff00; }",
+        );
+        let ua = Stylesheet::ua();
+        let state = ElementState::default();
+        let viewport = (800.0, 600.0);
+        let (full_styles, _) =
+            resolve_document_styles(&dom, &ua, &sheet, false, viewport, &state);
+        let tree = LayoutTree::build(&dom, &sheet, viewport.0, viewport.1)
+            .expect("layout builds");
+        let root = dom.root().unwrap();
+        let html = find_element(&dom, root, "html").unwrap();
+        let wrap = find_by_class(&dom, root, "wrap").unwrap();
+        let p_c = find_by_class(&dom, root, "c").unwrap();
+        for (name, sub_root) in [("html", html), ("wrap", wrap), ("p.c", p_c)] {
+            let (sub_styles, _) = resolve_subtree_styles(
+                &dom,
+                &ua,
+                &sheet,
+                false,
+                viewport,
+                &state,
+                sub_root,
+                &tree.node_styles,
+            );
+            assert_eq!(
+                sub_styles.len(),
+                full_styles.len(),
+                "{name}: subtree map covers every element"
+            );
+            for (id, style) in &full_styles {
+                let got = sub_styles
+                    .get(id)
+                    .unwrap_or_else(|| panic!("{name}: no style for {id:?}"));
+                assert_eq!(got.as_ref(), style.as_ref(), "{name}: style differs for {id:?}");
+            }
+        }
+        // Spot-check the values the seeding must get right: the
+        // wrap's 1rem is the html 20px; `.b` at 150% of it is 30px;
+        // the second <p> is red by nth-child; the span is green.
+        let b = find_by_class(&dom, root, "b").unwrap();
+        assert_eq!(full_styles[&wrap].font_size, 20.0);
+        assert_eq!(full_styles[&b].font_size, 30.0);
+        assert_eq!(full_styles[&b].color, [255, 0, 0]);
+        let span = find_element(&dom, p_c, "span").unwrap();
+        assert_eq!(full_styles[&span].color, [0, 255, 0]);
     }
 
     // ---- R8 cascade + selectors ----

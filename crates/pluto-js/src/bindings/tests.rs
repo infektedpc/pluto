@@ -16,7 +16,9 @@ use pluto_ipc::{Origin, RequestMode};
 use crate::bindings::fetch::{
     FetchBackend, FetchCompletion, FetchError, FetchRequest, FetchResponse, ResponseType,
 };
-use crate::bindings::test_host::TestHost;
+use crate::bindings::events::TypedEventKind;
+use crate::host::DomHost;
+use crate::bindings::test_host::{TestHost, TestHostLog};
 use crate::engine::JsValue;
 use crate::observers::ComputedIntersection;
 use crate::realm::RealmConfig;
@@ -1306,4 +1308,509 @@ fn intersection_observer_options_validation_take_records_and_threshold() {
     tab.run_until_idle().unwrap();
     assert_eq!(read_num(&mut tab, "__entries.length"), 2.0);
     assert_eq!(read_num(&mut tab, "__entries[1].intersectionRatio"), 0.6);
+}
+
+// ---------------------------------------------------------------- Stage 12 Rec 7: binding batch
+
+/// A backend that never answers (for abort tests): records the
+/// request and the ids `cancel_fetch` was called for, and sends
+/// no completion.
+struct NeverBackend {
+    requests: Arc<Mutex<Vec<FetchRequest>>>,
+    cancelled: Arc<Mutex<Vec<u64>>>,
+}
+
+impl FetchBackend for NeverBackend {
+    fn start_fetch(&self, request: FetchRequest, _done: mpsc::Sender<FetchCompletion>) {
+        self.requests.lock().unwrap().push(request);
+    }
+
+    fn cancel_fetch(&self, id: u64) {
+        self.cancelled.lock().unwrap().push(id);
+    }
+}
+
+/// A backend that answers late (for the late-completion test):
+/// spawns a thread that sends the canned response after 50 ms.
+struct LateBackend {
+    response: FetchResponse,
+}
+
+impl FetchBackend for LateBackend {
+    fn start_fetch(&self, request: FetchRequest, done: mpsc::Sender<FetchCompletion>) {
+        let id = request.id;
+        let response = self.response.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let _ = done.send(FetchCompletion {
+                id,
+                result: Ok(response),
+            });
+        });
+    }
+}
+
+#[test]
+fn location_parts_and_assign_records_navigation() {
+    let log = Arc::new(Mutex::new(TestHostLog::default()));
+    let mut tab = TabJs::new(&RealmConfig::default()).unwrap();
+    tab.set_dom_host(Box::new(TestHost::from_html_with_log(DOC, Arc::clone(&log))));
+    run(
+        &mut tab,
+        "globalThis.__r = [location.href, location.protocol, location.host, location.hostname, location.port, location.pathname, location.search, location.hash, location.origin, String(location)].join('|'); \
+         location.assign('/page?q=1#frag'); \
+         location.replace('/other'); \
+         location.reload();",
+    );
+    assert_eq!(
+        read_str(&mut tab, "__r"),
+        "https://example.com/|https:|example.com|example.com||/| | |https://example.com|https://example.com/"
+            .replace("| | |", "|||")
+    );
+    assert_eq!(
+        log.lock().unwrap().navigation_requests,
+        vec![
+            ("https://example.com/page?q=1#frag".to_string(), false),
+            ("https://example.com/other".to_string(), true),
+            ("https://example.com/".to_string(), false),
+        ]
+    );
+}
+
+#[test]
+fn url_and_search_params() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "const u = new URL('https://example.com:8080/a/b?x=1&x=2#frag'); \
+         globalThis.__r = [u.href, u.origin, u.protocol, u.host, u.hostname, u.port, u.pathname, u.search, u.hash].join('|'); \
+         globalThis.__p = [u.searchParams.get('x'), u.searchParams.getAll('x').join(','), u.searchParams.has('y')].join('|'); \
+         u.searchParams.set('x', '9'); u.searchParams.append('y', 'z'); u.searchParams.delete('x'); \
+         globalThis.__p2 = [u.search, u.searchParams.toString()].join('|'); \
+         const u2 = new URL('/rel', 'https://example.com/base/'); \
+         globalThis.__rel = u2.href; \
+         const sp = new URLSearchParams('a=1&b=2'); \
+         sp.set('b', '3'); \
+         globalThis.__sp = sp.toString(); \
+         let threw = ''; try { new URL('::not a url::'); } catch (e) { threw = e.name; } \
+         globalThis.__threw = threw;",
+    );
+    assert_eq!(
+        read_str(&mut tab, "__r"),
+        "https://example.com:8080/a/b?x=1&x=2#frag|https://example.com:8080|https:|example.com:8080|example.com|8080|/a/b|?x=1&x=2|#frag"
+    );
+    assert_eq!(read_str(&mut tab, "__p"), "1|1,2|false");
+    assert_eq!(read_str(&mut tab, "__p2"), "?y=z|y=z");
+    assert_eq!(read_str(&mut tab, "__rel"), "https://example.com/rel");
+    assert_eq!(read_str(&mut tab, "__sp"), "a=1&b=3");
+    assert_eq!(read_str(&mut tab, "__threw"), "TypeError");
+}
+
+#[test]
+fn dataset_live_read_write() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "const app = document.getElementById('app'); \
+         app.dataset.fooBar = 'baz'; \
+         globalThis.__r = [app.getAttribute('data-foo-bar'), app.dataset.fooBar].join('|'); \
+         app.setAttribute('data-user-name', 'Jo'); \
+         globalThis.__r2 = app.dataset.userName; \
+         delete app.dataset.fooBar; \
+         globalThis.__keys = Object.keys(app.dataset).join(','); \
+         globalThis.__r3 = app.hasAttribute('data-foo-bar');",
+    );
+    assert_eq!(read_str(&mut tab, "__r"), "baz|baz");
+    assert_eq!(read_str(&mut tab, "__r2"), "Jo");
+    assert_eq!(read_str(&mut tab, "__keys"), "userName");
+    assert!(!read_bool(&mut tab, "__r3"));
+}
+
+#[test]
+fn clone_node_deep_and_shallow() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "const app = document.getElementById('app'); \
+         const deep = app.cloneNode(true); \
+         const shallow = app.cloneNode(false); \
+         globalThis.__r = [deep.tagName, deep.childNodes.length, deep.className, deep.textContent, deep.parentNode].join('|'); \
+         globalThis.__s = [shallow.tagName, shallow.childNodes.length, shallow.className].join('|');",
+    );
+    assert_eq!(read_str(&mut tab, "__r"), "DIV|2|root|HelloClick|");
+    assert_eq!(read_str(&mut tab, "__s"), "DIV|0|root");
+}
+
+#[test]
+fn closest_and_matches() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "const para = document.getElementById('para'); \
+         globalThis.__r = [para.matches('p'), para.matches('.root'), para.matches('#para')].join(','); \
+         globalThis.__c = [para.closest('div') === document.getElementById('app'), para.closest('#app') === document.getElementById('app'), para.closest('ul')].join(',');",
+    );
+    assert_eq!(read_str(&mut tab, "__r"), "true,false,true");
+    assert_eq!(read_str(&mut tab, "__c"), "true,true,");
+}
+
+#[test]
+fn get_elements_by_tag_class_name() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "const input = document.createElement('input'); \
+         input.setAttribute('name', 'q'); \
+         document.body.appendChild(input); \
+         globalThis.__r = [document.getElementsByTagName('li').length, document.getElementsByClassName('item').length, document.getElementsByName('q').length, document.getElementById('list').getElementsByTagName('li').length, document.getElementById('list').getElementsByClassName('item').length].join(',');",
+    );
+    assert_eq!(read_str(&mut tab, "__r"), "3,3,1,3,3");
+}
+
+#[test]
+fn image_constructor_and_document_images() {
+    let log = Arc::new(Mutex::new(TestHostLog::default()));
+    let mut tab = TabJs::new(&RealmConfig::default()).unwrap();
+    tab.set_dom_host(Box::new(TestHost::from_html_with_log(DOC, Arc::clone(&log))));
+    run(
+        &mut tab,
+        "const img = new Image(640, 480); \
+         img.src = 'https://example.com/pic.png'; \
+         globalThis.__r = [img.tagName, img.width, img.height, img.complete, img.src, img instanceof Image].join('|'); \
+         const docImg = document.createElement('img'); \
+         docImg.setAttribute('src', '/a.png'); \
+         document.body.appendChild(docImg); \
+         globalThis.__n = document.images.length; \
+         globalThis.__t = document.images[0].tagName;",
+    );
+    assert_eq!(
+        read_str(&mut tab, "__r"),
+        "IMG|640|480|false|https://example.com/pic.png|true"
+    );
+    assert_eq!(read_num(&mut tab, "__n"), 1.0);
+    assert_eq!(read_str(&mut tab, "__t"), "IMG");
+    assert_eq!(
+        log.lock().unwrap().image_requests,
+        vec![(
+            "https://example.com/pic.png".to_string(),
+            "https://example.com/".to_string()
+        )]
+    );
+}
+
+#[test]
+fn image_load_event_fires_on_shell_report() {
+    let mut host = TestHost::from_html(DOC);
+    let img_key = host.dom.create_element("img");
+    host.dom.set_attribute(img_key, "id", "pic");
+    let body = host.body().unwrap();
+    host.dom.append_child(body, img_key);
+    let mut tab = TabJs::new(&RealmConfig::default()).unwrap();
+    tab.set_dom_host(Box::new(host));
+    run(
+        &mut tab,
+        "const pic = document.getElementById('pic'); \
+         let loaded = 0, onloaded = 0; \
+         pic.addEventListener('load', () => { loaded = 1; }); \
+         pic.onload = () => { onloaded = 1; }; \
+         globalThis.__loaded = () => loaded; \
+         globalThis.__onloaded = () => onloaded; \
+         globalThis.__pic = pic;",
+    );
+    tab.notify_image_loaded(img_key, 640, 480);
+    tab.run_until_idle().unwrap();
+    assert_eq!(read_num(&mut tab, "__loaded()"), 1.0);
+    assert_eq!(read_num(&mut tab, "__onloaded()"), 1.0);
+    assert!(read_bool(&mut tab, "__pic.complete"));
+    assert_eq!(read_num(&mut tab, "__pic.naturalWidth"), 640.0);
+    assert_eq!(read_num(&mut tab, "__pic.naturalHeight"), 480.0);
+}
+
+#[test]
+fn typed_keyboard_event_dispatch() {
+    let host = TestHost::from_html(DOC);
+    let btn = host.get_element_by_id("btn").unwrap();
+    let mut tab = TabJs::new(&RealmConfig::default()).unwrap();
+    tab.set_dom_host(Box::new(host));
+    run(
+        &mut tab,
+        "const seen = []; \
+         document.getElementById('btn').addEventListener('keydown', (e) => { seen.push([e.key, e.code, e instanceof KeyboardEvent, e instanceof Event]); }); \
+         globalThis.__seen = seen;",
+    );
+    tab.dispatch_typed_event(
+        btn,
+        "keydown",
+        true,
+        TypedEventKind::Keyboard {
+            key: "Enter".to_string(),
+            code: "Enter".to_string(),
+        },
+    );
+    tab.run_until_idle().unwrap();
+    assert_eq!(read_str(&mut tab, "__seen[0].join(',')"), "Enter,Enter,true,true");
+}
+
+#[test]
+fn typed_mouse_event_dispatch() {
+    let host = TestHost::from_html(DOC);
+    let btn = host.get_element_by_id("btn").unwrap();
+    let mut tab = TabJs::new(&RealmConfig::default()).unwrap();
+    tab.set_dom_host(Box::new(host));
+    run(
+        &mut tab,
+        "const seen = []; \
+         document.getElementById('btn').addEventListener('click', (e) => { seen.push([e.clientX, e.clientY, e.button, e instanceof MouseEvent]); }); \
+         globalThis.__seen = seen;",
+    );
+    tab.dispatch_typed_event(
+        btn,
+        "click",
+        true,
+        TypedEventKind::Mouse {
+            client_x: 10.0,
+            client_y: 20.0,
+            button: 0,
+        },
+    );
+    tab.run_until_idle().unwrap();
+    assert_eq!(read_str(&mut tab, "__seen[0].join(',')"), "10,20,0,true");
+}
+
+#[test]
+fn typed_input_event_dispatch() {
+    let host = TestHost::from_html(DOC);
+    let para = host.get_element_by_id("para").unwrap();
+    let mut tab = TabJs::new(&RealmConfig::default()).unwrap();
+    tab.set_dom_host(Box::new(host));
+    run(
+        &mut tab,
+        "const seen = []; \
+         document.getElementById('para').addEventListener('input', (e) => { seen.push([e.data, e instanceof InputEvent, e.target === document.getElementById('para')]); }); \
+         globalThis.__seen = seen;",
+    );
+    tab.dispatch_typed_event(
+        para,
+        "input",
+        true,
+        TypedEventKind::Input {
+            data: Some("x".to_string()),
+        },
+    );
+    tab.run_until_idle().unwrap();
+    assert_eq!(read_str(&mut tab, "__seen[0].join(',')"), "x,true,true");
+}
+
+// ---------------------------------------------------------------- Stage 12 Rec 8: fetch surface
+
+#[test]
+fn request_round_trip_through_fetch() {
+    let (backend, requests) = FakeBackend::ok("ok");
+    let mut tab = test_tab();
+    tab.set_fetch_backend(backend);
+    run(
+        &mut tab,
+        "const req = new Request('/api', { method: 'POST', headers: { 'x-a': '1' }, body: 'hi' }); \
+         globalThis.__r = [req.url, req.method, req.headers.get('x-a')].join('|'); \
+         fetch(req).then((r) => r.text()).then((t) => { globalThis.__body = t; });",
+    );
+    assert_eq!(read_str(&mut tab, "__r"), "/api|POST|1");
+    assert_eq!(read_str(&mut tab, "__body"), "ok");
+    let recorded = requests.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].url, "/api");
+    assert_eq!(recorded[0].method, "POST");
+    assert!(recorded[0].headers.iter().any(|(n, v)| n == "x-a" && v == "1"));
+    assert_eq!(recorded[0].body, Some(b"hi".to_vec()));
+}
+
+#[test]
+fn abort_before_completion_rejects_with_abort_error() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let cancelled = Arc::new(Mutex::new(Vec::new()));
+    let backend = Arc::new(NeverBackend {
+        requests: Arc::clone(&requests),
+        cancelled: Arc::clone(&cancelled),
+    });
+    let mut tab = test_tab();
+    tab.set_fetch_backend(backend);
+    run(
+        &mut tab,
+        "const c = new AbortController(); \
+         let onabort = 0; c.signal.onabort = () => { onabort = 1; }; \
+         globalThis.__onabort = () => onabort; \
+         fetch('/slow', { signal: c.signal }) \
+           .then(() => { globalThis.__resolved = 1; }) \
+           .catch((e) => { globalThis.__name = e.name; }); \
+         c.abort();",
+    );
+    assert_eq!(read_str(&mut tab, "__name"), "AbortError");
+    assert_eq!(read_num(&mut tab, "__onabort()"), 1.0);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert_eq!(cancelled.lock().unwrap().len(), 1);
+    assert_eq!(
+        cancelled.lock().unwrap()[0],
+        requests.lock().unwrap()[0].id
+    );
+}
+
+#[test]
+fn abort_after_completion_is_a_noop() {
+    let (backend, _) = FakeBackend::ok("done");
+    let mut tab = test_tab();
+    tab.set_fetch_backend(backend);
+    run(
+        &mut tab,
+        "const c = new AbortController(); \
+         fetch('/x', { signal: c.signal }) \
+           .then((r) => r.text()) \
+           .then((t) => { globalThis.__body = t; c.abort(); globalThis.__aborted = c.signal.aborted; });",
+    );
+    assert_eq!(read_str(&mut tab, "__body"), "done");
+    assert!(read_bool(&mut tab, "__aborted"));
+}
+
+#[test]
+fn abort_of_already_aborted_signal_rejects_immediately() {
+    let (backend, requests) = FakeBackend::ok("ok");
+    let mut tab = test_tab();
+    tab.set_fetch_backend(backend);
+    run(
+        &mut tab,
+        "const c = new AbortController(); \
+         c.abort(); \
+         fetch('/x', { signal: c.signal }).catch((e) => { globalThis.__name = e.name; });",
+    );
+    assert_eq!(read_str(&mut tab, "__name"), "AbortError");
+    assert_eq!(requests.lock().unwrap().len(), 0);
+}
+
+#[test]
+fn late_fetch_completion_after_abort_is_ignored() {
+    let backend = Arc::new(LateBackend {
+        response: FetchResponse {
+            status: 200,
+            status_text: "OK".to_string(),
+            headers: Vec::new(),
+            body: b"late".to_vec(),
+            response_type: ResponseType::Basic,
+        },
+    });
+    let mut tab = test_tab();
+    tab.set_fetch_backend(backend);
+    run(
+        &mut tab,
+        "const c = new AbortController(); \
+         globalThis.__resolved = 0; \
+         fetch('/slow', { signal: c.signal }) \
+           .then(() => { globalThis.__resolved = 1; }) \
+           .catch((e) => { globalThis.__name = e.name; }); \
+         c.abort(); \
+         setTimeout(() => { globalThis.__done = 1; }, 200);",
+    );
+    assert_eq!(read_str(&mut tab, "__name"), "AbortError");
+    assert_eq!(read_num(&mut tab, "__resolved"), 0.0);
+    assert_eq!(read_num(&mut tab, "__done"), 1.0);
+}
+
+#[test]
+fn headers_iteration_order_and_delete() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "const h = new Headers([['b', '2'], ['a', '1'], ['b', '3']]); \
+         globalThis.__get = h.get('b'); \
+         h.delete('a'); \
+         globalThis.__entries = h.entries().map(([k, v]) => k + '=' + v).join(';'); \
+         globalThis.__keys = h.keys().join(','); \
+         const seen = []; h.forEach((v, k) => seen.push(k + ':' + v)); \
+         globalThis.__foreach = seen.join(';'); \
+         const iterated = []; for (const [k, v] of h) iterated.push(k + '=' + v); \
+         globalThis.__iter = iterated.join(';');",
+    );
+    assert_eq!(read_str(&mut tab, "__get"), "2, 3");
+    assert_eq!(read_str(&mut tab, "__entries"), "b=2, 3");
+    assert_eq!(read_str(&mut tab, "__keys"), "b");
+    assert_eq!(read_str(&mut tab, "__foreach"), "b:2, 3");
+    assert_eq!(read_str(&mut tab, "__iter"), "b=2, 3");
+}
+
+#[test]
+fn response_clone_blob_and_array_buffer() {
+    let (backend, _) = FakeBackend::ok("hello");
+    let mut tab = test_tab();
+    tab.set_fetch_backend(backend);
+    run(
+        &mut tab,
+        "fetch('/x').then((r) => { \
+           globalThis.__r = r; \
+           const c = r.clone(); \
+           globalThis.__c = c; \
+           globalThis.__meta = [c.url, c.redirected, c.status, c !== r].join('|'); \
+           return Promise.all([r.text(), c.text(), r.blob(), r.arrayBuffer()]); \
+         }).then(([t1, t2, blob, ab]) => { \
+           globalThis.__texts = [t1, t2].join('|'); \
+           globalThis.__blob = blob.size + ':' + blob.type; \
+           globalThis.__ab = ab.byteLength + ':' + new Uint8Array(ab)[0]; \
+         });",
+    );
+    assert_eq!(read_str(&mut tab, "__meta"), "/x|false|200|true");
+    assert_eq!(read_str(&mut tab, "__texts"), "hello|hello");
+    assert_eq!(read_str(&mut tab, "__blob"), "5:application/json");
+    assert_eq!(read_str(&mut tab, "__ab"), "5:104");
+}
+
+// ---------------------------------------------------------------- Stage 12 Rec 10: console
+
+#[test]
+fn console_extended_methods() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "console.trace('tmsg'); \
+         console.assert(false, 'must hold'); \
+         console.assert(true, 'never shown'); \
+         console.count('a'); console.count('a'); console.countReset('a'); console.count('a'); \
+         console.time('t'); console.timeLog('t'); console.timeEnd('t'); console.timeEnd('nope'); \
+         console.dir({ a: 1 }); \
+         console.table([{ a: 1, b: 2 }, { a: 3, b: 4 }]); \
+         console.group('g'); console.log('inner'); console.groupEnd(); console.log('outer');",
+    );
+    let lines = tab.console_lines();
+    let messages: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
+    assert!(
+        messages.iter().any(|m| m.starts_with("Trace: tmsg")),
+        "trace line missing: {messages:?}"
+    );
+    assert!(
+        messages.contains(&"Assertion failed: must hold"),
+        "assert line missing: {messages:?}"
+    );
+    assert!(
+        !messages.iter().any(|m| m.contains("never shown")),
+        "passing assert must not log: {messages:?}"
+    );
+    assert!(messages.contains(&"a: 1"));
+    assert!(messages.contains(&"a: 2"));
+    assert!(messages.contains(&"a: 0"));
+    assert!(
+        messages.iter().filter(|m| **m == "a: 1").count() == 2,
+        "count sequence wrong: {messages:?}"
+    );
+    let timed: Vec<&&str> = messages.iter().filter(|m| m.starts_with("t: ")).collect();
+    assert_eq!(timed.len(), 2, "timeLog + timeEnd: {messages:?}");
+    assert!(timed.iter().all(|m| m.ends_with(" ms")));
+    assert!(messages.contains(&"Timer 'nope' does not exist"));
+    assert!(
+        messages.iter().any(|m| m.contains("\"a\": 1")),
+        "dir line missing: {messages:?}"
+    );
+    let table = messages
+        .iter()
+        .find(|m| m.contains("(index)"))
+        .expect("table line missing");
+    assert!(table.contains('a') && table.contains('b') && table.contains('4'), "{table}");
+    assert!(messages.contains(&"g"));
+    assert!(messages.contains(&"  inner"));
+    assert!(messages.contains(&"outer"));
 }

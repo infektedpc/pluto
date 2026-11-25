@@ -49,11 +49,14 @@ use rquickjs::{Ctx, Function, Object};
 use crate::bindings::{
     BindingState, FetchBackend, FetchCompletion, call_onerror, install_bindings, registry_map,
 };
+use crate::bindings::dom::fire_image_event;
+use crate::bindings::events::TypedEventKind;
 use crate::bindings::permissions::PermissionsBackend;
 use crate::bindings::storage::StorageBackend;
 use crate::bytecode::{BytecodeCache, CacheHit};
 use crate::engine::{EvalKind, JsEngine, JsValue};
 use crate::error::JsError;
+use crate::module_loader::ModuleSources;
 use crate::event_loop::{
     FRAME_INTERVAL, LoopState, Microtask, TaskKind, TaskSource,
 };
@@ -125,6 +128,11 @@ pub struct TabJs {
     pending_modules: Vec<u64>,
     /// Next loop-driven module id.
     next_module_id: u64,
+    /// Pre-fetched module sources for this navigation (Stage 12
+    /// Rec 1): the browser's load task fills this, the realm's
+    /// loader reads it. Replaced on navigation, so a dying load
+    /// task cannot leak old sources into the new document.
+    module_sources: ModuleSources,
 }
 
 impl TabJs {
@@ -140,7 +148,7 @@ impl TabJs {
         let mut realm = TabRealm::new(&config)?;
         Self::install_globals(&mut realm, &state)?;
         install_bindings(&mut realm, &state, &bindings, fetch_tx.clone())?;
-        Ok(Self {
+        let mut tab = Self {
             state,
             realm,
             rejection_rx: rx,
@@ -155,7 +163,18 @@ impl TabJs {
             fetch_rx,
             pending_modules: Vec::new(),
             next_module_id: 1,
-        })
+            module_sources: ModuleSources::new(),
+        };
+        tab.install_module_loader()?;
+        Ok(tab)
+    }
+
+    /// Install the module loader on the current realm: sources
+    /// shared with the load task. Called from `new` and from
+    /// `navigate`.
+    fn install_module_loader(&mut self) -> Result<(), JsError> {
+        self.realm
+            .install_module_loader(self.module_sources.clone())
     }
 
     /// Attach the host document (the per-tab worker's `Dom`). The
@@ -233,7 +252,7 @@ impl TabJs {
                 self.pending_modules.push(id);
                 Ok(())
             }
-            Err(e) => self.record_or_propagate(e),
+            Err(e) => self.record_or_propagate_with_source(e, Some(url)),
         }
     }
 
@@ -299,6 +318,84 @@ impl TabJs {
             .map_err(JsError::Internal)
     }
 
+    /// Dispatch an external *typed* event (a shell key press, mouse
+    /// click, or text input) to a node: enqueued as a
+    /// `UserInteraction`-source task, so the listeners run on the
+    /// loop, not inline in the caller. The shell's input dispatch
+    /// (renderer input handling) calls this instead of
+    /// [`Self::dispatch_event`] for keyboard / mouse / input events
+    /// — see `TypedEventKind`; the plain `dispatch_event` stays for
+    /// untyped events (`click` from `element.click()`,
+    /// `DOMContentLoaded`).
+    pub fn dispatch_typed_event(
+        &mut self,
+        target: DomKey,
+        event_type: &str,
+        bubbles: bool,
+        kind: TypedEventKind,
+    ) {
+        let event_type = event_type.to_string();
+        self.enqueue_host_task(
+            TaskSource::UserInteraction,
+            Box::new(move |tab| {
+                let _ = tab.dispatch_typed_event_now(target, &event_type, bubbles, kind);
+            }),
+        );
+    }
+
+    /// Run a typed external-event dispatch now (inside a loop task).
+    pub(crate) fn dispatch_typed_event_now(
+        &mut self,
+        target: DomKey,
+        event_type: &str,
+        bubbles: bool,
+        kind: TypedEventKind,
+    ) -> Result<(), JsError> {
+        let bindings = Rc::clone(&self.bindings);
+        let event_type = event_type.to_string();
+        self.realm
+            .with_ctx(|ctx| {
+                crate::bindings::events::dispatch_typed_external(
+                    &ctx, &bindings, target, &event_type, bubbles, &kind,
+                )
+                .map_err(|e| e.to_string())
+            })
+            .map_err(JsError::Internal)
+    }
+
+    /// Report an `Image()` / `<img>` load outcome from the shell's
+    /// Stage 11 image store: marks the image complete with its
+    /// intrinsic size and fires a `load` event on the element (plus
+    /// its `onload` handler). Enqueued as a `UserInteraction`-source
+    /// task so the event runs on the loop.
+    pub fn notify_image_loaded(&mut self, target: DomKey, width: u32, height: u32) {
+        self.enqueue_host_task(
+            TaskSource::UserInteraction,
+            Box::new(move |tab| {
+                let bindings = Rc::clone(&tab.bindings);
+                let _ = tab.realm.with_ctx(|ctx| {
+                    fire_image_event(&ctx, &bindings, target, "load", width, height)
+                        .map_err(|e| e.to_string())
+                });
+            }),
+        );
+    }
+
+    /// Report an `Image()` / `<img>` load failure: fires an `error`
+    /// event on the element (plus its `onerror` handler).
+    pub fn notify_image_failed(&mut self, target: DomKey) {
+        self.enqueue_host_task(
+            TaskSource::UserInteraction,
+            Box::new(move |tab| {
+                let bindings = Rc::clone(&tab.bindings);
+                let _ = tab.realm.with_ctx(|ctx| {
+                    fire_image_event(&ctx, &bindings, target, "error", 0, 0)
+                        .map_err(|e| e.to_string())
+                });
+            }),
+        );
+    }
+
     /// Current navigation epoch.
     pub fn epoch(&self) -> u64 {
         self.state.borrow().epoch
@@ -324,6 +421,14 @@ impl TabJs {
     /// through (and for tests to inspect hit/miss counts).
     pub fn bytecode_cache(&mut self) -> &mut BytecodeCache {
         &mut self.bytecode
+    }
+
+    /// The shared pre-fetched module sources for this navigation.
+    /// The browser's load task clones this handle and fills it
+    /// while fetching; the realm's loader reads from it at link
+    /// time. Fresh per navigation (see `navigate`).
+    pub fn module_sources(&self) -> ModuleSources {
+        self.module_sources.clone()
     }
 
     /// Load a module script through the bytecode cache: compile once
@@ -424,6 +529,8 @@ impl TabJs {
         self.fetch_rx = fetch_rx;
         self.bytecode = BytecodeCache::new(DEFAULT_BYTECODE_CAPACITY_BYTES);
         self.pending_modules.clear();
+        self.module_sources = ModuleSources::new();
+        self.install_module_loader()?;
         Ok(())
     }
 
@@ -761,7 +868,7 @@ impl TabJs {
             TaskKind::Script { source, url } => {
                 match self.realm.eval(EvalKind::Classic, &source, &url) {
                     Ok(_) => Ok(()),
-                    Err(e) => self.record_or_propagate(e),
+                    Err(e) => self.record_or_propagate_with_source(e, Some(&url)),
                 }
             }
             TaskKind::Timer { id, nesting, repeats } => {
@@ -805,17 +912,41 @@ impl TabJs {
     /// handler runs first: if it returns `true`, the default report
     /// (recording in `script_errors`) is suppressed, per HTML.
     fn record_or_propagate(&mut self, err: JsError) -> Result<(), JsError> {
+        self.record_or_propagate_with_source(err, None)
+    }
+
+    /// Like [`Self::record_or_propagate`], but the caller knows the
+    /// script's URL (the `Script` task's `url`, the module's URL):
+    /// when the exception's stack names only the engine's generic
+    /// filename (`eval_script` — the realm evaluates classic
+    /// scripts without a filename), the handler is told the real
+    /// script URL instead. `None` keeps whatever the stack says
+    /// (or `undefined` when the stack names nothing real).
+    fn record_or_propagate_with_source(
+        &mut self,
+        err: JsError,
+        source_url: Option<&str>,
+    ) -> Result<(), JsError> {
         if err.is_script_error() {
-            let message = err.to_string();
+            let full = err.to_string();
+            let (message, source, lineno, colno) =
+                parse_error_location(&full, source_url);
             let suppressed = {
                 let bindings = Rc::clone(&self.bindings);
-                call_onerror(&mut self.realm, &bindings, &message)
+                call_onerror(
+                    &mut self.realm,
+                    &bindings,
+                    &message,
+                    source.as_deref(),
+                    lineno,
+                    colno,
+                )
             };
             if !suppressed {
-                self.state.borrow_mut().script_errors.push(message.clone());
+                self.state.borrow_mut().script_errors.push(full.clone());
             }
             if let Some(host) = self.bindings.borrow().host.clone() {
-                host.borrow().report_error(&message);
+                host.borrow().report_error(&full);
             }
             Ok(())
         } else {
@@ -823,8 +954,7 @@ impl TabJs {
         }
     }
 
-    /// Microtask checkpoint: drain host microtasks and engine promise
-    /// jobs until both are empty, including microtasks queued by
+    /// Microtask checkpoint: drain host microtasks and engine promise    /// jobs until both are empty, including microtasks queued by
     /// microtasks. A throwing microtask is recorded, not fatal — the
     /// checkpoint continues (a throwing microtask must not stop later
     /// microtasks from running). Bounded so a microtask loop that keeps
@@ -949,6 +1079,79 @@ impl TabJs {
             .map_err(JsError::Internal)
     }
 }
+
+/// Split a `JsError` string into the `window.onerror` arguments
+/// (Stage 12 Rec 9): `(message, source, lineno, colno)`.
+///
+/// The realm stringifies a caught exception as
+/// `"JS exception: Error: boom\n    at f (file:line:col)\n …"`
+/// (`rquickjs::Exception`'s `Display` appends the stack), so the
+/// throw site is recoverable here without touching the realm: the
+/// message is the first line, the location is the first stack
+/// frame. A stack frame whose file is the engine's generic
+/// filename (`eval_script`, `<eval>`, …) carries no real source:
+/// the caller's `source_url` (the script / module URL) replaces
+/// it, or the source is `None` (→ `undefined`) when the caller
+/// knows none either. Errors with no stack (interrupted, OOM)
+/// yield the message alone.
+fn parse_error_location(
+    text: &str,
+    source_url: Option<&str>,
+) -> (String, Option<String>, Option<u32>, Option<u32>) {
+    let mut lines = text.lines();
+    let first = lines.next().unwrap_or_default();
+    let message = first
+        .strip_prefix("JS exception: ")
+        .unwrap_or(first)
+        .to_string();
+    for line in lines {
+        let trimmed = line.trim();
+        let Some(frame) = trimmed.strip_prefix("at ") else {
+            continue;
+        };
+        // `name (file:line:col)` or `file:line:col`.
+        let loc = if let Some(open) = frame.rfind('(')
+            && let Some(close) = frame.rfind(')')
+            && close > open
+        {
+            &frame[open + 1..close]
+        } else {
+            frame
+        };
+        let Some((file, line_no, col_no)) = parse_frame_location(loc) else {
+            continue;
+        };
+        let generic = matches!(file.as_str(), "eval_script" | "<eval>" | "eval" | "<anonymous>");
+        let source = if generic {
+            source_url.map(|s| s.to_string())
+        } else {
+            Some(file)
+        };
+        return (message, source, line_no, col_no);
+    }
+    (message, None, None, None)
+}
+
+/// Parse `file:line:col` (or `file:line`) from one stack frame,
+/// splitting from the right so `:` inside the file (a URL scheme,
+/// a Windows drive) survives.
+fn parse_frame_location(loc: &str) -> Option<(String, Option<u32>, Option<u32>)> {
+    let loc = loc.trim();
+    let parts: Vec<&str> = loc.rsplitn(3, ':').collect();
+    match parts.len() {
+        3 => {
+            let col: u32 = parts[0].parse().ok()?;
+            let line: u32 = parts[1].parse().ok()?;
+            Some((parts[2].to_string(), Some(line), Some(col)))
+        }
+        2 => {
+            let line: u32 = parts[0].parse().ok()?;
+            Some((parts[1].to_string(), Some(line), None))
+        }
+        _ => None,
+    }
+}
+
 
 /// Install the host globals into `ctx`. Runs once per realm, on the
 /// owner thread, while the runtime lock is held. The closures capture
@@ -1460,5 +1663,229 @@ mod tests {
         );
         tab.eval_script("globalThis.__after = 8;", "after.js").unwrap();
         assert_eq!(read_num(&mut tab, "__after"), 8.0);
+    }
+
+    /// Stage 12 Rec 2: fixed JS workload for the `-Os` before/after
+    /// measurement. Pure CPU (arithmetic loop, string building,
+    /// numeric sort) — no host calls, so the time is engine time.
+    /// The result is deterministic: three runs must agree exactly,
+    /// which also proves the workload was not optimised away.
+    /// The timings print to stderr (visible with `--nocapture`);
+    /// the test itself only asserts correctness + a generous
+    /// completion bound, so it stays green on slow CI runners.
+    #[test]
+    fn js_workload_benchmark_reports_timing() {
+        const WORKLOAD: &str = r#"
+            let acc = 0;
+            for (let i = 0; i < 2000000; i++) {
+                acc = (acc * 31 + i) % 1000003;
+                acc ^= (acc >>> 7);
+            }
+            let s = "";
+            for (let i = 0; i < 5000; i++) { s += "x" + (i % 10); }
+            const a = [];
+            for (let i = 0; i < 50000; i++) a.push((i * 2654435761) % 100000);
+            a.sort((x, y) => x - y);
+            globalThis.__bench = acc + s.length + a[0] + a[a.length - 1];
+        "#;
+        let mut results = Vec::new();
+        let mut times_ms = Vec::new();
+        for _ in 0..3 {
+            let mut tab = test_tab();
+            let start = std::time::Instant::now();
+            tab.eval_script(WORKLOAD, "bench.js").unwrap();
+            tab.run_until_idle().unwrap();
+            times_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            results.push(read_num(&mut tab, "__bench"));
+            assert!(
+                tab.script_errors().is_empty(),
+                "workload errored: {:?}",
+                tab.script_errors()
+            );
+        }
+        assert_eq!(results[0], results[1], "workload must be deterministic");
+        assert_eq!(results[0], results[2], "workload must be deterministic");
+        times_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "[pluto js-bench] runs: {:.1}ms / {:.1}ms / {:.1}ms (median {:.1}ms) result={}",
+            times_ms[0], times_ms[1], times_ms[2], times_ms[1], results[0]
+        );
+    }
+
+    /// Stage 12 Rec 1: a module importing a relative specifier
+    /// resolves it against its own URL and runs the pre-fetched
+    /// import's code (the browser fills `module_sources`; the test
+    /// stands in for it).
+    #[test]
+    fn module_import_resolves_from_prefetched_sources() {
+        let mut tab = test_tab();
+        tab.module_sources().insert(
+            "https://example.com/util.mjs",
+            "export const answer = 41;".to_string(),
+        );
+        tab.start_module_async(
+            "https://example.com/main.mjs",
+            "import { answer } from './util.mjs'; globalThis.__got = answer + 1;",
+        )
+        .unwrap();
+        tab.run_until_idle().unwrap();
+        assert_eq!(read_num(&mut tab, "__got"), 42.0);
+        assert!(tab.script_errors().is_empty(), "{:?}", tab.script_errors());
+    }
+
+    /// Stage 12 Rec 1: an import that was never pre-fetched makes
+    /// the module reject cleanly — recorded as a script error, no
+    /// realm poison, later scripts still run.
+    #[test]
+    fn module_missing_import_rejects_cleanly() {
+        let mut tab = test_tab();
+        tab.start_module_async(
+            "https://example.com/main.mjs",
+            "import './gone.mjs'; globalThis.__got = 1;",
+        )
+        .unwrap();
+        tab.run_until_idle().unwrap();
+        assert!(
+            tab.script_errors().iter().any(|e| e.contains("gone.mjs")),
+            "expected gone.mjs in errors: {:?}",
+            tab.script_errors()
+        );
+        assert!(!tab.realm.is_poisoned(), "realm must not be poisoned");
+        tab.eval_script("globalThis.__after = 9;", "after.js").unwrap();
+        assert_eq!(read_num(&mut tab, "__after"), 9.0);
+    }
+
+    /// Stage 12 Rec 1: a string-literal dynamic `import()` goes
+    /// through the same loader and works when pre-fetched.
+    #[test]
+    fn module_dynamic_import_literal_resolves() {
+        let mut tab = test_tab();
+        tab.module_sources().insert(
+            "https://example.com/chunk.mjs",
+            "export const v = 5;".to_string(),
+        );
+        tab.start_module_async(
+            "https://example.com/main.mjs",
+            "const m = await import('./chunk.mjs'); globalThis.__got = m.v;",
+        )
+        .unwrap();
+        tab.run_until_idle().unwrap();
+        assert_eq!(read_num(&mut tab, "__got"), 5.0);
+        assert!(tab.script_errors().is_empty(), "{:?}", tab.script_errors());
+    }
+
+    /// Stage 12 Rec 1: a bare specifier rejects with the import-map
+    /// note (no import maps in M4), not a crash or a hang.
+    #[test]
+    fn module_bare_specifier_rejects_with_import_map_note() {
+        let mut tab = test_tab();
+        tab.start_module_async(
+            "https://example.com/main.mjs",
+            "import 'lodash'; globalThis.__got = 1;",
+        )
+        .unwrap();
+        tab.run_until_idle().unwrap();
+        assert!(
+            tab.script_errors()
+                .iter()
+                .any(|e| e.contains("import map")),
+            "expected import-map note in errors: {:?}",
+            tab.script_errors()
+        );
+        assert!(!tab.realm.is_poisoned(), "realm must not be poisoned");
+    }
+
+    /// Stage 12 Rec 1: transitive imports resolve — the entry
+    /// imports A, A imports B, both pre-fetched.
+    #[test]
+    fn module_transitive_import_resolves() {
+        let mut tab = test_tab();
+        let sources = tab.module_sources();
+        sources.insert(
+            "https://example.com/a.mjs",
+            "import { b } from './sub/b.mjs'; export const a = b + 1;".to_string(),
+        );
+        sources.insert(
+            "https://example.com/sub/b.mjs",
+            "export const b = 10;".to_string(),
+        );
+        tab.start_module_async(
+            "https://example.com/main.mjs",
+            "import { a } from './a.mjs'; globalThis.__got = a;",
+        )
+        .unwrap();
+        tab.run_until_idle().unwrap();
+        assert_eq!(read_num(&mut tab, "__got"), 11.0);
+        assert!(tab.script_errors().is_empty(), "{:?}", tab.script_errors());
+    }
+
+    /// Stage 12 Rec 9: a throwing inline script calls `onerror`
+    /// with the message, the script URL, and the throw site's line
+    /// and column (parsed out of the exception's stack — see
+    /// `parse_error_location`).
+    #[test]
+    fn onerror_receives_source_line_and_column() {
+        let mut tab = test_tab();
+        tab.eval_script(
+            "const seen = []; \
+             window.onerror = (msg, src, line, col, err) => { \
+               seen.push([msg, src, line, col, err]); return true; \
+             }; \
+             globalThis.__seen = seen;",
+            "test.js",
+        )
+        .unwrap();
+        tab.run_until_idle().unwrap();
+        // The throw sits on line 2, column 11 (`Error` starts at
+        // column 11 of `throw new Error('loc-boom');`).
+        tab.eval_script("var __x = 1;\nthrow new Error('loc-boom');", "s.js")
+            .unwrap();
+        tab.run_until_idle().unwrap();
+        assert!(
+            tab.script_errors().is_empty(),
+            "suppressed error must not be recorded: {:?}",
+            tab.script_errors()
+        );
+        assert_eq!(read_num(&mut tab, "__seen.length"), 1.0);
+        assert_eq!(
+            read_str(&mut tab, "__seen[0].join('|')"),
+            "Error: loc-boom|s.js|2|11|"
+        );
+    }
+
+    /// Stage 12 Rec 9: without a location the handler still runs
+    /// with `undefined` source/line/col (an interrupted script has
+    /// no throw site to report).
+    #[test]
+    fn onerror_without_location_gets_undefineds() {
+        let mut tab = test_tab();
+        tab.eval_script(
+            "const seen = []; \
+             window.onerror = (msg, src, line, col) => { \
+               seen.push([msg, src, line, col]); return true; \
+             }; \
+             globalThis.__seen = seen;",
+            "test.js",
+        )
+        .unwrap();
+        tab.run_until_idle().unwrap();
+        // A throwing *timer* callback has a stack, but no script
+        // URL is known for it — the source is the engine's generic
+        // filename, which the loop maps to `undefined`.
+        tab.eval_script(
+            "setTimeout(() => { throw new Error('timer-boom'); }, 0);",
+            "test.js",
+        )
+        .unwrap();
+        tab.run_until_idle().unwrap();
+        assert_eq!(read_num(&mut tab, "__seen.length"), 1.0);
+        // Message + `undefined` source (the timer callback has a
+        // stack, so line/col are present, but no script URL).
+        assert_eq!(
+            read_str(&mut tab, "__seen[0].slice(0, 2).join('|')"),
+            "Error: timer-boom|"
+        );
+        assert_eq!(read_num(&mut tab, "__seen[0][2]"), 1.0);
+        assert!(read_num(&mut tab, "__seen[0][3]") > 0.0);
     }
 }

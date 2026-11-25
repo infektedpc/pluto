@@ -518,6 +518,7 @@ impl Parser {
                         priority: Priority::Medium,
                         from: "script[src]",
                         integrity: integrity.clone(),
+                        is_module: paused.is_module,
                     }));
                 }
             }
@@ -539,6 +540,7 @@ impl Parser {
                         priority: Priority::Medium,
                         from: "script[src]",
                         integrity: integrity.clone(),
+                        is_module: paused.is_module,
                     }));
                 }
             }
@@ -631,6 +633,7 @@ impl Parser {
                             priority: Priority::Low,
                             from: if is_imageset { "imageset" } else { "img[src]" },
                             integrity,
+                            is_module: false,
                         }));
                     }
                 } else {
@@ -658,6 +661,7 @@ impl Parser {
                             priority: raw.priority,
                             from: raw.from,
                             integrity: raw.integrity.clone(),
+                            is_module: raw.is_module,
                         }));
                     }
                 }

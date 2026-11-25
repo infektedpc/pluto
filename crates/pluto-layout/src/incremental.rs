@@ -196,13 +196,6 @@ pub fn classify_style_change(old: &ComputedStyle, new: &ComputedStyle) -> Damage
 
 // ---- safe-root predicate (Stage 8 Rec 6 §d.2) ----
 
-fn spacing_is_nonzero(sp: Spacing) -> bool {
-    match sp {
-        Spacing::Px(v) | Spacing::Pct(v) | Spacing::Vh(v) | Spacing::Vw(v) => v > 0.0,
-        Spacing::Auto => false,
-    }
-}
-
 fn is_positioned(position: PositionKind) -> bool {
     matches!(
         position,
@@ -265,12 +258,29 @@ fn has_outside_resolving_descendant(
 /// incremental layout root, `Some(reason)` when it is not. The
 /// checks are the report's, in order:
 ///
-/// 1. Size independence — a definite size, `contain: layout`, a
+/// 1. Size independence — a definite width, `contain: layout`, a
 ///    replaced element, or a fixed-size leaf — so the root's size
-///    cannot change because of what changed inside it.
-/// 2. No margin collapse with outside — a BFC root, an out-of-flow
-///    box, or non-zero padding on both sides (which blocks
-///    parent/child collapse).
+///    cannot change because of what changed inside it. (Stage 12
+///    Rec 4 stage 1: the width is the requirement, not the height.
+///    A definite px width cannot change with the contents, and a
+///    height change propagates correctly: taffy `mark_dirty` is
+///    recursive up the ancestor chain (taffy 0.15.1
+///    `TaffyTree::mark_dirty`), so the parent and every ancestor
+///    re-run their layout and reposition siblings from the new
+///    size; siblings whose available space changed miss taffy's
+///    cache, which is keyed on available space, and are
+///    re-measured; `recollect()` rebuilds every clip from the
+///    fresh boxes. The debug incremental==cold assertion is the
+///    tripwire.)
+/// 2. Margin collapse with outside — no predicate guard (Stage 12
+///    Rec 4 stage 2). Taffy computes margin collapse during
+///    layout, and the dirty ancestors re-run their layout on a
+///    subtree rebuild, so the collapse is re-evaluated for every
+///    partner: the parent, a preceding sibling, and collapse
+///    through the parent to the grandparent. The old guard (BFC
+///    root / out-of-flow / padding) was conservative; the debug
+///    incremental==cold assertion is the tripwire if the
+///    recomputation ever diverges.
 /// 3. No floats intruding outside — vacuous in Pluto today (`float`
 ///    / `clear` are deliberately unmodelled), and a BFC root would
 ///    contain floats anyway; the check becomes real when floats land.
@@ -294,30 +304,28 @@ pub fn unsafe_layout_root_reason(
     if matches!(style.display, DisplayKind::Inline | DisplayKind::None) {
         return Some("root is not a block-level box (inline or display:none)");
     }
-    // (1) Size independence.
+    // (1) Size independence (Stage 12 Rec 4 stage 1: definite
+    // width — the height may be auto, a percentage, or viewport
+    // relative; all of those are functions of the parent or the
+    // viewport, not of the subtree's contents, and a height change
+    // propagates through taffy's dirty ancestors).
+    let definite_width = matches!(style.width, Some(Dim::Px(_)));
     let definite_size =
-        matches!(style.width, Some(Dim::Px(_))) && matches!(style.height, Some(Dim::Px(_)));
+        definite_width && matches!(style.height, Some(Dim::Px(_)));
     let replaced = matches!(dom.tag(root), Some("img"));
     // A leaf with a definite size: the fourth alternative, listed
     // separately for the report even though it is subsumed by
     // `definite_size` (a leaf has no contents to size from).
     let fixed_size_leaf = definite_size && dom.children(root).iter().all(|&c| dom.tag(c).is_none());
-    if !definite_size && !style.contain_layout && !replaced && !fixed_size_leaf {
+    if !definite_width && !style.contain_layout && !replaced && !fixed_size_leaf {
         return Some(
-            "root has no definite size, no `contain: layout`, is not a replaced element, \
+            "root has no definite width, no `contain: layout`, is not a replaced element, \
              and is not a fixed-size leaf",
         );
     }
-    // (2) No margin collapse with outside.
-    let margin_safe = is_bfc_root(style, false)
-        || matches!(style.position, PositionKind::Absolute | PositionKind::Fixed)
-        || (spacing_is_nonzero(style.padding[0]) && spacing_is_nonzero(style.padding[2]));
-    if !margin_safe {
-        return Some(
-            "root participates in margin collapse with outside (not a BFC root, \
-             not out-of-flow, no padding blocking collapse)",
-        );
-    }
+    // (2) Margin collapse with outside — no guard (Stage 12 Rec 4
+    // stage 2): taffy recomputes the collapse for every dirty
+    // ancestor on a subtree rebuild; see the doc comment above.
     // (3) Floats: vacuous, see the doc comment above.
     // (4) No percentage descendants resolving outside the root.
     if has_outside_resolving_descendant(dom, styles, root, is_positioned(style.position)) {
@@ -340,10 +348,17 @@ pub fn is_safe_layout_root(
 
 // ---- relayout ----
 
-/// Which path `relayout_incremental` took.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which path `relayout_incremental` took — the widening metric
+/// (Stage 12 Rec 3): every submitted frame records its kind in the
+/// frame-time histogram, so the fallback rate (FullLayout /
+/// (SubtreeLayout + FullLayout)) is visible in the periodic stderr
+/// summary instead of guessed at. `ColdBuild` is a fresh tree for a
+/// new document/viewport — not a fallback, so it counts in neither
+/// side of the fallback rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RelayoutKind {
     /// Nothing was dirty, or the dirty subtree has no boxes.
+    #[default]
     NothingToDo,
     /// Only paint properties changed: box styles refreshed, boxes
     /// re-collected, taffy never ran.
@@ -357,6 +372,28 @@ pub enum RelayoutKind {
     /// The safe-root predicate (or the shape of the change) refused
     /// the incremental path; the tree was rebuilt cold.
     FullLayout,
+    /// A fresh tree was built for a new document/viewport (no
+    /// retained tree to be incremental against) — not a fallback.
+    ColdBuild,
+}
+
+impl RelayoutKind {
+    /// Number of variants — the histogram's per-kind counter array
+    /// is sized by this, so the two cannot drift apart silently.
+    pub const COUNT: usize = 6;
+
+    /// Index into the histogram's per-kind counters, in
+    /// declaration order.
+    pub fn as_index(self) -> usize {
+        match self {
+            RelayoutKind::NothingToDo => 0,
+            RelayoutKind::PaintOnly => 1,
+            RelayoutKind::PositionOnly => 2,
+            RelayoutKind::SubtreeLayout => 3,
+            RelayoutKind::FullLayout => 4,
+            RelayoutKind::ColdBuild => 5,
+        }
+    }
 }
 
 /// The outcome of `relayout_incremental`: which path ran, and why.
@@ -406,10 +443,17 @@ fn layout_dirty_element(dom: &Dom, id: DomId) -> Option<DomId> {
 /// parent link, so the child has no ancestor chain left — the
 /// parent, which the caller marks dirty, is the node that matters.
 /// (If *no* dirty node is attached, the caller falls back to a full
-/// rebuild.)
-fn dirty_elements(dom: &Dom, dirty: &DirtySet) -> Vec<DomId> {
+/// rebuild.) `extra` carries nodes damaged by other means — an
+/// image arrival's changed `<img>` nodes (Stage 12 Rec 5) — which
+/// take the same mapping and filtering.
+fn dirty_elements(dom: &Dom, dirty: &DirtySet, extra: &[DomId]) -> Vec<DomId> {
     let mut out: Vec<DomId> = Vec::new();
-    for &id in dirty.layout.iter().chain(dirty.style.iter()) {
+    for &id in dirty
+        .layout
+        .iter()
+        .chain(dirty.style.iter())
+        .chain(extra.iter())
+    {
         if let Some(el) = layout_dirty_element(dom, id) {
             if !is_attached(dom, el) {
                 continue;
@@ -467,9 +511,11 @@ fn lowest_common_ancestor(dom: &Dom, a: DomId, b: DomId) -> Option<DomId> {
 
 /// The lowest common ancestor of all dirty elements — the highest
 /// node whose subtree covers every dirty node. `None` when no dirty
-/// node maps to an element in the document (all stale).
-fn lowest_common_dirty_root(dom: &Dom, dirty: &DirtySet) -> Option<DomId> {
-    let ids = dirty_elements(dom, dirty);
+/// node maps to an element in the document (all stale). `extra`
+/// carries nodes damaged by other means (Stage 12 Rec 5: an image
+/// arrival's changed `<img>` nodes).
+fn lowest_common_dirty_root(dom: &Dom, dirty: &DirtySet, extra: &[DomId]) -> Option<DomId> {
+    let ids = dirty_elements(dom, dirty, extra);
     let mut it = ids.into_iter();
     let mut acc = it.next()?;
     for id in it {
@@ -521,6 +567,11 @@ impl LayoutTree {
     /// using the dirty set Stage 7 populated on the DOM. `dom` is the
     /// live, already-mutated document; `sheet` is the author sheet;
     /// `state` carries the dynamic pseudo-class state for the pass.
+    /// `images` is the fresh image map for this pass (`None` when
+    /// no image arrived): it replaces the retained map up front,
+    /// and the `<img>` nodes whose entries changed are damage too
+    /// (Stage 12 Rec 5) — an image landing inside a safe subtree
+    /// re-lays out that subtree, not the whole document.
     ///
     /// The path taken is reported in the outcome: paint-only changes
     /// refresh box styles without running taffy; offset-only moves
@@ -540,7 +591,33 @@ impl LayoutTree {
         viewport_width: f32,
         viewport_height: f32,
         state: &ElementState,
+        images: Option<&ImageMap>,
     ) -> Result<RelayoutOutcome, LayoutError> {
+        // Stage 12 Rec 5: the fresh image map replaces the retained
+        // one BEFORE any rebuild path runs, so a full rebuild (or
+        // the debug cold twin) builds with the new images, not the
+        // stale ones. The changed <img> nodes are extra damage
+        // (see `ImageMap::changed_node_ids`); a changed background
+        // cannot name its nodes, so it forces a full rebuild.
+        let image_changed: Vec<DomId> = match images {
+            Some(map) => {
+                let changed = map.changed_node_ids(&self.images);
+                let backgrounds_changed = map.backgrounds_changed(&self.images);
+                self.images = map.clone();
+                if backgrounds_changed {
+                    return self.full_rebuild(
+                        dom,
+                        sheet,
+                        viewport_width,
+                        viewport_height,
+                        state,
+                        "background image arrived",
+                    );
+                }
+                changed
+            }
+            None => Vec::new(),
+        };
         // A viewport change moves the root's available space, so
         // every cached layout is suspect; likewise with no retained
         // tree at all.
@@ -555,26 +632,16 @@ impl LayoutTree {
             );
         }
         let dirty = dom.dirty_set();
-        if dirty.is_empty() {
+        if dirty.is_empty() && image_changed.is_empty() {
             return Ok(RelayoutOutcome::of(
                 RelayoutKind::NothingToDo,
                 "dirty set is empty",
             ));
         }
-        // Whole-document style re-resolution (v1): the parallel pass
-        // stays cheap; the serial taffy pass is where incrementality
-        // pays. The new map is also the "new style" half of the
-        // damage diff below.
-        let ua = Stylesheet::ua();
-        let (styles, node_styles) = resolve_document_styles(
-            dom,
-            &ua,
-            sheet,
-            true,
-            (viewport_width, viewport_height),
-            state,
-        );
-        let Some(dirty_root) = lowest_common_dirty_root(dom, dirty) else {
+        // The dirty LCA comes first: the restyle roots at it
+        // (Stage 12 Rec 6), so only the dirty subtree pays the
+        // cascade.
+        let Some(dirty_root) = lowest_common_dirty_root(dom, dirty, &image_changed) else {
             return self.full_rebuild(
                 dom,
                 sheet,
@@ -584,9 +651,25 @@ impl LayoutTree {
                 "dirty nodes are no longer in the document",
             );
         };
+        // Stage 12 Rec 6: restyle only the dirty subtree — the
+        // LCA's subtree, seeded from the retained styles above it.
+        // The returned maps are the full merged ones, so the damage
+        // diff below and the subtree rebuild read them exactly as
+        // they read the whole-document maps before.
+        let ua = Stylesheet::ua();
+        let (styles, node_styles) = resolve_subtree_styles(
+            dom,
+            &ua,
+            sheet,
+            true,
+            (viewport_width, viewport_height),
+            state,
+            dirty_root,
+            &self.node_styles,
+        );
         // Classify the change: this tree's `node_styles` are the old
         // styles, the freshly resolved map the new ones.
-        let dirty_els = dirty_elements(dom, dirty);
+        let dirty_els = dirty_elements(dom, dirty, &image_changed);
         let mut aggregate = DamageKind::None;
         let mut color_changed = false;
         for &id in &dirty_els {
@@ -1162,16 +1245,30 @@ impl LayoutTree {
         // `take` leaves `None` behind; the fresh build restores it,
         // and on failure the caller falls back to a fresh scan.
         let fonts = self.font_system.take();
+        // Stage 12 Rec 5: the rebuild takes the retained image map
+        // (`self.images` is already the fresh one when this runs
+        // from `relayout_incremental` with an image arrival — the
+        // old no-images variants built with an empty map, so an
+        // image tick silently dropped every decoded image from the
+        // fresh tree).
         let fresh = match fonts {
-            Some(fs) => Self::build_with_state_reusing_font_system(
+            Some(fs) => Self::build_with_state_reusing_font_system_and_images(
                 dom,
                 sheet,
                 viewport_width,
                 viewport_height,
                 state,
                 fs,
+                &self.images,
             ),
-            None => Self::build_with_state(dom, sheet, viewport_width, viewport_height, state),
+            None => Self::build_with_state_and_images(
+                dom,
+                sheet,
+                viewport_width,
+                viewport_height,
+                state,
+                &self.images,
+            ),
         }?;
         *self = fresh;
         self.scroll_offsets = scroll_offsets;
@@ -1288,7 +1385,18 @@ impl LayoutTree {
         viewport: (f32, f32),
         state: &ElementState,
     ) {
-        let mut cold = match Self::build_with_state(dom, sheet, viewport.0, viewport.1, state) {
+        // Stage 12 Rec 5: the cold twin builds with the same image
+        // map as this tree — the old no-images build would false-
+        // fail the assertion on any image tick (the incremental
+        // tree carries the images, the twin did not).
+        let mut cold = match Self::build_with_state_and_images(
+            dom,
+            sheet,
+            viewport.0,
+            viewport.1,
+            state,
+            &self.images,
+        ) {
             Ok(tree) => tree,
             Err(e) => panic!("incremental==cold check: cold build failed: {e}"),
         };
@@ -1460,11 +1568,43 @@ mod tests {
     /// Mutate (already done by the caller), relayout incrementally,
     /// clear the dirty set — the tab thread's contract.
     fn relayout(tree: &mut LayoutTree, dom: &mut Dom, sheet: &Stylesheet) -> RelayoutOutcome {
+        relayout_with_images(tree, dom, sheet, None)
+    }
+
+    /// Like [`relayout`], with a fresh image map for the pass
+    /// (Stage 12 Rec 5) — `None` means no image arrived.
+    fn relayout_with_images(
+        tree: &mut LayoutTree,
+        dom: &mut Dom,
+        sheet: &Stylesheet,
+        images: Option<&ImageMap>,
+    ) -> RelayoutOutcome {
         let out = tree
-            .relayout_incremental(dom, sheet, VIEWPORT.0, VIEWPORT.1, &ElementState::default())
+            .relayout_incremental(
+                dom,
+                sheet,
+                VIEWPORT.0,
+                VIEWPORT.1,
+                &ElementState::default(),
+                images,
+            )
             .expect("relayout works");
         dom.clear_dirty();
         out
+    }
+
+    /// A cold twin built with an image map (Stage 12 Rec 5): the
+    /// reference geometry for image-arrival relayouts.
+    fn cold_with_images(dom: &Dom, sheet: &Stylesheet, images: &ImageMap) -> LayoutTree {
+        LayoutTree::build_with_state_and_images(
+            dom,
+            sheet,
+            VIEWPORT.0,
+            VIEWPORT.1,
+            &ElementState::default(),
+            images,
+        )
+        .expect("cold layout builds")
     }
 
     fn box_for<'a>(tree: &'a LayoutTree, dom: &Dom, tag: &str) -> &'a LayoutBox {
@@ -1523,20 +1663,36 @@ mod tests {
         let (dom, sheet, _) = build(r#"<div class="box"><p>hi</p></div>"#, ".box {}");
         let styles = styles_of(&dom, &sheet);
         let reason = unsafe_layout_root_reason(&dom, &styles, el(&dom, "div")).expect("unsafe");
-        assert!(reason.contains("definite size"), "reason: {reason}");
+        assert!(reason.contains("definite width"), "reason: {reason}");
     }
 
     #[test]
-    fn safe_root_rejects_margin_collapse() {
-        // Definite size but no BFC, no out-of-flow position, no
-        // padding: the first child's margins collapse through it.
+    fn safe_root_accepts_definite_width_auto_height() {
+        // Stage 12 Rec 4 stage 1: a definite px width with auto
+        // height is a safe root — the width cannot change with
+        // the contents, and the height change propagates through
+        // taffy's dirty ancestors.
+        let (dom, sheet, _) = build(
+            r#"<div class="box"><p>hi</p></div>"#,
+            ".box { width: 300px; overflow: hidden; }",
+        );
+        let styles = styles_of(&dom, &sheet);
+        assert!(is_safe_layout_root(&dom, &styles, el(&dom, "div")));
+    }
+
+    #[test]
+    fn safe_root_accepts_margin_collapse() {
+        // Stage 12 Rec 4 stage 2: a definite-size root whose
+        // first child's margins collapse through it is a safe
+        // root now — taffy recomputes the collapse for every
+        // dirty ancestor on a subtree rebuild. (This test used to
+        // assert rejection.)
         let (dom, sheet, _) = build(
             r#"<div class="box"><p>hi</p></div>"#,
             ".box { width: 300px; height: 200px; }",
         );
         let styles = styles_of(&dom, &sheet);
-        let reason = unsafe_layout_root_reason(&dom, &styles, el(&dom, "div")).expect("unsafe");
-        assert!(reason.contains("margin collapse"), "reason: {reason}");
+        assert!(is_safe_layout_root(&dom, &styles, el(&dom, "div")));
     }
 
     #[test]
@@ -1809,6 +1965,299 @@ mod tests {
     }
 
     #[test]
+    fn incremental_auto_height_root_grows_and_shifts_sibling() {
+        // Stage 12 Rec 4 stage 1: a text mutation inside a
+        // definite-width auto-height root takes the subtree path,
+        // the root grows, and the sibling below it moves down —
+        // exactly the case the old definite-height requirement
+        // refused (it fell back to a full rebuild).
+        let (mut dom, sheet, mut tree) = build(
+            r#"<div class="box"><p>short</p></div><div class="after"><p>below</p></div>"#,
+            ".box { width: 300px; overflow: hidden; }",
+        );
+        let body = el(&dom, "body");
+        let divs: Vec<DomId> = dom
+            .children(body)
+            .iter()
+            .copied()
+            .filter(|&c| dom.tag(c) == Some("div"))
+            .collect();
+        assert_eq!(divs.len(), 2);
+        let (box_div, after_div) = (divs[0], divs[1]);
+        let box_before = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom == Some(box_div))
+            .expect("box div")
+            .clone();
+        let after_before = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom == Some(after_div))
+            .expect("after div")
+            .clone();
+        let p = el(&dom, "p");
+        let text = first_text(&dom, p);
+        dom.set_text(
+            text,
+            "a much longer line of text that wraps onto several lines inside the 300px box",
+        );
+        dom.mark_dirty(text);
+        let out = relayout(&mut tree, &mut dom, &sheet);
+        assert_eq!(
+            out.kind,
+            RelayoutKind::SubtreeLayout,
+            "reason: {}",
+            out.reason
+        );
+        let box_after = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom == Some(box_div))
+            .expect("box div after");
+        let after_after = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom == Some(after_div))
+            .expect("after div after");
+        assert!(
+            box_after.height > box_before.height,
+            "the root grew: {} -> {}",
+            box_before.height,
+            box_after.height
+        );
+        assert!(
+            after_after.y > after_before.y,
+            "the sibling moved down: {} -> {}",
+            after_before.y,
+            after_after.y
+        );
+        assert_same_geometry(&tree, &cold(&dom, &sheet));
+    }
+
+    #[test]
+    fn incremental_margin_collapse_through_root() {
+        // Stage 12 Rec 4 stage 2: the old rejection case — a
+        // definite-size root with no BFC/padding, whose first
+        // child's margins collapse through it — now takes the
+        // subtree path, and the collapsed margins come out exactly
+        // as the cold build computes them.
+        let (mut dom, sheet, mut tree) = build(
+            r#"<div class="box"><p>short</p></div><div class="after"><p>below</p></div>"#,
+            ".box { width: 300px; height: 200px; }",
+        );
+        let p = el(&dom, "p");
+        let text = first_text(&dom, p);
+        dom.set_text(
+            text,
+            "a much longer line of text that wraps onto several lines inside the 300px box",
+        );
+        dom.mark_dirty(text);
+        let out = relayout(&mut tree, &mut dom, &sheet);
+        assert_eq!(
+            out.kind,
+            RelayoutKind::SubtreeLayout,
+            "reason: {}",
+            out.reason
+        );
+        assert_same_geometry(&tree, &cold(&dom, &sheet));
+    }
+
+    #[test]
+    fn incremental_margin_collapse_sibling_gap_preserved() {
+        // Stage 12 Rec 4 stage 2: adjacent-sibling margins
+        // collapse across the rebuild boundary — the gap between
+        // the growing root and the sibling below it is the
+        // collapsed margin, before and after, not the sum.
+        let (mut dom, sheet, mut tree) = build(
+            r#"<div class="box"><p>short</p></div><div class="after"><p>below</p></div>"#,
+            ".box { width: 300px; margin-bottom: 20px; } .after { margin-top: 30px; }",
+        );
+        let body = el(&dom, "body");
+        let divs: Vec<DomId> = dom
+            .children(body)
+            .iter()
+            .copied()
+            .filter(|&c| dom.tag(c) == Some("div"))
+            .collect();
+        assert_eq!(divs.len(), 2);
+        let (box_div, after_div) = (divs[0], divs[1]);
+        let gap_before = {
+            let bx = tree
+                .boxes
+                .iter()
+                .find(|b| b.dom == Some(box_div))
+                .expect("box div");
+            let af = tree
+                .boxes
+                .iter()
+                .find(|b| b.dom == Some(after_div))
+                .expect("after div");
+            af.y - (bx.y + bx.height)
+        };
+        let p = el(&dom, "p");
+        let text = first_text(&dom, p);
+        dom.set_text(
+            text,
+            "a much longer line of text that wraps onto several lines inside the 300px box",
+        );
+        dom.mark_dirty(text);
+        let out = relayout(&mut tree, &mut dom, &sheet);
+        assert_eq!(
+            out.kind,
+            RelayoutKind::SubtreeLayout,
+            "reason: {}",
+            out.reason
+        );
+        let gap_after = {
+            let bx = tree
+                .boxes
+                .iter()
+                .find(|b| b.dom == Some(box_div))
+                .expect("box div after");
+            let af = tree
+                .boxes
+                .iter()
+                .find(|b| b.dom == Some(after_div))
+                .expect("after div after");
+            af.y - (bx.y + bx.height)
+        };
+        assert!(
+            (gap_after - gap_before).abs() < 0.001,
+            "collapsed sibling gap changed across the rebuild: {gap_before} -> {gap_after}"
+        );
+        assert_same_geometry(&tree, &cold(&dom, &sheet));
+    }
+
+    #[test]
+    fn incremental_text_change_with_image_arrival_stays_subtree() {
+        // Stage 12 Rec 5: a text mutation AND an image arrival in
+        // the same tick — before Rec 5 the image forced a full
+        // rebuild; now the subtree path runs with the fresh map,
+        // and the <img> gets its intrinsic size.
+        let (mut dom, sheet, mut tree) = build(
+            r#"<div class="box"><p>short</p><img src="https://example.com/a.png"></div><div class="after"><p>below</p></div>"#,
+            SAFE_DIV_CSS,
+        );
+        let img = el(&dom, "img");
+        let mut map = ImageMap::new();
+        map.by_node.insert(
+            img,
+            ImageInfo {
+                resource: 1,
+                width: 40,
+                height: 30,
+            },
+        );
+        let p = el(&dom, "p");
+        let text = first_text(&dom, p);
+        dom.set_text(
+            text,
+            "a much longer line of text that wraps onto several lines inside the 300px box",
+        );
+        dom.mark_dirty(text);
+        let out = relayout_with_images(&mut tree, &mut dom, &sheet, Some(&map));
+        assert_eq!(
+            out.kind,
+            RelayoutKind::SubtreeLayout,
+            "reason: {}",
+            out.reason
+        );
+        let img_box = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom == Some(img))
+            .expect("img box");
+        assert!(
+            (img_box.width - 40.0).abs() < 0.001,
+            "img width: {}",
+            img_box.width
+        );
+        assert!(
+            (img_box.height - 30.0).abs() < 0.001,
+            "img height: {}",
+            img_box.height
+        );
+        assert_same_geometry(&tree, &cold_with_images(&dom, &sheet, &map));
+    }
+
+    #[test]
+    fn incremental_image_only_arrival_in_safe_root_is_subtree() {
+        // Stage 12 Rec 5: an image-only tick (empty dirty set) —
+        // the changed <img> is the damage, and inside a safe root
+        // it re-lays out just that subtree with the fresh map.
+        let (mut dom, sheet, mut tree) = build(
+            r#"<div class="box"><img src="https://example.com/a.png"></div>"#,
+            SAFE_DIV_CSS,
+        );
+        let img = el(&dom, "img");
+        let mut map = ImageMap::new();
+        map.by_node.insert(
+            img,
+            ImageInfo {
+                resource: 1,
+                width: 40,
+                height: 30,
+            },
+        );
+        let out = relayout_with_images(&mut tree, &mut dom, &sheet, Some(&map));
+        assert_eq!(
+            out.kind,
+            RelayoutKind::SubtreeLayout,
+            "reason: {}",
+            out.reason
+        );
+        let img_box = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom == Some(img))
+            .expect("img box");
+        assert!(
+            (img_box.width - 40.0).abs() < 0.001,
+            "img width: {}",
+            img_box.width
+        );
+        assert!(
+            (img_box.height - 30.0).abs() < 0.001,
+            "img height: {}",
+            img_box.height
+        );
+        assert_same_geometry(&tree, &cold_with_images(&dom, &sheet, &map));
+    }
+
+    #[test]
+    fn incremental_background_arrival_forces_full_rebuild() {
+        // Stage 12 Rec 5: a background-image arrival cannot name
+        // its nodes (the map is keyed by URL), so it forces the
+        // full rebuild — same as before Rec 5 — and the fresh
+        // resource id lands on the box.
+        let (mut dom, sheet, mut tree) = build(
+            r#"<div class="box"><p>hi</p></div>"#,
+            ".box { width: 300px; height: 200px; background-image: url(bg.png); background-size: cover; }",
+        );
+        let mut map = ImageMap::new();
+        map.backgrounds.insert(
+            "bg.png".to_string(),
+            ImageInfo {
+                resource: 9,
+                width: 800,
+                height: 600,
+            },
+        );
+        let out = relayout_with_images(&mut tree, &mut dom, &sheet, Some(&map));
+        assert_eq!(
+            out.kind,
+            RelayoutKind::FullLayout,
+            "reason: {}",
+            out.reason
+        );
+        let div = box_for(&tree, &dom, "div");
+        assert_eq!(div.background_image, Some(9));
+        assert_eq!(div.background_image_size, Some((800, 600)));
+        assert_same_geometry(&tree, &cold_with_images(&dom, &sheet, &map));
+    }
+
+    #[test]
     fn incremental_attribute_change_paint_only() {
         let (mut dom, sheet, mut tree) = build(
             r#"<div class="box"><p>hi</p></div>"#,
@@ -2039,6 +2488,7 @@ mod tests {
                 VIEWPORT.0,
                 VIEWPORT.1,
                 &ElementState::default(),
+                None,
             )
             .expect("relayout works");
         assert_eq!(out.kind, RelayoutKind::NothingToDo);
