@@ -617,6 +617,15 @@ pub struct ElementState {
     /// sees a URL, only element ids, so visited-ness cannot leak
     /// through a layout-dependent query).
     pub visited: HashSet<DomId>,
+    /// Form pseudo-class projections (Stage 13 Rec 8): the worker
+    /// projects the `Dom` form state onto element ids before each
+    /// style pass, exactly like `:visited` — the matcher never
+    /// reads a control's value itself.
+    pub invalid: HashSet<DomId>,
+    pub required: HashSet<DomId>,
+    pub disabled: HashSet<DomId>,
+    pub checked: HashSet<DomId>,
+    pub read_only: HashSet<DomId>,
 }
 
 impl ElementState {
@@ -637,6 +646,31 @@ impl ElementState {
 
     pub fn with_visited(mut self, id: DomId) -> Self {
         self.visited.insert(id);
+        self
+    }
+
+    pub fn with_invalid(mut self, id: DomId) -> Self {
+        self.invalid.insert(id);
+        self
+    }
+
+    pub fn with_required(mut self, id: DomId) -> Self {
+        self.required.insert(id);
+        self
+    }
+
+    pub fn with_disabled(mut self, id: DomId) -> Self {
+        self.disabled.insert(id);
+        self
+    }
+
+    pub fn with_checked(mut self, id: DomId) -> Self {
+        self.checked.insert(id);
+        self
+    }
+
+    pub fn with_read_only(mut self, id: DomId) -> Self {
+        self.read_only.insert(id);
         self
     }
 }
@@ -1580,6 +1614,57 @@ impl<'a, 't> Builder<'a, 't> {
             );
             return Some(node);
         }
+        // Form controls (Stage 13 Rec 4): a control's leaf shows
+        // its LIVE value from the `Dom` form state, not its static
+        // children — typing must repaint, and a `<select>` paints
+        // only the selected option's text (the generic inline path
+        // below would concatenate every option). Value-driven
+        // damage clears the taffy cache on the node via the
+        // renderer's dirty set (trap 18, Stage 12 Rec 4/6): the
+        // leaf is rebuilt from the `Dom` on every dirty re-layout,
+        // so a stale measurement can never survive a value change.
+        if tag == "select" {
+            let options = self.dom.select_options(id);
+            let idx = self.dom.form_selected_index(id).unwrap_or(-1);
+            let text = if idx >= 0 && (idx as usize) < options.len() {
+                let opt = options[idx as usize];
+                self.dom
+                    .descendant_text(opt)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                String::new()
+            };
+            return Some(self.control_text_leaf(id, style, &text));
+        }
+        if tag == "textarea" {
+            let text = self.dom.form_value(id).unwrap_or_default();
+            return Some(self.control_text_leaf(id, style, &text));
+        }
+        if tag == "input" {
+            let ty = self.dom.input_type(id);
+            match ty.as_str() {
+                "checkbox" | "radio" | "hidden" | "submit" | "button" | "reset"
+                | "image" | "file" => {}
+                "password" => {
+                    let len = self.dom.form_value(id).map(|v| v.chars().count()).unwrap_or(0);
+                    let masked = "\u{2022}".repeat(len);
+                    return Some(self.control_text_leaf(id, style, &masked));
+                }
+                _ => {
+                    let mut text = self.dom.form_value(id).unwrap_or_default();
+                    if text.is_empty() {
+                        text = self
+                            .dom
+                            .attr(id, "placeholder")
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                    return Some(self.control_text_leaf(id, style, &text));
+                }
+            }
+        }
         let mut spans: Vec<TextSpan> = Vec::new();
         let mut out: Vec<TaffyId> = Vec::new();
         self.append_inline(id, style, style, &mut spans, &mut out);
@@ -1626,6 +1711,52 @@ impl<'a, 't> Builder<'a, 't> {
         );
         self.leaves.push(node);
         Some(node)
+    }
+
+    /// One text leaf for a form control (Stage 13 Rec 4): the
+    /// control's live value (or the selected option's text, or the
+    /// placeholder) as a single span. Empty text still makes a
+    /// leaf — the UA sheet gives the control its intrinsic size
+    /// (min-width / border), so an unstyled `<input>` is a visible
+    /// box, not a ~2px sliver.
+    fn control_text_leaf(
+        &mut self,
+        id: DomId,
+        style: &ComputedStyle,
+        text: &str,
+    ) -> TaffyId {
+        let leaf = if text.is_empty() {
+            None
+        } else {
+            Some(LeafText {
+                spans: vec![TextSpan {
+                    text: text.to_string(),
+                    color: style.color,
+                    bold: style.bold,
+                }],
+                font_size: style.font_size,
+                line_height: style.line_height,
+                shaped: None,
+            })
+        };
+        let has_text = leaf.is_some();
+        let node = self
+            .taffy
+            .new_leaf_with_context(to_taffy_style(style, self.viewport), leaf.clone())
+            .expect("taffy insert cannot fail");
+        self.meta.insert(
+            node,
+            BoxMeta {
+                dom: Some(id),
+                style: style.clone(),
+                children: Vec::new(),
+                text: leaf,
+            },
+        );
+        if has_text {
+            self.leaves.push(node);
+        }
+        node
     }
 
     /// Turn accumulated inline spans into a taffy text leaf (an
@@ -2790,6 +2921,12 @@ fn match_simple(
     }
 }
 
+/// Whether `id` is a control `:valid` / `:optional` can apply
+/// to (Stage 13 Rec 8): inputs, textareas, selects, and buttons.
+fn is_form_control(dom: &Dom, id: DomId) -> bool {
+    matches!(dom.tag(id), Some("input" | "textarea" | "select" | "button"))
+}
+
 fn match_pseudo_class(
     dom: &Dom,
     id: DomId,
@@ -2893,6 +3030,26 @@ fn match_pseudo_class(
         PseudoClass::Hover => state.hover.contains(&id),
         PseudoClass::Active => state.active.contains(&id),
         PseudoClass::Focus | PseudoClass::FocusVisible => state.focus.contains(&id),
+        // Form pseudo-classes (Stage 13 Rec 8). `:valid` is the
+        // complement of `:invalid` for controls that can validate
+        // (anything in either set is a form control); `:optional`
+        // is the complement of `:required` on the same terms.
+        // `:read-only` is the complement of editable: text
+        // controls without `readonly` are NOT `:read-only` — the
+        // projection only flags genuinely read-only controls, so
+        // the matcher treats "not in the set" as read-only only
+        // for controls (see `is_form_control` below).
+        PseudoClass::Valid => {
+            is_form_control(dom, id) && !state.invalid.contains(&id)
+        }
+        PseudoClass::Invalid => state.invalid.contains(&id),
+        PseudoClass::Required => state.required.contains(&id),
+        PseudoClass::Optional => {
+            is_form_control(dom, id) && !state.required.contains(&id)
+        }
+        PseudoClass::Disabled => state.disabled.contains(&id),
+        PseudoClass::Checked => state.checked.contains(&id),
+        PseudoClass::ReadOnly => state.read_only.contains(&id),
         PseudoClass::FocusWithin => {
             if state.focus.contains(&id) {
                 return true;
@@ -2932,6 +3089,16 @@ fn flags_for_selector(sel: &Selector) -> SelectorFlags {
                         | PseudoClass::Focus
                         | PseudoClass::FocusVisible
                         | PseudoClass::FocusWithin
+                        // Form pseudo-classes (Stage 13 Rec 8) are
+                        // dynamic too: validity / required-ness /
+                        // checked-ness change as the user types.
+                        | PseudoClass::Valid
+                        | PseudoClass::Invalid
+                        | PseudoClass::Required
+                        | PseudoClass::Optional
+                        | PseudoClass::Disabled
+                        | PseudoClass::Checked
+                        | PseudoClass::ReadOnly
                 ) {
                     flags.has_dynamic_pseudo = true;
                 }

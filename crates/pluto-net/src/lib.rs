@@ -347,6 +347,14 @@ impl ResourceLoader {
         self.scheduler.hsts_store()
     }
 
+    /// The shared cookie jar this loader's scheduler consults
+    /// (Stage 13 Rec 9). `pluto-browser` loads it from
+    /// `cookies.json` at startup and saves it back after
+    /// navigations (session cookies stripped before the save).
+    pub fn cookie_jar(&self) -> Arc<std::sync::Mutex<CookieJar>> {
+        self.scheduler.jar()
+    }
+
     /// Replace this loader's HSTS store contents (profile load).
     pub fn set_hsts_store(&self, store: HstsStore) {
         *self.scheduler.hsts_store().lock().unwrap() = store;
@@ -616,6 +624,7 @@ mod tests {
             top_level_site: base.clone(),
             upgrade_insecure_requests: false,
             integrity: None,
+            body: None,
         };
         let mut events = loader.fetch_stream(request, CancellationToken::new()).await;
         let mut saw_headers = false;
@@ -658,6 +667,7 @@ mod tests {
             top_level_site: base.clone(),
             upgrade_insecure_requests: false,
             integrity: None,
+            body: None,
         };
         let mut rx1 = loader
             .fetch_stream(request.clone(), CancellationToken::new())
@@ -759,6 +769,7 @@ mod tests {
             top_level_site: base.clone(),
             upgrade_insecure_requests: false,
             integrity: None,
+            body: None,
         };
         let response = loader
             .fetch_with_progress(request, CancellationToken::new(), move |received, total| {

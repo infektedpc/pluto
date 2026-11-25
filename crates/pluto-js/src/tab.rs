@@ -343,6 +343,78 @@ impl TabJs {
         );
     }
 
+    /// Dispatch a typed external event synchronously and report
+    /// whether its default action was NOT prevented (Stage 13 Rec
+    /// 2/7): the renderer calls this from its input path — a
+    /// `keydown` listener's `preventDefault()` must suppress the
+    /// following `input` / insertion, and a `submit` listener's
+    /// `preventDefault()` must block the navigation — so the
+    /// answer has to come back inline, not through the queued
+    /// `dispatch_typed_event`. Runs the listeners on the calling
+    /// thread (the tab thread), exactly like the loop task would.
+    pub fn dispatch_typed_event_sync(
+        &mut self,
+        target: DomKey,
+        event_type: &str,
+        bubbles: bool,
+        kind: TypedEventKind,
+    ) -> Result<bool, JsError> {
+        let bindings = Rc::clone(&self.bindings);
+        let event_type = event_type.to_string();
+        self.realm
+            .with_ctx(|ctx| {
+                crate::bindings::events::dispatch_typed_external_bool(
+                    &ctx, &bindings, target, &event_type, bubbles, &kind,
+                )
+                .map_err(|e| e.to_string())
+            })
+            .map_err(JsError::Internal)
+    }
+
+    /// Dispatch a plain external event synchronously, reporting
+    /// whether its default action was NOT prevented (Stage 13 Rec
+    /// 7: cancelable `submit` / `reset` events from the renderer).
+    pub fn dispatch_event_sync(
+        &mut self,
+        target: DomKey,
+        event_type: &str,
+        bubbles: bool,
+    ) -> Result<bool, JsError> {
+        let bindings = Rc::clone(&self.bindings);
+        let event_type = event_type.to_string();
+        self.realm
+            .with_ctx(|ctx| {
+                crate::bindings::events::dispatch_external_bool(
+                    &ctx, &bindings, target, &event_type, bubbles,
+                )
+                .map_err(|e| e.to_string())
+            })
+            .map_err(JsError::Internal)
+    }
+
+    /// Dispatch a `storage` event to the window (Stage 13 Rec
+    /// 10d): called by the tab thread when another tab mutated
+    /// the shared store for this document's origin. Never to the
+    /// mutating tab itself — the caller filters by tab id.
+    pub fn dispatch_storage_event(
+        &mut self,
+        key: Option<&str>,
+        old_value: Option<&str>,
+        new_value: Option<&str>,
+        url: &str,
+    ) -> Result<(), JsError> {
+        let bindings = Rc::clone(&self.bindings);
+        let url = url.to_string();
+        self.realm
+            .with_ctx(|ctx| {
+                crate::bindings::events::dispatch_storage_event(
+                    &ctx, &bindings, key, old_value, new_value, &url,
+                )
+                .map_err(|e| e.to_string())
+            })
+            .map_err(JsError::Internal)
+    }
+
     /// Run a typed external-event dispatch now (inside a loop task).
     pub(crate) fn dispatch_typed_event_now(
         &mut self,

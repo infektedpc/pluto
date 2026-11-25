@@ -107,8 +107,12 @@ during bootstrap, verified against the actual sources:
   restyle, the binding batch (`location`, `URL`, `dataset`,
   `cloneNode`, typed events, fetch surface, `onerror`, console),
   and the production shell wiring for all of it.
-- **M5 — next.** Forms, cookies + storage on disk, multi-process
-  sandboxing (research underway).
+- **M5 — done.** Forms, cookies + storage on disk, multi-process
+  sandboxing: form state + real key/input dispatch, focus model,
+  text editing with caret, the value/state JS APIs, submission +
+  FormData, constraint validation, persisted cookies, one shared
+  storage store across tabs, fetch behind a broker, fail-closed
+  sandbox with watchdog + sad tab.
 
-Full workspace suite: 816 tests, all passing. See `ARCHITECTURE.md`
+Full workspace suite: 845 tests, all passing. See `ARCHITECTURE.md`
 for the full M1–M12 roadmap.

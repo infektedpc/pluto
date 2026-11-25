@@ -4203,6 +4203,7 @@ version = "0.1.0"
 dependencies = [
  "pluto-html",
  "pluto-ipc",
+ "regex",
  "rquickjs",
  "sha2",
  "thiserror 2.0.21",

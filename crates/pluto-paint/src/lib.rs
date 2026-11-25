@@ -137,6 +137,28 @@ pub enum DisplayItem {
     },
     /// Pop the most recent `PushClip`.
     PopClip,
+    /// The text caret of the focused editable control (Stage 13
+    /// Rec 4): a 2px vertical bar at `x`, spanning the line height
+    /// from `y`. The renderer draws it as a solid rect; the worker
+    /// blinks it by omitting the item on alternate ~530 ms ticks.
+    /// `color` is the control's text color.
+    Caret {
+        x: f32,
+        y: f32,
+        height: f32,
+        color: [f32; 4],
+    },
+    /// The text-selection highlight of the focused editable
+    /// control (Stage 13 Rec 4): one rect per selected line run
+    /// (single-line controls emit one). Painted under the glyphs,
+    /// above the background.
+    SelectionRect {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: [f32; 4],
+    },
 }
 
 impl DisplayItem {
@@ -183,7 +205,15 @@ impl DisplayItem {
                 width,
                 height,
                 ..
+            }
+            | DisplayItem::SelectionRect {
+                x,
+                y,
+                width,
+                height,
+                ..
             } => Some([*x, *y, *width, *height]),
+            DisplayItem::Caret { x, y, height, .. } => Some([*x, *y, 2.0, *height]),
             DisplayItem::BoxShadow {
                 x,
                 y,
@@ -603,6 +633,38 @@ impl DisplayList {
                     }
                 }
                 DisplayItem::PopClip => {}
+                DisplayItem::Caret {
+                    x,
+                    y,
+                    height,
+                    color,
+                } => {
+                    check_coord(*x)?;
+                    check_coord(*y)?;
+                    check_size(*height)?;
+                    for c in color {
+                        if !c.is_finite() || !(0.0..=1.0).contains(c) {
+                            return Err(ValidationError::BadColor(*c));
+                        }
+                    }
+                }
+                DisplayItem::SelectionRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                    color,
+                } => {
+                    check_coord(*x)?;
+                    check_coord(*y)?;
+                    check_size(*width)?;
+                    check_size(*height)?;
+                    for c in color {
+                        if !c.is_finite() || !(0.0..=1.0).contains(c) {
+                            return Err(ValidationError::BadColor(*c));
+                        }
+                    }
+                }
             }
         }
         Ok(())

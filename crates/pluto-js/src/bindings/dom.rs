@@ -248,7 +248,7 @@ pub fn install_prototypes<'js>(
 }
 
 /// Helper: define a method on a prototype object.
-fn def_method<'js>(
+pub(crate) fn def_method<'js>(
     _ctx: &Ctx<'js>,
     proto: &Object<'js>,
     name: &str,
@@ -260,7 +260,7 @@ fn def_method<'js>(
 }
 
 /// Helper: define an accessor on a prototype object.
-fn def_accessor<'js, G, S>(
+pub(crate) fn def_accessor<'js, G, S>(
     ctx: &Ctx<'js>,
     proto: &Object<'js>,
     name: &str,
@@ -286,7 +286,7 @@ where
 }
 
 /// A getter-only accessor.
-fn def_getter<'js, G>(
+pub(crate) fn def_getter<'js, G>(
     ctx: &Ctx<'js>,
     proto: &Object<'js>,
     name: &str,
@@ -513,7 +513,7 @@ fn node_arg<'js>(
 /// Build a JS `Array` of wrappers for `keys` (a fresh snapshot per
 /// access — M4 `getElementsBy*` / `querySelectorAll` collections
 /// are not live `HTMLCollection`s; see the binding notes).
-fn elements_array<'js>(
+pub(crate) fn elements_array<'js>(
     ctx: &Ctx<'js>,
     state: &Rc<RefCell<BindingState>>,
     keys: Vec<DomKey>,
@@ -1026,6 +1026,9 @@ fn install_element_methods<'js>(
     )
     .map_err(|e| format!("getElementsByName: {e}"))?;
     def_method(ctx, element, "getElementsByName", by_name)?;
+
+    // Form element APIs + validation + FormData (Stage 13 Rec 5/7/8).
+    crate::bindings::forms::install_form_methods(ctx, bindings, element)?;
     Ok(())
 }
 
@@ -1997,6 +2000,55 @@ fn install_document_methods<'js>(
         };
         elements_array(&ctx, &b, host.borrow().query_selector_all(scope, "img"))
     })?;
+
+    // document.forms: the `<form>` elements in document order.
+    let b = Rc::clone(bindings);
+    def_getter(ctx, document, "forms", move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+        let _ = dom_key_of_this(&ctx, &b, &this)?;
+        let host = match host_of(&b) {
+            Ok(h) => h,
+            Err(_) => return Ok(Value::from(Array::new(ctx.clone())?)),
+        };
+        elements_array(&ctx, &b, host.borrow().document_forms())
+    })?;
+
+    // document.activeElement: the focused element, or `<body>`
+    // when nothing is focused (null when there is no body yet).
+    let b = Rc::clone(bindings);
+    def_getter(ctx, document, "activeElement", move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+        let _ = dom_key_of_this(&ctx, &b, &this)?;
+        let host = match host_of(&b) {
+            Ok(h) => h,
+            Err(_) => return Ok(js_null(&ctx)),
+        };
+        let host = host.borrow();
+        match host.active_element().or_else(|| host.body()) {
+            Some(key) => Ok(Value::from(wrap_node(&ctx, &b, key)?)),
+            None => Ok(js_null(&ctx)),
+        }
+    })?;
+
+    // document.cookie (Stage 13 Rec 10c): non-HttpOnly cookies
+    // for the document origin; writes go through the jar's
+    // `store_set_cookie` semantics in the host.
+    let b = Rc::clone(bindings);
+    let get_cookie = move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+        let _ = dom_key_of_this(&ctx, &b, &this)?;
+        let host = match host_of(&b) {
+            Ok(h) => h,
+            Err(_) => return Ok(js(&ctx, "")),
+        };
+        Ok(js(&ctx, host.borrow().document_cookie().unwrap_or_default()))
+    };
+    let b = Rc::clone(bindings);
+    let set_cookie = move |ctx: Ctx<'js>, This(this): This<Object<'js>>, value: Value<'js>| -> rquickjs::Result<()> {
+        let _ = dom_key_of_this(&ctx, &b, &this)?;
+        let text = to_dom_string(&ctx, &value)?;
+        let host = host_of(&b).map_err(|e| throw_type_error(&ctx, &e))?;
+        host.borrow_mut().set_document_cookie(&text);
+        Ok(())
+    };
+    def_accessor(ctx, document, "cookie", get_cookie, set_cookie)?;
 
     // createElement / createTextNode.
     let b = Rc::clone(bindings);

@@ -216,7 +216,8 @@ Go pressed
   command channel for ~500 ms. Deferred, each with a one-line
   `TODO(stage)` at its hook point: full WebIDL/codegen (M5),
   workers (M5), Shadow DOM (M5), import maps (M5), storage APIs
-  (M5), full fetch/CORS (M5), CSP (M10). (IntersectionObserver
+  (M5 — landed in Stage 13: shared localStorage, `document.cookie`,
+  storage events, `navigator.storage.estimate()`), full fetch/CORS (M5), CSP (M10). (IntersectionObserver
   was deferred here too — it landed as Stage 8 Rec 10, see the
   entry below.)
 - Stage 8 application (rendering pipeline, applied 2026-11-24, all
@@ -450,16 +451,12 @@ Goal: client-side JS that reads and modifies the live page.
   `undefined` — it does not survive the realm boundary). Console
   (Rec 10) extends to `trace` / `assert` / `count` / `time` /
   `dir` / `table` / `group`, all landing in `console_lines` and
-  tracing. Shell-side wiring still owed after Stage 12 (the
-  production host does not yet override the new defaulted
-  `DomHost` methods — `document_url`, `request_navigation`,
-  `attribute_names`, `clone_node`, `request_image` — so in
-  production `location` reads `about:blank`, `cloneNode` returns
-  `null`, `dataset` reads/writes nothing, and `Image().src` never
-  loads; the renderer still dispatches plain `click` where it
-  should call `dispatch_typed_event` for keyboard/mouse/input;
-  and the `ImageStore` must call `notify_image_loaded` /
-  `notify_image_failed` when a JS-created image resolves).
+  tracing. Built — wiring follow-up (`d5ecc741`, Stage 12): the
+  production host now overrides the `DomHost` methods above
+  (`location` reads the real URL, `cloneNode` round-trips,
+  `dataset` reads/writes live attributes, `Image().src` loads
+  with onload/onerror), typed events carry clientX/Y + key, and
+  the `ImageStore` notifies on JS-created image resolve/fail.
   Deferred: dirty-subtree re-layout is still not the path for
   image arrivals that change a background; per-tab history is still
   single-file.
@@ -467,6 +464,35 @@ Goal: client-side JS that reads and modifies the live page.
 ### Milestone 5: HTML Forms, Storage & Process Isolation
 
 Goal: log into websites, persistent state, crash-safe tab isolation.
+
+**Built — Stage 13 (2026-11-25):** form state model in `pluto-html`
+(value/checked/selectedIndex + dirty flags, seeded at parse, reset
+restores defaults); production key/input dispatch with
+`preventDefault()` suppression; focus model (pointer-down moves
+focus first, `tabindex` ordering, disabled excluded); text editing
+with caret + selection paint and UA intrinsic sizing for unstyled
+controls; value/state JS APIs + `FormData` + cancelable
+submit/reset events; constraint validation + `:valid`/`:invalid`/
+`:required`/`:optional`/`:disabled`/`:checked`/`:read-only`;
+button semantics + submission through the existing loader (GET/POST,
+three encodings, Stage 9 gates); cookie jar persisted to
+`cookies.json` (session cookies stripped before the first save,
+expired pruned, sequences re-based); one shared localStorage store
+across tabs with a global cap, debounced saves, `document.cookie`,
+storage events, `navigator.storage.estimate()`; fetch moved
+browser-side behind the `NetworkBroker` (renderer holds no sockets
+in broker mode — proven by a no-socket seccomp test loading a real
+page); fail-closed sandbox reporting (`SandboxReport` over IPC),
+bridge watchdog (heartbeat + 30 s silence → kill + `RendererCrashed`),
+sad tab (`about:crashed` page, Reload re-navigates, 3-crashes-in-60 s
+restart policy), and the in-process fallback gated behind
+`PLUTO_ALLOW_INPROCESS_FALLBACK=1`. IPC `PROTOCOL_VERSION` 7.
+Deferred from the Stage 13 research: storage backends still live in
+the renderer (localStorage/sessionStorage writes land in the chroot
+tmpfs in broker mode — moving them behind IPC needs a sync-over-IPC
+redesign of the `DomHost` storage trait); broker-mode progress is a
+single end-of-fetch report; `<meta name="referrer">` policy updates
+are not yet threaded over IPC.
 
 - **Forms & input controls**: `<input>`, `<textarea>`, `<button>`,
   `<form>` submission (GET/POST), text cursor caret rendering,

@@ -13,3 +13,4 @@ pluto-html.workspace = true
 pluto-ipc.workspace = true
 sha2.workspace = true
 url.workspace = true
+regex = "1"

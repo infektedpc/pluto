@@ -56,19 +56,54 @@ async fn spawned_renderer_child_exchanges_messages_headless() {
         })
         .await
         .expect("navigation sends");
+    // Stage 13 Rec 12a: the child reports its sandbox layers
+    // before the first navigation — drain that report (and any
+    // heartbeat) and assert it names the load-bearing layers.
+    let mut saw_report = false;
+    let bytes = loop {
+        let msg = tokio::time::timeout(Duration::from_secs(20), renderer.recv())
+            .await
+            .expect("reply arrives in time")
+            .expect("recv succeeds")
+            .expect("a message arrives");
+        match msg {
+            RendererToBrowser::SandboxReport { layers } => {
+                for name in ["user-namespace", "chroot", "seccomp"] {
+                    assert!(
+                        layers.iter().any(|(n, _)| n == name),
+                        "sandbox report names {name}: {layers:?}"
+                    );
+                }
+                saw_report = true;
+            }
+            RendererToBrowser::SubmitDisplayList { bytes, .. } => break bytes,
+            RendererToBrowser::Heartbeat => {}
+            RendererToBrowser::RequestResource(request) => {
+                // `about:blank` has no fetch: the broker answers
+                // it with an Error (`invalid_url`) and the worker
+                // renders the error page. The test plays the
+                // broker's part for this one request — the real
+                // broker path is proven by the no-socket test.
+                assert_eq!(request.url, "about:blank", "only the blank page is asked");
+                renderer
+                    .send(&BrowserToRenderer::ResourceEvent(
+                        pluto_ipc::ResourceEvent::Error {
+                            request_id: request.request_id,
+                            code: "invalid_url".to_string(),
+                            reason: "non-http(s) scheme".to_string(),
+                        },
+                    ))
+                    .await
+                    .expect("error event sends");
+            }
+            other => panic!("expected SubmitDisplayList, got {other:?}"),
+        }
+    };
+    assert!(saw_report, "sandbox report arrived before the first list");
     // The error page arrives as a display list first, then the
     // reason for the status line. A `TitleChanged` for the error
     // page's title may interleave between the two (the worker
     // coalesces it onto the submit) — skip it here.
-    let first = tokio::time::timeout(Duration::from_secs(20), renderer.recv())
-        .await
-        .expect("first reply arrives in time")
-        .expect("recv succeeds")
-        .expect("a message arrives");
-    let bytes = match first {
-        RendererToBrowser::SubmitDisplayList { bytes, .. } => bytes,
-        other => panic!("expected SubmitDisplayList first, got {other:?}"),
-    };
     let list = DisplayList::from_bytes(&bytes).expect("list bytes decode");
     assert!(!list.is_empty(), "error page still paints");
     let mut second;
@@ -173,17 +208,44 @@ async fn sandboxed_renderer_exchange_under_trap_diagnostics() {
         })
         .await
         .expect("navigation sends");
-    let first = tokio::time::timeout(Duration::from_secs(20), renderer.recv())
-        .await
-        .expect("first reply arrives in time")
-        .expect("recv succeeds")
-        .expect("a message arrives");
-    match first {
-        RendererToBrowser::SubmitDisplayList { bytes, .. } => {
-            let list = DisplayList::from_bytes(&bytes).expect("list bytes decode");
-            assert!(!list.is_empty(), "error page still paints under the sandbox");
+    // Stage 13 Rec 12a: the sandbox report precedes the list.
+    let bytes = loop {
+        let msg = tokio::time::timeout(Duration::from_secs(20), renderer.recv())
+            .await
+            .expect("reply arrives in time")
+            .expect("recv succeeds")
+            .expect("a message arrives");
+        match msg {
+            RendererToBrowser::SandboxReport { layers } => {
+                assert!(
+                    layers.iter().any(|(n, ok)| n == "seccomp" && *ok),
+                    "seccomp landed under the trap filter: {layers:?}"
+                );
+            }
+            RendererToBrowser::SubmitDisplayList { bytes, .. } => break bytes,
+            RendererToBrowser::Heartbeat => {}
+            RendererToBrowser::RequestResource(request) => {
+                // `about:blank` has no fetch: the broker answers
+                // it with an Error (`invalid_url`) and the worker
+                // renders the error page (see the headless test).
+                assert_eq!(request.url, "about:blank", "only the blank page is asked");
+                renderer
+                    .send(&BrowserToRenderer::ResourceEvent(
+                        pluto_ipc::ResourceEvent::Error {
+                            request_id: request.request_id,
+                            code: "invalid_url".to_string(),
+                            reason: "non-http(s) scheme".to_string(),
+                        },
+                    ))
+                    .await
+                    .expect("error event sends");
+            }
+            other => panic!("expected SubmitDisplayList, got {other:?}"),
         }
-        other => panic!("expected SubmitDisplayList first, got {other:?}"),
+    };
+    {
+        let list = DisplayList::from_bytes(&bytes).expect("list bytes decode");
+        assert!(!list.is_empty(), "error page still paints under the sandbox");
     }
     assert!(renderer.is_alive(), "child stays alive after the exchange");
     assert_eq!(
@@ -231,5 +293,149 @@ async fn no_sandbox_env_hatch_spawns_working_renderer() {
         renderer.close().await,
         Closed::Clean,
         "an unsandboxed renderer exits cleanly on Shutdown"
+    );
+}
+
+/// Stage 13 Rec 11: a renderer with `socket`/`connect` removed
+/// from its seccomp allow-list still loads a real HTTP page
+/// end-to-end — every fetch goes through the browser-side broker
+/// over IPC, so the child never opens a socket itself. If the
+/// child tried a direct fetch, `socket()` would kill it
+/// (KILL_PROCESS) and no `DidCommit` would ever arrive.
+#[tokio::test]
+async fn no_socket_renderer_loads_real_page_via_broker() {
+    use pluto_browser::broker::NetworkBroker;
+    use pluto_browser::renderer_process::TEST_NO_SOCKET_ENV;
+    use pluto_net::ResourceLoader;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // A tiny local HTTP server: every path serves the same page.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test server binds");
+    let port = listener.local_addr().expect("listener addr").port();
+    let body = "<!doctype html><title>Broker Page</title><h1>Broker Page</h1><p>served through the broker</p>";
+    tokio::task::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let body = body.to_string();
+            tokio::task::spawn(async move {
+                // Read the request headers, then answer.
+                let mut buf = [0u8; 4096];
+                let mut request = Vec::new();
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            request.extend_from_slice(&buf[..n]);
+                            if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    let exe = renderer_exe_for_test();
+    let mut renderer =
+        RendererProcess::spawn_with_env(&exe, &[(TEST_NO_SOCKET_ENV, "1")], 7)
+            .await
+            .expect("no-socket renderer child spawns and handshakes");
+    assert!(renderer.is_alive(), "child is alive after handshake");
+
+    renderer
+        .send(&BrowserToRenderer::Resize {
+            width: 800.0,
+            height: 600.0,
+        })
+        .await
+        .expect("resize sends");
+    renderer
+        .send(&BrowserToRenderer::SetVisible { visible: true })
+        .await
+        .expect("visibility sends");
+    let url = format!("http://127.0.0.1:{port}/");
+    renderer
+        .send(&BrowserToRenderer::CommitNavigation { url: url.clone() })
+        .await
+        .expect("navigation sends");
+
+    // The test process plays the shell's broker role: serve each
+    // RequestResource on the real broker, forward its events to
+    // the child, honour cancellations.
+    let broker = Arc::new(NetworkBroker::new(Arc::new(ResourceLoader::new())));
+    let (broker_tx, mut broker_rx) = tokio::sync::mpsc::channel::<pluto_ipc::ResourceEvent>(64);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut committed = false;
+    let mut saw_glyphs = false;
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no-socket renderer did not load the page in 30 s (committed={committed}, glyphs={saw_glyphs})"
+        );
+        tokio::select! {
+            msg = renderer.recv() => {
+                let Some(msg) = msg.expect("recv succeeds") else {
+                    panic!("renderer closed before the page loaded (committed={committed}, glyphs={saw_glyphs})");
+                };
+                match msg {
+                    RendererToBrowser::RequestResource(request) => {
+                        let broker = Arc::clone(&broker);
+                        let tx = broker_tx.clone();
+                        tokio::task::spawn(async move {
+                            broker.serve(request, tx).await;
+                        });
+                    }
+                    RendererToBrowser::CancelResource { request_id } => {
+                        broker.cancel(request_id);
+                    }
+                    RendererToBrowser::DidCommit { url: committed_url, .. } => {
+                        assert_eq!(committed_url, url, "commit is for the broker-served page");
+                        committed = true;
+                    }
+                    RendererToBrowser::SubmitDisplayList { bytes, .. } => {
+                        let list = DisplayList::from_bytes(&bytes).expect("list bytes decode");
+                        if list.0.iter().any(|item| {
+                            matches!(item, pluto_paint::DisplayItem::Glyphs { glyphs, .. } if !glyphs.is_empty())
+                        }) {
+                            saw_glyphs = true;
+                        }
+                    }
+                    RendererToBrowser::RendererCrashed { reason } => {
+                        panic!("no-socket renderer crashed: {reason}");
+                    }
+                    _ => {}
+                }
+                if committed && saw_glyphs {
+                    break;
+                }
+            }
+            event = broker_rx.recv() => {
+                let Some(event) = event else { continue };
+                renderer
+                    .send(&BrowserToRenderer::ResourceEvent(event))
+                    .await
+                    .expect("ResourceEvent sends");
+            }
+        }
+    }
+    assert!(committed, "DidCommit arrived for the broker-served page");
+    assert!(saw_glyphs, "a display list with glyphs arrived");
+    assert!(renderer.is_alive(), "child survived the broker-mode load");
+    assert_eq!(
+        renderer.close().await,
+        Closed::Clean,
+        "a no-socket renderer exits cleanly on Shutdown"
     );
 }

@@ -187,6 +187,36 @@ pub trait StorageBackend: Send + Sync {
     fn key(&self, kind: StorageKind, key: &StorageKey, index: usize) -> Option<String>;
 
     fn len(&self, kind: StorageKind, key: &StorageKey) -> usize;
+
+    /// Cross-tab `storage` events this backend has not delivered
+    /// yet (Stage 13 Rec 10d): mutations from *other* tabs, in
+    /// order. Defaults to none (the in-memory backend is
+    /// process-shared with no fan-out — every tab already sees
+    /// the same buckets, so there is nothing to deliver).
+    fn drain_storage_events(&self) -> Vec<StorageEventRecord> {
+        Vec::new()
+    }
+
+    /// `(used, quota)` bytes for `navigator.storage.estimate()`
+    /// (Stage 13 Rec 10d). Defaults to the in-memory accounting.
+    fn usage_bytes(&self) -> (u64, u64) {
+        (0, 0)
+    }
+}
+
+/// One cross-tab `storage` event (Stage 13 Rec 10d): the mutated
+/// key + old/new values for one origin. `key: None` means the
+/// whole bucket was cleared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageEventRecord {
+    /// The origin whose bucket changed (serialised URL origin).
+    pub origin: String,
+    /// The mutated key (`None` = whole-bucket `clear()`).
+    pub key: Option<String>,
+    /// The previous value (`None` = key absent).
+    pub old_value: Option<String>,
+    /// The new value (`None` = key removed / bucket cleared).
+    pub new_value: Option<String>,
 }
 
 /// One storage bucket: entries in insertion order (the `key(n)`

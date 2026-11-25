@@ -59,6 +59,13 @@ pub struct TestHost {
     pub document_url: String,
     /// Shared side-effect log (navigation + image requests).
     pub log: Arc<Mutex<TestHostLog>>,
+    /// Custom validity messages set by `setCustomValidity`.
+    pub custom_validity: std::collections::HashMap<DomKey, String>,
+    /// Form submissions queued by `form.submit()` /
+    /// `requestSubmit()` for the (test) renderer to drain.
+    pub pending_form_submits: Vec<(DomKey, Option<DomKey>)>,
+    /// The focused element (`document.activeElement`).
+    pub focused: Option<DomKey>,
 }
 
 impl TestHost {
@@ -78,6 +85,9 @@ impl TestHost {
             geometry_growth: Cell::new(0.0),
             document_url: "https://example.com/".to_string(),
             log,
+            custom_validity: std::collections::HashMap::new(),
+            pending_form_submits: Vec::new(),
+            focused: None,
         }
     }
 
@@ -278,6 +288,177 @@ fn is_void(tag: &str) -> bool {
 impl DomHost for TestHost {
     fn validate(&self, key: DomKey) -> bool {
         self.dom.get(key).is_some()
+    }
+
+    // ---- Stage 13 (M5 forms): delegate to the real `Dom` ----
+    fn is_form_control(&self, key: DomKey) -> bool {
+        self.dom.is_form_control(key)
+    }
+
+    fn input_type(&self, key: DomKey) -> Option<String> {
+        self.dom.get(key).map(|_| self.dom.input_type(key))
+    }
+
+    fn is_disabled(&self, key: DomKey) -> bool {
+        self.dom.is_control_disabled(key)
+    }
+
+    fn form_value(&self, key: DomKey) -> Option<String> {
+        self.dom.form_value(key)
+    }
+
+    fn form_default_value(&self, key: DomKey) -> Option<String> {
+        self.dom.form_default_value(key)
+    }
+
+    fn form_value_dirty(&self, key: DomKey) -> bool {
+        self.dom.form_value_dirty(key)
+    }
+
+    fn set_form_value(&mut self, key: DomKey, value: &str) -> bool {
+        self.dom.set_form_value(key, value)
+    }
+
+    fn form_checked(&self, key: DomKey) -> Option<bool> {
+        self.dom.form_checked(key)
+    }
+
+    fn set_form_checked(&mut self, key: DomKey, checked: bool) -> bool {
+        self.dom.set_form_checked(key, checked)
+    }
+
+    fn form_selected_index(&self, key: DomKey) -> Option<i64> {
+        self.dom.form_selected_index(key)
+    }
+
+    fn set_form_selected_index(&mut self, key: DomKey, index: i64) -> bool {
+        self.dom.set_form_selected_index(key, index)
+    }
+
+    fn form_options(&self, key: DomKey) -> Vec<DomKey> {
+        self.dom.select_options(key)
+    }
+
+    fn form_owner(&self, key: DomKey) -> Option<DomKey> {
+        self.dom.form_owner(key)
+    }
+
+    fn form_controls(&self, key: DomKey) -> Vec<DomKey> {
+        self.dom.form_controls(key)
+    }
+
+    fn document_forms(&self) -> Vec<DomKey> {
+        let Some(root) = self.dom.root() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(n) = stack.pop() {
+            if self.dom.tag(n) == Some("form") {
+                out.push(n);
+            }
+            let mut kids = self.dom.children(n).to_vec();
+            kids.reverse();
+            stack.extend(kids);
+        }
+        // The stack walk above is pre-order only if children are
+        // pushed reversed and popped in order — re-collect in
+        // document order via a recursive walk instead.
+        out.clear();
+        fn walk(dom: &Dom, id: DomKey, out: &mut Vec<DomKey>) {
+            if dom.tag(id) == Some("form") {
+                out.push(id);
+            }
+            for &c in dom.children(id) {
+                walk(dom, c, out);
+            }
+        }
+        walk(&self.dom, root, &mut out);
+        out
+    }
+
+    fn form_entries(&self, key: DomKey, submitter: Option<DomKey>) -> Vec<(String, String)> {
+        self.dom.form_entries(key, submitter)
+    }
+
+    fn reset_form(&mut self, key: DomKey) -> bool {
+        if self.dom.tag(key) != Some("form") {
+            return false;
+        }
+        self.dom.reset_form(key);
+        true
+    }
+
+    fn form_caret(&self, key: DomKey) -> Option<usize> {
+        self.dom.form_caret(key)
+    }
+
+    fn form_selection(&self, key: DomKey) -> Option<(usize, usize)> {
+        self.dom.form_selection(key)
+    }
+
+    fn set_form_selection(&mut self, key: DomKey, start: usize, end: usize) -> bool {
+        self.dom.set_form_selection(key, start, end)
+    }
+
+    fn insert_form_text(&mut self, key: DomKey, text: &str) -> Option<usize> {
+        self.dom.insert_form_text(key, text)
+    }
+
+    fn delete_form_text(&mut self, key: DomKey, backspace: bool) -> Option<usize> {
+        self.dom.delete_form_text(key, backspace)
+    }
+
+    fn custom_validity(&self, key: DomKey) -> Option<String> {
+        self.custom_validity.get(&key).cloned()
+    }
+
+    fn set_custom_validity(&mut self, key: DomKey, message: &str) -> bool {
+        if self.dom.get(key).is_none() {
+            return false;
+        }
+        if message.is_empty() {
+            self.custom_validity.remove(&key);
+        } else {
+            self.custom_validity.insert(key, message.to_string());
+        }
+        true
+    }
+
+    fn active_element(&self) -> Option<DomKey> {
+        self.focused.filter(|&k| self.dom.get(k).is_some())
+    }
+
+    fn focus_element(&mut self, key: DomKey) -> bool {
+        if self.dom.get(key).is_none() || self.dom.is_control_disabled(key) {
+            return false;
+        }
+        let focusable = self.dom.is_form_control(key)
+            || matches!(self.dom.tag(key), Some("button"))
+            || (self.dom.tag(key) == Some("a")
+                && self.dom.attr(key, "href").is_some())
+            || self.dom.attr(key, "tabindex").is_some();
+        if !focusable {
+            return false;
+        }
+        self.focused = Some(key);
+        true
+    }
+
+    fn blur_element(&mut self) {
+        self.focused = None;
+    }
+
+    fn request_form_submit(&mut self, form: DomKey, submitter: Option<DomKey>) -> bool {
+        if self.dom.tag(form) != Some("form") {
+            return false;
+        }
+        self.pending_form_submits.push((form, submitter));
+        true
+    }
+
+    fn take_pending_form_submits(&mut self) -> Vec<(DomKey, Option<DomKey>)> {
+        std::mem::take(&mut self.pending_form_submits)
     }
 
     fn document_node(&self) -> Option<DomKey> {

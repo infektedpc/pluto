@@ -686,6 +686,104 @@ pub fn dispatch_external<'js>(
     Ok(())
 }
 
+/// Like [`dispatch_external`], but returns whether the event's
+/// default action was NOT prevented (`dispatch_to_target`'s bool):
+/// the renderer needs the answer synchronously for `keydown`
+/// (suppress the following `input` / insertion) and `submit`
+/// (block the navigation). Stage 13 Rec 2/7.
+pub fn dispatch_external_bool<'js>(
+    ctx: &Ctx<'js>,
+    state: &Rc<RefCell<BindingState>>,
+    target: DomKey,
+    ty: &str,
+    bubbles: bool,
+) -> rquickjs::Result<bool> {
+    let existing = state.borrow().wrapper_ids.get(&target).copied();
+    let id = match existing {
+        Some(id) => id,
+        None => {
+            let id = mint_wrapper_id(state);
+            state.borrow_mut().wrapper_keys.insert(id, target);
+            state.borrow_mut().wrapper_ids.insert(target, id);
+            id
+        }
+    };
+    let event: Object = ctx.eval::<Object, _>(format!(
+        "new Event({ty:?}, {{ bubbles: {bubbles}, cancelable: true }})"
+    ))?;
+    dispatch_to_target(ctx, state, id, &event, ty)
+}
+
+/// Like [`dispatch_typed_external`], but returns whether the
+/// event's default action was NOT prevented. Stage 13 Rec 2.
+pub fn dispatch_typed_external_bool<'js>(
+    ctx: &Ctx<'js>,
+    state: &Rc<RefCell<BindingState>>,
+    target: DomKey,
+    ty: &str,
+    bubbles: bool,
+    kind: &TypedEventKind,
+) -> rquickjs::Result<bool> {
+    let existing = state.borrow().wrapper_ids.get(&target).copied();
+    let id = match existing {
+        Some(id) => id,
+        None => {
+            let id = mint_wrapper_id(state);
+            state.borrow_mut().wrapper_keys.insert(id, target);
+            state.borrow_mut().wrapper_ids.insert(target, id);
+            id
+        }
+    };
+    let event: Object = match kind {
+        TypedEventKind::Keyboard { key, code } => ctx.eval::<Object, _>(format!(
+            "new KeyboardEvent({ty:?}, {{ bubbles: {bubbles}, cancelable: true, key: {key:?}, code: {code:?} }})"
+        ))?,
+        TypedEventKind::Mouse {
+            client_x,
+            client_y,
+            button,
+        } => ctx.eval::<Object, _>(format!(
+            "new MouseEvent({ty:?}, {{ bubbles: {bubbles}, cancelable: true, clientX: {client_x}, clientY: {client_y}, button: {button} }})"
+        ))?,
+        TypedEventKind::Input { data } => {
+            let data_js = match data {
+                Some(d) => format!("{d:?}"),
+                None => "null".to_string(),
+            };
+            ctx.eval::<Object, _>(format!(
+                "new InputEvent({ty:?}, {{ bubbles: {bubbles}, cancelable: false, data: {data_js} }})"
+            ))?
+        }
+    };
+    dispatch_to_target(ctx, state, id, &event, ty)
+}
+
+/// Dispatch a `storage` event to the window (Stage 13 Rec 10d):
+/// `key` / `oldValue` / `newValue` / `url` as event properties.
+/// `storage` does not bubble and is not cancelable; the event is
+/// constructed as a plain `Event` with the StorageEvent fields
+/// attached (there is no `StorageEvent` constructor in the realm
+/// yet — a dedicated class is Stage 14 work).
+pub fn dispatch_storage_event<'js>(
+    ctx: &Ctx<'js>,
+    state: &Rc<RefCell<BindingState>>,
+    key: Option<&str>,
+    old_value: Option<&str>,
+    new_value: Option<&str>,
+    url: &str,
+) -> rquickjs::Result<()> {
+    let event: Object = ctx.eval::<Object, _>(
+        "new Event('storage', { bubbles: false, cancelable: false })",
+    )?;
+    // `Option<&str>` converts to a JS string or `null`.
+    event.set("key", key)?;
+    event.set("oldValue", old_value)?;
+    event.set("newValue", new_value)?;
+    event.set("url", url)?;
+    dispatch_to_target(ctx, state, WINDOW_TARGET_ID, &event, "storage")?;
+    Ok(())
+}
+
 /// The typed payload of a shell-dispatched event: which `Event`
 /// subclass to construct, and its fields. `TabJs` builds one of
 /// these from the shell's input event; the shell call-site wiring

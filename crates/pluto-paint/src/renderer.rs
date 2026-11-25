@@ -1632,6 +1632,44 @@ impl ImageTextureCache {
 }
 /// Six vertices (two triangles) for one solid rect. Pure: unit-tested.
 fn rect_vertices_for(item: &DisplayItem) -> Vec<RectVertex> {
+    // Caret / selection paint as plain rects (Stage 13 Rec 4):
+    // normalise them to a `FillRect` at this seam so the run
+    // builder below needs no new run kind.
+    let owned;
+    let item = match item {
+        DisplayItem::Caret {
+            x,
+            y,
+            height,
+            color,
+        } => {
+            owned = DisplayItem::FillRect {
+                x: *x,
+                y: *y,
+                width: 2.0,
+                height: *height,
+                color: *color,
+            };
+            &owned
+        }
+        DisplayItem::SelectionRect {
+            x,
+            y,
+            width,
+            height,
+            color,
+        } => {
+            owned = DisplayItem::FillRect {
+                x: *x,
+                y: *y,
+                width: *width,
+                height: *height,
+                color: *color,
+            };
+            &owned
+        }
+        other => other,
+    };
     let DisplayItem::FillRect {
         x,
         y,
@@ -2885,7 +2923,9 @@ impl PaintRenderer {
                 continue;
             }
             match item {
-                DisplayItem::FillRect { .. } => {
+                DisplayItem::FillRect { .. }
+                | DisplayItem::Caret { .. }
+                | DisplayItem::SelectionRect { .. } => {
                     has_content = true;
                     let first = rect_vertices.len() as u32;
                     let verts = rect_vertices_for(item);

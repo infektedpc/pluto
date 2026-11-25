@@ -62,6 +62,7 @@
 
 pub mod dom;
 pub mod events;
+pub mod forms;
 pub mod fetch;
 pub mod observers;
 pub mod permissions;
@@ -580,6 +581,7 @@ fn install_bindings_in<'js>(
     dom::install_dataset_helpers(&ctx, bindings)
         .map_err(|e| format!("install dataset helpers: {e}"))?;
     fetch::install_fetch(&ctx, state, bindings, fetch_tx).map_err(|e| format!("install fetch: {e}"))?;
+    forms::install_form_data(&ctx, bindings).map_err(|e| format!("install FormData: {e}"))?;
     storage::install_storage(&ctx, bindings).map_err(|e| format!("install storage: {e}"))?;
     permissions::install_permissions(&ctx, bindings).map_err(|e| format!("install permissions: {e}"))?;
     observers::install_observers(&ctx, bindings).map_err(|e| format!("install observers: {e}"))?;

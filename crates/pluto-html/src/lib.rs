@@ -72,7 +72,7 @@ pub mod scripts;
 pub mod streaming;
 pub mod tokenizer;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use builder::ParseOutput;
 use slotmap::{SlotMap, new_key_type};
@@ -258,6 +258,50 @@ impl DirtySet {
     }
 }
 
+/// Live state of one form control (Stage 13 Rec 1, M5 forms).
+///
+/// The DOM is the single source of truth for control state: the
+/// parser seeds the *defaults* from attributes / RCDATA text /
+/// the `selected` rule, typing and script mutate the *live*
+/// value, and `reset()` restores the live value from the seeded
+/// defaults (never by re-parsing). The dirty flags are the
+/// value/attribute split: once the user (or script, via the
+/// `.value` IDL setter) has typed a value, `setAttribute('value',
+/// …)` changes only the default — the typed value survives.
+/// `Dom` is `Send + Sync` (see the module docs): this struct
+/// holds only plain owned data, so that invariant is untouched.
+#[derive(Debug, Clone, Default)]
+pub struct FormControlState {
+    /// Live value (input / textarea / select's selected option).
+    pub value: String,
+    /// Value the control had at parse time (the `value` attribute,
+    /// textarea RCDATA text, or the selected option's value).
+    pub default_value: String,
+    /// True once the live value was set by typing or the IDL
+    /// `.value` setter — after that, attribute writes only move
+    /// the default.
+    pub value_dirty: bool,
+    /// Live checkedness (checkbox / radio).
+    pub checked: bool,
+    /// Checkedness at parse time (presence of `checked`).
+    pub default_checked: bool,
+    /// True once checkedness was set by click or the IDL
+    /// `.checked` setter.
+    pub checked_dirty: bool,
+    /// Index into the select's options in tree order, `-1` when
+    /// the select has no options.
+    pub selected_index: i64,
+    /// Selected index at parse time (last `selected` wins, else
+    /// the first option).
+    pub default_selected_index: i64,
+    /// Caret offset in chars within `value` (text controls).
+    pub caret: usize,
+    /// Selection range within `value`, `[selection_start,
+    /// selection_end)`; collapsed at the caret when equal.
+    pub selection_start: usize,
+    pub selection_end: usize,
+}
+
 /// The arena-allocated DOM tree for one document.
 #[derive(Debug, Clone, Default)]
 pub struct Dom {
@@ -276,6 +320,11 @@ pub struct Dom {
     /// when the builder finishes; JS-driven mutations always
     /// record. This flag is internal state, not a public toggle.
     suppress_records: bool,
+    /// Live form-control state, keyed by node. Seeded lazily on
+    /// first access from the node's attributes / children (Stage
+    /// 13 Rec 1), so controls created by the parser, by
+    /// `createElement`, or by cloning all share one seeding path.
+    form_states: HashMap<NodeId, FormControlState>,
 }
 
 impl Dom {
@@ -815,6 +864,9 @@ impl Dom {
             Some(before),
         );
         self.notify_observers(ObserverMutationRecord::attribute(id, name, old_value));
+        // Stage 13 Rec 1: an attribute write moves the control's
+        // seeded default (and the live value only while clean).
+        self.sync_form_default_on_attribute(id, name, true);
     }
 
     pub fn remove_attribute(&mut self, id: NodeId, name: &str) {
@@ -833,6 +885,9 @@ impl Dom {
                 Some(before),
             );
             self.notify_observers(ObserverMutationRecord::attribute(id, name, old_value));
+            // Stage 13 Rec 1: removing the attribute clears the
+            // seeded default (live value follows only while clean).
+            self.sync_form_default_on_attribute(id, name, false);
         }
     }
 
@@ -879,6 +934,679 @@ impl Dom {
         }
         self.note_mutation(id, MutationKind::CharacterDataChanged, Some(before));
         self.notify_observers(ObserverMutationRecord::character_data(id, old_value));
+    }
+    // ---- form-control state (Stage 13 Rec 1) ----
+
+    /// Whether `id` is a form control carrying live state
+    /// (`input`, `textarea`, `select`).
+    pub fn is_form_control(&self, id: NodeId) -> bool {
+        matches!(self.tag(id), Some("input" | "textarea" | "select"))
+    }
+
+    /// The `type` attribute of an `<input>`, lowercased, defaulting
+    /// to `"text"` (missing or empty `type` is `text` per HTML).
+    pub fn input_type(&self, id: NodeId) -> String {
+        self.attr(id, "type")
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "text".to_string())
+    }
+
+    /// Whether the control is disabled: its own `disabled`
+    /// attribute, or a `disabled` `<fieldset>` ancestor.
+    pub fn is_control_disabled(&self, id: NodeId) -> bool {
+        if self.attr(id, "disabled").is_some() {
+            return true;
+        }
+        let mut cur = self.get(id).and_then(|n| n.parent);
+        while let Some(n) = cur {
+            if self.tag(n) == Some("fieldset") && self.attr(n, "disabled").is_some() {
+                return true;
+            }
+            cur = self.get(n).and_then(|n| n.parent);
+        }
+        false
+    }
+
+    /// The concatenated descendant text of `id` (element text
+    /// content, no markup) — the textarea RCDATA default and the
+    /// `<option>` value fallback.
+    pub fn descendant_text(&self, id: NodeId) -> String {
+        let mut out = String::new();
+        let mut stack: Vec<NodeId> = self.children(id).to_vec();
+        stack.reverse();
+        while let Some(n) = stack.pop() {
+            match self.get(n).map(|node| &node.kind) {
+                Some(NodeKind::Text(t)) => out.push_str(t),
+                Some(NodeKind::Element { .. }) => {
+                    let mut kids = self.children(n).to_vec();
+                    kids.reverse();
+                    stack.extend(kids);
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// An `<option>`'s value: its `value` attribute, else its
+    /// text with whitespace stripped and collapsed (HTML §4.10.9).
+    pub fn option_value(&self, id: NodeId) -> String {
+        if let Some(v) = self.attr(id, "value") {
+            return v.to_string();
+        }
+        self.descendant_text(id)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A `<select>`'s `<option>` descendants in tree order
+    /// (including options inside `<optgroup>`).
+    pub fn select_options(&self, id: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack: Vec<NodeId> = self.children(id).to_vec();
+        stack.reverse();
+        while let Some(n) = stack.pop() {
+            match self.tag(n) {
+                Some("option") => out.push(n),
+                Some(_) => {
+                    let mut kids = self.children(n).to_vec();
+                    kids.reverse();
+                    stack.extend(kids);
+                }
+                None => {}
+            }
+        }
+        out
+    }
+
+    /// The seeded state for a control, computed purely from its
+    /// attributes / children — the same rule the parser's
+    /// last-`selected`-wins resolution uses (`builder.rs`), reused
+    /// here so `reset()` restores from seeded defaults without
+    /// re-parsing. `None` for non-controls / stale keys.
+    fn compute_form_defaults(&self, id: NodeId) -> Option<FormControlState> {
+        let tag = self.tag(id)?;
+        match tag {
+            "input" => {
+                let ty = self.input_type(id);
+                let default_value = match ty.as_str() {
+                    "checkbox" | "radio" => {
+                        self.attr(id, "value").unwrap_or("on").to_string()
+                    }
+                    _ => self.attr(id, "value").unwrap_or("").to_string(),
+                };
+                let default_checked = self.attr(id, "checked").is_some();
+                let len = default_value.chars().count();
+                Some(FormControlState {
+                    value: default_value.clone(),
+                    default_value,
+                    value_dirty: false,
+                    checked: default_checked,
+                    default_checked,
+                    checked_dirty: false,
+                    selected_index: -1,
+                    default_selected_index: -1,
+                    caret: len,
+                    selection_start: len,
+                    selection_end: len,
+                })
+            }
+            "textarea" => {
+                let default_value = self.descendant_text(id);
+                let len = default_value.chars().count();
+                Some(FormControlState {
+                    value: default_value.clone(),
+                    default_value,
+                    value_dirty: false,
+                    checked: false,
+                    default_checked: false,
+                    checked_dirty: false,
+                    selected_index: -1,
+                    default_selected_index: -1,
+                    caret: len,
+                    selection_start: len,
+                    selection_end: len,
+                })
+            }
+            "select" => {
+                let options = self.select_options(id);
+                // Last `selected` wins, else the first option (the
+                // builder's `update_selectedcontent` rule); no
+                // options means -1.
+                let default_selected_index = if options.is_empty() {
+                    -1
+                } else {
+                    options
+                        .iter()
+                        .rposition(|&o| self.attr(o, "selected").is_some())
+                        .map(|i| i as i64)
+                        .unwrap_or(0)
+                };
+                let default_value = if default_selected_index >= 0 {
+                    self.option_value(options[default_selected_index as usize])
+                } else {
+                    String::new()
+                };
+                Some(FormControlState {
+                    value: default_value.clone(),
+                    default_value,
+                    value_dirty: false,
+                    checked: false,
+                    default_checked: false,
+                    checked_dirty: false,
+                    selected_index: default_selected_index,
+                    default_selected_index,
+                    caret: 0,
+                    selection_start: 0,
+                    selection_end: 0,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Live state for a control, seeding it from the defaults on
+    /// first access. `None` for non-controls / stale keys.
+    pub fn form_state_mut(&mut self, id: NodeId) -> Option<&mut FormControlState> {
+        if !self.is_form_control(id) {
+            return None;
+        }
+        if !self.form_states.contains_key(&id) {
+            if let Some(seed) = self.compute_form_defaults(id) {
+                self.form_states.insert(id, seed);
+            }
+        }
+        self.form_states.get_mut(&id)
+    }
+
+    /// Live state for a control, if already seeded. Prefer the
+    /// `form_*` accessors below, which fall back to the computed
+    /// defaults without mutating.
+    pub fn form_state(&self, id: NodeId) -> Option<&FormControlState> {
+        self.form_states.get(&id)
+    }
+
+    /// Live value of a control (seeded default when never touched).
+    pub fn form_value(&self, id: NodeId) -> Option<String> {
+        if let Some(s) = self.form_states.get(&id) {
+            return Some(s.value.clone());
+        }
+        self.compute_form_defaults(id).map(|s| s.value)
+    }
+
+    /// Default (parse-time) value of a control.
+    pub fn form_default_value(&self, id: NodeId) -> Option<String> {
+        if let Some(s) = self.form_states.get(&id) {
+            return Some(s.default_value.clone());
+        }
+        self.compute_form_defaults(id).map(|s| s.default_value)
+    }
+
+    /// Whether the control's live value differs from its default
+    /// by user/script action (the dirty-value flag).
+    pub fn form_value_dirty(&self, id: NodeId) -> bool {
+        self.form_states
+            .get(&id)
+            .map(|s| s.value_dirty)
+            .unwrap_or(false)
+    }
+
+    /// Live checkedness of a checkbox / radio.
+    pub fn form_checked(&self, id: NodeId) -> Option<bool> {
+        if let Some(s) = self.form_states.get(&id) {
+            return Some(s.checked);
+        }
+        self.compute_form_defaults(id).map(|s| s.checked)
+    }
+
+    /// Live selected index of a `<select>` (`-1` = no options).
+    pub fn form_selected_index(&self, id: NodeId) -> Option<i64> {
+        if let Some(s) = self.form_states.get(&id) {
+            return Some(s.selected_index);
+        }
+        self.compute_form_defaults(id)
+            .map(|s| s.selected_index)
+    }
+
+    /// Caret offset (chars) of a text control.
+    pub fn form_caret(&self, id: NodeId) -> Option<usize> {
+        if let Some(s) = self.form_states.get(&id) {
+            return Some(s.caret);
+        }
+        self.compute_form_defaults(id).map(|s| s.caret)
+    }
+
+    /// Selection range `[start, end)` of a text control.
+    pub fn form_selection(&self, id: NodeId) -> Option<(usize, usize)> {
+        if let Some(s) = self.form_states.get(&id) {
+            return Some((s.selection_start, s.selection_end));
+        }
+        self.compute_form_defaults(id)
+            .map(|s| (s.selection_start, s.selection_end))
+    }
+
+    /// Set the live value (typing or the IDL `.value` setter):
+    /// marks the value dirty and collapses the selection to the
+    /// end of the new value.
+    pub fn set_form_value(&mut self, id: NodeId, value: &str) -> bool {
+        let Some(state) = self.form_state_mut(id) else {
+            return false;
+        };
+        state.value = value.to_string();
+        state.value_dirty = true;
+        let len = value.chars().count();
+        state.caret = len;
+        state.selection_start = len;
+        state.selection_end = len;
+        true
+    }
+
+    /// Set the live checkedness (click or the IDL `.checked`
+    /// setter): marks the checked flag dirty.
+    pub fn set_form_checked(&mut self, id: NodeId, checked: bool) -> bool {
+        let Some(state) = self.form_state_mut(id) else {
+            return false;
+        };
+        state.checked = checked;
+        state.checked_dirty = true;
+        true
+    }
+
+    /// Set the selected index of a `<select>` (clamped to the
+    /// option range; `-1` only when there are no options) and
+    /// sync the live value to the selected option's value.
+    pub fn set_form_selected_index(&mut self, id: NodeId, index: i64) -> bool {
+        if self.tag(id) != Some("select") {
+            return false;
+        }
+        let options = self.select_options(id);
+        // `-1` deselects (the option's `selected = false` path);
+        // any other negative index clamps to the first option.
+        let clamped = if index < 0 || options.is_empty() {
+            -1
+        } else {
+            index.clamp(0, options.len() as i64 - 1)
+        };
+        let value = if clamped >= 0 {
+            self.option_value(options[clamped as usize])
+        } else {
+            String::new()
+        };
+        let Some(state) = self.form_state_mut(id) else {
+            return false;
+        };
+        state.selected_index = clamped;
+        state.value = value;
+        true
+    }
+
+    /// Set the caret / selection of a text control (clamped to
+    /// the value length, in chars).
+    pub fn set_form_selection(&mut self, id: NodeId, start: usize, end: usize) -> bool {
+        let len = self
+            .form_value(id)
+            .map(|v| v.chars().count())
+            .unwrap_or(0);
+        let Some(state) = self.form_state_mut(id) else {
+            return false;
+        };
+        let (start, end) = (start.min(len), end.min(len));
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        state.selection_start = start;
+        state.selection_end = end;
+        state.caret = end;
+        true
+    }
+
+    /// Insert `text` at the caret (replacing any selection) and
+    /// return the new caret offset — the text-editing primitive
+    /// the renderer drives from dispatched keys (Stage 13 Rec 4).
+    /// Honours `maxlength` (the attribute caps the value length).
+    pub fn insert_form_text(&mut self, id: NodeId, text: &str) -> Option<usize> {
+        let max = self
+            .attr(id, "maxlength")
+            .and_then(|m| m.parse::<usize>().ok());
+        let (value, start, end) = {
+            let state = self.form_state_mut(id)?;
+            (state.value.clone(), state.selection_start, state.selection_end)
+        };
+        let mut chars: Vec<char> = value.chars().collect();
+        let (start, end) = (start.min(chars.len()), end.min(chars.len()));
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        chars.splice(start..end, text.chars());
+        if let Some(max) = max {
+            chars.truncate(max);
+        }
+        let new_value: String = chars.iter().collect();
+        let caret = (start + text.chars().count()).min(new_value.chars().count());
+        let state = self.form_state_mut(id)?;
+        state.value = new_value;
+        state.value_dirty = true;
+        state.caret = caret;
+        state.selection_start = caret;
+        state.selection_end = caret;
+        Some(caret)
+    }
+
+    /// Delete the selection, or the char before the caret
+    /// (`backspace`) / after it (`delete`). Returns the new caret.
+    pub fn delete_form_text(&mut self, id: NodeId, backspace: bool) -> Option<usize> {
+        let (value, start, end) = {
+            let state = self.form_state_mut(id)?;
+            (
+                state.value.clone(),
+                state.selection_start,
+                state.selection_end,
+            )
+        };
+        let mut chars: Vec<char> = value.chars().collect();
+        let caret = if start != end {
+            let (s, e) = if start <= end {
+                (start, end)
+            } else {
+                (end, start)
+            };
+            chars.drain(s.min(chars.len())..e.min(chars.len()));
+            s.min(chars.len())
+        } else if backspace {
+            if start == 0 {
+                return Some(0);
+            }
+            chars.remove(start - 1);
+            start - 1
+        } else {
+            if start >= chars.len() {
+                return Some(chars.len());
+            }
+            chars.remove(start);
+            start
+        };
+        let new_value: String = chars.iter().collect();
+        let state = self.form_state_mut(id)?;
+        state.value = new_value;
+        state.value_dirty = true;
+        state.caret = caret;
+        state.selection_start = caret;
+        state.selection_end = caret;
+        Some(caret)
+    }
+
+    /// The form that owns `id`: the nearest `<form>` ancestor, or
+    /// the `<form>` named by the control's `form` attribute (by
+    /// `id`, document order). `None` for controls outside any form.
+    pub fn form_owner(&self, id: NodeId) -> Option<NodeId> {
+        if let Some(form_id) = self.attr(id, "form") {
+            let form_id = form_id.to_string();
+            if let Some(root) = self.root() {
+                let mut stack = vec![root];
+                while let Some(n) = stack.pop() {
+                    if self.tag(n) == Some("form")
+                        && self.attr(n, "id") == Some(form_id.as_str())
+                    {
+                        return Some(n);
+                    }
+                    stack.extend(self.children(n).iter().rev());
+                }
+            }
+        }
+        let mut cur = self.get(id).and_then(|n| n.parent);
+        while let Some(n) = cur {
+            if self.tag(n) == Some("form") {
+                return Some(n);
+            }
+            cur = self.get(n).and_then(|n| n.parent);
+        }
+        None
+    }
+
+    /// All form controls owned by `form_id`, in document order.
+    pub fn form_controls(&self, form_id: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        // Pre-order walk of the form subtree.
+        let mut order: Vec<NodeId> = Vec::new();
+        let mut stack: Vec<NodeId> = vec![form_id];
+        while let Some(n) = stack.pop() {
+            order.push(n);
+            let mut kids = self.children(n).to_vec();
+            kids.reverse();
+            stack.extend(kids);
+        }
+        for n in order {
+            // `form.elements` includes buttons too (they carry no
+            // live value state, but they are listed controls).
+            let listed = self.is_form_control(n) || self.tag(n) == Some("button");
+            if n != form_id && listed && self.form_owner(n) == Some(form_id) {
+                out.push(n);
+            }
+        }
+        // Controls outside the subtree whose `form` attribute names
+        // this form: scan the whole document in order.
+        if let Some(form_id_attr) = self.attr(form_id, "id").map(|s| s.to_string()) {
+            if let Some(root) = self.root() {
+                let mut all: Vec<NodeId> = Vec::new();
+                let mut s = vec![root];
+                while let Some(n) = s.pop() {
+                    all.push(n);
+                    let mut kids = self.children(n).to_vec();
+                    kids.reverse();
+                    s.extend(kids);
+                }
+                for n in all {
+                    let listed = self.is_form_control(n) || self.tag(n) == Some("button");
+                    if listed
+                        && self.attr(n, "form") == Some(form_id_attr.as_str())
+                        && !out.contains(&n)
+                    {
+                        out.push(n);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Reset every control of a form to its seeded default and
+    /// clear the dirty flags (Stage 13 Rec 1): `reset()` restores
+    /// from the seeded defaults, never by re-parsing.
+    pub fn reset_form(&mut self, form_id: NodeId) {
+        for control in self.form_controls(form_id) {
+            if let Some(seed) = self.compute_form_defaults(control) {
+                self.form_states.insert(control, seed);
+            }
+        }
+    }
+
+    /// The submission entry list for a form (Stage 13 Rec 6):
+    /// `(name, value)` for successful controls only — a control
+    /// needs a non-empty `name`, must not be disabled, and
+    /// unchecked checkboxes / radios are excluded; `type=submit`
+    /// / `image` / `button` / `reset` / `file` never submit (the
+    /// submitter itself contributes its name/value when it is a
+    /// submit button with a name). Selects contribute the selected
+    /// option's value.
+    pub fn form_entries(
+        &self,
+        form_id: NodeId,
+        submitter: Option<NodeId>,
+    ) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for control in self.form_controls(form_id) {
+            let Some(name) = self.attr(control, "name") else {
+                continue;
+            };
+            if name.is_empty() || self.is_control_disabled(control) {
+                continue;
+            }
+            match self.tag(control) {
+                Some("input") => {
+                    let ty = self.input_type(control);
+                    match ty.as_str() {
+                        "checkbox" | "radio" => {
+                            if self.form_checked(control).unwrap_or(false) {
+                                out.push((
+                                    name.to_string(),
+                                    self.form_value(control).unwrap_or_default(),
+                                ));
+                            }
+                        }
+                        "submit" | "image" | "button" | "reset" | "file" => {
+                            if Some(control) == submitter
+                                && (ty == "submit" || ty == "image")
+                            {
+                                out.push((
+                                    name.to_string(),
+                                    self.form_value(control).unwrap_or_default(),
+                                ));
+                            }
+                        }
+                        _ => {
+                            out.push((
+                                name.to_string(),
+                                self.form_value(control).unwrap_or_default(),
+                            ));
+                        }
+                    }
+                }
+                Some("textarea") => {
+                    out.push((
+                        name.to_string(),
+                        self.form_value(control).unwrap_or_default(),
+                    ));
+                }
+                Some("select") => {
+                    if let Some(idx) = self.form_selected_index(control) {
+                        if idx >= 0 {
+                            out.push((
+                                name.to_string(),
+                                self.form_value(control).unwrap_or_default(),
+                            ));
+                        }
+                    }
+                }
+                Some("button") => {
+                    if Some(control) == submitter {
+                        let ty = self
+                            .attr(control, "type")
+                            .map(|t| t.to_ascii_lowercase())
+                            .unwrap_or_else(|| "submit".to_string());
+                        if ty == "submit" {
+                            out.push((
+                                name.to_string(),
+                                self.attr(control, "value").unwrap_or("").to_string(),
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Keep a control's seeded defaults in sync when a content
+    /// attribute changes (Stage 13 Rec 1/5): `setAttribute('value',
+    /// …)` moves the *default* and — only while the value is not
+    /// dirty — the live value; `checked` / `selected` behave the
+    /// same for their flags. Called from `set_attribute` /
+    /// `remove_attribute` after the attribute write.
+    fn sync_form_default_on_attribute(&mut self, id: NodeId, name: &str, present: bool) {
+        if self.tag(id) == Some("option") {
+            // A selected-attribute change re-resolves the owning
+            // select's default + live index (last-selected-wins).
+            if name == "selected" {
+                let mut cur = self.get(id).and_then(|n| n.parent);
+                while let Some(n) = cur {
+                    if self.tag(n) == Some("select") {
+                        let options = self.select_options(n);
+                        let idx = if options.is_empty() {
+                            -1
+                        } else {
+                            options
+                                .iter()
+                                .rposition(|&o| self.attr(o, "selected").is_some())
+                                .map(|i| i as i64)
+                                .unwrap_or(0)
+                        };
+                        let value = if idx >= 0 {
+                            self.option_value(options[idx as usize])
+                        } else {
+                            String::new()
+                        };
+                        if let Some(state) = self.form_states.get_mut(&n) {
+                            state.default_selected_index = idx;
+                            state.selected_index = idx;
+                            state.value = value;
+                        } else if let Some(mut seed) = self.compute_form_defaults(n) {
+                            seed.default_selected_index = idx;
+                            seed.selected_index = idx;
+                            seed.value = value.clone();
+                            seed.default_value = value;
+                            self.form_states.insert(n, seed);
+                        }
+                        break;
+                    }
+                    cur = self.get(n).and_then(|n| n.parent);
+                }
+            }
+            return;
+        }
+        if !self.is_form_control(id) {
+            return;
+        }
+        match (self.tag(id), name) {
+            (Some("input"), "value") => {
+                let new_default = if present {
+                    self.attr(id, "value").unwrap_or("").to_string()
+                } else {
+                    String::new()
+                };
+                let _ = self.form_state_mut(id);
+                if let Some(state) = self.form_states.get_mut(&id) {
+                    state.default_value = new_default.clone();
+                    if !state.value_dirty {
+                        state.value = new_default;
+                        let len = state.value.chars().count();
+                        state.caret = len;
+                        state.selection_start = len;
+                        state.selection_end = len;
+                    }
+                }
+            }
+            (Some("input"), "checked") => {
+                let _ = self.form_state_mut(id);
+                if let Some(state) = self.form_states.get_mut(&id) {
+                    state.default_checked = present;
+                    if !state.checked_dirty {
+                        state.checked = present;
+                    }
+                }
+            }
+            (Some("textarea"), "value") => {
+                let new_default = if present {
+                    self.attr(id, "value").unwrap_or("").to_string()
+                } else {
+                    self.descendant_text(id)
+                };
+                let _ = self.form_state_mut(id);
+                if let Some(state) = self.form_states.get_mut(&id) {
+                    state.default_value = new_default.clone();
+                    if !state.value_dirty {
+                        state.value = new_default;
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -974,6 +1702,112 @@ mod tests {
             s.push_str(&text_content(dom, child));
         }
         s
+    }
+
+
+    // ---- Stage 13 Rec 1: form-control state ----
+
+    #[test]
+    fn form_state_seeded_from_attributes() {
+        let mut dom = parse(
+            r#"<form><input name="q" value="hello"><input type="checkbox" name="c" checked><textarea name="t">dflt</textarea></form>"#,
+        );
+        let root = dom.root().unwrap();
+        let form = find_tag(&dom, root, "form").unwrap();
+        let mut inputs = Vec::new();
+        find_all_tags(&dom, form, "input", &mut inputs);
+        assert_eq!(dom.form_value(inputs[0]).as_deref(), Some("hello"));
+        assert_eq!(dom.form_default_value(inputs[0]).as_deref(), Some("hello"));
+        assert!(!dom.form_value_dirty(inputs[0]));
+        assert_eq!(dom.form_checked(inputs[1]), Some(true));
+        let ta = find_tag(&dom, form, "textarea").unwrap();
+        assert_eq!(dom.form_value(ta).as_deref(), Some("dflt"));
+        assert_eq!(dom.form_owner(inputs[0]), Some(form));
+    }
+
+    #[test]
+    fn dirty_value_survives_set_attribute_and_reset_restores() {
+        let mut dom = parse(r#"<form><input name="q" value="orig"></form>"#);
+        let root = dom.root().unwrap();
+        let form = find_tag(&dom, root, "form").unwrap();
+        let input = find_tag(&dom, form, "input").unwrap();
+        assert!(dom.set_form_value(input, "typed"));
+        assert!(dom.form_value_dirty(input));
+        // setAttribute moves the default only — the typed value stands.
+        dom.set_attribute(input, "value", "attr-change");
+        assert_eq!(dom.form_value(input).as_deref(), Some("typed"));
+        assert_eq!(dom.form_default_value(input).as_deref(), Some("attr-change"));
+        // reset() restores from the (new) seeded default.
+        dom.reset_form(form);
+        assert_eq!(dom.form_value(input).as_deref(), Some("attr-change"));
+        assert!(!dom.form_value_dirty(input));
+    }
+
+    #[test]
+    fn clean_value_follows_set_attribute() {
+        let mut dom = parse(r#"<form><input name="q" value="a"></form>"#);
+        let root = dom.root().unwrap();
+        let form = find_tag(&dom, root, "form").unwrap();
+        let input = find_tag(&dom, form, "input").unwrap();
+        dom.set_attribute(input, "value", "b");
+        assert_eq!(dom.form_value(input).as_deref(), Some("b"));
+        dom.remove_attribute(input, "value");
+        assert_eq!(dom.form_value(input).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn select_last_selected_wins_and_entries_use_selected() {
+        let mut dom = parse(
+            r#"<form><select name="s"><option value="a">A</option><option value="b" selected>B</option><option value="c" selected>C</option></select></form>"#,
+        );
+        let root = dom.root().unwrap();
+        let form = find_tag(&dom, root, "form").unwrap();
+        let select = find_tag(&dom, form, "select").unwrap();
+        assert_eq!(dom.form_selected_index(select), Some(2));
+        assert_eq!(dom.form_value(select).as_deref(), Some("c"));
+        assert_eq!(dom.form_entries(form, None), vec![("s".to_string(), "c".to_string())]);
+        assert!(dom.set_form_selected_index(select, 0));
+        assert_eq!(dom.form_value(select).as_deref(), Some("a"));
+        dom.reset_form(form);
+        assert_eq!(dom.form_selected_index(select), Some(2));
+    }
+
+    #[test]
+    fn form_entries_successful_controls_only() {
+        let mut dom = parse(
+            r#"<form><input name="a" value="1"><input name="b" value="2" disabled><input name="c"><input type="checkbox" name="d" value="yes" checked><input type="checkbox" name="e" value="yes"><input type="submit" name="go" value="Go"></form>"#,
+        );
+        let root = dom.root().unwrap();
+        let form = find_tag(&dom, root, "form").unwrap();
+        // No submitter: the submit button contributes nothing.
+        assert_eq!(
+            dom.form_entries(form, None),
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("c".to_string(), "".to_string()),
+                ("d".to_string(), "yes".to_string()),
+            ]
+        );
+        let mut submits = Vec::new();
+        find_all_tags(&dom, form, "input", &mut submits);
+        let submit = *submits.last().unwrap();
+        let mut entries = dom.form_entries(form, Some(submit));
+        assert_eq!(entries.pop(), Some(("go".to_string(), "Go".to_string())));
+    }
+
+    #[test]
+    fn form_text_editing_insert_and_delete() {
+        let mut dom = parse(r#"<form><input name="q" value="ab"></form>"#);
+        let root = dom.root().unwrap();
+        let form = find_tag(&dom, root, "form").unwrap();
+        let input = find_tag(&dom, form, "input").unwrap();
+        assert_eq!(dom.insert_form_text(input, "c"), Some(3));
+        assert_eq!(dom.form_value(input).as_deref(), Some("abc"));
+        assert_eq!(dom.delete_form_text(input, true), Some(2));
+        assert_eq!(dom.form_value(input).as_deref(), Some("ab"));
+        assert!(dom.set_form_selection(input, 1, 1));
+        assert_eq!(dom.insert_form_text(input, "X"), Some(2));
+        assert_eq!(dom.form_value(input).as_deref(), Some("aXb"));
     }
 
     fn assert_sync<T: Sync>() {}

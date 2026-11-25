@@ -193,9 +193,75 @@ impl CookieJar {
         serde_json::to_string(self)
     }
 
-    /// Restore a jar previously produced by [`CookieJar::to_json`].
+    /// Restore a jar previously produced by [`CookieJar::to_json`]
+    /// (Stage 13 Rec 9): expired cookies are pruned on load — a
+    /// restored jar must never serve/send stale entries — and the
+    /// restored `created_seq` / `last_access_seq` values are
+    /// re-based onto this process's sequence counter, so sequence
+    /// numbers from a previous process cannot skew eviction
+    /// priority (old entries would otherwise look ancient, or new
+    /// entries would collide with restored ones).
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
+        let mut jar: Self = serde_json::from_str(json)?;
+        // Prune expired cookies (all partitions), then drop empty
+        // partitions.
+        for part in jar.partitions.values_mut() {
+            part.retain(|e| !e.cookie.is_expired());
+        }
+        jar.partitions.retain(|_, p| !p.is_empty());
+        // Re-base sequence numbers: shift every stored seq by
+        // (max_stored_seq + 1) below the live counter is wrong —
+        // instead, renumber in creation order so the relative
+        // order survives and the live counter continues above it.
+        let mut entries: Vec<&mut StoredCookie> = jar
+            .partitions
+            .values_mut()
+            .flat_map(|p| p.iter_mut())
+            .collect();
+        entries.sort_by_key(|e| e.created_seq);
+        let mut seq = 0u64;
+        for e in entries {
+            seq += 1;
+            // Preserve the created-before-accessed ordering within
+            // an entry: keep last_access_seq >= created_seq.
+            let accessed_after = e.last_access_seq.saturating_sub(e.created_seq);
+            e.created_seq = seq;
+            e.last_access_seq = seq + accessed_after.min(1_000_000);
+        }
+        jar.seq = seq;
+        Ok(jar)
+    }
+
+    /// Non-HttpOnly cookies for `url` in the `top_level_site`
+    /// partition, as `name=value` pairs (Stage 13 Rec 10c:
+    /// `document.cookie` reads exactly this — HttpOnly cookies are
+    /// never exposed to script, but ARE sent on the wire by
+    /// [`CookieJar::cookie_header`]).
+    pub fn document_cookies(&mut self, url: &str, top_level_site: &str) -> Vec<(String, String)> {
+        let Ok(request_url) = Url::parse(url) else {
+            return Vec::new();
+        };
+        let Some(host) = request_url.host_str() else {
+            return Vec::new();
+        };
+        let key = partition_key(top_level_site);
+        let Some(part) = self.partitions.get_mut(&key) else {
+            return Vec::new();
+        };
+        part.retain(|e| !e.cookie.is_expired());
+        part.iter()
+            .filter(|e| {
+                !e.cookie.http_only().unwrap_or(false)
+                    && e.cookie.domain.matches(&request_url)
+                    && e.cookie.path.matches(&request_url)
+            })
+            .map(|e| {
+                (
+                    e.cookie.name().to_string(),
+                    e.cookie.value().to_string(),
+                )
+            })
+            .collect()
     }
 
     /// Intake: store every `Set-Cookie` header received with the response
@@ -1317,6 +1383,101 @@ mod tests {
             "=__Secure-x; Path=/; Max-Age=3600",
         );
         assert_eq!(jar.len(), 0);
+    }
+
+    #[test]
+    fn from_json_prunes_expired_and_rebases_sequences() {
+        let mut jar = CookieJar::new();
+        set(
+            &mut jar,
+            "https://example.com/",
+            "https://example.com",
+            "keep=1; Path=/; Max-Age=3600",
+        );
+        set(
+            &mut jar,
+            "https://example.com/",
+            "https://example.com",
+            "live=1; Path=/; Max-Age=3600",
+        );
+        // A cookie that expires *after* being saved: hand-edit
+        // the serialised `expires` (RFC 3339) of the "live" cookie
+        // to the past — the intake path would have rejected an
+        // already-expired `Set-Cookie`, so the only way an expired
+        // cookie reaches disk is by expiring between save and load.
+        // (Editing the raw `Set-Cookie` string alone would not do:
+        // `is_expired` reads the separate `expires` field.)
+        let json = jar.to_json().unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mut edited = false;
+        if let Some(parts) = value.get_mut("partitions").and_then(|p| p.as_object_mut()) {
+            for (_, entries) in parts.iter_mut() {
+                for entry in entries.as_array_mut().unwrap_or(&mut Vec::new()) {
+                    let is_live = entry
+                        .get("cookie")
+                        .and_then(|c| c.get("raw_cookie"))
+                        .and_then(|r| r.as_str())
+                        .map(|s| s.contains("live=1"))
+                        .unwrap_or(false);
+                    if is_live {
+                        if let Some(exp) = entry
+                            .get_mut("cookie")
+                            .and_then(|c| c.get_mut("expires"))
+                            .and_then(|e| e.get_mut("AtUtc"))
+                        {
+                            *exp = serde_json::Value::String(
+                                "1970-01-01T00:00:00Z".to_string(),
+                            );
+                            edited = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(edited, "live cookie expiry not found in {json}");
+        let json = serde_json::to_string(&value).unwrap();
+        let mut restored = CookieJar::from_json(&json).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            get(&mut restored, "https://example.com/", "https://example.com"),
+            Some("keep=1".to_string())
+        );
+        // The restored jar still orders + evicts sanely: store a
+        // second cookie and confirm both send.
+        set(
+            &mut restored,
+            "https://example.com/",
+            "https://example.com",
+            "second=2; Path=/; Max-Age=3600",
+        );
+        assert_eq!(restored.len(), 2);
+    }
+
+    #[test]
+    fn document_cookies_hides_http_only() {
+        let mut jar = CookieJar::new();
+        set(
+            &mut jar,
+            "https://example.com/",
+            "https://example.com",
+            "vis=1; Path=/; Max-Age=3600",
+        );
+        set(
+            &mut jar,
+            "https://example.com/",
+            "https://example.com",
+            "hid=1; Path=/; Max-Age=3600; HttpOnly",
+        );
+        // HttpOnly is still sent on the wire...
+        assert_eq!(
+            get(&mut jar, "https://example.com/", "https://example.com"),
+            Some("vis=1; hid=1".to_string())
+        );
+        // ...but never exposed to `document.cookie`.
+        assert_eq!(
+            jar.document_cookies("https://example.com/", "https://example.com"),
+            vec![("vis".to_string(), "1".to_string())]
+        );
     }
 
     #[test]

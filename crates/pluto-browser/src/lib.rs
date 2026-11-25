@@ -1,5 +1,11 @@
+mod atomic;
 mod bookmarks;
+/// The browser-side network broker (Stage 13 Rec 11) — public
+/// so integration tests can drive a real broker against a
+/// no-socket renderer child.
+pub mod broker;
 mod compositor;
+mod cookies;
 mod history;
 mod images;
 mod js_host;
@@ -96,6 +102,23 @@ struct Tab {
     /// Rec 9): bytes received vs `Content-Length` (`None` =
     /// indeterminate). Cleared on commit.
     progress: Option<(u64, Option<u64>)>,
+    /// Per-layer sandbox results from the child's
+    /// `SandboxReport` (Stage 13 Rec 12a): empty until the first
+    /// report arrives (in-process tabs never report).
+    sandbox_layers: Vec<(String, bool)>,
+    /// Sad-tab state (Stage 13 Rec 12c): set on
+    /// `RendererCrashed`, cleared on the next successful
+    /// navigation or Reload.
+    crashed: bool,
+    /// Times of recent crashes (pruned to the last 60 s): three
+    /// or more makes the tab `dead` — the restart policy.
+    crash_times: Vec<std::time::Instant>,
+    /// The last crash's reason, for the status line.
+    crash_reason: String,
+    /// Restart policy: three crashes in 60 s. While dead, only
+    /// Reload may navigate this tab; other navigations are
+    /// blocked with a status message until the user reloads.
+    dead: bool,
 }
 
 impl Tab {
@@ -118,6 +141,11 @@ impl Tab {
             status: format!("Loading {url}…"),
             pending_url: Some(url),
             progress: None,
+            sandbox_layers: Vec::new(),
+            crashed: false,
+            crash_times: Vec::new(),
+            crash_reason: String::new(),
+            dead: false,
         }
     }
 }
@@ -165,6 +193,12 @@ pub struct PlutoBrowser {
     /// wheel, or one after >200 ms idle, is `Began`; the rest are
     /// `Changed`. (`Ended` is synthesised worker-side by timeout.)
     last_wheel: Option<std::time::Instant>,
+    /// The browser-side network broker (Stage 13 Rec 11): owns
+    /// the one shared `ResourceLoader` (cookie jar, HTTP cache,
+    /// HSTS store, blocker) and answers renderer
+    /// `RequestResource` messages over IPC. The renderers hold
+    /// no sockets and write no profile state of their own.
+    broker: Arc<crate::broker::NetworkBroker>,
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +240,10 @@ pub enum Message {
     /// One event from a tab's worker (commit, display list,
     /// failure...), tagged with the tab id.
     RendererEvent(u64, RendererToBrowser),
+    /// A broker serve task finished (Stage 13 Rec 11): the
+    /// events were already forwarded to the tab as they arrived;
+    /// this is just the task's completion signal (no-op).
+    BrokerServeDone,
     /// The viewport widget's bounds changed (window resize, or the
     /// first frame reporting the real page area).
     ViewportResized(f32, f32),
@@ -351,6 +389,20 @@ impl PlutoBrowser {
     /// stays visible until the new list lands: the holder keeps
     /// the last-good list.
     fn commit(&mut self, url: String) {
+        // Stage 13 Rec 12c: restart policy — a dead tab (three
+        // crashes in 60 s) accepts no navigation except Reload,
+        // which clears `dead` before calling here.
+        if self.active().dead {
+            self.active_mut().status =
+                "Renderer crashed repeatedly — press Reload to retry".to_string();
+            return;
+        }
+        self.active_mut().crashed = false;
+        // Stage 13 Rec 11: the page being left is the referrer
+        // for the next navigation's document fetch (the broker's
+        // loader holds the referrer context in broker mode).
+        let prev_url = self.active().active_url.clone();
+        self.broker.loader().set_referrer_document(&prev_url);
         let has_renderer = {
             let tab = self.active_mut();
             tab.active_url = url.clone();
@@ -683,6 +735,14 @@ impl Application for PlutoBrowser {
         // panel simply sees it pre-populated. The index starts on
         // the newest entry, so Back from a fresh launch goes to
         // the previous visit.
+        // Stage 13 Rec 11: the broker owns the shared loader —
+        // load the persisted HSTS store and cookie jar into it
+        // at startup (session cookies were stripped before the
+        // last save, so nothing stale comes back).
+        let broker_loader = Arc::new(pluto_net::ResourceLoader::new());
+        crate::security::load_into(&broker_loader);
+        crate::cookies::load_into(&broker_loader);
+        let broker = Arc::new(crate::broker::NetworkBroker::new(broker_loader));
         let history = load_history();
         let history_index = history.len().saturating_sub(1);
         let mut first_tab = Tab::new(0, url.clone());
@@ -701,6 +761,7 @@ impl Application for PlutoBrowser {
             modifiers: pluto_ipc::Modifiers::default(),
             buttons_held: 0,
             last_wheel: None,
+            broker,
         };
         (app, Task::none())
     }
@@ -745,7 +806,13 @@ impl Application for PlutoBrowser {
                 }
             }
             Message::Reload => {
-                let url = self.active().active_url.clone();
+                // Stage 13 Rec 12c: Reload is the one navigation
+                // that may revive a dead tab — clear the restart
+                // policy state before committing.
+                let tab = self.active_mut();
+                tab.dead = false;
+                tab.crashed = false;
+                let url = tab.active_url.clone();
                 self.commit(url);
             }
             Message::NewTab => {
@@ -831,12 +898,24 @@ impl Application for PlutoBrowser {
                 match event {
                     RendererToBrowser::DidCommit { url, status } => {
                         eprintln!("[pluto] page loaded: {url}");
+                        // Stage 13 Rec 12c: the crash page commits
+                        // like any page, but it must not touch the
+                        // URL, title, or history — the address bar
+                        // keeps the real URL, and the crash status
+                        // stays until Reload.
+                        if url == "about:crashed" {
+                            let tab = &mut self.tabs[tab_index];
+                            tab.progress = None;
+                            return Task::none();
+                        }
                         let tab = &mut self.tabs[tab_index];
                         tab.active_url = url.clone();
                         tab.url_input = url.clone();
                         tab.title = url.clone();
                         tab.status = status;
                         tab.progress = None;
+                        tab.crashed = false;
+                        tab.dead = false;
                         // History (R17): a back/forward commit only
                         // moves the index (already done in Back/Forward);
                         // any other commit — address bar, reload, link
@@ -954,24 +1033,105 @@ impl Application for PlutoBrowser {
                         tab.progress = None;
                     }
                     RendererToBrowser::CancelResource { request_id } => {
-                        // The worker cancels its own fetches by token
-                        // (Stage 5 #5); the shell holds no loader, so
-                        // there is nothing to cancel here. At M5, when
-                        // the fetch lives browser-side behind
-                        // `RequestResource`, this is where the shell
-                        // cancels it on the scheduler.
-                        eprintln!(
-                            "[pluto] ignoring CancelResource {request_id} (no shell-side loader)"
-                        );
+                        // Stage 13 Rec 11: the fetch lives
+                        // browser-side behind the broker — cancel it
+                        // on the broker's scheduler.
+                        self.broker.cancel(request_id);
+                    }
+                    RendererToBrowser::SandboxReport { layers } => {
+                        // Stage 13 Rec 12a: record the per-layer
+                        // results; warn in the status line when a
+                        // load-bearing layer (user-namespace,
+                        // chroot, seccomp) is OFF — the tab still
+                        // loads, but the user should know the
+                        // sandbox is degraded.
+                        let off: Vec<&str> = layers
+                            .iter()
+                            .filter(|(name, ok)| {
+                                !*ok && matches!(
+                                    name.as_str(),
+                                    "user-namespace" | "chroot" | "seccomp"
+                                )
+                            })
+                            .map(|(name, _)| name.as_str())
+                            .collect();
+                        if !off.is_empty() {
+                            eprintln!(
+                                "[pluto] sandbox degraded on tab {}: {} OFF",
+                                tab_id,
+                                off.join(", ")
+                            );
+                            let tab = &mut self.tabs[tab_index];
+                            tab.status =
+                                format!("Sandbox degraded: {} OFF", off.join(", "));
+                        }
+                        self.tabs[tab_index].sandbox_layers = layers;
+                    }
+                    RendererToBrowser::Heartbeat => {
+                        // Stage 13 Rec 12b: the watchdog lives in
+                        // the bridge (`run_renderer_bridge`), which
+                        // sees every event including heartbeats —
+                        // the shell needs nothing here.
                     }
                     RendererToBrowser::RendererCrashed { reason } => {
+                        // Stage 13 Rec 12c: the sad tab. NOTE the
+                        // `renderer_tx` is KEPT: dropping it would
+                        // close the bridge's command channel and
+                        // the bridge would exit, so no later
+                        // navigation could ever respawn the
+                        // renderer (that was the pre-M5 behaviour —
+                        // "the next navigation recovers" was a
+                        // broken promise). The bridge stays alive
+                        // with no renderer and respawns on the
+                        // next `CommitNavigation`.
                         eprintln!("[pluto] renderer crashed: {reason}");
+                        let now = std::time::Instant::now();
                         let tab = &mut self.tabs[tab_index];
-                        tab.status = format!("Renderer crashed: {reason}");
-                        tab.renderer_tx = None;
-                        // The stale list stays visible; the next
-                        // navigation recovers (the bridge respawns
-                        // the renderer on `CommitNavigation`).
+                        tab.crashed = true;
+                        tab.crash_reason = reason.clone();
+                        tab.crash_times.retain(|t| now.duration_since(*t).as_secs() < 60);
+                        tab.crash_times.push(now);
+                        // Restart policy: three crashes in 60 s
+                        // makes the tab dead — only Reload may
+                        // navigate it until the user reloads.
+                        if tab.crash_times.len() >= 3 {
+                            tab.dead = true;
+                            tab.status = "Renderer crashed repeatedly — press Reload to retry"
+                                .to_string();
+                        } else {
+                            tab.status =
+                                format!("Renderer crashed: {reason} — press Reload to retry");
+                        }
+                        tab.progress = None;
+                        // Show the crash page: the bridge respawns
+                        // a fresh renderer for this navigation, and
+                        // the worker renders `about:crashed`
+                        // locally (no fetch). The resize/visibility
+                        // re-sync follows so the fresh child lays
+                        // the page out at the real window size.
+                        self.send_command_to(
+                            tab_id,
+                            BrowserToRenderer::CommitNavigation {
+                                url: "about:crashed".to_string(),
+                            },
+                        );
+                        let viewport = self.viewport;
+                        self.send_command_to(
+                            tab_id,
+                            BrowserToRenderer::Resize {
+                                width: viewport.0,
+                                height: viewport.1,
+                            },
+                        );
+                        let visible = self.visible;
+                        self.send_command_to(
+                            tab_id,
+                            BrowserToRenderer::SetVisible { visible },
+                        );
+                        self.send_command_to(
+                            tab_id,
+                            BrowserToRenderer::SetFocused { focused: visible },
+                        );
                     }
                     RendererToBrowser::ScrollViewport { dx, dy } => {
                         // Stage 8 Rec 9: the worker owns the wheel —
@@ -979,11 +1139,45 @@ impl Application for PlutoBrowser {
                         // comes back here as the viewport scroll.
                         self.tabs[tab_index].compositor.scroll_by(dx, dy);
                     }
-                    RendererToBrowser::RequestResource(..) => {
-                        // M2 (subresources) fetches these; ignored now.
+                    RendererToBrowser::RequestResource(request) => {
+                        // Stage 13 Rec 11: serve the request on the
+                        // broker and forward its events to the tab as
+                        // they arrive. The future runs serve + the
+                        // forward loop itself (no extra spawn): the
+                        // events channel closes when the fetch ends.
+                        let Some(tx) = self.tabs[tab_index].renderer_tx.clone() else {
+                            return Task::none();
+                        };
+                        let broker = Arc::clone(&self.broker);
+                        return Task::perform(
+                            async move {
+                                let (events_tx, mut events_rx) =
+                                    tokio::sync::mpsc::channel(64);
+                                let serve = broker.serve(request, events_tx);
+                                tokio::pin!(serve);
+                                loop {
+                                    tokio::select! {
+                                        _ = &mut serve => break,
+                                        event = events_rx.recv() => match event {
+                                            Some(event) => {
+                                                if tx.send(BrowserToRenderer::ResourceEvent(event))
+                                                    .is_err()
+                                                {
+                                                    break;
+                                                }
+                                            }
+                                            None => break,
+                                        },
+                                    }
+                                }
+                                Message::BrokerServeDone
+                            },
+                            |message| cosmic::Action::App(message),
+                        );
                     }
                 }
             }
+            Message::BrokerServeDone => {}
             Message::ViewportResized(width, height) => {
                 // Degenerate sizes (minimised window) carry no layout;
                 // a real size arrives when the window is restored.

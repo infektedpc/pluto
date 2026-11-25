@@ -254,6 +254,196 @@ pub trait DomHost {
         false
     }
 
+    // --- Stage 13 (M5 forms) extensions (additive; defaults report
+    // "not a control" so hosts without form state keep compiling) ---
+
+    /// Whether `key` is a form control (`input` / `textarea` /
+    /// `select`).
+    fn is_form_control(&self, _key: DomKey) -> bool {
+        false
+    }
+
+    /// The `<input>` `type` IDL value (lowercased, `"text"` default).
+    fn input_type(&self, _key: DomKey) -> Option<String> {
+        None
+    }
+
+    /// Whether the control is disabled (own attribute or a disabled
+    /// `<fieldset>` ancestor).
+    fn is_disabled(&self, _key: DomKey) -> bool {
+        false
+    }
+
+    /// Live `.value` of a control, or `None` for non-controls.
+    fn form_value(&self, _key: DomKey) -> Option<String> {
+        None
+    }
+
+    /// Default (parse-time) value of a control.
+    fn form_default_value(&self, _key: DomKey) -> Option<String> {
+        None
+    }
+
+    /// Whether the live value was set by typing / the IDL setter.
+    fn form_value_dirty(&self, _key: DomKey) -> bool {
+        false
+    }
+
+    /// Set the live value (IDL `.value` setter): marks it dirty.
+    fn set_form_value(&mut self, _key: DomKey, _value: &str) -> bool {
+        false
+    }
+
+    /// Live checkedness of a checkbox / radio.
+    fn form_checked(&self, _key: DomKey) -> Option<bool> {
+        None
+    }
+
+    /// Set the live checkedness (IDL `.checked` setter).
+    fn set_form_checked(&mut self, _key: DomKey, _checked: bool) -> bool {
+        false
+    }
+
+    /// Live selected index of a `<select>`.
+    fn form_selected_index(&self, _key: DomKey) -> Option<i64> {
+        None
+    }
+
+    /// Set the selected index of a `<select>`.
+    fn set_form_selected_index(&mut self, _key: DomKey, _index: i64) -> bool {
+        false
+    }
+
+    /// A `<select>`'s `<option>` keys in tree order.
+    fn form_options(&self, _key: DomKey) -> Vec<DomKey> {
+        Vec::new()
+    }
+
+    /// The `<form>` that owns a control, or `None`.
+    fn form_owner(&self, _key: DomKey) -> Option<DomKey> {
+        None
+    }
+
+    /// All controls owned by a form, in document order.
+    fn form_controls(&self, _key: DomKey) -> Vec<DomKey> {
+        Vec::new()
+    }
+
+    /// All `<form>` elements in the document, in document order.
+    fn document_forms(&self) -> Vec<DomKey> {
+        Vec::new()
+    }
+
+    /// The submission entry list of a form: successful controls
+    /// only, `(name, value)` in document order. `submitter` is the
+    /// button that submitted, if any.
+    fn form_entries(&self, _key: DomKey, _submitter: Option<DomKey>) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// Reset a form's controls to their seeded defaults.
+    fn reset_form(&mut self, _key: DomKey) -> bool {
+        false
+    }
+
+    /// Caret offset (chars) of a text control.
+    fn form_caret(&self, _key: DomKey) -> Option<usize> {
+        None
+    }
+
+    /// Selection range `[start, end)` of a text control.
+    fn form_selection(&self, _key: DomKey) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// Set the caret / selection of a text control.
+    /// Insert `text` at the caret (replacing the selection),
+    /// honouring `maxlength` (Stage 13 Rec 4). Returns the new
+    /// caret position, or `None` when the node is not an editable
+    /// text control.
+    fn insert_form_text(&mut self, _key: DomKey, _text: &str) -> Option<usize> {
+        None
+    }
+
+    /// Delete one char before (`backspace`) or after the caret
+    /// (or the whole selection) (Stage 13 Rec 4). Returns the new
+    /// caret position, or `None` when the node is not editable.
+    fn delete_form_text(&mut self, _key: DomKey, _backspace: bool) -> Option<usize> {
+        None
+    }
+
+    fn set_form_selection(&mut self, _key: DomKey, _start: usize, _end: usize) -> bool {
+        false
+    }
+
+    /// The custom validity message set by `setCustomValidity`
+    /// (empty = no custom error).
+    fn custom_validity(&self, _key: DomKey) -> Option<String> {
+        None
+    }
+
+    /// Set the custom validity message (empty clears it).
+    fn set_custom_validity(&mut self, _key: DomKey, _message: &str) -> bool {
+        false
+    }
+
+    /// The currently focused element (`document.activeElement`),
+    /// or `None` when nothing is focused.
+    fn active_element(&self) -> Option<DomKey> {
+        None
+    }
+
+    /// Focus `key` (the `focus()` IDL method): returns false when
+    /// the node cannot take focus. The renderer moves its own
+    /// focus state too; this only records the host-side focus the
+    /// bindings read back.
+    /// Take a focus change queued by `focus_element` /
+    /// `blur_element` for the renderer to apply (Stage 13 Rec 3):
+    /// the host cannot move the tab's focus itself — the tab
+    /// thread owns `state.focused` — so JS-driven focus is a
+    /// pending request the tab thread drains after each JS run
+    /// (like `take_pending_navigation`). `None` = no pending
+    /// change; `Some(Some(key))` = focus that node;
+    /// `Some(None)` = blur.
+    fn take_pending_focus(&mut self) -> Option<Option<DomKey>> {
+        None
+    }
+
+    fn focus_element(&mut self, _key: DomKey) -> bool {
+        false
+    }
+
+    /// Blur the focused element (the `blur()` IDL method).
+    fn blur_element(&mut self) {}
+
+    /// `document.cookie` for the document origin: non-HttpOnly
+    /// cookies as `name=value; ...`, or `None` when the host has
+    /// no jar.
+    fn document_cookie(&self) -> Option<String> {
+        None
+    }
+
+    /// Set one cookie from `document.cookie = "..."` (a single
+    /// `name=value` pair plus attributes, `store_set_cookie`
+    /// semantics). Returns false when the host has no jar.
+    fn set_document_cookie(&mut self, _cookie: &str) -> bool {
+        false
+    }
+
+    /// Queue a form submission for the renderer to perform
+    /// (`form.submit()` / `requestSubmit()` after validation and
+    /// the `submit` event): the tab thread drains the queue and
+    /// navigates through the loader. Returns false when the host
+    /// cannot submit (no renderer attached).
+    fn request_form_submit(&mut self, _form: DomKey, _submitter: Option<DomKey>) -> bool {
+        false
+    }
+
+    /// Drain queued form submissions, oldest first.
+    fn take_pending_form_submits(&mut self) -> Vec<(DomKey, Option<DomKey>)> {
+        Vec::new()
+    }
+
     /// First element in `scope`'s subtree (including `scope` itself
     /// if it is an element) matching `selector`, in document order.
     /// The production host implements this with the Stage-6 selector

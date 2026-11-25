@@ -173,6 +173,7 @@ pub fn image_resource_request(
         top_level_site: origin,
         upgrade_insecure_requests: false,
         integrity,
+        body: None,
     }
 }
 
@@ -260,7 +261,7 @@ impl ImageStore {
     /// the tab thread). The outcome carries the navigation epoch
     /// so a stale fetch is dropped, never applied.
     pub fn spawn_fetch(
-        loader: ResourceLoader,
+        fetch: crate::broker::FetchSource,
         req: ImageRequest,
         tab_id: u64,
         epoch: u64,
@@ -277,7 +278,7 @@ impl ImageStore {
         );
         let url = req.url.clone();
         tokio::task::spawn(async move {
-            let outcome = match loader.fetch_with(request, cancel).await {
+            let outcome = match fetch.fetch_with(request, cancel).await {
                 Ok(response) => {
                     let bytes = response.body;
                     let (tx, rx) = tokio::sync::oneshot::channel();

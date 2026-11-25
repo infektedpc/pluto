@@ -76,7 +76,7 @@ pub mod transport;
 /// `SetFocused` and `ScrollViewport`. v2 bytes are rejected by
 /// [`decode_message`] — Pluto ships one binary, so a bump is a
 /// clean break, not a migration.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// What went wrong decoding a versioned message.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -238,6 +238,17 @@ pub enum RendererToBrowser {
     FaviconChanged {
         resource_id: Option<pluto_paint::ResourceId>,
     },
+    /// Per-layer sandbox results (Stage 13 Rec 12a): sent once
+    /// by the child right after the sandbox hook, before the
+    /// first navigation. Each layer reports whether it landed;
+    /// the shell records it per tab and warns when a load-bearing
+    /// layer (user-namespace, chroot, seccomp) is OFF.
+    SandboxReport { layers: Vec<(String, bool)> },
+    /// Heartbeat (Stage 13 Rec 12b): the child sends one every
+    /// few seconds from its tab-thread tick while alive, so the
+    /// browser-side watchdog can tell a hung renderer (no
+    /// heartbeat, no progress) from a merely slow one.
+    Heartbeat,
 }
 
 /// A resource ask, frozen as v1 in Stage 5. This is the payload of
@@ -296,6 +307,12 @@ pub struct ResourceRequest {
     /// subresource discoveries; navigations and `fetch()` asks
     /// leave it `None`.
     pub integrity: Option<String>,
+    /// Request body bytes (Stage 13 Rec 6: form POSTs). `None`
+    /// for GET/HEAD and every bodyless ask; `Some` carries the
+    /// encoded form body, with `Content-Type` in `headers`.
+    /// The net layer drops it (and strips the body headers) when
+    /// a redirect converts the method to GET.
+    pub body: Option<Vec<u8>>,
 }
 
 impl ResourceRequest {
@@ -320,6 +337,7 @@ impl ResourceRequest {
             top_level_site: origin,
             upgrade_insecure_requests: false,
             integrity: None,
+            body: None,
         }
     }
 }
@@ -739,8 +757,11 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_five() {
-        assert_eq!(PROTOCOL_VERSION, 5);
+    fn protocol_version_is_seven() {
+        // Bumped 5 -> 6 (Stage 13: ResourceRequest.body for form
+        // POSTs) and 6 -> 7 (Stage 13 Rec 12: SandboxReport +
+        // Heartbeat).
+        assert_eq!(PROTOCOL_VERSION, 7);
     }
 
     #[test]
@@ -885,6 +906,7 @@ mod tests {
                 method: "GET".to_string(),
                 headers: Vec::new(),
                 is_imageset: false,
+                body: None,
                 destination: Destination::Stylesheet,
                 priority: Priority::VeryHigh,
                 mode: RequestMode::NoCors,

@@ -337,6 +337,7 @@ mod tests {
                 headers: Vec::new(),
                 is_imageset: false,
             destination: Destination::Stylesheet,
+            body: None,
             priority: Priority::VeryHigh,
             mode: RequestMode::NoCors,
             credentials: CredentialsMode::SameOrigin,

@@ -558,6 +558,32 @@ fn install_storage_object<'js>(
         .set("persisted", persisted_fn)
         .map_err(|e| format!("storage.persisted: {e}"))?;
 
+    // `navigator.storage.estimate()`: resolve `{ usage, quota }`
+    // from the storage backend (Stage 13 Rec 10d). The browser
+    // backend reports the shared `localStorage` store's bytes
+    // against the global cap; the in-memory default reports
+    // `(0, 0)` until a backend is attached.
+    let b = Rc::clone(bindings);
+    let estimate_fn = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>| -> rquickjs::Result<Value<'js>> {
+            let (promise, resolve, _reject) = ctx.promise()?;
+            let backend = Arc::clone(&b.borrow().storage_backend);
+            let (usage, quota) = backend.usage_bytes();
+            let estimate = Object::new(ctx.clone()).map_err(|_| {
+                rquickjs::Error::new_from_js("TypeError", "storage.estimate")
+            })?;
+            estimate.set("usage", usage as f64)?;
+            estimate.set("quota", quota as f64)?;
+            let _: Value = resolve.call((estimate,))?;
+            Ok(promise.into_value())
+        },
+    )
+    .map_err(|e| format!("storage.estimate: {e}"))?;
+    storage
+        .set("estimate", estimate_fn)
+        .map_err(|e| format!("storage.estimate: {e}"))?;
+
     navigator
         .set("storage", storage)
         .map_err(|e| format!("navigator.storage: {e}"))?;

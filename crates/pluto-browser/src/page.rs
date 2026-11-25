@@ -362,6 +362,8 @@ fn subresource_request(
         // attribute, verified over the decoded bytes in
         // `pluto-net` before `Done`.
         integrity,
+        // Stage 13 Rec 6: subresources never carry a body.
+        body: None,
     }
 }
 
@@ -490,13 +492,22 @@ pub trait ScriptHooks {
 ///
 /// Logs each stage to stderr: the terminal is the only window into a
 /// load that stalls (no logging framework is wired up yet).
+/// A form-POST body for a navigation (Stage 13 Rec 6): the
+/// encoded entry list plus its `Content-Type`. `None` means a
+/// plain GET navigation.
+#[derive(Debug, Clone)]
+pub struct PostBody {
+    pub bytes: Vec<u8>,
+    pub content_type: String,
+}
+
 /// Load a page, with an optional [`ScriptHooks`] runner attached:
 /// parser-blocking scripts execute at their pause, async scripts on
 /// arrival, defer scripts after the parse, and `DOMContentLoaded`
 /// fires once the defer queue drains. `None` keeps the old
 /// behaviour (scripts fetched and held, never executed).
 pub async fn load_page_cancellable_with_hooks(
-    loader: &ResourceLoader,
+    fetch: &crate::broker::FetchSource,
     url: String,
     cancel: CancellationToken,
     mut hooks: Option<Box<dyn ScriptHooks + '_>>,
@@ -504,7 +515,19 @@ pub async fn load_page_cancellable_with_hooks(
     tab_id: u64,
     epoch: u64,
     viewport: (f32, f32),
+    post_body: Option<PostBody>,
+    referrer_url: &str,
 ) -> Result<(Document, String), String> {
+    // Stage 13 Rec 12c: the internal crash page renders locally
+    // — no fetch, no gates — from the fixed crash document. It is
+    // only ever reached by the shell navigating a crashed tab to
+    // `about:crashed`; it is not a user-navigable URL.
+    if url == "about:crashed" {
+        return Ok((
+            parse_document_with_base(&crash_document(), "about:crashed"),
+            "about:crashed".to_string(),
+        ));
+    }
     // Stage 9 Rec 7 (T11): scheme allowlist at the load entry
     // point — defence in depth behind `normalize_url` (link clicks
     // and other callers reach here without it). A disallowed scheme
@@ -514,13 +537,24 @@ pub async fn load_page_cancellable_with_hooks(
         eprintln!("[pluto] blocked navigation: {reason}");
         return Err(reason);
     }
-    let request = ResourceRequest::navigate(next_request_id(), tab_id, epoch, &url);
+    let mut request = ResourceRequest::navigate(next_request_id(), tab_id, epoch, &url);
+    // Stage 13 Rec 6: a form POST rides the same loader (same
+    // Stage 9 gates — mixed content, blocker, HSTS, cookie jar,
+    // epoch cancellation) as a GET navigation; only the method,
+    // body and `Content-Type` differ.
+    if let Some(post) = post_body {
+        request.method = "POST".to_string();
+        request.body = Some(post.bytes);
+        request
+            .headers
+            .push(("Content-Type".to_string(), post.content_type));
+    }
     eprintln!("[pluto] fetching {url}");
     // Stage 11 Rec 9: the document fetch streams its progress
     // (bytes vs Content-Length) to the shell's progress bar via
     // the sink; without a sink the callback is a no-op.
     let progress_tx = sinks.progress.clone();
-    let response = match loader
+    let response = match fetch
         .fetch_with_progress(request, cancel.clone(), move |received, total| {
             if let Some(tx) = &progress_tx {
                 let _ = tx.send((received, total));
@@ -569,13 +603,10 @@ pub async fn load_page_cancellable_with_hooks(
         // The previous document is the secure context a mixed
         // download is judged against; a typed first navigation
         // has none, so the mixed check passes through to `decide`.
-        let page_origin = loader
-            .referrer_context()
-            .lock()
-            .unwrap()
-            .document_url
-            .clone()
-            .unwrap_or_default();
+        // Stage 13 Rec 11: the referrer arrives as a parameter
+        // — in broker mode the loader-side referrer context lives
+        // in the broker, not in this process.
+        let page_origin = referrer_url.to_string();
         if is_mixed_download_blocked(&page_origin, &final_url, disposition) {
             return Err(format!("mixed download blocked: {final_url}"));
         }
@@ -614,7 +645,7 @@ pub async fn load_page_cancellable_with_hooks(
     // network streaming (feed chunks as they arrive) is the
     // follow-up — see the module docs.
     fire_preloads(
-        loader,
+        fetch,
         &response.body,
         &final_url,
         cancel.clone(),
@@ -626,7 +657,7 @@ pub async fn load_page_cancellable_with_hooks(
     // Stage 11 Rec 6: warm the connection hints the scanner
     // recorded (`<link rel="preconnect">` / `dns-prefetch`) on a
     // detached task — the parse must not wait on a TLS handshake.
-    fire_connection_hints(loader, &response.body, &final_url);
+    fire_connection_hints(fetch, &response.body, &final_url);
     // Wave 2b: the parser lives in an `Rc<RefCell>` so the script
     // runner (via the host) can reach its `DocumentWriter` while
     // the load drives it.
@@ -645,7 +676,7 @@ pub async fn load_page_cancellable_with_hooks(
         hooks.parser_created(&parser);
     }
     let mut load = StreamingLoad::new(
-        loader,
+        fetch.clone(),
         cancel.clone(),
         final_url.clone(),
         parser,
@@ -705,7 +736,7 @@ pub async fn load_page_cancellable_with_hooks(
 /// 10), so a srcset candidate is selected for the actual page
 /// width, not the 1024 px default.
 fn fire_preloads(
-    loader: &ResourceLoader,
+    fetch: &crate::broker::FetchSource,
     body: &[u8],
     base_url: &str,
     cancel: CancellationToken,
@@ -728,7 +759,7 @@ fn fire_preloads(
         if found.destination == HtmlDestination::Image {
             continue;
         }
-        let loader = loader.clone();
+        let fetch = fetch.clone();
         let cancel = cancel.clone();
         let request = subresource_request(
             &found.url,
@@ -750,7 +781,7 @@ fn fire_preloads(
             epoch,
         );
         tokio::spawn(async move {
-            let _ = loader.fetch_with(request, cancel).await;
+            let _ = fetch.fetch_with(request, cancel).await;
         });
     }
 }
@@ -765,9 +796,9 @@ fn fire_preloads(
 /// values). `preconnect` itself applies HSTS and refuses
 /// blocker-blocked tracker origins, so this needs no extra
 /// gating here.
-fn fire_connection_hints(loader: &ResourceLoader, body: &[u8], base_url: &str) {
+fn fire_connection_hints(fetch: &crate::broker::FetchSource, body: &[u8], base_url: &str) {
     use pluto_html::HintKind;
-    let loader = loader.clone();
+    let fetch = fetch.clone();
     let hints = scan_hints(body, base_url);
     if hints.is_empty() {
         return;
@@ -777,12 +808,12 @@ fn fire_connection_hints(loader: &ResourceLoader, body: &[u8], base_url: &str) {
         for hint in hints {
             match hint.kind {
                 HintKind::Preconnect if preconnected < MAX_PRECONNECTS_PER_PAGE => {
-                    if loader.preconnect(&hint.url).await {
+                    if fetch.preconnect(&hint.url).await {
                         preconnected += 1;
                     }
                 }
                 _ => {
-                    let _ = loader.dns_prefetch(&hint.url).await;
+                    let _ = fetch.dns_prefetch(&hint.url).await;
                 }
             }
         }
@@ -792,8 +823,8 @@ fn fire_connection_hints(loader: &ResourceLoader, body: &[u8], base_url: &str) {
 /// The streaming load's mutable state: the parser, the caches that
 /// survive an encoding restart (so nothing is refetched), and the
 /// render-blocking deadline.
-struct StreamingLoad<'a, 'h> {
-    loader: &'a ResourceLoader,
+struct StreamingLoad<'h> {
+    fetch: crate::broker::FetchSource,
     cancel: CancellationToken,
     base_url: String,
     /// The parser, shared with the script runner (via the host) so
@@ -834,9 +865,9 @@ struct StreamingLoad<'a, 'h> {
     encoding_logged: bool,
 }
 
-impl<'a, 'h> StreamingLoad<'a, 'h> {
+impl<'h> StreamingLoad<'h> {
     fn new(
-        loader: &'a ResourceLoader,
+        fetch: crate::broker::FetchSource,
         cancel: CancellationToken,
         base_url: String,
         parser: std::rc::Rc<std::cell::RefCell<Parser>>,
@@ -846,7 +877,7 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
         epoch: u64,
     ) -> Self {
         Self {
-            loader,
+            fetch,
             cancel,
             base_url: base_url.clone(),
             parser,
@@ -895,7 +926,7 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
                 // wins; the response header's policy was already
                 // applied when the document response arrived).
                 if let Some(policy) = self.parser.borrow().referrer_policy() {
-                    self.loader
+                    self.fetch
                         .set_referrer_policy(map_html_referrer_policy(policy));
                 }
                 let mut resume = false;
@@ -1121,7 +1152,7 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
             self.tab_id,
             self.epoch,
         );
-        let fetch = self.loader.fetch_with(request, self.cancel.clone());
+        let fetch = self.fetch.fetch_with(request, self.cancel.clone());
         match tokio::time::timeout_at(self.blocking_deadline, fetch).await {
             Ok(Ok(response)) => Some(response.text()),
             Ok(Err(e)) => {
@@ -1164,7 +1195,7 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
             self.tab_id,
             self.epoch,
         );
-        match self.loader.fetch_with(request, self.cancel.clone()).await {
+        match self.fetch.fetch_with(request, self.cancel.clone()).await {
             Ok(response) => {
                 let final_url = response.final_url.to_string();
                 let bytes = response.body;
@@ -1250,7 +1281,7 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
             self.tab_id,
             self.epoch,
         );
-        match self.loader.fetch_with(request, self.cancel.clone()).await {
+        match self.fetch.fetch_with(request, self.cancel.clone()).await {
             Ok(response) => {
                 let final_url = response.final_url.to_string();
                 let text = String::from_utf8_lossy(&response.body).into_owned();
@@ -1645,6 +1676,38 @@ fn combine_media(outer: Option<&str>, inner: Option<MediaCondition>) -> Option<M
     }
 }
 
+/// The sad-tab crash page (Stage 13 Rec 12c), rendered through
+/// the same pipeline as a real page. Reached only via the
+/// internal `about:crashed` URL the shell navigates a crashed
+/// tab to — never fetched, never in history, never user-typed.
+/// It has no links: the only way out is the shell's Reload.
+pub fn crash_document() -> String {
+    r#"<!doctype html>
+<html>
+<head>
+    <title>Pluto: renderer crashed</title>
+    <style type="text/css">
+    body {
+        background-color: #ffffff;
+        margin: 0;
+        padding: 2em;
+    }
+    h1 {
+        font-size: 24px;
+    }
+    p {
+        font-size: 16px;
+    }
+    </style>
+</head>
+<body>
+    <h1>Aw, snap! The renderer crashed.</h1>
+    <p>This page stopped responding. Press Reload to try again.</p>
+</body>
+</html>"#
+        .to_string()
+}
+
 /// A small error page, rendered through the same pipeline as a real one.
 pub fn error_document(url: &str, err: &str) -> String {
     format!(
@@ -1991,8 +2054,9 @@ mod tests {
         tokio::spawn(serve(listener));
         let url = format!("http://127.0.0.1:{}/", addr.port());
         let loader = ResourceLoader::new();
+        let fetch = crate::broker::FetchSource::Direct(std::sync::Arc::new(loader));
         let (doc, final_url) =
-            load_page_cancellable_with_hooks(&loader, url.clone(), CancellationToken::new(), None, LoadSinks::none(), 0, 0, DEFAULT_VIEWPORT)
+            load_page_cancellable_with_hooks(&fetch, url.clone(), CancellationToken::new(), None, LoadSinks::none(), 0, 0, DEFAULT_VIEWPORT, None, "")
                 .await
                 .expect("page loads");
         assert_eq!(final_url, url);
@@ -2043,7 +2107,8 @@ mod tests {
         tokio::spawn(serve_attachment(listener));
         let url = format!("http://127.0.0.1:{}/", addr.port());
         let loader = ResourceLoader::new();
-        let err = load_page_cancellable_with_hooks(&loader, url, CancellationToken::new(), None, LoadSinks::none(), 0, 0, DEFAULT_VIEWPORT)
+        let fetch = crate::broker::FetchSource::Direct(std::sync::Arc::new(loader));
+        let err = load_page_cancellable_with_hooks(&fetch, url, CancellationToken::new(), None, LoadSinks::none(), 0, 0, DEFAULT_VIEWPORT, None, "")
             .await
             .expect_err("an attachment must not load as a page");
         assert!(
@@ -2083,6 +2148,7 @@ mod tests {
         });
         let url = format!("http://127.0.0.1:{}/", addr.port());
         let loader = ResourceLoader::new();
+        let fetch = crate::broker::FetchSource::Direct(std::sync::Arc::new(loader));
         let (img_tx, mut img_rx) = tokio::sync::mpsc::unbounded_channel();
         let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel();
         let sinks = LoadSinks {
@@ -2091,7 +2157,7 @@ mod tests {
             module_sources: None,
         };
         let (_, _) = load_page_cancellable_with_hooks(
-            &loader,
+            &fetch,
             url.clone(),
             CancellationToken::new(),
             None,
@@ -2099,6 +2165,8 @@ mod tests {
             3,
             1,
             DEFAULT_VIEWPORT,
+            None,
+            "",
         )
         .await
         .expect("page loads");
@@ -2118,9 +2186,42 @@ mod tests {
         assert_eq!(last, (BODY.len() as u64, Some(BODY.len() as u64)));
     }
 
+    /// Stage 13 Rec 12c: the internal crash page renders
+    /// locally — no fetch, no gates — and commits as
+    /// `about:crashed` so the shell can show it on a dead tab
+    /// while the address bar keeps the real URL.
+    #[tokio::test]
+    async fn load_page_about_crashed_renders_crash_page() {
+        let loader = ResourceLoader::new();
+        let fetch = crate::broker::FetchSource::Direct(std::sync::Arc::new(loader));
+        let (document, final_url) = load_page_cancellable_with_hooks(
+            &fetch,
+            "about:crashed".to_string(),
+            CancellationToken::new(),
+            None,
+            LoadSinks::none(),
+            0,
+            0,
+            DEFAULT_VIEWPORT,
+            None,
+            "",
+        )
+        .await
+        .expect("about:crashed loads without a fetch");
+        assert_eq!(final_url, "about:crashed");
+        let dom = document.dom();
+        let root = dom.root().expect("crash page has a root");
+        let text = dom.descendant_text(root);
+        assert!(
+            text.to_lowercase().contains("renderer crashed"),
+            "crash page says the renderer crashed: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn load_page_invalid_url_errors() {
         let loader = ResourceLoader::new();
+        let fetch = crate::broker::FetchSource::Direct(std::sync::Arc::new(loader));
         // Stage 9 Rec 7 (T11): disallowed schemes fail in the load
         // entry point, before any fetch — the caller renders the
         // error page from this `Err`.
@@ -2132,7 +2233,7 @@ mod tests {
         ] {
             assert!(
                 load_page_cancellable_with_hooks(
-                    &loader,
+                    &fetch,
                     url.to_string(),
                     CancellationToken::new(),
                     None,
@@ -2140,6 +2241,8 @@ mod tests {
                     0,
                     0,
                     DEFAULT_VIEWPORT,
+                    None,
+                    "",
                 )
                 .await
                 .is_err(),
@@ -2225,8 +2328,9 @@ mod tests {
         tokio::spawn(serve_tracked(listener, Arc::clone(&hits)));
         let url = format!("http://127.0.0.1:{}/", addr.port());
         let loader = ResourceLoader::new();
+        let fetch = crate::broker::FetchSource::Direct(std::sync::Arc::new(loader));
         let (doc, _final_url) =
-            load_page_cancellable_with_hooks(&loader, url.clone(), CancellationToken::new(), None, LoadSinks::none(), 0, 0, DEFAULT_VIEWPORT)
+            load_page_cancellable_with_hooks(&fetch, url.clone(), CancellationToken::new(), None, LoadSinks::none(), 0, 0, DEFAULT_VIEWPORT, None, "")
                 .await
                 .expect("page loads");
         assert_eq!(doc.base_url, url);
@@ -2309,7 +2413,8 @@ mod tests {
         });
         let url = format!("http://127.0.0.1:{}/", addr.port());
         let loader = ResourceLoader::new();
-        let (doc, _) = load_page_cancellable_with_hooks(&loader, url, CancellationToken::new(), None, LoadSinks::none(), 0, 0, DEFAULT_VIEWPORT)
+        let fetch = crate::broker::FetchSource::Direct(std::sync::Arc::new(loader));
+        let (doc, _) = load_page_cancellable_with_hooks(&fetch, url, CancellationToken::new(), None, LoadSinks::none(), 0, 0, DEFAULT_VIEWPORT, None, "")
             .await
             .expect("page loads");
         // Both paragraphs rendered (the parser resumed past the
@@ -2374,7 +2479,8 @@ mod tests {
         });
         let url = format!("http://127.0.0.1:{}/", addr.port());
         let loader = ResourceLoader::new();
-        let (doc, _) = load_page_cancellable_with_hooks(&loader, url, CancellationToken::new(), None, LoadSinks::none(), 0, 0, DEFAULT_VIEWPORT)
+        let fetch = crate::broker::FetchSource::Direct(std::sync::Arc::new(loader));
+        let (doc, _) = load_page_cancellable_with_hooks(&fetch, url, CancellationToken::new(), None, LoadSinks::none(), 0, 0, DEFAULT_VIEWPORT, None, "")
             .await
             .expect("page loads despite the missing sheet");
         let display = layout_for(&doc, (800.0, 600.0));

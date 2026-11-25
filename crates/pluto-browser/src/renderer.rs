@@ -66,6 +66,7 @@ use pluto_ipc::{
     WheelPhase, origin_of,
 };
 use pluto_ipc::transport::{recv_browser_message, Transport};
+use pluto_js::DomHost;
 use pluto_js::TabJs;
 use pluto_js::bindings::events::TypedEventKind;
 use pluto_layout::{ElementState, ImageMap, LayoutTree, OverscrollBehavior, RelayoutKind};
@@ -112,12 +113,28 @@ fn worker_stream(tab_id: u64) -> impl cosmic::iced::futures::stream::Stream<Item
             .send(crate::Message::RendererReady(tab_id, cmd_tx))
             .await;
         match std::env::current_exe() {
-            Ok(exe) => run_renderer_bridge(tab_id, &exe, cmd_rx, output).await,
+            Ok(exe) => {
+                run_renderer_bridge(tab_id, &exe, cmd_rx, output, inprocess_fallback_allowed())
+                    .await
+            }
             Err(e) => {
-                eprintln!(
-                    "[pluto] cannot find own executable ({e}) — falling back to the in-process renderer"
-                );
-                run_worker(tab_id, cmd_rx, output).await;
+                // Stage 13 Rec 12d: no executable to spawn and the
+                // in-process fallback is OFF by default — report
+                // the crash and stay alive. The bridge is entered
+                // with an unspawnable path, so it reports the
+                // spawn failure as a crash and awaits a
+                // navigation (a later Reload retries the spawn).
+                eprintln!("[pluto] cannot find own executable ({e})");
+                let allow = inprocess_fallback_allowed();
+                if allow {
+                    eprintln!(
+                        "[pluto] PLUTO_ALLOW_INPROCESS_FALLBACK=1 — falling back to the in-process renderer"
+                    );
+                    run_worker(tab_id, cmd_rx, output).await;
+                } else {
+                    run_renderer_bridge(tab_id, std::path::Path::new(""), cmd_rx, output, allow)
+                        .await;
+                }
             }
         }
     })
@@ -136,24 +153,52 @@ fn worker_stream(tab_id: u64) -> impl cosmic::iced::futures::stream::Stream<Item
 /// page recovers. Commands other than navigation are dropped
 /// while no renderer is alive — there is no page to act on.
 ///
-/// If the child cannot be spawned at all, the bridge falls back
-/// to the in-process worker (`run_worker`) so the browser still
-/// runs — loudly logged, never silent.
+/// If the child cannot be spawned at all, the bridge reports a
+/// crash and stays alive awaiting a navigation (Stage 13 Rec 12d:
+/// the in-process fallback runs only with
+/// `PLUTO_ALLOW_INPROCESS_FALLBACK=1`, loudly logged, never
+/// silent).
 async fn run_renderer_bridge(
     tab_id: u64,
     exe: &std::path::Path,
     mut commands: CommandReceiver,
     mut output: mpsc::Sender<crate::Message>,
+    allow_inprocess_fallback: bool,
 ) {
+    // Stage 13 Rec 12b: the watchdog — the last instant any
+    // event (heartbeat or otherwise) arrived from the renderer.
+    let timeout = watchdog_timeout();
+    let mut last_progress = tokio::time::Instant::now();
+    let mut watchdog_tick = tokio::time::interval(Duration::from_secs(1));
+    // Consume the immediate first tick: the first real check is
+    // one second in.
+    watchdog_tick.tick().await;
     let mut renderer =
         match crate::renderer_process::RendererProcess::spawn(exe, tab_id).await {
             Ok(renderer) => Some(renderer),
             Err(e) => {
-                eprintln!(
-                    "[pluto] renderer process spawn failed ({e}) — falling back to the in-process renderer"
-                );
-                run_worker(tab_id, commands, output).await;
-                return;
+                eprintln!("[pluto] renderer process spawn failed ({e})");
+                if allow_inprocess_fallback {
+                    eprintln!(
+                        "[pluto] PLUTO_ALLOW_INPROCESS_FALLBACK=1 — falling back to the in-process renderer"
+                    );
+                    run_worker(tab_id, commands, output).await;
+                    return;
+                }
+                // Fail closed (Stage 13 Rec 12d): report the crash
+                // and stay alive with no renderer — the loop below
+                // respawns on the next `CommitNavigation`.
+                let _ = output
+                    .send(crate::Message::RendererEvent(
+                        tab_id,
+                        RendererToBrowser::RendererCrashed {
+                            reason: format!(
+                                "renderer spawn failed: {e} (in-process fallback disabled)"
+                            ),
+                        },
+                    ))
+                    .await;
+                None
             }
         };
     // Whether the shell has asked for shutdown: a clean EOF after
@@ -232,6 +277,10 @@ async fn run_renderer_bridge(
             } => {
                 match event {
                     Ok(Some(event)) => {
+                        // Stage 13 Rec 12b: any event — heartbeat
+                        // or otherwise — proves the renderer is
+                        // alive; the watchdog clock restarts here.
+                        last_progress = tokio::time::Instant::now();
                         if output
                             .send(crate::Message::RendererEvent(tab_id, event))
                             .await
@@ -270,6 +319,36 @@ async fn run_renderer_bridge(
                         )
                         .await;
                     }
+                }
+            }
+            // Stage 13 Rec 12b: the watchdog — a renderer that
+            // has sent nothing (no heartbeat, no progress) for
+            // the whole timeout is hung, not slow: kill it and
+            // report the crash. The bridge stays alive with no
+            // renderer; the next navigation respawns. A shutdown
+            // in progress never fires it (the child is exiting
+            // on purpose, and its silence is expected).
+            _ = watchdog_tick.tick(), if timeout.is_some() => {
+                if let Some(limit) = timeout
+                    && !shutting_down
+                    && renderer.is_some()
+                    && last_progress.elapsed() > limit
+                {
+                    eprintln!(
+                        "[pluto] renderer watchdog: no heartbeat or progress for {}s — killing",
+                        limit.as_secs()
+                    );
+                    report_renderer_crash(
+                        tab_id,
+                        &mut output,
+                        &mut renderer,
+                        &format!(
+                            "renderer unresponsive (watchdog: no heartbeat or progress for {}s)",
+                            limit.as_secs()
+                        ),
+                        shutting_down,
+                    )
+                    .await;
                 }
             }
         }
@@ -1143,6 +1222,40 @@ impl FrameTimeHistogram {
 /// ~60 Hz; see the module docs — no shell vsync exists to drive it).
 const TAB_TICK: Duration = Duration::from_millis(16);
 
+/// Heartbeat interval (Stage 13 Rec 12b): the tab thread sends
+/// one `RendererToBrowser::Heartbeat` this often while alive, so
+/// the bridge watchdog can tell a hung renderer from a slow one.
+/// Five seconds against the 30 s watchdog timeout leaves room
+/// for six missed beats before a kill.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Watchdog timeout (Stage 13 Rec 12b): silence longer than this
+/// — no heartbeat, no event of any kind — means the renderer is
+/// hung; the bridge kills it and reports `RendererCrashed`.
+/// `PLUTO_WATCHDOG_SECS` overrides it for tests; `0` disables it.
+const WATCHDOG_SECS_DEFAULT: u64 = 30;
+const WATCHDOG_ENV: &str = "PLUTO_WATCHDOG_SECS";
+
+/// Debug-only escape hatch (Stage 13 Rec 12d): the in-process
+/// fallback is OFF by default — a spawn failure must surface as
+/// a crashed tab, never silently run the page in-process.
+const ALLOW_INPROCESS_FALLBACK_ENV: &str = "PLUTO_ALLOW_INPROCESS_FALLBACK";
+
+fn inprocess_fallback_allowed() -> bool {
+    std::env::var_os(ALLOW_INPROCESS_FALLBACK_ENV).is_some_and(|v| v == "1")
+}
+
+fn watchdog_timeout() -> Option<Duration> {
+    match std::env::var(WATCHDOG_ENV) {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(Duration::from_secs(secs)),
+            Err(_) => Some(Duration::from_secs(WATCHDOG_SECS_DEFAULT)),
+        },
+        Err(_) => Some(Duration::from_secs(WATCHDOG_SECS_DEFAULT)),
+    }
+}
+
 /// The outcome of one navigation's load task, sent back to the
 /// tab thread's main loop. Carries the navigation epoch it belongs
 /// to: a load that was cancelled by a newer navigation can still
@@ -1172,6 +1285,12 @@ struct TabState {
     tab_id: u64,
     layout_tx: std::sync::mpsc::Sender<LayoutJob>,
     loader: ResourceLoader,
+    /// Where this tab's fetches go (Stage 13 Rec 11): direct
+    /// loader in-process, browser-side broker out-of-process.
+    fetch_source: crate::broker::FetchSource,
+    /// The broker handle when `fetch_source` is `Broker`
+    /// (`None` in-process) — routes inbound `ResourceEvent`s.
+    broker_handle: Option<Arc<crate::broker::BrokerHandle>>,
     /// The worker's image pipeline (Stage 11 Rec 1/7/11): decoded
     /// pixels, per-URL state, animation timers, favicon
     /// bookkeeping.
@@ -1280,6 +1399,15 @@ struct TabState {
     wheel_idle_ticks: u32,
     /// Frame ticks elapsed (gesture timeout bookkeeping).
     tick_count: u64,
+    /// Caret blink clock (Stage 13 Rec 4): reset on every focus
+    /// change and edit, so the caret is visible right after
+    /// typing; the visible half is ~530 ms.
+    caret_blink_epoch: std::time::Instant,
+    /// Blink phase at the last submit: the tick re-submits the
+    /// cached display list (no layout) when it flips.
+    caret_blink_on: bool,
+    /// Last heartbeat sent to the bridge (Stage 13 Rec 12b).
+    last_heartbeat: std::time::Instant,
     viewport: (f32, f32),
     /// The viewport scroll offset, mirrored from the shell (Stage 8
     /// Rec 10): every viewport scroll flows through
@@ -1340,6 +1468,7 @@ impl TabState {
         fetch_handle: tokio::runtime::Handle,
         tab_id: u64,
         shared: &SharedLoader,
+        broker: Option<Arc<crate::broker::BrokerHandle>>,
     ) -> Self {
         let errors = Rc::new(std::sync::Mutex::new(Vec::new()));
         let render_requested = Rc::new(Cell::new(false));
@@ -1365,7 +1494,31 @@ impl TabState {
         // shared; CSP, referrer, HTTPS-only, preflight cache,
         // caps/dedup stay per-tab) instead of a fresh private one.
         let loader = ResourceLoader::from_shared(shared);
-        crate::security::load_into(&loader);
+        // Stage 13 Rec 11: broker mode fetches through the
+        // browser-side broker, so this process owns no profile
+        // state — no HSTS / cookie load, no temp sweep, no
+        // persistence writes (the broker owns all of it).
+        let fetch_source = match &broker {
+            Some(handle) => crate::broker::FetchSource::Broker(Arc::clone(handle)),
+            None => crate::broker::FetchSource::Direct(Arc::new(loader.clone())),
+        };
+        if broker.is_none() {
+            // Stage 13 Rec 10c: `document.cookie` reads/writes
+            // the shared jar through the host.
+            host.lock()
+                .unwrap()
+                .set_cookie_jar(loader.cookie_jar());
+            crate::security::load_into(&loader);
+            // Stage 13 Rec 9: restore the persisted cookie jar
+            // into the shared loader (session cookies were
+            // stripped before the last save, so nothing stale
+            // comes back), and sweep stale atomic-write temp
+            // files from the profile dir.
+            crate::cookies::load_into(&loader);
+            if let Some(dir) = crate::security::profile_dir() {
+                crate::atomic::sweep_stale_temps(&dir);
+            }
+        }
         // Stage 10 Rec 8: seed `:visited` from the persisted
         // history, so links to pages visited in a previous
         // session already match on the first layout pass — the
@@ -1379,6 +1532,8 @@ impl TabState {
             tab_id,
             layout_tx,
             loader,
+            fetch_source,
+            broker_handle: broker,
             fetch_handle,
             images: ImageStore::new(),
             last_display: None,
@@ -1412,6 +1567,9 @@ impl TabState {
             wheel_chain: Vec::new(),
             wheel_idle_ticks: 0,
             tick_count: 0,
+            caret_blink_epoch: std::time::Instant::now(),
+            caret_blink_on: true,
+            last_heartbeat: std::time::Instant::now(),
             viewport: page::DEFAULT_VIEWPORT,
             viewport_scroll: (0.0, 0.0),
             tab_started: std::time::Instant::now(),
@@ -1442,7 +1600,7 @@ impl TabState {
             let mut js = crate::js_host::new_tab_js().expect("tab JS realm creates");
             js.set_dom_host(Box::new(crate::js_host::SharedHost(Rc::clone(&self.host))));
             let backend = std::sync::Arc::new(crate::js_host::PlutoFetchBackend::new(
-                self.loader.clone(),
+                self.fetch_source.clone(),
                 self.fetch_handle.clone(),
                 "",
                 self.tab_id,
@@ -1455,6 +1613,9 @@ impl TabState {
             // tab; `TabJs::navigate` re-attaches them to the
             // fresh realm on every navigation).
             let backends = crate::js_host::new_tab_backends();
+            // Tag this tab's mutations for the cross-tab `storage`
+            // event fan-out (Stage 13 Rec 10d).
+            backends.storage.set_tab_id(self.tab_id);
             js.set_storage_backend(
                 std::sync::Arc::clone(&backends.storage)
                     as std::sync::Arc<dyn pluto_js::bindings::storage::StorageBackend>,
@@ -1486,6 +1647,7 @@ fn tab_thread_main(
     layout_tx: std::sync::mpsc::Sender<LayoutJob>,
     tab_id: u64,
     shared: SharedLoader,
+    broker: bool,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1493,7 +1655,7 @@ fn tab_thread_main(
         .expect("tab thread runtime builds");
     runtime.block_on(async {
         tokio::task::LocalSet::new()
-            .run_until(tab_main(commands, events, layout_tx, tab_id, shared))
+            .run_until(tab_main(commands, events, layout_tx, tab_id, shared, broker))
             .await;
     });
 }
@@ -1509,16 +1671,33 @@ async fn tab_main(
     layout_tx: std::sync::mpsc::Sender<LayoutJob>,
     tab_id: u64,
     shared: SharedLoader,
+    broker: bool,
 ) {
-    let mut state = TabState::new(layout_tx, tokio::runtime::Handle::current(), tab_id, &shared);
+    // Stage 13 Rec 11: the out-of-process child fetches through
+    // the browser-side broker (no sockets in this process); the
+    // in-process worker keeps its direct loader.
+    let broker_handle = if broker {
+        Some(crate::broker::BrokerHandle::new(events.clone()))
+    } else {
+        None
+    };
+    let mut state = TabState::new(
+        layout_tx,
+        tokio::runtime::Handle::current(),
+        tab_id,
+        &shared,
+        broker_handle,
+    );
     // Stage 9 Rec 12: refresh the tracker lists in the
     // background (EasyList + EasyPrivacy, fetched by default).
     // The refresh works on its own copy — loaded from the
     // profile dir — and swaps it in at the end, so page loads
     // never wait on it and never see an empty blocker
     // mid-refresh; it is freshness-gated (~4 h), so only the
-    // first tab in the window actually fetches.
-    {
+    // first tab in the window actually fetches. Skipped in
+    // broker mode (Stage 13 Rec 11): the broker owns the
+    // blocker, and this process must not write the profile.
+    if state.broker_handle.is_none() {
         let blocker = state.loader.blocker();
         tokio::task::spawn(async move {
             let Some(dir) = pluto_net::blocker::profile_list_dir() else {
@@ -1566,6 +1745,13 @@ async fn tab_main(
                 // the whole frame, not just the layout half.
                 let tick_started = std::time::Instant::now();
                 state.tick_count += 1;
+                // Stage 13 Rec 12b: heartbeat for the bridge
+                // watchdog — best-effort (a full event channel
+                // means the bridge is gone; the tick continues).
+                if state.last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                    state.last_heartbeat = std::time::Instant::now();
+                    let _ = events.try_send(RendererToBrowser::Heartbeat);
+                }
                 // Wheel gesture expiry (Stage 8 Rec 9): no wheel
                 // for ~200 ms (~12 ticks) ends the gesture — the
                 // chain is forgotten, so the next wheel re-picks
@@ -1584,6 +1770,7 @@ async fn tab_main(
                 // host only recorded the request, so the tab
                 // thread acts on it here, once per tick.
                 drain_host_requests(&mut state);
+                drain_host_requests_async(&mut state, &events).await;
                 // Stage 11 Rec 11: advance due animations (the
                 // visible set is refreshed by a `Geometry` job
                 // every ~30 ticks — see below) and re-submit the
@@ -1637,6 +1824,20 @@ async fn tab_main(
                     }
                     if sent {
                         submit(&mut state, &events, display).await;
+                    }
+                }
+                // Stage 13 Rec 4: caret blink — when the ~530 ms
+                // phase flips with a focused text control, re-submit
+                // the cached (caret-free) display list with fresh
+                // caret items: no layout, just a new submit.
+                if state.focused.is_some() {
+                    let phase = caret_blink_on(&state);
+                    if phase != state.caret_blink_on {
+                        state.caret_blink_on = phase;
+                        if let Some(display) = state.last_display.clone() {
+                            let display = with_caret(&mut state, display);
+                            submit(&mut state, &events, display).await;
+                        }
                     }
                 }
                 // Dirty-bit flow (Rec 7): a JS mutation sets the
@@ -1729,6 +1930,10 @@ async fn tab_main(
     if let Some(backends) = state.tab_backends.take() {
         crate::js_host::save_tab_backends(&backends);
     }
+    // Stage 13 Rec 11: in broker mode the broker owns the jar.
+    if state.broker_handle.is_none() {
+        crate::cookies::save_from(&state.loader);
+    }
 }
 
 /// Handle one shell command. Returns false when the loop should
@@ -1808,12 +2013,15 @@ async fn handle_single_command(
             state.window_focused = focused;
         }
         BrowserToRenderer::ResourceEvent(event) => {
-            // The M5 shape: the shell streams fetch events back
-            // to the renderer. Today the worker fetches through
-            // its own loader, which consumes the events
-            // internally, so nothing arrives here — ignore it if
-            // it ever does.
-            eprintln!("[pluto] ignoring ResourceEvent from shell: {event:?}");
+            // Stage 13 Rec 11: the broker streams fetch events
+            // back to the renderer — deliver to the waiting
+            // fetch by request id. No handle (in-process) means
+            // a stray event; ignore it.
+            if let Some(handle) = &state.broker_handle {
+                handle.deliver(event).await;
+            } else {
+                eprintln!("[pluto] ignoring ResourceEvent from shell: {event:?}");
+            }
         }
         BrowserToRenderer::InputEvent(event) => {
             handle_input(state, events, event).await;
@@ -1958,6 +2166,78 @@ fn drain_host_requests(state: &mut TabState) {
     }
 }
 
+/// Drain the JS requests that need an async tab thread (Stage 13
+/// Rec 3/6/7): a JS-queued focus change (`el.focus()` /
+/// `el.blur()`) and queued form submissions (`form.submit()` /
+/// `requestSubmit()` after validation + the `submit` event).
+/// Called from the tick, after the sync drain above: focus moves
+/// and submissions restyle / navigate, so they need the async
+/// context (and the one-tick delay is invisible).
+async fn drain_host_requests_async(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+) {
+    let (focus, submits) = {
+        let mut host = state.host.lock().unwrap();
+        (
+            host.take_pending_focus(),
+            host.take_pending_form_submits(),
+        )
+    };
+    if let Some(focus) = focus {
+        set_focus(state, events, focus).await;
+    }
+    for (form, submitter) in submits {
+        submit_form(state, events, form, submitter).await;
+    }
+    // Storage events fan out here too (Stage 13 Rec 10d): other
+    // tabs' mutations arrive as `storage` events on this tab's
+    // window, never the mutating tab's.
+    drain_storage_events(state);
+}
+
+/// Drain cross-tab `storage` events for this tab's origin and
+/// dispatch them to the window (Stage 13 Rec 10d). The shared
+/// store already filtered out this tab's own mutations; this
+/// filters to the current document's origin (storage is
+/// partitioned) and hands each event to `TabJs` (which builds a
+/// plain `Event('storage')` with `key` / `oldValue` / `newValue`
+/// / `url` on the window).
+fn drain_storage_events(state: &mut TabState) {
+    let Some(backends) = &state.tab_backends else {
+        return;
+    };
+    use pluto_js::bindings::storage::StorageBackend;
+    let events = backends.storage.drain_storage_events();
+    if events.is_empty() {
+        return;
+    }
+    let origin = state
+        .document
+        .as_ref()
+        .map(|doc| pluto_ipc::Origin::from_url(doc.base_url()).serialize())
+        .unwrap_or_default();
+    let url = state
+        .document
+        .as_ref()
+        .map(|doc| doc.base_url().to_string())
+        .unwrap_or_default();
+    let Some(js) = state.tab_js.as_mut() else {
+        return;
+    };
+    for event in events {
+        if event.origin != origin {
+            continue;
+        }
+        let _ = js.dispatch_storage_event(
+            event.key.as_deref(),
+            event.old_value.as_deref(),
+            event.new_value.as_deref(),
+            &url,
+        );
+    }
+}
+
 /// Run the worker: forward shell commands to the tab thread and tab
 /// events to the shell. Ends when the command channel closes, the
 /// tab thread ends, or `Shutdown` arrives.
@@ -1966,7 +2246,7 @@ pub async fn run_worker(
     mut commands: CommandReceiver,
     mut events: mpsc::Sender<crate::Message>,
 ) {
-    let threads = spawn_tab_threads(tab_id);
+    let threads = spawn_tab_threads(tab_id, false);
     let tab_cmd_tx = threads.tab_cmd_tx;
     let mut tab_event_rx = threads.tab_event_rx;
     loop {
@@ -1974,7 +2254,24 @@ pub async fn run_worker(
             cmd = commands.recv() => {
                 match cmd {
                     None => {
+                        // The shell is gone: shut the tab thread
+                        // down, then wait (bounded) for it to end
+                        // before returning. The tab thread's
+                        // shutdown saves (cookies, storage,
+                        // permissions) must land while this
+                        // worker's HOME guard is still held — an
+                        // early return lets them land in the next
+                        // test's home instead (Stage 13: a rare
+                        // parallel-run permissions flake traced to
+                        // exactly this).
                         let _ = tab_cmd_tx.send(BrowserToRenderer::Shutdown).await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            async {
+                                while tab_event_rx.recv().await.is_some() {}
+                            },
+                        )
+                        .await;
                         break;
                     }
                     Some(cmd) => {
@@ -1996,8 +2293,17 @@ pub async fn run_worker(
             }
         }
         // The shell is gone: there is nobody left to report to.
+        // Same bounded wait as above: the tab thread's shutdown
+        // saves must finish before this worker returns.
         if events.is_closed() {
             let _ = tab_cmd_tx.send(BrowserToRenderer::Shutdown).await;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                async {
+                    while tab_event_rx.recv().await.is_some() {}
+                },
+            )
+            .await;
             break;
         }
     }
@@ -2022,7 +2328,7 @@ struct TabThreads {
 /// process — one tab per process today, so one handle covers the
 /// tab — and handed to the tab thread, which builds its
 /// `ResourceLoader` from it instead of a fresh private one.
-fn spawn_tab_threads(tab_id: u64) -> TabThreads {
+fn spawn_tab_threads(tab_id: u64, broker: bool) -> TabThreads {
     let (layout_tx, layout_rx) = std::sync::mpsc::channel::<LayoutJob>();
     std::thread::Builder::new()
         .name("pluto-layout".to_string())
@@ -2034,7 +2340,7 @@ fn spawn_tab_threads(tab_id: u64) -> TabThreads {
     let shared = SharedLoader::new();
     std::thread::Builder::new()
         .name("pluto-tab".to_string())
-        .spawn(move || tab_thread_main(tab_cmd_rx, tab_event_tx, layout_tx2, tab_id, shared))
+        .spawn(move || tab_thread_main(tab_cmd_rx, tab_event_tx, layout_tx2, tab_id, shared, broker))
         .expect("tab thread spawns");
     TabThreads {
         tab_cmd_tx,
@@ -2061,7 +2367,7 @@ fn spawn_tab_threads(tab_id: u64) -> TabThreads {
 /// only parses, lays out, runs JS, and builds display lists — the
 /// same work the in-process worker does, over a different carrier.
 pub(crate) async fn run_worker_transport<T: Transport>(mut transport: T, tab_id: u64) -> i32 {
-    let threads = spawn_tab_threads(tab_id);
+    let threads = spawn_tab_threads(tab_id, true);
     let tab_cmd_tx = threads.tab_cmd_tx;
     let mut tab_event_rx = threads.tab_event_rx;
     loop {
@@ -2132,7 +2438,652 @@ pub(crate) async fn run_worker_transport<T: Transport>(mut transport: T, tab_id:
 /// `spawn_local` task on the tab thread's runtime. The old page
 /// stays visible until the new list lands; a stale outcome is
 /// discarded by epoch in `handle_nav_outcome`.
+// ------------------------------------------------------------------
+// Stage 13 (M5 forms): focus, keys, editing, submission, caret.
+// ------------------------------------------------------------------
+
+/// Sync the form pseudo-class sets (`:valid` / `:invalid` /
+/// `:required` / `:optional` / `:disabled` / `:checked` /
+/// `:read-only`) from the live `Dom` into `element_state`
+/// (Stage 13 Rec 8). Called at the top of every `restyle`, so a
+/// value edit that flips validity re-matches selectors on the
+/// next layout pass. Validity itself is computed by the same
+/// `pluto_js::bindings::forms::validity_of` the JS bindings use —
+/// one rule, two callers.
+fn sync_form_pseudo_state(state: &mut TabState) {
+    let Some(doc) = state.document.as_ref() else {
+        return;
+    };
+    let dom = doc.dom();
+    let Some(root) = dom.root() else {
+        return;
+    };
+    let shared = crate::js_host::SharedHost(Rc::clone(&state.host));
+    let host: &dyn pluto_js::DomHost = &shared;
+    let mut invalid = HashSet::new();
+    let mut required = HashSet::new();
+    let mut disabled = HashSet::new();
+    let mut checked = HashSet::new();
+    let mut read_only = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        stack.extend(dom.children(id).iter().rev());
+        if !host.is_form_control(id) && dom.tag(id) != Some("button") {
+            continue;
+        }
+        if dom.attr(id, "required").is_some() {
+            required.insert(id);
+        }
+        if host.is_disabled(id) {
+            disabled.insert(id);
+        }
+        if host.form_checked(id) == Some(true) {
+            checked.insert(id);
+        }
+        if dom.attr(id, "readonly").is_some() {
+            read_only.insert(id);
+        }
+        if pluto_js::bindings::forms::will_validate(host, id)
+            && !pluto_js::bindings::forms::validity_of(host, id).valid()
+        {
+            invalid.insert(id);
+        }
+    }
+    state.element_state.invalid = invalid;
+    state.element_state.required = required;
+    state.element_state.disabled = disabled;
+    state.element_state.checked = checked;
+    state.element_state.read_only = read_only;
+}
+
+/// Move keyboard focus (Stage 13 Rec 3): updates `state.focused`,
+/// the `:focus` set, and the host's `activeElement` mirror, and
+/// fires `blur` on the old element then `focus` on the new one
+/// (both sync dispatches, so a listener sees the move at once).
+/// The caret blink restarts (visible) on every focus change.
+async fn set_focus(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    new: Option<NodeId>,
+) {
+    let old = state.focused;
+    if old == new {
+        return;
+    }
+    if let Some(old_id) = old {
+        if let Some(js) = state.tab_js.as_mut() {
+            let _ = js.dispatch_event_sync(old_id, "blur", false);
+        }
+    }
+    state.focused = new;
+    state.element_state.focus = new.into_iter().collect();
+    state.host.lock().unwrap().set_focused(new);
+    state.caret_blink_epoch = std::time::Instant::now();
+    state.caret_blink_on = true;
+    if let Some(new_id) = new {
+        if let Some(js) = state.tab_js.as_mut() {
+            let _ = js.dispatch_event_sync(new_id, "focus", false);
+        }
+    }
+    let mut changed: Vec<NodeId> = Vec::new();
+    if let Some(old_id) = old {
+        changed.push(old_id);
+    }
+    if let Some(new_id) = new {
+        changed.push(new_id);
+    }
+    let dirty = restyle_dirty_set(state, &changed, pseudo_reach(state, "focus"));
+    restyle(state, events, &dirty).await;
+}
+
+/// The `tabindex` value of a node (`None` = no `tabindex`
+/// attribute; unparseable values count as 0, per spec).
+fn tabindex_of(dom: &pluto_html::Dom, id: NodeId) -> Option<i64> {
+    dom.attr(id, "tabindex")
+        .and_then(|v| v.trim().parse::<i64>().ok().or(Some(0)))
+}
+
+/// The Tab-order list (Stage 13 Rec 3): positive-`tabindex`
+/// elements first (ascending `tabindex`, DOM order within),
+/// then the rest in DOM order. `tabindex="-1"` elements are
+/// focusable (click / `focus()`) but never in the Tab order,
+/// and disabled controls are excluded entirely.
+fn tab_order(doc: &Document) -> Vec<NodeId> {
+    let dom = doc.dom();
+    let all = focusable_in_order(doc);
+    let mut positive: Vec<(i64, usize, NodeId)> = Vec::new();
+    let mut rest: Vec<NodeId> = Vec::new();
+    for (i, id) in all.into_iter().enumerate() {
+        match tabindex_of(dom, id) {
+            Some(t) if t > 0 => positive.push((t, i, id)),
+            Some(t) if t < 0 => {}
+            _ => rest.push(id),
+        }
+    }
+    positive.sort_by_key(|(t, i, _)| (*t, *i));
+    positive.into_iter().map(|(_, _, id)| id).chain(rest).collect()
+}
+
+/// The `code` for a `KeyboardEvent` from its `key` (best effort:
+/// physical codes are not available from the shell yet, so the
+/// code mirrors the key for named keys and `KeyX` for letters).
+fn key_code(key: &str) -> String {
+    match key {
+        " " => "Space".to_string(),
+        "Enter" | "Tab" | "Escape" | "Backspace" | "Delete" | "Home" | "End" | "PageUp"
+        | "PageDown" | "ArrowLeft" | "ArrowRight" | "ArrowUp" | "ArrowDown" => key.to_string(),
+        _ => {
+            let mut chars = key.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) if c.is_ascii_alphabetic() => {
+                    format!("Key{}", c.to_ascii_uppercase())
+                }
+                _ => key.to_string(),
+            }
+        }
+    }
+}
+
+/// Whether `key` is a text control that accepts typed input:
+/// `<textarea>`, or a single-line `<input>` of a text-like type.
+fn is_text_control(host: &dyn pluto_js::DomHost, key: NodeId) -> bool {
+    match host.tag_name(key).as_deref() {
+        Some("textarea") => true,
+        Some("input") => matches!(
+            host.input_type(key).as_deref(),
+            Some("text" | "search" | "url" | "tel" | "email" | "password" | "number")
+        ),
+        _ => false,
+    }
+}
+
+/// Handle one editing key on a focused text control (Stage 13
+/// Rec 2/4): printable keys insert, Backspace/Delete remove,
+/// arrows/Home/End move the caret, Ctrl+A selects all, Enter in a
+/// `<textarea>` inserts a newline. Mutations fire a sync `input`
+/// event and restyle (the value text is part of the layout, and
+/// the caret restarts visible). Returns true when the key was
+/// consumed (no further default action).
+async fn handle_edit_key(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    focused: NodeId,
+    key: &str,
+    modifiers: pluto_ipc::Modifiers,
+) -> bool {
+    let is_textarea;
+    {
+        let shared = crate::js_host::SharedHost(Rc::clone(&state.host));
+        let host: &dyn pluto_js::DomHost = &shared;
+        if !is_text_control(host, focused) {
+            return false;
+        }
+        is_textarea = host.tag_name(focused).as_deref() == Some("textarea");
+    }
+    // Ctrl/Meta chords are not text (except Ctrl+A = select all).
+    if modifiers.ctrl || modifiers.meta {
+        if (key == "a" || key == "A") && !modifiers.alt {
+            let len = {
+                let host = state.host.lock().unwrap();
+                host.form_value(focused).map(|v| v.chars().count()).unwrap_or(0)
+            };
+            state.host.lock().unwrap().set_form_selection(focused, 0, len);
+            state.caret_blink_epoch = std::time::Instant::now();
+            restyle(state, events, &[focused]).await;
+        }
+        return false;
+    }
+    let mut inserted: Option<String> = None;
+    match key {
+        "Backspace" => {
+            state.host.lock().unwrap().delete_form_text(focused, true);
+        }
+        "Delete" => {
+            state.host.lock().unwrap().delete_form_text(focused, false);
+        }
+        "ArrowLeft" => {
+            let (start, end) = state
+                .host
+                .lock()
+                .unwrap()
+                .form_selection(focused)
+                .unwrap_or((0, 0));
+            let at = if modifiers.shift { end } else { start.min(end) };
+            let at = at.saturating_sub(1);
+            let (s, e) = if modifiers.shift { (start.min(at), start.max(at)) } else { (at, at) };
+            state.host.lock().unwrap().set_form_selection(focused, s, e);
+            state.caret_blink_epoch = std::time::Instant::now();
+            restyle(state, events, &[focused]).await;
+            return true;
+        }
+        "ArrowRight" => {
+            let len = {
+                let host = state.host.lock().unwrap();
+                host.form_value(focused).map(|v| v.chars().count()).unwrap_or(0)
+            };
+            let (start, end) = state
+                .host
+                .lock()
+                .unwrap()
+                .form_selection(focused)
+                .unwrap_or((0, 0));
+            let at = if modifiers.shift { end } else { start.max(end) };
+            let at = (at + 1).min(len);
+            let (s, e) = if modifiers.shift { (start.min(at), start.max(at)) } else { (at, at) };
+            state.host.lock().unwrap().set_form_selection(focused, s, e);
+            state.caret_blink_epoch = std::time::Instant::now();
+            restyle(state, events, &[focused]).await;
+            return true;
+        }
+        "Home" => {
+            state.host.lock().unwrap().set_form_selection(focused, 0, 0);
+            state.caret_blink_epoch = std::time::Instant::now();
+            restyle(state, events, &[focused]).await;
+            return true;
+        }
+        "End" => {
+            let len = {
+                let host = state.host.lock().unwrap();
+                host.form_value(focused).map(|v| v.chars().count()).unwrap_or(0)
+            };
+            state.host.lock().unwrap().set_form_selection(focused, len, len);
+            state.caret_blink_epoch = std::time::Instant::now();
+            restyle(state, events, &[focused]).await;
+            return true;
+        }
+        "Enter" if is_textarea => {
+            state.host.lock().unwrap().insert_form_text(focused, "\n");
+            inserted = Some("\n".to_string());
+        }
+        _ => {
+            // A single printable character inserts; anything else
+            // (arrows handled above, function keys, Tab) falls
+            // through to the default action below.
+            if key.chars().count() == 1 && !modifiers.alt {
+                state.host.lock().unwrap().insert_form_text(focused, key);
+                inserted = Some(key.to_string());
+            } else {
+                return false;
+            }
+        }
+    }
+    // The mutation landed: fire `input` (listeners read the new
+    // value off the control) and restyle so the painted text and
+    // the caret move.
+    if let Some(js) = state.tab_js.as_mut() {
+        let _ = js.dispatch_typed_event_sync(
+            focused,
+            "input",
+            true,
+            TypedEventKind::Input { data: inserted },
+        );
+    }
+    state.caret_blink_epoch = std::time::Instant::now();
+    restyle(state, events, &[focused]).await;
+    true
+}
+
+/// Percent-encode one `application/x-www-form-urlencoded` value:
+/// alphanumerics + `-_.` verbatim, space as `+`, the rest `%XX`.
+fn form_urlencode(value: &str) -> String {
+    let mut out = String::new();
+    for &b in value.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Encode an entry list as `application/x-www-form-urlencoded`.
+fn encode_urlencoded(entries: &[(String, String)]) -> Vec<u8> {
+    entries
+        .iter()
+        .map(|(n, v)| format!("{}={}", form_urlencode(n), form_urlencode(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+        .into_bytes()
+}
+
+/// Encode an entry list as `multipart/form-data` with a fresh
+/// boundary (returns body + full `Content-Type` value).
+fn encode_multipart(entries: &[(String, String)]) -> (Vec<u8>, String) {
+    let boundary = format!(
+        "----pluto-form-{}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+        std::process::id()
+    );
+    let mut body = Vec::new();
+    for (name, value) in entries {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (
+        body,
+        format!("multipart/form-data; boundary={boundary}"),
+    )
+}
+
+/// Encode an entry list as `text/plain` (`name=value` lines).
+fn encode_text_plain(entries: &[(String, String)]) -> Vec<u8> {
+    entries
+        .iter()
+        .map(|(n, v)| format!("{n}={v}"))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        .into_bytes()
+}
+
+/// First control in `form` that fails constraint validation
+/// (Stage 13 Rec 8), in document order — `reportValidity`
+/// focuses and reports this one, and submission stops here.
+fn first_invalid_control(state: &TabState, form: NodeId) -> Option<NodeId> {
+    let shared = crate::js_host::SharedHost(Rc::clone(&state.host));
+    let host: &dyn pluto_js::DomHost = &shared;
+    for control in host.form_controls(form) {
+        if pluto_js::bindings::forms::will_validate(host, control)
+            && !pluto_js::bindings::forms::validity_of(host, control).valid()
+        {
+            return Some(control);
+        }
+    }
+    None
+}
+
+/// Submit a form (Stage 13 Rec 6/7/8): validation gate first
+/// (first invalid control gets an `invalid` event + focus, no
+/// navigation), then the cancelable `submit` event
+/// (`preventDefault` blocks navigation), then the entry list is
+/// encoded and navigated THROUGH THE EXISTING LOADER (same
+/// Stage 9 gates as a link click) via `start_navigation_with_body`.
+async fn submit_form(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    form: NodeId,
+    submitter: Option<NodeId>,
+) {
+    // Validation gate: report the first invalid control and stop.
+    if let Some(invalid) = first_invalid_control(state, form) {
+        if let Some(js) = state.tab_js.as_mut() {
+            let _ = js.dispatch_event_sync(invalid, "invalid", false);
+        }
+        set_focus(state, events, Some(invalid)).await;
+        return;
+    }
+    // Cancelable `submit` event (bubbles, per spec).
+    let not_prevented = match state.tab_js.as_mut() {
+        Some(js) => js.dispatch_event_sync(form, "submit", true).unwrap_or(true),
+        None => true,
+    };
+    if !not_prevented {
+        return;
+    }
+    let (entries, action, method, enctype, target) = {
+        let shared = crate::js_host::SharedHost(Rc::clone(&state.host));
+        let host: &dyn pluto_js::DomHost = &shared;
+        let entries = host.form_entries(form, submitter);
+        let action = host.get_attribute(form, "action").unwrap_or_default();
+        let method = host
+            .get_attribute(form, "method")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let enctype = host
+            .get_attribute(form, "enctype")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let target = host.get_attribute(form, "target").unwrap_or_default();
+        (entries, action, method, enctype, target)
+    };
+    // Only `_self` (or no target) navigates this tab; other
+    // targets (`_blank`, named frames) are not opened in M5.
+    if !target.is_empty() && target != "_self" {
+        eprintln!("[pluto] form target {target} not supported in M5 — submission dropped");
+        return;
+    }
+    let base_url = state
+        .document
+        .as_ref()
+        .map(|doc| doc.base_url().to_string())
+        .unwrap_or_default();
+    let url = if action.trim().is_empty() {
+        base_url.clone()
+    } else {
+        pluto_html::resolve_url(&base_url, action.trim())
+    };
+    let method = if method == "post" { "post" } else { "get" };
+    if method == "get" {
+        // GET: entries ride the query string; the fragment (if
+        // any) stays last.
+        let query = String::from_utf8_lossy(&encode_urlencoded(&entries)).into_owned();
+        let mut url = url;
+        if !query.is_empty() {
+            let (head, frag) = match url.split_once('#') {
+                Some((h, f)) => (h.to_string(), Some(f.to_string())),
+                None => (url.clone(), None),
+            };
+            url = if head.contains('?') {
+                format!("{head}&{query}")
+            } else {
+                format!("{head}?{query}")
+            };
+            if let Some(f) = frag {
+                url = format!("{url}#{f}");
+            }
+        }
+        start_navigation(state, url);
+    } else {
+        let (body, content_type) = match enctype.as_str() {
+            "multipart/form-data" => encode_multipart(&entries),
+            "text/plain" => (encode_text_plain(&entries), "text/plain".to_string()),
+            _ => (
+                encode_urlencoded(&entries),
+                "application/x-www-form-urlencoded".to_string(),
+            ),
+        };
+        start_navigation_with_body(
+            state,
+            url,
+            Some(page::PostBody {
+                bytes: body,
+                content_type,
+            }),
+        );
+    }
+}
+
+/// Reset a form (Stage 13 Rec 6/7): cancelable `reset` event;
+/// `preventDefault` keeps the current values, otherwise the
+/// seeded defaults return and the form restyles.
+async fn reset_form_action(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    form: NodeId,
+) {
+    let not_prevented = match state.tab_js.as_mut() {
+        Some(js) => js.dispatch_event_sync(form, "reset", true).unwrap_or(true),
+        None => true,
+    };
+    if !not_prevented {
+        return;
+    }
+    state.host.lock().unwrap().reset_form(form);
+    let shared = crate::js_host::SharedHost(Rc::clone(&state.host));
+    let controls = shared.form_controls(form);
+    restyle(state, events, &controls).await;
+}
+
+/// Enter on a focused control (Stage 13 Rec 6): a submit button
+/// submits its form, a reset button resets it, Enter in a
+/// single-line text input submits its form, Enter in a
+/// `<textarea>` is editing (handled by `handle_edit_key`).
+/// Returns true when the key was consumed.
+async fn submit_on_enter(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    focused: NodeId,
+) -> bool {
+    let shared = crate::js_host::SharedHost(Rc::clone(&state.host));
+    let host: &dyn pluto_js::DomHost = &shared;
+    let tag = host.tag_name(focused);
+    let input_type = host.input_type(focused);
+    let (form, is_submit, is_reset) = match tag.as_deref() {
+        Some("button") => {
+            let ty = host
+                .get_attribute(focused, "type")
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let is_submit = ty.is_empty() || ty == "submit";
+            let is_reset = ty == "reset";
+            (host.form_owner(focused), is_submit, is_reset)
+        }
+        Some("input") => match input_type.as_deref() {
+            Some("submit") => (host.form_owner(focused), true, false),
+            Some("reset") => (host.form_owner(focused), false, true),
+            Some("button") => (None, false, false),
+            _ => (host.form_owner(focused), false, false),
+        },
+        _ => (None, false, false),
+    };
+    let Some(form) = form else {
+        return false;
+    };
+    if is_reset {
+        reset_form_action(state, events, form).await;
+        return true;
+    }
+    if is_submit {
+        submit_form(state, events, form, Some(focused)).await;
+        return true;
+    }
+    // Enter in a text-like input submits the form (the
+    // single-text-input / implicit-submission rule, simplified:
+    // any text input Enter submits when a form owns it).
+    if tag.as_deref() == Some("input") && is_text_control(host, focused) {
+        submit_form(state, events, form, None).await;
+        return true;
+    }
+    false
+}
+
+// ------------------------------------------------------------------
+// Stage 13 (M5 forms): caret painting.
+// ------------------------------------------------------------------
+
+/// Whether the caret blink is currently in its visible half
+/// (~530 ms on / ~530 ms off, from the last focus change or edit).
+fn caret_blink_on(state: &TabState) -> bool {
+    state.caret_blink_epoch.elapsed().as_millis() / 530 % 2 == 0
+}
+
+/// Caret + selection paint items for the focused text control
+/// (Stage 13 Rec 4), or `None` when no caret is shown (no focus,
+/// not a text control, window unfocused, blink off). Positions
+/// are estimated: ~7 px per char at the control's font size and
+/// ~16 px per line — the layout actor does not expose shaped
+/// text metrics to the tab thread, so an on-box check owns the
+/// exact placement.
+fn caret_display_items(state: &mut TabState) -> Vec<pluto_paint::DisplayItem> {
+    let Some(focused) = state.focused else {
+        return Vec::new();
+    };
+    if !state.window_focused || !caret_blink_on(state) {
+        return Vec::new();
+    }
+    let shared = crate::js_host::SharedHost(Rc::clone(&state.host));
+    let host: &dyn pluto_js::DomHost = &shared;
+    if !is_text_control(host, focused) {
+        return Vec::new();
+    }
+    let mut host_mut = state.host.lock().unwrap();
+    let Some(geometry) = host_mut.geometry(focused) else {
+        return Vec::new();
+    };
+    let value = host_mut.form_value(focused).unwrap_or_default();
+    let (sel_start, sel_end) = host_mut.form_selection(focused).unwrap_or((0, 0));
+    drop(host_mut);
+    const CHAR_W: f32 = 7.0;
+    const LINE_H: f32 = 16.0;
+    const PAD_X: f32 = 2.0;
+    const PAD_Y: f32 = 2.0;
+    const CARET_H: f32 = 14.0;
+    let caret_chars = value.chars().count().min(sel_end);
+    let x = (geometry.x as f32 + PAD_X + caret_chars as f32 * CHAR_W)
+        .min(geometry.x as f32 + geometry.width as f32 - 3.0);
+    // Single-line controls centre the caret vertically; a
+    // textarea's caret walks lines (row = newlines before it).
+    let is_textarea = {
+        let shared = crate::js_host::SharedHost(Rc::clone(&state.host));
+        shared.tag_name(focused).as_deref() == Some("textarea")
+    };
+    let y = if is_textarea {
+        let row = value.chars().take(sel_end).filter(|&c| c == '\n').count();
+        geometry.y as f32 + PAD_Y + row as f32 * LINE_H
+    } else {
+        geometry.y as f32 + ((geometry.height as f32 - CARET_H).max(0.0) / 2.0)
+    };
+    let mut items = Vec::new();
+    // Selection first (under the caret): single-line only — a
+    // multi-line selection rect is a follow-up, not a guess.
+    if sel_start != sel_end && !is_textarea {
+        let sx = geometry.x as f32 + PAD_X + sel_start as f32 * CHAR_W;
+        let sw = (sel_end - sel_start) as f32 * CHAR_W;
+        items.push(pluto_paint::DisplayItem::SelectionRect {
+            x: sx,
+            y,
+            width: sw,
+            height: CARET_H,
+            color: [0.0, 0.47, 0.84, 0.4],
+        });
+    }
+    items.push(pluto_paint::DisplayItem::Caret {
+        x,
+        y,
+        height: CARET_H,
+        color: [0.0, 0.0, 0.0, 1.0],
+    });
+    items
+}
+
+/// A display list with the caret items appended (Stage 13 Rec 4):
+/// the cached `last_display` stays caret-free, so the blink tick
+/// can re-derive it from the base each phase.
+fn with_caret(state: &mut TabState, base: Arc<DisplayList>) -> Arc<DisplayList> {
+    let items = caret_display_items(state);
+    if items.is_empty() {
+        return base;
+    }
+    let mut list = DisplayList(base.0.clone(), base.1);
+    for item in items {
+        list.push(item);
+    }
+    Arc::new(list)
+}
+
 fn start_navigation(state: &mut TabState, url: String) {
+    start_navigation_with_body(state, url, None);
+}
+
+/// Start a navigation, optionally as a form POST (Stage 13 Rec
+/// 6): the body rides the same loader and the same Stage 9 gates
+/// as a GET navigation; only the method / body / `Content-Type`
+/// differ (see `page::load_page_cancellable_with_hooks`).
+fn start_navigation_with_body(
+    state: &mut TabState,
+    url: String,
+    post_body: Option<page::PostBody>,
+) {
     // Stage 9 Rec 11: visiting an origin extends its
     // permission grants (they expire after ~90 days of
     // non-visit). Opaque origins are skipped by `note_visit`.
@@ -2159,7 +3110,7 @@ fn start_navigation(state: &mut TabState, url: String) {
     // is sent. (Typed-URL navigations cannot be told apart from
     // link navigations here — see `service::referer_for_request`.)
     if let Some(doc) = &state.document {
-        state.loader.set_referrer_document(doc.base_url());
+        state.fetch_source.set_referrer_document(doc.base_url());
     }
     // Perf (Stage 8 Rec 5): a navigation — address bar, reload,
     // or link click — starts the first-paint clock here, not just
@@ -2219,7 +3170,7 @@ fn start_navigation(state: &mut TabState, url: String) {
         host.set_base_url(&url);
         host.set_element_state(state.element_state.clone());
     }
-    let loader = state.loader.clone();
+    let fetch_source = state.fetch_source.clone();
     let exec_tx = state.exec_tx.clone();
     let outcome_tx = state.load_outcome_tx.clone();
     let host = Rc::clone(&state.host);
@@ -2237,10 +3188,18 @@ fn start_navigation(state: &mut TabState, url: String) {
     };
     let tab_id = state.tab_id;
     let viewport = state.viewport;
+    // Stage 13 Rec 11: the previous document's URL is the
+    // referrer for the mixed-download check (the broker owns the
+    // loader-side referrer context in broker mode).
+    let referrer = state
+        .document
+        .as_ref()
+        .map(|doc| doc.base_url().to_string())
+        .unwrap_or_default();
     let handle = tokio::task::spawn_local(async move {
         let hooks = crate::js_host::LoadHooks::new(epoch, exec_tx, host);
         let outcome = page::load_page_cancellable_with_hooks(
-            &loader,
+            &fetch_source,
             url.clone(),
             token,
             Some(Box::new(hooks)),
@@ -2248,6 +3207,8 @@ fn start_navigation(state: &mut TabState, url: String) {
             tab_id,
             epoch,
             viewport,
+            post_body,
+            &referrer,
         )
         .await;
         let outcome = match outcome {
@@ -2291,7 +3252,14 @@ async fn handle_nav_outcome(
     // Stage 9 Rec 5: persist the HSTS store (entries may have
     // been recorded during this navigation's fetches) and the
     // HTTPS-only state after every completed navigation.
-    crate::security::save_from(&state.loader);
+    // Stage 13 Rec 9: same for the cookie jar — a login taken in
+    // during this navigation survives a restart (session cookies
+    // are stripped before the write). Skipped in broker mode
+    // (Stage 13 Rec 11): the broker owns the jar + HSTS store.
+    if state.broker_handle.is_none() {
+        crate::security::save_from(&state.loader);
+        crate::cookies::save_from(&state.loader);
+    }
     match outcome {
         LoadOutcome::Loaded {
             document,
@@ -2365,7 +3333,7 @@ fn maybe_request_favicon(state: &mut TabState, final_url: &str) {
     };
     if state.images.request(&req) {
         ImageStore::spawn_fetch(
-            state.loader.clone(),
+            state.fetch_source.clone(),
             req,
             state.tab_id,
             state.nav_epoch,
@@ -2395,7 +3363,7 @@ fn spawn_image_fetch(state: &mut TabState, req: ImageRequest) {
         .clone()
         .unwrap_or_else(CancellationToken::new);
     ImageStore::spawn_fetch(
-        state.loader.clone(),
+        state.fetch_source.clone(),
         req,
         state.tab_id,
         state.nav_epoch,
@@ -2767,6 +3735,11 @@ async fn layout_and_submit(
             // animation frame advance can re-submit it with
             // fresh pixels and no layout at all.
             state.last_display = Some(Arc::clone(&display));
+            // Stage 13 Rec 4: the caret + selection paint rides
+            // on the submitted list, not the cached one — the
+            // blink tick re-derives it from the caret-free base.
+            let display = with_caret(state, display);
+            state.caret_blink_on = caret_blink_on(state);
             let submit_started = std::time::Instant::now();
             let submitted = submit(state, events, display).await;
             // Stage 11 Rec 8: the title is emitted here, after
@@ -3299,6 +4272,11 @@ async fn restyle(
     events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
     dirty: &[NodeId],
 ) {
+    // Stage 13 Rec 8: form pseudo-classes (`:valid` / `:invalid` /
+    // `:required` / `:disabled` / `:checked` / `:read-only`) are
+    // derived state — re-derive them from the live `Dom` before
+    // every restyle, so a value edit flips them on the next pass.
+    sync_form_pseudo_state(state);
     {
         let mut host = state.host.lock().unwrap();
         host.set_element_state(state.element_state.clone());
@@ -3368,6 +4346,16 @@ async fn handle_pointer_down(
     let Some(target) = hit_test(state, x, y).await else {
         return;
     };
+    // Stage 13 Rec 3: a pointer press moves focus to the hit
+    // element BEFORE the click dispatch (the click itself lands
+    // on pointer-up) — a click on an input focuses it first.
+    if state.focused != Some(target) {
+        if let Some(doc) = state.document.as_ref() {
+            if is_focusable(doc.dom(), target) {
+                set_focus(state, events, Some(target)).await;
+            }
+        }
+    }
     if button == Some(0) {
         state.pointer_down_target = Some(target);
     }
@@ -3676,11 +4664,16 @@ async fn scroll_containers(state: &TabState) -> Vec<NodeId> {
     reply_rx.await.unwrap_or_default()
 }
 
-/// A key press (Stage 8 Rec 9). Releases do nothing in M2 (no
-/// `keyup` listeners yet), and keys are ignored while the window
-/// is unfocused — the shell filters to uncaptured keys only, so
-/// this is the worker-side half. Repeats re-fire the action
-/// (holding an arrow scrolls repeatedly).
+/// A key press / release (Stage 8 Rec 9, Stage 13 Rec 2/4).
+/// Releases dispatch a real `keyup` on the focused element.
+/// Presses dispatch a cancelable `keydown` first (sync, so
+/// `preventDefault()` suppresses the following input and the
+/// default action); then editing keys mutate the focused text
+/// control (`input` event + restyle), Enter submits, and the
+/// remaining keys keep their M2 default actions. Repeats re-fire
+/// the action (holding an arrow scrolls repeatedly). Keys are
+/// ignored while the window is unfocused — the shell filters to
+/// uncaptured keys only, so this is the worker-side half.
 async fn handle_key(
     state: &mut TabState,
     events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
@@ -3688,8 +4681,60 @@ async fn handle_key(
     pressed: bool,
     modifiers: pluto_ipc::Modifiers,
 ) {
-    if !pressed || !state.window_focused {
+    if !state.window_focused {
         return;
+    }
+    if !pressed {
+        // A real `keyup` on the focused element (Stage 13 Rec 2).
+        if let Some(focused) = state.focused {
+            if let Some(js) = state.tab_js.as_mut() {
+                let _ = js.dispatch_typed_event_sync(
+                    focused,
+                    "keyup",
+                    true,
+                    TypedEventKind::Keyboard {
+                        key: key.to_string(),
+                        code: key_code(key),
+                    },
+                );
+            }
+        }
+        return;
+    }
+    // Cancelable `keydown` on the focused element: a prevented
+    // keydown suppresses the input AND the default action.
+    if let Some(focused) = state.focused {
+        let not_prevented = match state.tab_js.as_mut() {
+            Some(js) => js
+                .dispatch_typed_event_sync(
+                    focused,
+                    "keydown",
+                    true,
+                    TypedEventKind::Keyboard {
+                        key: key.to_string(),
+                        code: key_code(key),
+                    },
+                )
+                .unwrap_or(true),
+            None => true,
+        };
+        if !not_prevented {
+            return;
+        }
+    }
+    // Editing keys consume the key on a focused text control.
+    if let Some(focused) = state.focused
+        && handle_edit_key(state, events, focused, key, modifiers).await
+    {
+        return;
+    }
+    // Enter on a focused control submits / resets its form.
+    if key == "Enter" {
+        if let Some(focused) = state.focused
+            && submit_on_enter(state, events, focused).await
+        {
+            return;
+        }
     }
     match key {
         "Tab" => move_focus(state, events, !modifiers.shift).await,
@@ -3742,6 +4787,11 @@ fn walk_focusable(dom: &pluto_html::Dom, id: NodeId, out: &mut Vec<NodeId>) {
 }
 
 fn is_focusable(dom: &pluto_html::Dom, id: NodeId) -> bool {
+    // Stage 13 Rec 3: disabled controls are never focusable —
+    // not by click, not by Tab, not by `focus()`.
+    if dom.is_control_disabled(id) {
+        return false;
+    }
     if dom.attr(id, "tabindex").is_some() {
         return true;
     }
@@ -3755,10 +4805,11 @@ fn is_focusable(dom: &pluto_html::Dom, id: NodeId) -> bool {
     }
 }
 
-/// Move keyboard focus (Stage 8 Rec 9): Tab forward, Shift+Tab
-/// backward, wrapping at the ends. The old and new elements (plus
-/// the new element's ancestors, for `:focus-within`) are marked
-/// dirty and restyled.
+/// Move keyboard focus (Stage 8 Rec 9, Stage 13 Rec 3): Tab
+/// forward, Shift+Tab backward, wrapping at the ends, in Tab
+/// order (positive `tabindex` first, `tabindex="-1"` and disabled
+/// controls excluded). The move goes through `set_focus`, so
+/// `blur` / `focus` events fire and `activeElement` stays true.
 async fn move_focus(
     state: &mut TabState,
     events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
@@ -3767,7 +4818,7 @@ async fn move_focus(
     let Some(doc) = state.document.as_ref() else {
         return;
     };
-    let focusable = focusable_in_order(doc);
+    let focusable = tab_order(doc);
     if focusable.is_empty() {
         return;
     }
@@ -3780,14 +4831,7 @@ async fn move_focus(
         None if forward => focusable[0],
         None => *focusable.last().unwrap(),
     };
-    let old = state.focused.replace(next);
-    state.element_state.focus = [next].into_iter().collect();
-    let mut changed: Vec<NodeId> = vec![next];
-    if let Some(old) = old {
-        changed.push(old);
-    }
-    let dirty = restyle_dirty_set(state, &changed, pseudo_reach(state, "focus"));
-    restyle(state, events, &dirty).await;
+    set_focus(state, events, Some(next)).await;
 }
 
 /// Activate the focused element (Stage 8 Rec 9): a link navigates,
@@ -4075,22 +5119,47 @@ mod tests {
             })
             .await
             .expect("navigation sends");
+        // Stage 13 Rec 11: the broker-mode child asks the browser
+        // for the document — even `about:blank`, which has no fetch.
+        // Answer that ask the way the broker would (Error
+        // `invalid_url`) and the worker renders the error page.
         // The error page arrives as a display list first, then the
         // reason — the same order as the in-process worker.
-        let first = tokio::time::timeout(
-            Duration::from_secs(20),
-            recv_renderer_message(&mut browser),
-        )
-        .await
-        .expect("first reply arrives in time")
-        .expect("recv succeeds")
-        .expect("a message arrives");
-        match first {
-            RendererToBrowser::SubmitDisplayList { bytes, .. } => {
-                let list = DisplayList::from_bytes(&bytes).expect("list bytes decode");
-                assert!(!list.is_empty(), "error page still paints");
+        let answer_blank_ask = async |browser: &mut pluto_ipc::transport::ChannelTransport,
+                                      request: pluto_ipc::ResourceRequest| {
+            assert_eq!(request.url, "about:blank", "only the blank page is asked");
+            browser
+                .send_message(&BrowserToRenderer::ResourceEvent(
+                    pluto_ipc::ResourceEvent::Error {
+                        request_id: request.request_id,
+                        code: "invalid_url".to_string(),
+                        reason: "non-http(s) scheme".to_string(),
+                    },
+                ))
+                .await
+                .expect("error event sends");
+        };
+        let bytes = loop {
+            let msg = tokio::time::timeout(
+                Duration::from_secs(20),
+                recv_renderer_message(&mut browser),
+            )
+            .await
+            .expect("first reply arrives in time")
+            .expect("recv succeeds")
+            .expect("a message arrives");
+            match msg {
+                RendererToBrowser::SubmitDisplayList { bytes, .. } => break bytes,
+                RendererToBrowser::RequestResource(request) => {
+                    answer_blank_ask(&mut browser, request).await;
+                }
+                RendererToBrowser::Heartbeat | RendererToBrowser::SandboxReport { .. } => {}
+                other => panic!("expected SubmitDisplayList first, got {other:?}"),
             }
-            other => panic!("expected SubmitDisplayList first, got {other:?}"),
+        };
+        {
+            let list = DisplayList::from_bytes(&bytes).expect("list bytes decode");
+            assert!(!list.is_empty(), "error page still paints");
         }
         // The error page's title may interleave as a
         // `TitleChanged` between the display list and the
@@ -4105,8 +5174,13 @@ mod tests {
             .expect("second reply arrives in time")
             .expect("recv succeeds")
             .expect("a message arrives");
-            if !matches!(second, RendererToBrowser::TitleChanged { .. }) {
-                break;
+            match second {
+                RendererToBrowser::RequestResource(request) => {
+                    answer_blank_ask(&mut browser, request).await;
+                }
+                RendererToBrowser::Heartbeat | RendererToBrowser::SandboxReport { .. } => {}
+                RendererToBrowser::TitleChanged { .. } => continue,
+                _ => break,
             }
         }
         match second {
@@ -4127,10 +5201,63 @@ mod tests {
         );
     }
 
-    /// Stage 9 Rec 9: when the renderer process cannot be spawned
-    /// at all, the bridge falls back to the in-process worker —
-    /// the browser still runs (loudly logged), and the navigation
-    /// still produces renderer events.
+    /// Stage 13 Rec 12d: when the renderer process cannot be
+    /// spawned at all, the bridge FAILS CLOSED by default — it
+    /// reports a crash and stays alive awaiting a navigation,
+    /// never silently running the page in-process.
+    #[tokio::test]
+    async fn renderer_bridge_fails_closed_when_spawn_fails() {
+        let _home = worker_home();
+        let (cmd_tx, cmd_rx) = pluto_ipc::command_channel();
+        let (output_tx, mut output_rx) = mpsc::channel::<crate::Message>(100);
+        let handle = tokio::spawn(run_renderer_bridge(
+            0,
+            std::path::Path::new("/nonexistent/pluto-browser"),
+            cmd_rx,
+            output_tx,
+            false,
+        ));
+        let event = tokio::time::timeout(Duration::from_secs(20), next_event(&mut output_rx))
+            .await
+            .expect("a renderer event arrives in time");
+        assert!(
+            matches!(
+                event,
+                RendererToBrowser::RendererCrashed { ref reason }
+                    if reason.contains("in-process fallback disabled")
+            ),
+            "spawn failure reports a fail-closed crash, got {event:?}"
+        );
+        // The bridge stays alive: a later navigation retries the
+        // spawn and reports the failure again instead of dying.
+        cmd_tx
+            .send(BrowserToRenderer::CommitNavigation {
+                url: "about:blank".to_string(),
+            })
+            .expect("bridge takes the navigation");
+        let event = tokio::time::timeout(Duration::from_secs(20), next_event(&mut output_rx))
+            .await
+            .expect("a renderer event arrives in time");
+        assert!(
+            matches!(
+                event,
+                RendererToBrowser::RendererCrashed { ref reason }
+                    if reason.contains("respawn failed")
+            ),
+            "a later navigation retries the spawn, got {event:?}"
+        );
+        drop(cmd_tx);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("bridge ends after the shell goes away")
+            .expect("bridge task joins");
+    }
+
+    /// Stage 9 Rec 9 (gated by Stage 13 Rec 12d): with the
+    /// fallback allowed — and only then — the bridge falls back
+    /// to the in-process worker when the renderer process cannot
+    /// be spawned at all. The flag is passed explicitly (never
+    /// via process env — parallel tests would race on it).
     #[tokio::test]
     async fn renderer_bridge_falls_back_to_in_process_worker_when_spawn_fails() {
         let _home = worker_home();
@@ -4141,6 +5268,7 @@ mod tests {
             std::path::Path::new("/nonexistent/pluto-browser"),
             cmd_rx,
             output_tx,
+            true,
         ));
         cmd_tx
             .send(BrowserToRenderer::CommitNavigation {
@@ -4173,10 +5301,13 @@ mod tests {
     /// document fetch, before `DidCommit`), `TitleChanged`
     /// (coalesced onto the display-list submit, after it),
     /// `FaviconChanged` (an async fetch that lands whenever it
-    /// lands), and `ResourceReady` (one per decoded image, in
-    /// arrival order). Tests that assert on progress, titles,
-    /// favicons, or resources read the raw channel instead of
-    /// this helper.
+    /// lands), `ResourceReady` (one per decoded image, in
+    /// arrival order), `Heartbeat` (Stage 13 Rec 12b: every 5 s —
+    /// silence-window tests would see one), and `SandboxReport`
+    /// (Stage 13 Rec 12a: once, before the first navigation).
+    /// Tests that assert on progress, titles, favicons,
+    /// resources, heartbeats, or sandbox reports read the raw
+    /// channel instead of this helper.
     async fn next_event(rx: &mut mpsc::Receiver<crate::Message>) -> RendererToBrowser {
         loop {
             match rx.next().await.expect("worker emits an event") {
@@ -4184,7 +5315,9 @@ mod tests {
                     RendererToBrowser::LoadProgress { .. }
                     | RendererToBrowser::TitleChanged { .. }
                     | RendererToBrowser::FaviconChanged { .. }
-                    | RendererToBrowser::ResourceReady { .. } => continue,
+                    | RendererToBrowser::ResourceReady { .. }
+                    | RendererToBrowser::Heartbeat
+                    | RendererToBrowser::SandboxReport { .. } => continue,
                     event => return event,
                 },
                 other => panic!("expected a RendererEvent, got {other:?}"),
@@ -4268,6 +5401,77 @@ mod tests {
                 timestamp_ms: 0,
             }))
             .expect("worker takes the key event");
+    }
+
+    /// Send a key release (Stage 13 Rec 2: a real `keyup`).
+    fn send_key_release(
+        cmd_tx: &pluto_ipc::CommandSender,
+        key: &str,
+        code: &str,
+        modifiers: pluto_ipc::Modifiers,
+    ) {
+        cmd_tx
+            .send(BrowserToRenderer::InputEvent(InputEvent::Key {
+                key: key.to_string(),
+                code: code.to_string(),
+                pressed: false,
+                repeat: false,
+                modifiers,
+                timestamp_ms: 0,
+            }))
+            .expect("worker takes the key event");
+    }
+
+    /// Wait for a `SubmitDisplayList` satisfying `want` (other
+    /// lists are skipped; anything else is a failure).
+    async fn wait_for_list(
+        rx: &mut mpsc::Receiver<crate::Message>,
+        timeout: Duration,
+        want: impl Fn(&DisplayList) -> bool,
+    ) -> Option<DisplayList> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let event = match tokio::time::timeout(remaining, next_event(rx)).await {
+                Ok(event) => event,
+                Err(_) => return None,
+            };
+            match event {
+                RendererToBrowser::SubmitDisplayList { bytes, .. } => {
+                    let list = DisplayList::from_bytes(&bytes).expect("list bytes decode");
+                    if want(&list) {
+                        return Some(list);
+                    }
+                }
+                other => panic!("expected SubmitDisplayList while waiting, got {other:?}"),
+            }
+        }
+    }
+
+    /// True when no `DidCommit` arrives within `timeout`
+    /// (other events — caret-blink resubmits included — are
+    /// consumed and ignored).
+    async fn no_commit_within(
+        rx: &mut mpsc::Receiver<crate::Message>,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return true;
+            }
+            let event = match tokio::time::timeout(remaining, next_event(rx)).await {
+                Ok(event) => event,
+                Err(_) => return true,
+            };
+            if matches!(event, RendererToBrowser::DidCommit { .. }) {
+                return false;
+            }
+        }
     }
 
     /// Every glyph in a display list as (colour, x, y).
@@ -5866,7 +7070,7 @@ mod tests {
         // A real tab: `TabState::new` reads the security profile,
         // `tab_js()` builds the tab backends, loading permissions.
         let (layout_tx, _layout_rx) = std::sync::mpsc::channel::<LayoutJob>();
-        let mut state = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new());
+        let mut state = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new(), None);
         state.tab_js();
         let backends = std::sync::Arc::new(
             state.tab_backends.take().expect("tab backends built"),
@@ -5943,7 +7147,7 @@ mod tests {
             "https://example.com/b#frag".to_string(),
         ]);
         let (layout_tx, _layout_rx) = std::sync::mpsc::channel::<LayoutJob>();
-        let state = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new());
+        let state = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new(), None);
         assert!(state.visited_urls.contains("https://example.com/a"));
         // The fragment is stripped on seed, as on commit.
         assert!(state.visited_urls.contains("https://example.com/b"));
@@ -5956,7 +7160,7 @@ mod tests {
                 .join(crate::history::HISTORY_FILE),
         );
         let (layout_tx, _layout_rx) = std::sync::mpsc::channel::<LayoutJob>();
-        let fresh = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new());
+        let fresh = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new(), None);
         assert!(fresh.visited_urls.is_empty());
     }
 
@@ -6217,7 +7421,7 @@ mod tests {
             .name("pluto-layout".to_string())
             .spawn(move || layout_thread(layout_rx))
             .expect("layout actor thread spawns");
-        let mut state = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new());
+        let mut state = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new(), None);
         let (events_tx, mut events_rx) =
             tokio::sync::mpsc::channel::<RendererToBrowser>(100);
         let doc = page::parse_document(EXAMPLE_COM);
@@ -6287,4 +7491,210 @@ mod tests {
         );
     }
 
+    /// Stage 13 Rec 2/4: typing into a focused `<input>` inserts
+    /// the text (painted value glyphs), fires `input` events the
+    /// page counts, fires real `keyup` events on release, and
+    /// paints a caret bar while the blink is on.
+    #[tokio::test]
+    async fn worker_typing_inserts_text_and_fires_input_and_keyup() {
+        let page = "<!doctype html><html><head><style>body{margin:0}</style></head><body><input id=\"q\"><span id=\"c\">0</span><span id=\"k\">0</span><script>document.getElementById('q').addEventListener('input', () => { const c = document.getElementById('c'); c.textContent = String(Number(c.textContent) + 1); }); document.getElementById('q').addEventListener('keyup', () => { const k = document.getElementById('k'); k.textContent = String(Number(k.textContent) + 1); });</script></body></html>";
+        let routes = std::sync::Arc::new(vec![(
+            "/".to_string(),
+            "text/html".to_string(),
+            page.to_string(),
+        )]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_routes(listener, routes));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        // Two "0" spans = 2 glyphs.
+        assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 2);
+        let no_modifiers = pluto_ipc::Modifiers::default();
+        // Tab focuses the input; type "hi" (press + release each).
+        send_key(&cmd_tx, "Tab", "Tab", no_modifiers);
+        send_key(&cmd_tx, "h", "KeyH", no_modifiers);
+        send_key_release(&cmd_tx, "h", "KeyH", no_modifiers);
+        send_key(&cmd_tx, "i", "KeyI", no_modifiers);
+        send_key_release(&cmd_tx, "i", "KeyI", no_modifiers);
+        // "hi" (2) + input count "2" (1) + keyup count "2" (1) = 4
+        // glyphs, with a caret bar painted (blink just restarted,
+        // so it is on).
+        let list = wait_for_list(&mut event_rx, Duration::from_secs(5), |list| {
+            glyph_count(list) == 4
+                && list
+                    .0
+                    .iter()
+                    .any(|item| matches!(item, DisplayItem::Caret { .. }))
+        })
+        .await
+        .expect("typing did not paint 'hi' + counts + caret");
+        assert!(
+            list.0.iter().any(|item| matches!(
+                item,
+                DisplayItem::Caret { .. }
+            )),
+            "caret bar is painted while focused"
+        );
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Stage 13 Rec 6: Enter in a text input submits the form as
+    /// a GET navigation through the loader — the query string
+    /// carries the entry list and the results page loads.
+    #[tokio::test]
+    async fn worker_form_submit_get_navigates_with_query() {
+        let page = "<!doctype html><html><head><style>body{margin:0}</style></head><body><form action=\"/search\" method=\"get\"><input id=\"q\" name=\"q\"><button>Go</button></form></body></html>";
+        let routes = std::sync::Arc::new(vec![
+            ("/".to_string(), "text/html".to_string(), page.to_string()),
+            (
+                "/search?q=pluto".to_string(),
+                "text/html".to_string(),
+                "<!doctype html><html><head><style>body{margin:0}</style></head><body>FOUND</body></html>".to_string(),
+            ),
+        ]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_routes(listener, routes));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        // "Go" = 2 glyphs.
+        assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 2);
+        let no_modifiers = pluto_ipc::Modifiers::default();
+        send_key(&cmd_tx, "Tab", "Tab", no_modifiers);
+        for (key, code) in [
+            ("p", "KeyP"),
+            ("l", "KeyL"),
+            ("u", "KeyU"),
+            ("t", "KeyT"),
+            ("o", "KeyO"),
+        ] {
+            send_key(&cmd_tx, key, code, no_modifiers);
+        }
+        // "Go" (2) + "pluto" (5) = 7 glyphs before submit.
+        assert!(
+            wait_for_glyphs(&mut event_rx, 7, Duration::from_secs(5)).await,
+            "typed value did not paint"
+        );
+        send_key(&cmd_tx, "Enter", "Enter", no_modifiers);
+        // The submission navigates: DidCommit, then the results
+        // page ("FOUND" = 5 glyphs).
+        assert!(matches!(
+            next_event(&mut event_rx).await,
+            RendererToBrowser::DidCommit { .. }
+        ));
+        match next_event(&mut event_rx).await {
+            RendererToBrowser::SubmitDisplayList { bytes, .. } => {
+                let list = DisplayList::from_bytes(&bytes).expect("list bytes decode");
+                assert_eq!(glyph_count(&list), 5, "results page paints FOUND");
+            }
+            other => panic!("expected SubmitDisplayList after submit, got {other:?}"),
+        }
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Stage 13 Rec 8: Enter on an empty `required` input does
+    /// NOT navigate — validation blocks submission before any
+    /// navigation, and the form stays put.
+    #[tokio::test]
+    async fn worker_form_validation_blocks_empty_required_submit() {
+        let page = "<!doctype html><html><head><style>body{margin:0}</style></head><body><form action=\"/search\" method=\"get\"><input id=\"q\" name=\"q\" required><button>Go</button></form></body></html>";
+        let routes = std::sync::Arc::new(vec![(
+            "/".to_string(),
+            "text/html".to_string(),
+            page.to_string(),
+        )]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_routes(listener, routes));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 2);
+        let no_modifiers = pluto_ipc::Modifiers::default();
+        send_key(&cmd_tx, "Tab", "Tab", no_modifiers);
+        send_key(&cmd_tx, "Enter", "Enter", no_modifiers);
+        assert!(
+            no_commit_within(&mut event_rx, Duration::from_millis(500)).await,
+            "empty required input must not navigate"
+        );
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+
+    /// Stage 13 Rec 12b: the bridge watchdog kills a hung renderer.
+    /// The child hangs after its handshake (`PLUTO_TEST_RENDERER_HANG`),
+    /// so it never sends a heartbeat or any event; with
+    /// `PLUTO_WATCHDOG_SECS=2` the bridge must report a watchdog
+    /// crash within a few seconds instead of waiting forever.
+    /// The env vars are set on this test process (the child inherits
+    /// them) and removed afterwards; no other test reads them.
+    #[tokio::test]
+    async fn bridge_watchdog_kills_hung_renderer() {
+        // The child binary: the test executable lives in
+        // target/debug/deps, the pluto-browser binary in
+        // target/debug. Skip (do not fail) when it was not built
+        // — `cargo test --lib` does not build bins.
+        let exe = match std::env::current_exe() {
+            Ok(path) => path
+                .parent()
+                .and_then(|deps| deps.parent())
+                .map(|debug| debug.join("pluto-browser"))
+                .filter(|p| p.exists()),
+            Err(_) => None,
+        };
+        let Some(exe) = exe else {
+            eprintln!("[pluto] skipping watchdog test: pluto-browser binary not built");
+            return;
+        };
+        // SAFETY: single-threaded test setup — no other thread
+        // reads these vars while this test runs.
+        unsafe {
+            std::env::set_var(crate::renderer_process::TEST_HANG_ENV, "1");
+            std::env::set_var(WATCHDOG_ENV, "2");
+        }
+        let (cmd_tx, cmd_rx) = pluto_ipc::command_channel();
+        let (out_tx, mut out_rx) = mpsc::channel::<crate::Message>(100);
+        let bridge = tokio::spawn(async move {
+            run_renderer_bridge(77, &exe, cmd_rx, out_tx, false).await
+        });
+        let crashed = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match out_rx.recv().await {
+                    Ok(crate::Message::RendererEvent(
+                        _,
+                        RendererToBrowser::RendererCrashed { reason },
+                    )) => break reason,
+                    Ok(_) => continue,
+                    Err(_) => panic!("bridge output closed without a crash report"),
+                }
+            }
+        })
+        .await
+        .expect("watchdog reports within 20 s");
+        assert!(
+            crashed.contains("watchdog"),
+            "crash reason names the watchdog: {crashed}"
+        );
+        // Closing the command channel ends the bridge: the hung
+        // child is already dead (killed by the watchdog), so this
+        // must return promptly, not hang.
+        drop(cmd_tx);
+        tokio::time::timeout(Duration::from_secs(10), bridge)
+            .await
+            .expect("bridge exits after the command channel closes")
+            .expect("bridge task joins");
+        unsafe {
+            std::env::remove_var(crate::renderer_process::TEST_HANG_ENV);
+            std::env::remove_var(WATCHDOG_ENV);
+        }
+    }
 }

@@ -124,6 +124,16 @@ pub const TEST_GARBAGE_ENV: &str = "PLUTO_TEST_RENDERER_GARBAGE";
 /// [`TEST_GARBAGE_ENV`]: it can only make the renderer die.
 pub const TEST_HANG_ENV: &str = "PLUTO_TEST_RENDERER_HANG";
 
+/// Test hook: when the `--renderer` child sees this env var, the
+/// seccomp allow-list drops `socket` and `connect` — so tests can
+/// prove a renderer that cannot open any socket still loads a
+/// real page end-to-end through the browser-side broker (Stage 13
+/// Rec 11). `sendmsg`/`recvmsg` stay: the IPC transport runs over
+/// a socketpair created *before* the hook, on pre-opened fds.
+/// Same caveat as [`TEST_GARBAGE_ENV`]: it can only make the
+/// renderer die.
+pub const TEST_NO_SOCKET_ENV: &str = "PLUTO_TEST_NO_SOCKET_SYSCALLS";
+
 /// Escape hatch (UNSAFE, debugging only): `PLUTO_NO_SANDBOX=1`, or
 /// the `--no-sandbox` argument, skips the whole sandbox hook and
 /// the renderer runs unconfined. Never ship it. See
@@ -220,13 +230,17 @@ fn sandbox_warn(message: &str) {
 /// `chroot`, and `PR_SET_SECCOMP` would confine the caller
 /// itself. Tests exercise it only by spawning a real `--renderer`
 /// child, or by calling the pure filter builder below.
-pub fn install_sandbox_hook(ipc_fd: RawFd) {
+/// Install the sandbox layers and return the per-layer results
+/// (Stage 13 Rec 12a): the child reports them to the browser over
+/// IPC before the first navigation, so the shell knows — instead
+/// of guessing — which layers landed.
+pub fn install_sandbox_hook(ipc_fd: RawFd) -> Vec<(String, bool)> {
     if sandbox_disabled() {
         sandbox_warn(
             "sandbox DISABLED via --no-sandbox / PLUTO_NO_SANDBOX=1 — UNSAFE: \
              the renderer runs unconfined. Never ship this.",
         );
-        return;
+        return vec![("sandbox-disabled".to_string(), false)];
     }
     let mut results: Vec<(&'static str, bool)> = Vec::new();
     attempt_layer(&mut results, "user-namespace", install_user_namespace);
@@ -254,6 +268,10 @@ pub fn install_sandbox_hook(ipc_fd: RawFd) {
         .map(|(name, ok)| format!("{name}={}", if *ok { "ok" } else { "OFF" }))
         .collect();
     eprintln!("[pluto-sandbox] layers: {}", summary.join(" "));
+    results
+        .into_iter()
+        .map(|(name, ok)| (name.to_string(), ok))
+        .collect()
 }
 
 /// Run one sandbox layer best-effort and record the outcome. A
@@ -344,7 +362,7 @@ fn install_namespaces() -> io::Result<()> {
         }
     } else {
         eprintln!(
-            "[pluto-sandbox] net namespace skipped (renderer still fetches directly; \
+            "[pluto-sandbox] net namespace skipped (broker mode fetches browser-side; \
              set PLUTO_SANDBOX_NET_NS=1 to opt in)"
         );
     }
@@ -814,6 +832,13 @@ fn install_seccomp() -> io::Result<()> {
 /// `restart_syscall` is required: the kernel re-enters
 /// interrupted syscalls through it.
 ///
+/// Stage 13 Rec 11: the broker fetch has landed — the
+/// out-of-process child fetches through the browser-side broker
+/// and needs no socket at all. `socket`/`connect` stay in the
+/// list only because the *in-process* worker still fetches
+/// directly; [`TEST_NO_SOCKET_ENV`] drops them for broker-mode
+/// tests, proving the child loads a real page with no socket.
+///
 /// NEVER in this list, by design: `ptrace` (a tracer can rewrite
 /// syscalls and escape), `execve`/`execveat` (the renderer must
 /// never run another program), `fork`/`vfork` (threads use
@@ -840,8 +865,20 @@ fn install_seccomp() -> io::Result<()> {
 /// against the renderer's real post-hook behaviour (threads,
 /// font scan, layout, JS, IPC); it is not a measured count and
 /// no size is claimed for it.
-fn seccomp_allowed_syscalls() -> &'static [libc::c_long] {
-    &ALLOWED_SYSCALLS
+///
+/// With [`TEST_NO_SOCKET_ENV`] set, `socket` and `connect` are
+/// dropped from the list (Stage 13 Rec 11 test hook) — the
+/// renderer must then fetch through the broker, never directly.
+fn seccomp_allowed_syscalls() -> Vec<libc::c_long> {
+    if env_flag_on(TEST_NO_SOCKET_ENV) {
+        ALLOWED_SYSCALLS
+            .iter()
+            .copied()
+            .filter(|nr| *nr != libc::SYS_socket && *nr != libc::SYS_connect)
+            .collect()
+    } else {
+        ALLOWED_SYSCALLS.to_vec()
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1039,7 +1076,7 @@ fn build_seccomp_filter(default_action: u32) -> Vec<libc::sock_filter> {
         libc::BPF_LD as u16 | libc::BPF_W as u16 | libc::BPF_ABS as u16,
         0,
     ));
-    for &nr in seccomp_allowed_syscalls() {
+    for nr in seccomp_allowed_syscalls() {
         prog.push(bpf_jump(
             libc::BPF_JMP as u16 | libc::BPF_JEQ as u16 | libc::BPF_K as u16,
             nr as u32,
@@ -1401,7 +1438,18 @@ pub fn run_renderer_child(fd: RawFd, tab_id: u64) -> i32 {
         // Best-effort layers (see install_sandbox_hook): a failed
         // layer degrades, it never fails the spawn. The IPC fd is
         // passed so the FD-close layer knows what to keep.
-        install_sandbox_hook(fd);
+        // Stage 13 Rec 12a: report the sandbox layers to the
+        // browser before the first navigation (a failed send
+        // means the browser is gone — the worker loop below will
+        // exit on its own).
+        let layers = install_sandbox_hook(fd);
+        if transport
+            .send_message(&pluto_ipc::RendererToBrowser::SandboxReport { layers })
+            .await
+            .is_err()
+        {
+            return 1;
+        }
         crate::renderer::run_worker_transport(transport, tab_id).await
     })
 }

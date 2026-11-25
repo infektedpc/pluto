@@ -54,53 +54,11 @@ fn read_file(dir: &PathBuf, name: &str) -> Option<String> {
     std::fs::read_to_string(dir.join(name)).ok()
 }
 
-/// Write a file atomically (temp-file + rename), creating the
-/// profile dir if needed.
-///
-/// The temp name is unique per write (process id + a
-/// per-process counter, created with `O_EXCL` and retried on
-/// collision): two writers to the same profile dir — two Pluto
-/// windows sharing `$HOME/.config/pluto`, or two test threads —
-/// must never share one temp file, or their writes interleave
-/// and the renamed target ends up as one JSON value plus
-/// trailing bytes (Stage 10 Rec 6). The rename still publishes
-/// each write whole, so a reader only ever sees a complete
-/// document.
+/// Write a file atomically: the shared writer in
+/// [`crate::atomic`] (Stage 13 Rec 9 / trap 14 — one copy for the
+/// whole browser crate, with `fsync` + a startup temp sweep).
 fn write_file_atomic(dir: &PathBuf, name: &str, contents: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let target = dir.join(name);
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let mut attempt = 0;
-    loop {
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
-            Ok(mut file) => {
-                use std::io::Write;
-                let written = file.write_all(contents.as_bytes());
-                drop(file);
-                let result = written.and_then(|()| std::fs::rename(&tmp, target));
-                if result.is_err() {
-                    let _ = std::fs::remove_file(&tmp);
-                }
-                return result;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // A stale temp file with this pid + counter (a pid
-                // reused after a crash, or a counter wrap): take
-                // the next name instead of clobbering it.
-                attempt += 1;
-                if attempt > 100 {
-                    return Err(e);
-                }
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    crate::atomic::write_file_atomic(dir, name, contents)
 }
 
 /// Load the persisted security state into `loader`. Missing or

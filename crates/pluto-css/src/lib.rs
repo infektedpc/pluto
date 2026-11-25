@@ -405,6 +405,17 @@ pub enum PseudoClass {
     Focus,
     FocusVisible,
     FocusWithin,
+    // Form pseudo-classes (Stage 13 Rec 8, M5): matched from the
+    // worker-projected `ElementState` form sets (see
+    // `pluto-layout`), never from the DOM directly — the matcher
+    // only sees element ids.
+    Valid,
+    Invalid,
+    Required,
+    Optional,
+    Disabled,
+    Checked,
+    ReadOnly,
     Not(Vec<Selector>),
     Is(Vec<Selector>),
     Where(Vec<Selector>),
@@ -1785,6 +1796,13 @@ fn pseudo_class_name(pc: &PseudoClass) -> String {
         PseudoClass::Focus => "focus",
         PseudoClass::FocusVisible => "focus-visible",
         PseudoClass::FocusWithin => "focus-within",
+        PseudoClass::Valid => "valid",
+        PseudoClass::Invalid => "invalid",
+        PseudoClass::Required => "required",
+        PseudoClass::Optional => "optional",
+        PseudoClass::Disabled => "disabled",
+        PseudoClass::Checked => "checked",
+        PseudoClass::ReadOnly => "read-only",
         // Logical variants are recursed into by the caller and
         // never reach here; name them defensively anyway.
         PseudoClass::Not(_) => "not",
@@ -1849,6 +1867,10 @@ colgroup { display: table-column-group; }
 button, input, select, textarea { display: inline-block; }
 button { padding: 1px 6px; }
 input { padding: 1px; }
+input, select, textarea { border: 1px solid; background: #ffffff; color: #000000; }
+input { min-width: 150px; }
+textarea { white-space: pre; }
+input[type="checkbox"], input[type="radio"] { min-width: 0; }
 img { display: inline; }
 "#;
 
@@ -2976,6 +2998,13 @@ impl<'a> SelectorParser<'a> {
             "focus" => PseudoClass::Focus,
             "focus-visible" => PseudoClass::FocusVisible,
             "focus-within" => PseudoClass::FocusWithin,
+            "valid" => PseudoClass::Valid,
+            "invalid" => PseudoClass::Invalid,
+            "required" => PseudoClass::Required,
+            "optional" => PseudoClass::Optional,
+            "disabled" => PseudoClass::Disabled,
+            "checked" => PseudoClass::Checked,
+            "read-only" => PseudoClass::ReadOnly,
             "nth-child" | "nth-last-child" | "nth-of-type" | "nth-last-of-type" => {
                 let arg = self.read_paren_arg()?;
                 let ab = parse_an_plus_b(&arg)?;

@@ -365,54 +365,13 @@ pub fn parse_json(input: &str) -> Result<JsonValue, String> {
 }
 
 /// Write a file atomically (temp-file + rename), creating the
-/// profile dir if needed — the [`security`](crate::security)
-/// pattern, duplicated here because that module's helper is
-/// private.
-///
-/// The temp name is unique per write (process id + a
-/// per-process counter, created with `O_EXCL` and retried on
-/// collision): two writers to the same profile dir — two Pluto
-/// windows sharing `$HOME/.config/pluto`, or two test threads —
-/// must never share one temp file, or their writes interleave
-/// and the renamed target ends up as one JSON value plus
-/// trailing bytes (Stage 10 Rec 6). The rename still publishes
-/// each write whole, so a reader only ever sees a complete
-/// document.
+/// profile dir if needed — the shared writer in
+/// [`crate::atomic`] (Stage 13 Rec 9 / trap 14: one copy for the
+/// whole browser crate, with `fsync` + a startup temp sweep).
+/// Kept as a `pub` shim: `bookmarks` / `permissions` / tests call
+/// it through this module.
 pub fn write_file_atomic(dir: &PathBuf, name: &str, contents: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let target = dir.join(name);
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let mut attempt = 0;
-    loop {
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
-            Ok(mut file) => {
-                use std::io::Write;
-                let written = file.write_all(contents.as_bytes());
-                drop(file);
-                let result = written.and_then(|()| std::fs::rename(&tmp, target));
-                if result.is_err() {
-                    let _ = std::fs::remove_file(&tmp);
-                }
-                return result;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // A stale temp file with this pid + counter (a pid
-                // reused after a crash, or a counter wrap): take
-                // the next name instead of clobbering it.
-                attempt += 1;
-                if attempt > 100 {
-                    return Err(e);
-                }
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    crate::atomic::write_file_atomic(dir, name, contents)
 }
 
 // ------------------------------------------------------------------ bucket
@@ -546,11 +505,51 @@ fn buckets_from_json(text: &str) -> HashMap<StorageKey, Bucket> {
 
 // ------------------------------------------------------------------ local
 
+/// One `localStorage` mutation, for the cross-tab `storage`
+/// event fan-out (Stage 13 Rec 10d): the shared store is the
+/// fan-out point — every tab records its mutations here with its
+/// tab id, and every other tab drains the ones it has not seen.
+/// The mutating tab never receives its own events (the drain
+/// filters by `tab_id`).
+#[derive(Debug, Clone)]
+pub struct StorageEvent {
+    /// The tab that mutated.
+    pub tab_id: u64,
+    /// The origin whose bucket changed (serialised URL origin).
+    pub origin: String,
+    /// The mutated key (`None` = whole-bucket `clear()`).
+    pub key: Option<String>,
+    /// The previous value (`None` = key absent).
+    pub old_value: Option<String>,
+    /// The new value (`None` = key removed / bucket cleared).
+    pub new_value: Option<String>,
+}
+
+/// Global cap for the whole profile `localStorage` store (Stage
+/// 13 Rec 10b): buckets are 5 MiB each but bucket count is
+/// unbounded, so the store as a whole needs a bound. When a write
+/// would exceed it, whole other buckets are evicted (largest
+/// first) until it fits.
+pub const GLOBAL_STORAGE_CAP_BYTES: usize = 50 * 1024 * 1024;
+
+/// How long a dirty store waits before a debounced save flushes
+/// it (Stage 13 Rec 10b): rapid `setItem`s coalesce into one
+/// file write; tab close / an explicit `flush()` always writes.
+pub const SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// The profile-backed `localStorage` store: one bucket per
 /// partition key, shared across all tabs of that origin.
 #[derive(Debug, Default)]
 pub struct LocalStorageStore {
     buckets: HashMap<StorageKey, Bucket>,
+    /// True since the last successful save (debounce state).
+    dirty: bool,
+    /// When the store was last written to disk.
+    last_saved: Option<std::time::Instant>,
+    /// Mutation log for the `storage` event fan-out, in order.
+    events: Vec<(u64, StorageEvent)>,
+    /// Next event sequence number.
+    next_event_seq: u64,
 }
 
 impl LocalStorageStore {
@@ -574,7 +573,126 @@ impl LocalStorageStore {
         value: &str,
     ) -> Result<(), StorageError> {
         check_origin(&key.origin)?;
-        self.buckets.entry(key.clone()).or_default().set(name, value)
+        // Global cap (Stage 13 Rec 10b): evict whole *other*
+        // buckets, largest first, until the write fits. The
+        // per-bucket quota already bounds one bucket, so a write
+        // that still does not fit after evicting every other
+        // bucket is a quota error, not a silent drop.
+        let projected = {
+            let mut probe = self
+                .buckets
+                .get(key)
+                .cloned()
+                .unwrap_or_default();
+            probe.set(name, value)?;
+            self.total_bytes() - self.bucket_bytes(key) + probe.byte_len()
+        };
+        if projected > GLOBAL_STORAGE_CAP_BYTES {
+            let mut others: Vec<(StorageKey, usize)> = self
+                .buckets
+                .iter()
+                .filter(|(k, _)| *k != key)
+                .map(|(k, b)| (k.clone(), b.byte_len()))
+                .collect();
+            others.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            let mut freed = 0usize;
+            let over = projected - GLOBAL_STORAGE_CAP_BYTES;
+            for (other, size) in others {
+                if freed >= over {
+                    break;
+                }
+                self.buckets.remove(&other);
+                freed += size;
+            }
+            if self.total_bytes() - self.bucket_bytes(key)
+                + {
+                    let mut probe = self
+                        .buckets
+                        .get(key)
+                        .cloned()
+                        .unwrap_or_default();
+                    probe.set(name, value)?;
+                    probe.byte_len()
+                }
+                > GLOBAL_STORAGE_CAP_BYTES
+            {
+                return Err(StorageError::QuotaExceeded);
+            }
+        }
+        let result = self.buckets.entry(key.clone()).or_default().set(name, value);
+        if result.is_ok() {
+            self.dirty = true;
+        }
+        result
+    }
+
+    /// Bytes in one bucket (0 when absent).
+    pub fn bucket_bytes(&self, key: &StorageKey) -> usize {
+        self.buckets.get(key).map(|b| b.byte_len()).unwrap_or(0)
+    }
+
+    /// Bytes across all buckets.
+    pub fn total_bytes(&self) -> usize {
+        self.buckets.values().map(|b| b.byte_len()).sum()
+    }
+
+    /// `(used, cap)` for `navigator.storage.estimate()`.
+    pub fn usage_bytes(&self) -> (u64, u64) {
+        (self.total_bytes() as u64, GLOBAL_STORAGE_CAP_BYTES as u64)
+    }
+
+    /// Whether the store has unsaved changes.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Record one mutation for the `storage` event fan-out
+    /// (Stage 13 Rec 10d). Prunes the log to the newest 1000
+    /// entries — a tab that sleeps through more than that misses
+    /// the oldest events rather than growing the log forever.
+    pub fn record_event(&mut self, event: StorageEvent) {
+        self.next_event_seq += 1;
+        self.events.push((self.next_event_seq, event));
+        if self.events.len() > 1000 {
+            let excess = self.events.len() - 1000;
+            self.events.drain(..excess);
+        }
+    }
+
+    /// Events after `seq` (exclusive), plus the newest sequence
+    /// number. Callers advance their cursor to the returned seq
+    /// even for events they filter out (their own tab's).
+    pub fn events_since(&self, seq: u64) -> (Vec<(u64, StorageEvent)>, u64) {
+        let out: Vec<(u64, StorageEvent)> = self
+            .events
+            .iter()
+            .filter(|(s, _)| *s > seq)
+            .cloned()
+            .collect();
+        (out, self.next_event_seq)
+    }
+
+    /// Write the store now if it is dirty (tab close / explicit
+    /// flush always writes, whatever the debounce says).
+    pub fn flush(&mut self) {
+        if self.dirty {
+            save_local_storage(self);
+        }
+    }
+
+    /// Write the store now if it is dirty AND the debounce
+    /// window has elapsed since the last save (Stage 13 Rec 10b).
+    pub fn save_if_due(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        let due = match self.last_saved {
+            None => true,
+            Some(t) => t.elapsed() >= SAVE_DEBOUNCE,
+        };
+        if due {
+            save_local_storage(self);
+        }
     }
 
     pub fn remove_item(&mut self, key: &StorageKey, name: &str) {
@@ -583,6 +701,7 @@ impl LocalStorageStore {
         }
         if let Some(bucket) = self.buckets.get_mut(key) {
             bucket.remove(name);
+            self.dirty = true;
         }
     }
 
@@ -592,6 +711,7 @@ impl LocalStorageStore {
         }
         if let Some(bucket) = self.buckets.get_mut(key) {
             bucket.entries.clear();
+            self.dirty = true;
         }
     }
 
@@ -619,8 +739,39 @@ impl LocalStorageStore {
     pub fn from_json(text: &str) -> Self {
         Self {
             buckets: buckets_from_json(text),
+            ..Default::default()
         }
     }
+}
+
+/// The process-wide shared `localStorage` store (Stage 13 Rec
+/// 10a): ONE `Arc<Mutex<LocalStorageStore>>` per profile dir,
+/// handed to every tab instead of a fresh `load_local_storage()`
+/// per tab. The per-tab load was a live lost-update race — two
+/// tabs each held a snapshot, and whichever saved last silently
+/// discarded the other's writes; every single-tab test passed,
+/// so the race was invisible to the suite.
+///
+/// Keyed by profile dir so tests under distinct temp HOMEs get
+/// distinct stores; production tabs share one HOME, so they
+/// share one store. (In the out-of-process world the canonical
+/// store moves browser-side into the broker — Rec 11 — and the
+/// renderer tabs talk to it over IPC; this registry is the
+/// in-process sharing point until then.)
+pub fn shared_local_storage() -> Arc<Mutex<LocalStorageStore>> {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<LocalStorageStore>>>>> =
+        OnceLock::new();
+    let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let Some(dir) = profile_dir() else {
+        // No HOME: no persistence to share — a fresh store.
+        return Arc::new(Mutex::new(LocalStorageStore::new()));
+    };
+    let mut registry = registry.lock().unwrap();
+    registry
+        .entry(dir)
+        .or_insert_with(|| Arc::new(Mutex::new(load_local_storage())))
+        .clone()
 }
 
 /// Load the persisted `localStorage` store. Missing or corrupt
@@ -643,14 +794,18 @@ pub fn load_local_storage() -> LocalStorageStore {
 }
 
 /// Save the `localStorage` store to the profile. Failures are
-/// logged, never fatal.
-pub fn save_local_storage(store: &LocalStorageStore) {
+/// logged, never fatal. Clears the dirty flag and stamps the save
+/// time (the debounce state lives on the store).
+pub fn save_local_storage(store: &mut LocalStorageStore) {
     let Some(dir) = profile_dir() else {
         return;
     };
     if let Err(e) = write_file_atomic(&dir, LOCAL_STORAGE_FILE, &store.to_json()) {
         eprintln!("[pluto] could not save localStorage: {e}");
+        return;
     }
+    store.dirty = false;
+    store.last_saved = Some(std::time::Instant::now());
 }
 
 // ------------------------------------------------------------------ session
@@ -736,6 +891,10 @@ impl SessionStorageStore {
 pub struct PlutoStorageBackend {
     local: Arc<Mutex<LocalStorageStore>>,
     session: Arc<Mutex<SessionStorageStore>>,
+    /// Tab id tagging this backend's mutations (fan-out).
+    tab_id: std::sync::atomic::AtomicU64,
+    /// Event-log cursor for `drain_storage_events`.
+    last_event_seq: Mutex<u64>,
 }
 
 impl PlutoStorageBackend {
@@ -745,6 +904,8 @@ impl PlutoStorageBackend {
         Self {
             local,
             session: Arc::new(Mutex::new(SessionStorageStore::new())),
+            tab_id: std::sync::atomic::AtomicU64::new(0),
+            last_event_seq: Mutex::new(0),
         }
     }
 
@@ -753,9 +914,39 @@ impl PlutoStorageBackend {
         Arc::clone(&self.local)
     }
 
-    /// Persist the shared local store to the profile now.
+    /// Persist the shared local store to the profile now
+    /// (flush: always writes when dirty, whatever the debounce
+    /// says — tab close calls this).
     pub fn save_local(&self) {
-        save_local_storage(&self.local.lock().unwrap());
+        save_local_storage(&mut self.local.lock().unwrap());
+    }
+
+    /// The tab id this backend's mutations are tagged with for
+    /// the `storage` event fan-out (Stage 13 Rec 10d).
+    pub fn set_tab_id(&self, tab_id: u64) {
+        self.tab_id.store(tab_id, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Drain `storage` events from other tabs for this tab's
+    /// origin (Stage 13 Rec 10d): events this tab has not seen
+    /// yet, excluding its own mutations. The caller dispatches
+    /// them to the window; the cursor advances past every event
+    /// seen, including its own.
+    pub fn drain_storage_events_for_tab(&self) -> Vec<StorageEvent> {
+        let last = *self.last_event_seq.lock().unwrap();
+        let (events, newest) = self.local.lock().unwrap().events_since(last);
+        *self.last_event_seq.lock().unwrap() = newest;
+        let mine = self.tab_id.load(std::sync::atomic::Ordering::Relaxed);
+        events
+            .into_iter()
+            .filter(|(_, e)| e.tab_id != mine)
+            .map(|(_, e)| e)
+            .collect()
+    }
+
+    /// `(used, cap)` bytes for `navigator.storage.estimate()`.
+    pub fn usage_bytes(&self) -> (u64, u64) {
+        self.local.lock().unwrap().usage_bytes()
     }
 }
 
@@ -779,17 +970,30 @@ impl StorageBackend for PlutoStorageBackend {
         name: &str,
         value: &str,
     ) -> Result<(), StorageError> {
+        let old_value = if kind == StorageKind::Local {
+            self.local.lock().unwrap().get_item(key, name).ok().flatten()
+        } else {
+            None
+        };
         let result = match kind {
             StorageKind::Local => self.local.lock().unwrap().set_item(key, name, value),
             StorageKind::Session => {
                 self.session.lock().unwrap().set_item(key, name, value)
             }
         };
-        // `localStorage` persists to disk: a successful write is
-        // saved at once (the files are small and writes are
-        // infrequent relative to reads).
+        // `localStorage` persists to disk (debounced: rapid
+        // `setItem`s coalesce into one write — Stage 13 Rec 10b)
+        // and fans the mutation out to other tabs (Rec 10d).
         if result.is_ok() && kind == StorageKind::Local {
-            self.save_local();
+            let mut store = self.local.lock().unwrap();
+            store.record_event(StorageEvent {
+                tab_id: self.tab_id.load(std::sync::atomic::Ordering::Relaxed),
+                origin: key.origin.serialize(),
+                key: Some(name.to_string()),
+                old_value,
+                new_value: Some(value.to_string()),
+            });
+            store.save_if_due();
         }
         result
     }
@@ -797,8 +1001,23 @@ impl StorageBackend for PlutoStorageBackend {
     fn remove_item(&self, kind: StorageKind, key: &StorageKey, name: &str) {
         match kind {
             StorageKind::Local => {
-                self.local.lock().unwrap().remove_item(key, name);
-                self.save_local();
+                let old_value = self
+                    .local
+                    .lock()
+                    .unwrap()
+                    .get_item(key, name)
+                    .ok()
+                    .flatten();
+                let mut store = self.local.lock().unwrap();
+                store.remove_item(key, name);
+                store.record_event(StorageEvent {
+                    tab_id: self.tab_id.load(std::sync::atomic::Ordering::Relaxed),
+                    origin: key.origin.serialize(),
+                    key: Some(name.to_string()),
+                    old_value,
+                    new_value: None,
+                });
+                store.save_if_due();
             }
             StorageKind::Session => self.session.lock().unwrap().remove_item(key, name),
         }
@@ -807,8 +1026,16 @@ impl StorageBackend for PlutoStorageBackend {
     fn clear(&self, kind: StorageKind, key: &StorageKey) {
         match kind {
             StorageKind::Local => {
-                self.local.lock().unwrap().clear(key);
-                self.save_local();
+                let mut store = self.local.lock().unwrap();
+                store.clear(key);
+                store.record_event(StorageEvent {
+                    tab_id: self.tab_id.load(std::sync::atomic::Ordering::Relaxed),
+                    origin: key.origin.serialize(),
+                    key: None,
+                    old_value: None,
+                    new_value: None,
+                });
+                store.save_if_due();
             }
             StorageKind::Session => self.session.lock().unwrap().clear(key),
         }
@@ -819,6 +1046,24 @@ impl StorageBackend for PlutoStorageBackend {
             StorageKind::Local => self.local.lock().unwrap().key(key, index),
             StorageKind::Session => self.session.lock().unwrap().key(key, index),
         }
+    }
+
+    fn drain_storage_events(
+        &self,
+    ) -> Vec<pluto_js::bindings::storage::StorageEventRecord> {
+        self.drain_storage_events_for_tab()
+            .into_iter()
+            .map(|e| pluto_js::bindings::storage::StorageEventRecord {
+                origin: e.origin,
+                key: e.key,
+                old_value: e.old_value,
+                new_value: e.new_value,
+            })
+            .collect()
+    }
+
+    fn usage_bytes(&self) -> (u64, u64) {
+        self.usage_bytes()
     }
 
     fn len(&self, kind: StorageKind, key: &StorageKey) -> usize {
@@ -991,7 +1236,7 @@ mod tests {
             let mut store = load_local_storage();
             store.set_item(&key, "name", "pluto \"quoted\" \\ backslash\nnewline").unwrap();
             store.set_item(&shop, "cart", "3 items").unwrap();
-            save_local_storage(&store);
+            save_local_storage(&mut store);
         }
         let loaded = load_local_storage();
         assert_eq!(
@@ -1141,4 +1386,137 @@ mod tests {
         assert!(leftovers.is_empty(), "no temp files left behind: {leftovers:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// Stage 13 Rec 10a — the two-tab test: interleaved
+    /// `setItem`s from two live tabs sharing one store both
+    /// survive in the file AND after a reload. (The old
+    /// per-tab `load_local_storage()` snapshots lost whichever
+    /// tab saved first; this test is the regression proof.)
+    #[test]
+    fn two_tabs_share_one_store_without_lost_updates() {
+        let home = temp_home("two-tab");
+        let old = with_home(&home);
+        let key = StorageKey::for_document(&Origin::from_url("https://shop.example/"));
+        let shared = shared_local_storage();
+        let tab_a = PlutoStorageBackend::new(Arc::clone(&shared));
+        let tab_b = PlutoStorageBackend::new(Arc::clone(&shared));
+        tab_a.set_tab_id(1);
+        tab_b.set_tab_id(2);
+        // Interleaved writes, exactly the race the old snapshots lost.
+        tab_a.set_item(StorageKind::Local, &key, "cart-a", "1").unwrap();
+        tab_b.set_item(StorageKind::Local, &key, "cart-b", "2").unwrap();
+        tab_a.set_item(StorageKind::Local, &key, "cart-a2", "3").unwrap();
+        tab_b.set_item(StorageKind::Local, &key, "cart-b2", "4").unwrap();
+        // Both tabs read each other's writes immediately.
+        assert_eq!(
+            tab_a.get_item(StorageKind::Local, &key, "cart-b").unwrap().as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            tab_b.get_item(StorageKind::Local, &key, "cart-a2").unwrap().as_deref(),
+            Some("3")
+        );
+        // Flush (tab close) + reload from disk: nothing lost.
+        tab_a.save_local();
+        let reloaded = load_local_storage();
+        for (name, want) in [("cart-a", "1"), ("cart-b", "2"), ("cart-a2", "3"), ("cart-b2", "4")] {
+            assert_eq!(
+                reloaded.get_item(&key, name).unwrap().as_deref(),
+                Some(want),
+                "key {name} survives in the file after restart"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        restore_home(old);
+    }
+
+    /// Stage 13 Rec 10b — the global cap evicts whole other
+    /// buckets (largest first) instead of failing or growing
+    /// the profile without bound.
+    #[test]
+    fn global_cap_evicts_other_buckets() {
+        let mut store = LocalStorageStore::new();
+        // Fill the store to just under the cap with ten buckets,
+        // each under the 5 MiB per-bucket quota.
+        let mut keys = Vec::new();
+        for i in 0..10 {
+            let k = StorageKey::for_document(&Origin::from_url(&format!(
+                "https://big{i}.example/"
+            )));
+            // 5,242,874 bytes per bucket: just under the 5 MiB
+            // per-bucket quota, ten of them just under the 50 MiB
+            // global cap (52,428,740 of 52,428,800).
+            store
+                .set_item(&k, "bulk", &"x".repeat(5_242_870))
+                .unwrap();
+            keys.push(k);
+        }
+        assert!(store.total_bytes() <= GLOBAL_STORAGE_CAP_BYTES);
+        // A 1 KiB write from another origin exceeds the cap, so
+        // whole other buckets are evicted (largest first) until
+        // it fits.
+        let other = StorageKey::for_document(&Origin::from_url("https://other.example/"));
+        store
+            .set_item(&other, "small", &"v".repeat(1024))
+            .unwrap();
+        assert_eq!(
+            store.get_item(&other, "small").unwrap().as_deref(),
+            Some("v".repeat(1024).as_str())
+        );
+        assert!(
+            keys.iter().any(|k| store.get_item(k, "bulk").unwrap().is_none()),
+            "at least one old bucket was evicted"
+        );
+        assert!(store.total_bytes() <= GLOBAL_STORAGE_CAP_BYTES);
+    }
+
+    /// Stage 13 Rec 10b — debounced saves coalesce rapid writes
+    /// into one file write; `flush()` always writes when dirty.
+    #[test]
+    fn debounced_save_coalesces_and_flush_writes() {
+        let home = temp_home("debounce");
+        let old = with_home(&home);
+        let key = StorageKey::for_document(&Origin::from_url("https://deb.example/"));
+        let mut store = load_local_storage();
+        store.set_item(&key, "a", "1").unwrap();
+        assert!(store.is_dirty());
+        // A save within the debounce window does not happen on its own.
+        store.save_if_due();
+        // (First save has no `last_saved`, so it is due — force
+        // the not-due case by saving, then writing again at once.)
+        assert!(!store.is_dirty());
+        store.set_item(&key, "b", "2").unwrap();
+        let dir = profile_dir().unwrap();
+        let before = std::fs::read_to_string(dir.join(LOCAL_STORAGE_FILE)).unwrap();
+        store.save_if_due();
+        let after = std::fs::read_to_string(dir.join(LOCAL_STORAGE_FILE)).unwrap();
+        assert_eq!(before, after, "no write inside the debounce window");
+        store.flush();
+        assert!(!store.is_dirty());
+        let flushed = load_local_storage();
+        assert_eq!(flushed.get_item(&key, "b").unwrap().as_deref(), Some("2"));
+        let _ = std::fs::remove_dir_all(&home);
+        restore_home(old);
+    }
+
+    /// Stage 13 Rec 10d — a tab drains the other tab's events
+    /// but never its own.
+    #[test]
+    fn storage_events_fan_out_to_other_tabs_only() {
+        let shared = Arc::new(Mutex::new(LocalStorageStore::new()));
+        let key = StorageKey::for_document(&Origin::from_url("https://ev.example/"));
+        let a = PlutoStorageBackend::new(Arc::clone(&shared));
+        let b = PlutoStorageBackend::new(Arc::clone(&shared));
+        a.set_tab_id(1);
+        b.set_tab_id(2);
+        a.set_item(StorageKind::Local, &key, "x", "1").unwrap();
+        // B sees A's mutation; A never sees its own.
+        let b_events = b.drain_storage_events_for_tab();
+        assert_eq!(b_events.len(), 1);
+        assert_eq!(b_events[0].key.as_deref(), Some("x"));
+        assert_eq!(b_events[0].new_value.as_deref(), Some("1"));
+        assert!(a.drain_storage_events_for_tab().is_empty());
+        // Draining again delivers nothing (cursor advanced).
+        assert!(b.drain_storage_events_for_tab().is_empty());
+    }
+
 }

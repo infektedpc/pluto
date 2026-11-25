@@ -1833,3 +1833,171 @@ fn console_extended_methods() {
     assert!(messages.contains(&"  inner"));
     assert!(messages.contains(&"outer"));
 }
+
+// ------------------------------------------------------------------ Stage 13
+// M5 forms: value APIs, FormData, validation, focus, document.forms.
+
+const FORM_DOC: &str = r#"<!doctype html>
+<html><head><title>Forms</title></head><body>
+<form id="f" action="/search" method="get">
+<input id="q" name="q" value="orig" placeholder="Search" maxlength="10">
+<input id="cb" type="checkbox" name="cb" value="yes" checked>
+<input id="req" name="req" required>
+<input id="em" name="em" type="email">
+<select id="sel" name="sel"><option value="a">A</option><option value="b" selected>B</option><option value="c">C</option></select>
+<textarea id="ta" name="ta">dflt</textarea>
+<button id="go" type="submit" name="go" value="Go">Go</button>
+</form>
+</body></html>"#;
+
+fn form_tab() -> TabJs {
+    let mut tab = TabJs::new(&RealmConfig::default()).unwrap();
+    tab.set_dom_host(Box::new(TestHost::from_html(FORM_DOC)));
+    tab
+}
+
+const FORM_SETUP: &str = "const f = document.getElementById('f'); const q = document.getElementById('q'); const cb = document.getElementById('cb'); const req = document.getElementById('req'); const em = document.getElementById('em'); const sel = document.getElementById('sel'); const ta = document.getElementById('ta');";
+
+#[test]
+fn form_value_apis_dirty_value_survives_set_attribute() {
+    let mut tab = form_tab();
+    run(&mut tab, FORM_SETUP);
+    run(&mut tab, "q.value = 'typed';");
+    assert_eq!(read_str(&mut tab, "q.value"), "typed");
+    run(&mut tab, "q.setAttribute('value', 'attr-change');");
+    assert_eq!(read_str(&mut tab, "q.value"), "typed");
+    assert_eq!(read_str(&mut tab, "q.defaultValue"), "attr-change");
+    assert_eq!(read_str(&mut tab, "q.placeholder"), "Search");
+    assert_eq!(read_num(&mut tab, "q.maxLength"), 10.0);
+    assert_eq!(read_str(&mut tab, "q.type"), "text");
+    assert_eq!(read_str(&mut tab, "q.name"), "q");
+    assert!(!read_bool(&mut tab, "q.disabled"));
+    assert_eq!(read_str(&mut tab, "ta.value"), "dflt");
+    assert_eq!(read_str(&mut tab, "ta.type"), "textarea");
+}
+
+#[test]
+fn form_checked_and_select_apis() {
+    let mut tab = form_tab();
+    run(&mut tab, FORM_SETUP);
+    assert!(read_bool(&mut tab, "cb.checked"));
+    assert!(read_bool(&mut tab, "cb.defaultChecked"));
+    run(&mut tab, "cb.checked = false;");
+    assert!(!read_bool(&mut tab, "cb.checked"));
+    assert!(read_bool(&mut tab, "cb.defaultChecked"));
+    assert_eq!(read_num(&mut tab, "sel.selectedIndex"), 1.0);
+    assert_eq!(read_str(&mut tab, "sel.value"), "b");
+    assert_eq!(read_num(&mut tab, "sel.options.length"), 3.0);
+    assert_eq!(read_str(&mut tab, "sel.options[2].textContent"), "C");
+    assert!(read_bool(&mut tab, "sel.options[1].selected"));
+    run(&mut tab, "sel.selectedIndex = 0;");
+    assert_eq!(read_str(&mut tab, "sel.value"), "a");
+    assert_eq!(read_str(&mut tab, "sel.options[0].selected ? 'y' : 'n'"), "y");
+    assert_eq!(read_str(&mut tab, "q.form.id"), "f");
+    assert_eq!(read_num(&mut tab, "document.forms.length"), 1.0);
+    assert_eq!(read_num(&mut tab, "f.elements.length"), 7.0);
+}
+
+#[test]
+fn form_selection_apis() {
+    let mut tab = form_tab();
+    run(&mut tab, FORM_SETUP);
+    run(&mut tab, "q.value = 'hello'; q.setSelectionRange(1, 3);");
+    assert_eq!(read_num(&mut tab, "q.selectionStart"), 1.0);
+    assert_eq!(read_num(&mut tab, "q.selectionEnd"), 3.0);
+    run(&mut tab, "q.select();");
+    assert_eq!(read_num(&mut tab, "q.selectionStart"), 0.0);
+    assert_eq!(read_num(&mut tab, "q.selectionEnd"), 5.0);
+}
+
+#[test]
+fn form_data_reads_entry_list() {
+    let mut tab = form_tab();
+    run(&mut tab, FORM_SETUP);
+    run(&mut tab, "q.value = 'typed';");
+    assert_eq!(read_str(&mut tab, "new FormData(f).get('q')"), "typed");
+    assert_eq!(read_str(&mut tab, "new FormData(f).get('cb')"), "yes");
+    assert_eq!(read_str(&mut tab, "new FormData(f).get('sel')"), "b");
+    assert_eq!(read_str(&mut tab, "new FormData(f).get('ta')"), "dflt");
+    assert!(read_bool(&mut tab, "new FormData(f).has('req')"));
+    run(&mut tab, "var fd = new FormData(f); fd.append('x', '1'); fd.set('q', 'z');");
+    assert_eq!(read_str(&mut tab, "fd.get('x')"), "1");
+    assert_eq!(read_str(&mut tab, "fd.get('q')"), "z");
+    assert_eq!(read_num(&mut tab, "fd.getAll('q').length"), 1.0);
+}
+
+#[test]
+fn form_validation_required_and_email() {
+    let mut tab = form_tab();
+    run(&mut tab, FORM_SETUP);
+    assert!(!read_bool(&mut tab, "req.checkValidity()"));
+    assert!(read_bool(&mut tab, "req.validity.valueMissing"));
+    assert!(!read_bool(&mut tab, "req.validity.valid"));
+    assert_eq!(read_str(&mut tab, "req.validationMessage"), "Please fill out this field.");
+    run(&mut tab, "req.value = 'x';");
+    assert!(read_bool(&mut tab, "req.checkValidity()"));
+    assert!(read_bool(&mut tab, "em.checkValidity()"));
+    run(&mut tab, "em.value = 'not-an-email';");
+    assert!(!read_bool(&mut tab, "em.checkValidity()"));
+    assert!(read_bool(&mut tab, "em.validity.typeMismatch"));
+    run(&mut tab, "em.value = 'a@b.com';");
+    assert!(read_bool(&mut tab, "em.checkValidity()"));
+    run(&mut tab, "req.setCustomValidity('nope');");
+    assert!(!read_bool(&mut tab, "req.checkValidity()"));
+    assert!(read_bool(&mut tab, "req.validity.customError"));
+    assert_eq!(read_str(&mut tab, "req.validationMessage"), "nope");
+    assert!(!read_bool(&mut tab, "f.checkValidity()"));
+}
+
+#[test]
+fn form_submit_event_and_validation_gate() {
+    let mut tab = form_tab();
+    run(&mut tab, FORM_SETUP);
+    // Invalid form: requestSubmit fires `invalid`, never `submit`.
+    run(
+        &mut tab,
+        "window.__events = []; f.addEventListener('submit', function (e) { window.__events.push('submit'); }); f.addEventListener('invalid', function (e) { window.__events.push('invalid'); }, true); req.value = ''; f.requestSubmit();",
+    );
+    assert_eq!(read_str(&mut tab, "window.__events.join(',')"), "invalid");
+    // Valid form: submit fires (the host queue is the renderer's).
+    run(
+        &mut tab,
+        "req.value = 'x'; em.value = 'a@b.com'; f.requestSubmit();",
+    );
+    assert_eq!(
+        read_str(&mut tab, "window.__events.join(',')"),
+        "invalid,submit"
+    );
+    // preventDefault on submit: the event still fires.
+    run(
+        &mut tab,
+        "f.addEventListener('submit', function (e) { e.preventDefault(); window.__blocked = true; }); f.requestSubmit();",
+    );
+    assert!(read_bool(&mut tab, "window.__blocked"));
+}
+
+#[test]
+fn form_reset_restores_defaults() {
+    let mut tab = form_tab();
+    run(&mut tab, FORM_SETUP);
+    run(&mut tab, "q.value = 'typed'; cb.checked = false; sel.selectedIndex = 2;");
+    run(&mut tab, "f.reset();");
+    assert_eq!(read_str(&mut tab, "q.value"), "orig");
+    assert!(read_bool(&mut tab, "cb.checked"));
+    assert_eq!(read_num(&mut tab, "sel.selectedIndex"), 1.0);
+}
+
+#[test]
+fn form_focus_and_active_element() {
+    let mut tab = form_tab();
+    run(&mut tab, FORM_SETUP);
+    assert_eq!(read_str(&mut tab, "document.activeElement.tagName"), "BODY");
+    run(&mut tab, "q.focus();");
+    assert_eq!(read_str(&mut tab, "document.activeElement.id"), "q");
+    run(
+        &mut tab,
+        "window.__focus = []; q.addEventListener('blur', function () { window.__focus.push('blur'); }); sel.addEventListener('focus', function () { window.__focus.push('focus'); }); sel.focus();",
+    );
+    assert_eq!(read_str(&mut tab, "document.activeElement.id"), "sel");
+    assert_eq!(read_str(&mut tab, "window.__focus.join(',')"), "blur,focus");
+}

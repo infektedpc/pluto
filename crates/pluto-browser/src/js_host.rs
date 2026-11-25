@@ -124,6 +124,25 @@ pub struct BrowserDomHost {
     /// them through the Stage 11 store, which reports back via
     /// `TabJs::notify_image_loaded` / `notify_image_failed`.
     pending_images: Vec<crate::images::ImageRequest>,
+    /// `setCustomValidity` messages by node (Stage 13 Rec 8).
+    custom_validity: std::collections::HashMap<DomKey, String>,
+    /// Form submissions queued by JS (`form.submit()` /
+    /// `requestSubmit()`): the tab thread drains these and
+    /// navigates through the loader (Stage 13 Rec 6/7).
+    pending_form_submits: Vec<(DomKey, Option<DomKey>)>,
+    /// Focus change queued by JS (`el.focus()` / `el.blur()`):
+    /// `None` = no pending change, `Some(Some(k))` = focus `k`,
+    /// `Some(None)` = blur (Stage 13 Rec 3). The tab thread
+    /// drains it after each JS run and moves `state.focused`.
+    pending_focus: Option<Option<DomKey>>,
+    /// Focused node mirror (kept in sync with the tab thread's
+    /// `state.focused` via `set_focused`): `activeElement`
+    /// reads this.
+    focused: Option<DomKey>,
+    /// Shared cookie jar for `document.cookie` (Stage 13 Rec
+    /// 10c). `None` until the tab thread attaches the loader's
+    /// jar with `set_cookie_jar`.
+    cookie_jar: Option<Arc<std::sync::Mutex<pluto_net::CookieJar>>>,
 }
 
 impl BrowserDomHost {
@@ -152,6 +171,11 @@ impl BrowserDomHost {
             implicit_open_done: false,
             pending_navigation: None,
             pending_images: Vec::new(),
+            custom_validity: std::collections::HashMap::new(),
+            pending_form_submits: Vec::new(),
+            pending_focus: None,
+            focused: None,
+            cookie_jar: None,
         }
     }
 
@@ -191,6 +215,24 @@ impl BrowserDomHost {
     /// the final URL after redirects when the parse finishes.
     pub fn set_base_url(&mut self, url: &str) {
         self.base_url = url.to_string();
+    }
+
+    /// Attach the shared cookie jar (called by the tab thread
+    /// once the loader exists — Stage 13 Rec 10c).
+    pub fn set_cookie_jar(&mut self, jar: Arc<std::sync::Mutex<pluto_net::CookieJar>>) {
+        self.cookie_jar = Some(jar);
+    }
+
+    /// Take a JS-queued focus change for the tab thread to apply
+    /// (Stage 13 Rec 3).
+    pub fn take_pending_focus(&mut self) -> Option<Option<DomKey>> {
+        self.pending_focus.take()
+    }
+
+    /// Mirror a tab-thread focus change (pointer-down / Tab key)
+    /// into the host, so `activeElement` stays true.
+    pub fn set_focused(&mut self, focused: Option<DomKey>) {
+        self.focused = focused;
     }
 
     /// Take the pending JS navigation request, if any (last
@@ -1104,6 +1146,206 @@ impl DomHost for BrowserDomHost {
         }
         Some(depth)
     }
+    // ---- Stage 13 (M5 forms): delegate to the live `Dom` ----
+    fn is_form_control(&self, key: DomKey) -> bool {
+        self.dom.lock().unwrap().is_form_control(key)
+    }
+
+    fn input_type(&self, key: DomKey) -> Option<String> {
+        let dom = self.dom.lock().unwrap();
+        dom.get(key).map(|_| dom.input_type(key))
+    }
+
+    fn is_disabled(&self, key: DomKey) -> bool {
+        self.dom.lock().unwrap().is_control_disabled(key)
+    }
+
+    fn form_value(&self, key: DomKey) -> Option<String> {
+        self.dom.lock().unwrap().form_value(key)
+    }
+
+    fn form_default_value(&self, key: DomKey) -> Option<String> {
+        self.dom.lock().unwrap().form_default_value(key)
+    }
+
+    fn form_value_dirty(&self, key: DomKey) -> bool {
+        self.dom.lock().unwrap().form_value_dirty(key)
+    }
+
+    fn set_form_value(&mut self, key: DomKey, value: &str) -> bool {
+        self.dom.lock().unwrap().set_form_value(key, value)
+    }
+
+    fn form_checked(&self, key: DomKey) -> Option<bool> {
+        self.dom.lock().unwrap().form_checked(key)
+    }
+
+    fn set_form_checked(&mut self, key: DomKey, checked: bool) -> bool {
+        self.dom.lock().unwrap().set_form_checked(key, checked)
+    }
+
+    fn form_selected_index(&self, key: DomKey) -> Option<i64> {
+        self.dom.lock().unwrap().form_selected_index(key)
+    }
+
+    fn set_form_selected_index(&mut self, key: DomKey, index: i64) -> bool {
+        self.dom.lock().unwrap().set_form_selected_index(key, index)
+    }
+
+    fn form_options(&self, key: DomKey) -> Vec<DomKey> {
+        self.dom.lock().unwrap().select_options(key)
+    }
+
+    fn form_owner(&self, key: DomKey) -> Option<DomKey> {
+        self.dom.lock().unwrap().form_owner(key)
+    }
+
+    fn form_controls(&self, key: DomKey) -> Vec<DomKey> {
+        self.dom.lock().unwrap().form_controls(key)
+    }
+
+    fn document_forms(&self) -> Vec<DomKey> {
+        let dom = self.dom.lock().unwrap();
+        let Some(root) = dom.root() else {
+            return Vec::new();
+        };
+        fn walk(dom: &Dom, id: DomKey, out: &mut Vec<DomKey>) {
+            if dom.tag(id) == Some("form") {
+                out.push(id);
+            }
+            for &c in dom.children(id) {
+                walk(dom, c, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&dom, root, &mut out);
+        out
+    }
+
+    fn form_entries(&self, key: DomKey, submitter: Option<DomKey>) -> Vec<(String, String)> {
+        self.dom.lock().unwrap().form_entries(key, submitter)
+    }
+
+    fn reset_form(&mut self, key: DomKey) -> bool {
+        let mut dom = self.dom.lock().unwrap();
+        if dom.tag(key) != Some("form") {
+            return false;
+        }
+        dom.reset_form(key);
+        true
+    }
+
+    fn form_caret(&self, key: DomKey) -> Option<usize> {
+        self.dom.lock().unwrap().form_caret(key)
+    }
+
+    fn form_selection(&self, key: DomKey) -> Option<(usize, usize)> {
+        self.dom.lock().unwrap().form_selection(key)
+    }
+
+    fn set_form_selection(&mut self, key: DomKey, start: usize, end: usize) -> bool {
+        self.dom.lock().unwrap().set_form_selection(key, start, end)
+    }
+
+    fn insert_form_text(&mut self, key: DomKey, text: &str) -> Option<usize> {
+        self.dom.lock().unwrap().insert_form_text(key, text)
+    }
+
+    fn delete_form_text(&mut self, key: DomKey, backspace: bool) -> Option<usize> {
+        self.dom.lock().unwrap().delete_form_text(key, backspace)
+    }
+
+    fn custom_validity(&self, key: DomKey) -> Option<String> {
+        self.custom_validity.get(&key).cloned()
+    }
+
+    fn set_custom_validity(&mut self, key: DomKey, message: &str) -> bool {
+        if self.dom.lock().unwrap().get(key).is_none() {
+            return false;
+        }
+        if message.is_empty() {
+            self.custom_validity.remove(&key);
+        } else {
+            self.custom_validity.insert(key, message.to_string());
+        }
+        true
+    }
+
+    fn active_element(&self) -> Option<DomKey> {
+        let dom = self.dom.lock().unwrap();
+        self.focused.filter(|&k| dom.get(k).is_some())
+    }
+
+    fn take_pending_focus(&mut self) -> Option<Option<DomKey>> {
+        self.pending_focus.take()
+    }
+
+    fn focus_element(&mut self, key: DomKey) -> bool {
+        let dom = self.dom.lock().unwrap();
+        if dom.get(key).is_none() || dom.is_control_disabled(key) {
+            return false;
+        }
+        let focusable = dom.is_form_control(key)
+            || matches!(dom.tag(key), Some("button"))
+            || (dom.tag(key) == Some("a") && dom.attr(key, "href").is_some())
+            || dom.attr(key, "tabindex").is_some();
+        drop(dom);
+        if !focusable {
+            return false;
+        }
+        self.focused = Some(key);
+        self.pending_focus = Some(Some(key));
+        true
+    }
+
+    fn blur_element(&mut self) {
+        self.focused = None;
+        self.pending_focus = Some(None);
+    }
+
+    fn document_cookie(&self) -> Option<String> {
+        let jar = self.cookie_jar.as_ref()?;
+        let origin = Origin::from_url(&self.base_url);
+        if origin.is_opaque() {
+            return None;
+        }
+        let site = pluto_js::bindings::storage::top_level_site_of(&origin);
+        let pairs = jar.lock().unwrap().document_cookies(&self.base_url, &site);
+        Some(
+            pairs
+                .iter()
+                .map(|(n, v)| format!("{n}={v}"))
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    }
+
+    fn set_document_cookie(&mut self, cookie: &str) -> bool {
+        let Some(jar) = self.cookie_jar.as_ref() else {
+            return false;
+        };
+        let origin = Origin::from_url(&self.base_url);
+        if origin.is_opaque() {
+            return false;
+        }
+        let site = pluto_js::bindings::storage::top_level_site_of(&origin);
+        jar.lock()
+            .unwrap()
+            .store_set_cookie(&self.base_url, &site, &[cookie.to_string()]);
+        true
+    }
+
+    fn request_form_submit(&mut self, form: DomKey, submitter: Option<DomKey>) -> bool {
+        if self.dom.lock().unwrap().tag(form) != Some("form") {
+            return false;
+        }
+        self.pending_form_submits.push((form, submitter));
+        true
+    }
+
+    fn take_pending_form_submits(&mut self) -> Vec<(DomKey, Option<DomKey>)> {
+        std::mem::take(&mut self.pending_form_submits)
+    }
 }
 
 impl BrowserDomHost {
@@ -1336,6 +1578,103 @@ impl DomHost for SharedHost {
     fn depth(&self, key: DomKey) -> Option<usize> {
         self.0.lock().unwrap().depth(key)
     }
+    // ---- Stage 13 (M5 forms): delegate to the inner host ----
+    fn is_form_control(&self, key: DomKey) -> bool {
+        self.0.lock().unwrap().is_form_control(key)
+    }
+    fn input_type(&self, key: DomKey) -> Option<String> {
+        self.0.lock().unwrap().input_type(key)
+    }
+    fn is_disabled(&self, key: DomKey) -> bool {
+        self.0.lock().unwrap().is_disabled(key)
+    }
+    fn form_value(&self, key: DomKey) -> Option<String> {
+        self.0.lock().unwrap().form_value(key)
+    }
+    fn form_default_value(&self, key: DomKey) -> Option<String> {
+        self.0.lock().unwrap().form_default_value(key)
+    }
+    fn form_value_dirty(&self, key: DomKey) -> bool {
+        self.0.lock().unwrap().form_value_dirty(key)
+    }
+    fn set_form_value(&mut self, key: DomKey, value: &str) -> bool {
+        self.0.lock().unwrap().set_form_value(key, value)
+    }
+    fn form_checked(&self, key: DomKey) -> Option<bool> {
+        self.0.lock().unwrap().form_checked(key)
+    }
+    fn set_form_checked(&mut self, key: DomKey, checked: bool) -> bool {
+        self.0.lock().unwrap().set_form_checked(key, checked)
+    }
+    fn form_selected_index(&self, key: DomKey) -> Option<i64> {
+        self.0.lock().unwrap().form_selected_index(key)
+    }
+    fn set_form_selected_index(&mut self, key: DomKey, index: i64) -> bool {
+        self.0.lock().unwrap().set_form_selected_index(key, index)
+    }
+    fn form_options(&self, key: DomKey) -> Vec<DomKey> {
+        self.0.lock().unwrap().form_options(key)
+    }
+    fn form_owner(&self, key: DomKey) -> Option<DomKey> {
+        self.0.lock().unwrap().form_owner(key)
+    }
+    fn form_controls(&self, key: DomKey) -> Vec<DomKey> {
+        self.0.lock().unwrap().form_controls(key)
+    }
+    fn document_forms(&self) -> Vec<DomKey> {
+        self.0.lock().unwrap().document_forms()
+    }
+    fn form_entries(&self, key: DomKey, submitter: Option<DomKey>) -> Vec<(String, String)> {
+        self.0.lock().unwrap().form_entries(key, submitter)
+    }
+    fn reset_form(&mut self, key: DomKey) -> bool {
+        self.0.lock().unwrap().reset_form(key)
+    }
+    fn form_caret(&self, key: DomKey) -> Option<usize> {
+        self.0.lock().unwrap().form_caret(key)
+    }
+    fn form_selection(&self, key: DomKey) -> Option<(usize, usize)> {
+        self.0.lock().unwrap().form_selection(key)
+    }
+    fn set_form_selection(&mut self, key: DomKey, start: usize, end: usize) -> bool {
+        self.0.lock().unwrap().set_form_selection(key, start, end)
+    }
+    fn insert_form_text(&mut self, key: DomKey, text: &str) -> Option<usize> {
+        self.0.lock().unwrap().insert_form_text(key, text)
+    }
+    fn delete_form_text(&mut self, key: DomKey, backspace: bool) -> Option<usize> {
+        self.0.lock().unwrap().delete_form_text(key, backspace)
+    }
+    fn custom_validity(&self, key: DomKey) -> Option<String> {
+        self.0.lock().unwrap().custom_validity(key)
+    }
+    fn set_custom_validity(&mut self, key: DomKey, message: &str) -> bool {
+        self.0.lock().unwrap().set_custom_validity(key, message)
+    }
+    fn active_element(&self) -> Option<DomKey> {
+        self.0.lock().unwrap().active_element()
+    }
+    fn take_pending_focus(&mut self) -> Option<Option<DomKey>> {
+        self.0.lock().unwrap().take_pending_focus()
+    }
+    fn focus_element(&mut self, key: DomKey) -> bool {
+        self.0.lock().unwrap().focus_element(key)
+    }
+    fn blur_element(&mut self) {
+        self.0.lock().unwrap().blur_element()
+    }
+    fn document_cookie(&self) -> Option<String> {
+        self.0.lock().unwrap().document_cookie()
+    }
+    fn set_document_cookie(&mut self, cookie: &str) -> bool {
+        self.0.lock().unwrap().set_document_cookie(cookie)
+    }
+    fn request_form_submit(&mut self, form: DomKey, submitter: Option<DomKey>) -> bool {
+        self.0.lock().unwrap().request_form_submit(form, submitter)
+    }
+    fn take_pending_form_submits(&mut self) -> Vec<(DomKey, Option<DomKey>)> {
+        self.0.lock().unwrap().take_pending_form_submits()
+    }
 }
 
 /// Create a fresh [`TabJs`] for the tab thread (one realm per tab,
@@ -1379,11 +1718,20 @@ pub struct TabBackends {
     pub permissions: Arc<permissions::PlutoPermissionsBackend>,
 }
 
-/// Build the backends for a new tab: load the persisted local
-/// storage + permission stores from the profile (empty when none
-/// exists yet) and give the tab a fresh session store.
+/// Build the backends for a new tab over the process-wide
+/// shared `localStorage` store (Stage 13 Rec 10a): every tab
+/// gets a clone of the same `Arc<Mutex<LocalStorageStore>>`,
+/// so interleaved `setItem`s from two tabs both survive.
+/// `sessionStorage` stays per-tab (fresh store per tab).
 pub fn new_tab_backends() -> TabBackends {
-    let local = Arc::new(Mutex::new(storage::load_local_storage()));
+    new_tab_backends_with_shared(storage::shared_local_storage())
+}
+
+/// Build the backends for a new tab over an explicit shared
+/// local store (tests and the future broker inject theirs).
+pub fn new_tab_backends_with_shared(
+    local: Arc<Mutex<storage::LocalStorageStore>>,
+) -> TabBackends {
     let perms = Arc::new(Mutex::new(permissions::load_permissions()));
     TabBackends {
         storage: Arc::new(storage::PlutoStorageBackend::new(local)),
@@ -1400,32 +1748,16 @@ pub fn save_tab_backends(backends: &TabBackends) {
     backends.permissions.save();
 }
 
-// FOLLOW-UP WIRING (not done here — it needs `TabJs` setters
-// plus the renderer call, both outside this wave's file scope):
-//
-// 1. `pluto-js/src/tab.rs` — add to `TabJs`:
-//      `pub fn set_storage_backend(&mut self, backend: Arc<dyn StorageBackend>)`
-//      `pub fn set_permissions_backend(&mut self, backend: Arc<dyn PermissionsBackend>)`
-//    storing them like `fetch_backend`, and re-attach them in
-//    `TabJs::navigate` next to the existing `fetch_backend`
-//    re-attach, so a navigation keeps the same stores (the
-//    `localStorage` sharing + `sessionStorage` survival across
-//    reloads both depend on this).
-// 2. `pluto-browser/src/renderer.rs` — in `TabState::tab_js`,
-//    next to the existing `set_fetch_backend` call:
-//      `let backends = crate::js_host::new_tab_backends();`
-//      `js.set_storage_backend(Arc::clone(&backends.storage) as Arc<dyn pluto_js::bindings::storage::StorageBackend>);`
-//      `js.set_permissions_backend(Arc::clone(&backends.permissions) as Arc<dyn pluto_js::bindings::permissions::PermissionsBackend>);`
-//      `self.tab_backends = Some(backends);` (a new `TabState` field)
-//    and call `backends.permissions.note_visit(&origin)` on
-//    navigation (refreshing the ~90-day grant clock) plus
-//    `crate::js_host::save_tab_backends(&backends)` when the tab
-//    closes.
-// Until that lands, realms use the `pluto-js` in-memory
-// defaults: `localStorage` shared process-wide (correct
-// behaviour, not yet on disk) and `sessionStorage` per realm
-// (lost on navigation — the one behavioural gap this follow-up
-// closes).
+// WIRING LANDED (Stage 13 — the follow-up this comment
+// described is done): `TabJs::set_storage_backend` /
+// `set_permissions_backend` exist in `pluto-js/src/tab.rs` and
+// `TabState::tab_js` (`renderer.rs`) attaches the backends on
+// realm creation; `TabJs::navigate` re-attaches them to the
+// fresh realm on every navigation, so `localStorage` is shared
+// across tabs and on disk, and `sessionStorage` survives
+// reloads. Tab close flushes via `save_tab_backends` (which
+// calls `PlutoStorageBackend::save_local`, a flush that always
+// writes when dirty).
 
 // ------------------------------------------------------------------ fetch
 //
@@ -1463,7 +1795,9 @@ pub fn save_tab_backends(backends: &TabBackends) {
 /// (M10) slots in BEFORE the CORS decision when it lands; the
 /// no-op hook for it is `csp_pre_request_check` in `pluto-net`.
 pub struct PlutoFetchBackend {
-    loader: ResourceLoader,
+    /// Where `fetch()` goes (Stage 13 Rec 11): the direct
+    /// loader in-process, the browser-side broker out-of-process.
+    fetch: crate::broker::FetchSource,
     /// The tab thread's tokio runtime handle: `start_fetch` spawns
     /// the network task on it (the tab thread drives the runtime
     /// on its frame tick).
@@ -1485,13 +1819,13 @@ pub struct PlutoFetchBackend {
 
 impl PlutoFetchBackend {
     pub fn new(
-        loader: ResourceLoader,
+        fetch: crate::broker::FetchSource,
         handle: tokio::runtime::Handle,
         base_url: &str,
         tab_id: u64,
     ) -> Self {
         Self {
-            loader,
+            fetch,
             handle,
             base_url: Arc::new(Mutex::new(base_url.to_string())),
             origin: Arc::new(Mutex::new(Origin::from_url(base_url))),
@@ -1632,8 +1966,9 @@ impl FetchBackend for PlutoFetchBackend {
             top_level_site: doc_origin.serialize(),
             upgrade_insecure_requests: false,
             integrity: None,
+            body: None,
         };
-        let loader = self.loader.clone();
+        let fetch = self.fetch.clone();
         let epoch = Arc::clone(&self.epoch);
         let start_epoch = epoch.load(Ordering::SeqCst);
         // `Response.type` (Stage 9 Rec 2): the backend computes it
@@ -1643,7 +1978,7 @@ impl FetchBackend for PlutoFetchBackend {
         // signal; anything else is basic (same-origin) or cors.
         let doc_origin_for_type = doc_origin.clone();
         self.handle.spawn(async move {
-            let outcome = match loader
+            let outcome = match fetch
                 .fetch_with(resource, CancellationToken::new())
                 .await
             {
@@ -2441,7 +2776,12 @@ mod tests {
             .build()
             .expect("test runtime builds");
         let backend =
-            PlutoFetchBackend::new(ResourceLoader::new(), rt.handle().clone(), base_url, 0);
+            PlutoFetchBackend::new(
+            crate::broker::FetchSource::Direct(Arc::new(ResourceLoader::new())),
+            rt.handle().clone(),
+            base_url,
+            0,
+        );
         (backend, rt)
     }
 

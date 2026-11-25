@@ -208,15 +208,16 @@ pub struct Scheduler {
 ///
 /// Out-of-process reality: renderer children are separate
 /// processes, so these Arcs cannot literally cross tabs — what
-/// crosses processes is the profile-dir persistence (HSTS and
-/// cookies already persist to disk and are re-read per tab; the
-/// in-memory HTTP cache is per-process until the M5 broker
-/// shares it). The handle is still the one construction site for
-/// the shared stores, and the tests prove the sharing semantics
-/// in-process: two loaders from one handle see each other's
-/// cookies, HSTS entries and cache entries, while the jar's
-/// partition keying keeps one top-level site's cookies out of
-/// another's.
+/// crosses processes is the profile-dir persistence (HSTS
+/// persists to disk and is re-read per tab; cookies persist too
+/// since Stage 13 Rec 9, `cookies.json` via the browser's
+/// cookie store; the in-memory HTTP cache is per-process until
+/// the M5 broker shares it). The handle is still the one
+/// construction site for the shared stores, and the tests prove
+/// the sharing semantics in-process: two loaders from one handle
+/// see each other's cookies, HSTS entries and cache entries,
+/// while the jar's partition keying keeps one top-level site's
+/// cookies out of another's.
 #[derive(Clone)]
 pub struct SharedLoader {
     pub hsts: Arc<std::sync::Mutex<HstsStore>>,
@@ -1791,8 +1792,20 @@ fn build_request(
     for (name, value) in headers.iter() {
         builder = builder.header(name, value);
     }
+    // Stage 13 Rec 6: a request body (form POST) rides here;
+    // a redirect that converted the method to GET already dropped
+    // it (`body_dropped`), and the body headers went with it.
+    let body_bytes = if body_dropped {
+        Bytes::new()
+    } else {
+        request
+            .body
+            .as_ref()
+            .map(|b| Bytes::copy_from_slice(b))
+            .unwrap_or_default()
+    };
     builder
-        .body(Full::new(Bytes::new()))
+        .body(Full::new(body_bytes))
         .map_err(|e| NetError::Request(e.to_string()))
 }
 
@@ -2223,6 +2236,7 @@ mod tests {
             top_level_site: site.to_string(),
             upgrade_insecure_requests: false,
             integrity: None,
+            body: None,
         }
     }
 
@@ -2253,6 +2267,7 @@ mod tests {
             top_level_site: origin,
             upgrade_insecure_requests: false,
             integrity: None,
+            body: None,
         }
     }
 
@@ -2285,6 +2300,7 @@ mod tests {
             top_level_site: origin.to_string(),
             upgrade_insecure_requests: false,
             integrity: None,
+            body: None,
         }
     }
 
