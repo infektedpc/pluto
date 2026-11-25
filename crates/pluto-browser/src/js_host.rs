@@ -1300,6 +1300,8 @@ pub struct PlutoFetchBackend {
     /// as `Cancelled` (the loop drops it anyway — belt and braces).
     epoch: Arc<AtomicU64>,
     next_request_id: AtomicU64,
+    /// The shell-assigned tab id (Stage 11 Rec 4).
+    tab_id: u64,
 }
 
 impl PlutoFetchBackend {
@@ -1307,6 +1309,7 @@ impl PlutoFetchBackend {
         loader: ResourceLoader,
         handle: tokio::runtime::Handle,
         base_url: &str,
+        tab_id: u64,
     ) -> Self {
         Self {
             loader,
@@ -1315,6 +1318,10 @@ impl PlutoFetchBackend {
             origin: Arc::new(Mutex::new(Origin::from_url(base_url))),
             epoch: Arc::new(AtomicU64::new(0)),
             next_request_id: AtomicU64::new(1),
+            // Stage 11 Rec 4: the shell-assigned tab id, echoed
+            // in every `fetch()` request instead of the old
+            // hardcoded 0.
+            tab_id,
         }
     }
 
@@ -1424,7 +1431,7 @@ impl FetchBackend for PlutoFetchBackend {
         }
         let resource = ResourceRequest {
             request_id: self.next_request_id.fetch_add(1, Ordering::Relaxed),
-            tab_id: 0,
+            tab_id: self.tab_id,
             epoch: self.epoch.load(Ordering::SeqCst),
             url: absolute,
             destination: Destination::Fetch,
@@ -1927,7 +1934,7 @@ mod tests {
             .build()
             .expect("test runtime builds");
         let backend =
-            PlutoFetchBackend::new(ResourceLoader::new(), rt.handle().clone(), base_url);
+            PlutoFetchBackend::new(ResourceLoader::new(), rt.handle().clone(), base_url, 0);
         (backend, rt)
     }
 

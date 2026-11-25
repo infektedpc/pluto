@@ -103,6 +103,7 @@ use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, Weight};
 use pluto_css::{
     AnPlusB, AttrOp, BorderRadius, BoxShadow, CascadeKey, Combinator, Origin, PseudoClass,
     ResolvedCorners, Rule, Selector, SimpleSelector, Stylesheet, SupportsCondition, Value,
+    parse_value,
 };
 use pluto_html::{Dom, NodeId as DomId};
 use rayon::prelude::*;
@@ -372,6 +373,17 @@ pub struct ComputedStyle {
     /// layout root even without a definite size (Stage 8 Rec 6).
     /// `contain: size` alone does NOT set this.
     pub contain_layout: bool,
+    /// `background-image` URL as written in the CSS (Stage 11
+    /// Rec 3): the raw `url(...)` text, unresolved — the worker
+    /// resolves it against the document base and looks the decoded
+    /// resource up in the [`ImageMap`].
+    pub background_image: Option<String>,
+    /// `background-size` (Stage 11 Rec 3).
+    pub background_size: BackgroundSize,
+    /// `background-repeat` (Stage 11 Rec 3).
+    pub background_repeat: BackgroundRepeat,
+    /// `background-position` `(x, y)` (Stage 11 Rec 3).
+    pub background_position: (BackgroundPosition, BackgroundPosition),
 }
 
 impl ComputedStyle {
@@ -419,7 +431,72 @@ impl ComputedStyle {
             grid_row: (GridPlace::Auto, GridPlace::Auto),
             grid_auto_flow: GridAutoFlow::Row,
             contain_layout: false,
+            background_image: None,
+            background_size: BackgroundSize::Auto,
+            background_repeat: BackgroundRepeat::Repeat,
+            background_position: (BackgroundPosition::Start, BackgroundPosition::Start),
         }
+    }
+}
+
+/// `background-size` (Stage 11 Rec 3): `cover` / `contain` scale
+/// to the box; `Lengths` is explicit `(width, height)` where
+/// `None` on one axis means "auto" (scale by the intrinsic
+/// ratio); `Auto` (both auto) is the intrinsic size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BackgroundSize {
+    Cover,
+    Contain,
+    Lengths(Option<Dim>, Option<Dim>),
+    Auto,
+}
+
+/// `background-repeat` (Stage 11 Rec 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundRepeat {
+    Repeat,
+    NoRepeat,
+    RepeatX,
+    RepeatY,
+}
+
+/// One axis of `background-position` (Stage 11 Rec 3): keyword
+/// (`left`/`center`/`right`, `top`/`center`/`bottom`) or an
+/// explicit offset. Initial is `Start` on both axes (`0% 0%`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BackgroundPosition {
+    Start,
+    Center,
+    End,
+    Length(Dim),
+}
+
+/// One decoded image, as layout sees it (Stage 11, M3): the
+/// resource id — a plain `u32`, because layout must not depend
+/// on pluto-paint (paint re-wraps it as `ResourceId`) — plus the
+/// intrinsic size the HTML sizing rules need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageInfo {
+    pub resource: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Images the worker has decoded for this document (Stage 11,
+/// M3): per-`<img>` node (intrinsic size + resource id), the
+/// nodes whose image is known-broken (alt text renders instead),
+/// and background-image URLs (raw CSS url → intrinsic size +
+/// resource id, so paint can place `cover` / `contain`).
+#[derive(Debug, Clone, Default)]
+pub struct ImageMap {
+    pub by_node: HashMap<DomId, ImageInfo>,
+    pub broken: HashSet<DomId>,
+    pub backgrounds: HashMap<String, ImageInfo>,
+}
+
+impl ImageMap {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -574,6 +651,18 @@ pub struct LayoutBox {
     pub radii: ResolvedCorners,
     /// Nearest scroll-container ancestor (`None` = the viewport).
     pub scroll_ancestor: Option<DomId>,
+    /// Decoded `<img>` resource id for this box (`None` when the
+    /// element is not an `<img>` or its image has not arrived yet),
+    /// from the [`ImageMap`] the tree was built with (Stage 11,
+    /// M3). The id is a plain `u32` — paint re-wraps it as
+    /// `ResourceId`.
+    pub image: Option<u32>,
+    /// Background-image resource id for this box, plus the
+    /// intrinsic size paint needs for `cover` / `contain` /
+    /// `no-repeat` placement (Stage 11 Rec 3). `None` when the
+    /// element has no background image or it has not arrived yet.
+    pub background_image: Option<u32>,
+    pub background_image_size: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -649,6 +738,11 @@ pub struct LayoutTree {
     /// the fresh taffy layout already carries the new position.
     position_overrides: HashMap<TaffyId, (f32, f32)>,
     meta: HashMap<TaffyId, BoxMeta>,
+    /// Images decoded for this document (Stage 11, M3): the map
+    /// the tree was built with. `recollect` reads it, so a
+    /// re-layout after an image arrival picks the new image up
+    /// without the caller re-threading the map.
+    pub images: ImageMap,
 }
 
 impl LayoutTree {
@@ -666,6 +760,7 @@ impl LayoutTree {
             dom_to_taffy: HashMap::new(),
             position_overrides: HashMap::new(),
             meta: HashMap::new(),
+            images: ImageMap::default(),
         }
     }
 
@@ -708,6 +803,33 @@ impl LayoutTree {
             viewport_height,
             state,
             FontSystem::new(),
+            &ImageMap::default(),
+        )
+    }
+
+    /// Like [`build_with_state`](Self::build_with_state), but with
+    /// the images decoded so far (Stage 11, M3): `<img>` boxes get
+    /// intrinsic sizing from the map, broken images get alt text,
+    /// and background-image boxes get their resource id. An image
+    /// arrival rebuilds with the fuller map (full rebuild,
+    /// coalesced per tick — the incremental path does not take an
+    /// image map; see the worker's `images_dirty` flag).
+    pub fn build_with_state_and_images(
+        dom: &Dom,
+        sheet: &Stylesheet,
+        viewport_width: f32,
+        viewport_height: f32,
+        state: &ElementState,
+        images: &ImageMap,
+    ) -> Result<Self, LayoutError> {
+        Self::build_with_state_and_font_system(
+            dom,
+            sheet,
+            viewport_width,
+            viewport_height,
+            state,
+            FontSystem::new(),
+            images,
         )
     }
 
@@ -735,6 +857,30 @@ impl LayoutTree {
             viewport_height,
             state,
             font_system,
+            &ImageMap::default(),
+        )
+    }
+
+    /// Like [`build_with_state_reusing_font_system`](Self::build_with_state_reusing_font_system),
+    /// but with the images decoded so far (Stage 11, M3) — the
+    /// entry the worker uses for image-arrival rebuilds.
+    pub fn build_with_state_reusing_font_system_and_images(
+        dom: &Dom,
+        sheet: &Stylesheet,
+        viewport_width: f32,
+        viewport_height: f32,
+        state: &ElementState,
+        font_system: FontSystem,
+        images: &ImageMap,
+    ) -> Result<Self, LayoutError> {
+        Self::build_with_state_and_font_system(
+            dom,
+            sheet,
+            viewport_width,
+            viewport_height,
+            state,
+            font_system,
+            images,
         )
     }
 
@@ -745,6 +891,7 @@ impl LayoutTree {
         viewport_height: f32,
         state: &ElementState,
         font_system: FontSystem,
+        images: &ImageMap,
     ) -> Result<Self, LayoutError> {
         let ua = Stylesheet::ua();
         // Two-phase style resolution (Stage 4 #5): every element's
@@ -776,6 +923,7 @@ impl LayoutTree {
             meta: &mut meta,
             leaves: &mut leaves,
             viewport: (viewport_width, viewport_height),
+            images,
         };
         let root_dom = find_element(dom, dom.root().unwrap(), "html");
         let root = match root_dom {
@@ -844,6 +992,7 @@ impl LayoutTree {
             dom_to_taffy,
             position_overrides: HashMap::new(),
             meta,
+            images: images.clone(),
         };
         // Re-collect boxes (which also shapes glyphs at final width).
         tree.recollect();
@@ -881,6 +1030,7 @@ impl LayoutTree {
             self.viewport,
             self.root_font_size,
             &self.position_overrides,
+            &self.images,
             &mut boxes,
         );
         // `None` only transiently inside `full_rebuild` (see the
@@ -1087,6 +1237,9 @@ struct Builder<'a, 't> {
     /// Text-leaf taffy nodes, in build order (pre-shape input).
     leaves: &'t mut Vec<TaffyId>,
     viewport: (f32, f32),
+    /// Images decoded so far (Stage 11, M3): `<img>` intrinsic
+    /// sizes + broken-image set + background-image resources.
+    images: &'a ImageMap,
 }
 
 impl<'a, 't> Builder<'a, 't> {
@@ -1207,6 +1360,18 @@ impl<'a, 't> Builder<'a, 't> {
         spans: &mut Vec<TextSpan>,
         out: &mut Vec<TaffyId>,
     ) {
+        if self.dom.tag(id) == Some("img") {
+            // Replaced element (Stage 11 Rec 2): an `<img>` is
+            // atomic even though the UA sheet says `display:
+            // inline` — called here as the inline element itself,
+            // it has no text children to collect, so it becomes
+            // its own leaf instead of vanishing.
+            self.flush_spans(spans, parent_style, out);
+            if let Some(node) = self.build_atomic(id, style) {
+                out.push(node);
+            }
+            return;
+        }
         for &child in self.dom.children(id) {
             if let Some(text) = self.dom.text(child) {
                 if let Some(processed) = process_text(text, style.white_space) {
@@ -1233,7 +1398,19 @@ impl<'a, 't> Builder<'a, 't> {
             match child_style.display {
                 DisplayKind::None => {}
                 DisplayKind::Inline => {
-                    self.append_inline(child, &child_style, parent_style, spans, out);
+                    if tag == "img" {
+                        // Replaced element (Stage 11 Rec 2): an
+                        // `<img>` is atomic even though the UA sheet
+                        // says `display: inline` — it never
+                        // contributes inline text, so recursing into
+                        // it (as for a span) would drop it entirely.
+                        self.flush_spans(spans, parent_style, out);
+                        if let Some(node) = self.build_atomic(child, &child_style) {
+                            out.push(node);
+                        }
+                    } else {
+                        self.append_inline(child, &child_style, parent_style, spans, out);
+                    }
                 }
                 DisplayKind::InlineBlock => {
                     self.flush_spans(spans, parent_style, out);
@@ -1260,9 +1437,98 @@ impl<'a, 't> Builder<'a, 't> {
     fn build_atomic(&mut self, id: DomId, style: &ComputedStyle) -> Option<TaffyId> {
         let tag = self.dom.tag(id).unwrap_or("");
         if tag == "img" {
+            // Stage 11 Rec 2: HTML sizing rules. A broken image
+            // with alt text renders as a text leaf (the alt text,
+            // in the image's style); broken without alt is a
+            // zero-size leaf, as before.
+            if self.images.broken.contains(&id) {
+                if let Some(alt) = self.dom.attr(id, "alt").filter(|a| !a.trim().is_empty()) {
+                    let leaf = LeafText {
+                        spans: vec![TextSpan {
+                            text: alt.to_string(),
+                            color: style.color,
+                            bold: style.bold,
+                        }],
+                        font_size: style.font_size,
+                        line_height: style.line_height,
+                        shaped: None,
+                    };
+                    let node = self
+                        .taffy
+                        .new_leaf_with_context(to_taffy_style(style, self.viewport), Some(leaf.clone()))
+                        .ok()?;
+                    self.meta.insert(
+                        node,
+                        BoxMeta {
+                            dom: Some(id),
+                            style: style.clone(),
+                            children: Vec::new(),
+                            text: Some(leaf),
+                        },
+                    );
+                    self.leaves.push(node);
+                    return Some(node);
+                }
+            }
+            // Intrinsic size (decoded) or the 300x150 default when
+            // the image has not arrived yet; width/height
+            // attributes override one axis and scale the other by
+            // the intrinsic ratio; CSS width/height win over both.
+            let (iw, ih) = self
+                .images
+                .by_node
+                .get(&id)
+                .map(|info| (info.width as f32, info.height as f32))
+                .unwrap_or((300.0, 150.0));
+            let mut w = iw;
+            let mut h = ih;
+            let attr_w = self
+                .dom
+                .attr(id, "width")
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|v| *v > 0.0);
+            let attr_h = self
+                .dom
+                .attr(id, "height")
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|v| *v > 0.0);
+            if let Some(aw) = attr_w {
+                w = aw;
+                if attr_h.is_none() && iw > 0.0 {
+                    h = ih * (aw / iw);
+                }
+            }
+            if let Some(ah) = attr_h {
+                h = ah;
+                if attr_w.is_none() && ih > 0.0 {
+                    w = iw * (ah / ih);
+                }
+            }
+            let mut taffy_style = to_taffy_style(style, self.viewport);
+            if self.images.broken.contains(&id)
+                && style.width.is_none()
+                && style.height.is_none()
+            {
+                // Broken image with no alt text (the alt case
+                // returned above): a zero-size leaf. CSS width /
+                // height still win when set.
+                taffy_style.size.width = Dimension::length(0.0);
+                taffy_style.size.height = Dimension::length(0.0);
+            } else {
+                // `aspect_ratio` lets taffy derive the auto axis from
+                // the set one (CSS width with auto height, and vice
+                // versa) instead of collapsing it to zero.
+                if w > 0.0 && h > 0.0 {
+                    taffy_style.aspect_ratio = Some(w / h);
+                }
+                if style.width.is_none() && style.height.is_none() {
+                    taffy_style.size.width = Dimension::length(w);
+                    taffy_style.size.height = Dimension::length(h);
+                }
+            }
             let node = self
                 .taffy
-                .new_leaf_with_context(to_taffy_style(style, self.viewport), None)
+                .new_leaf_with_context(taffy_style, None)
                 .ok()?;
             self.meta.insert(
                 node,
@@ -1792,6 +2058,9 @@ fn collect_boxes(
     // and clips are computed from the translated rects, so an inner
     // clip moves with its subtree while an outer clip stays put.
     position_overrides: &HashMap<TaffyId, (f32, f32)>,
+    // Images decoded so far (Stage 11, M3): `<img>` resource ids
+    // and background-image resource ids land on the boxes here.
+    images: &ImageMap,
     out: &mut Vec<LayoutBox>,
 ) {
     let Some(layout) = taffy.layout(node).ok() else {
@@ -1843,6 +2112,19 @@ fn collect_boxes(
     } else {
         parent_scroll_ancestor
     };
+    // Stage 11 Rec 1/3: image + background-image resource ids
+    // for this box, from the image map the tree was built with.
+    // A background image is keyed by the raw CSS url in the
+    // computed style; paint needs its intrinsic size for
+    // cover/contain placement, so both ride the box.
+    let image = m.dom.and_then(|d| images.by_node.get(&d)).map(|i| i.resource);
+    let (background_image, background_image_size) = m
+        .style
+        .background_image
+        .as_ref()
+        .and_then(|url| images.backgrounds.get(url))
+        .map(|info| (Some(info.resource), Some((info.width, info.height))))
+        .unwrap_or((None, None));
     out.push(LayoutBox {
         taffy: node,
         dom: m.dom,
@@ -1858,6 +2140,9 @@ fn collect_boxes(
         clip_radii,
         radii,
         scroll_ancestor,
+        image,
+        background_image,
+        background_image_size,
     });
     // Descendants of a scroll container move with its offset.
     let (sx, sy) = match m.dom {
@@ -1880,6 +2165,7 @@ fn collect_boxes(
             viewport,
             root_font_size,
             position_overrides,
+            images,
             out,
         );
     }
@@ -2846,7 +3132,7 @@ fn apply_decl(
                 }
             }
             Value::Color(..) | Value::ColorA(..) | Value::BorderRadius(..)
-            | Value::BoxShadow(..) => {}
+            | Value::BoxShadow(..) | Value::Url(..) => {}
         },
         "font-family" => match value {
             Value::Raw(raw) | Value::Keyword(raw) => {
@@ -2919,8 +3205,117 @@ fn apply_decl(
         "background-color" | "background" => match value {
             Value::Color(r, g, b) => style.background = Some([*r, *g, *b]),
             Value::ColorA(r, g, b, _) => style.background = Some([*r, *g, *b]),
+            // Stage 11 Rec 3: `background: url(...)` is a
+            // shorthand — the image rides the same property.
+            Value::Url(url) => style.background_image = Some(url.clone()),
+            Value::Raw(raw) => {
+                if let Some(url) = pluto_css::extract_css_urls(raw).into_iter().next() {
+                    style.background_image = Some(url);
+                }
+            }
             _ => {}
         },
+        // Stage 11 Rec 3: background-image properties.
+        "background-image" => match value {
+            Value::Url(url) => style.background_image = Some(url.clone()),
+            Value::Keyword(k) if k == "none" => style.background_image = None,
+            Value::Raw(raw) => {
+                if let Some(url) = pluto_css::extract_css_urls(raw).into_iter().next() {
+                    style.background_image = Some(url);
+                }
+            }
+            _ => {}
+        },
+        "background-size" => {
+            style.background_size = match value {
+                Value::Keyword(k) if k == "cover" => BackgroundSize::Cover,
+                Value::Keyword(k) if k == "contain" => BackgroundSize::Contain,
+                Value::Keyword(k) if k == "auto" => BackgroundSize::Auto,
+                Value::Raw(raw) => {
+                    let mut parts = raw.split_whitespace();
+                    let first = parts
+                        .next()
+                        .and_then(|t| dim_value(&parse_value(t), style.font_size, root_font_size, viewport));
+                    let second = parts
+                        .next()
+                        .and_then(|t| dim_value(&parse_value(t), style.font_size, root_font_size, viewport));
+                    match (first, second) {
+                        (Some(w), Some(h)) => BackgroundSize::Lengths(Some(w), Some(h)),
+                        (Some(w), None) => BackgroundSize::Lengths(Some(w), None),
+                        (None, _) => BackgroundSize::Auto,
+                    }
+                }
+                v => match dim_value(v, style.font_size, root_font_size, viewport) {
+                    Some(d) => BackgroundSize::Lengths(Some(d), None),
+                    None => BackgroundSize::Auto,
+                },
+            };
+        }
+        "background-repeat" => {
+            if let Value::Keyword(k) = value {
+                style.background_repeat = match k.as_str() {
+                    "no-repeat" => BackgroundRepeat::NoRepeat,
+                    "repeat-x" => BackgroundRepeat::RepeatX,
+                    "repeat-y" => BackgroundRepeat::RepeatY,
+                    _ => BackgroundRepeat::Repeat,
+                };
+            } else if let Value::Raw(raw) = value {
+                // Two-value form (`repeat no-repeat` etc.) is
+                // staged: the first keyword wins, the second is
+                // ignored until M6.
+                let first = raw.split_whitespace().next().unwrap_or("repeat");
+                style.background_repeat = match first {
+                    "no-repeat" => BackgroundRepeat::NoRepeat,
+                    "repeat-x" => BackgroundRepeat::RepeatX,
+                    "repeat-y" => BackgroundRepeat::RepeatY,
+                    _ => BackgroundRepeat::Repeat,
+                };
+            }
+        }
+        "background-position" => {
+            // Keywords: `left`/`center`/`right` (x),
+            // `top`/`center`/`bottom` (y); one token sets x and
+            // centres y; lengths resolve via `dim_value`.
+            // Multi-token values arrive as `Raw`.
+            let parse_pos = |tok: &str, axis_is_x: bool| -> Option<BackgroundPosition> {
+                match tok {
+                    "left" if axis_is_x => Some(BackgroundPosition::Start),
+                    "top" if !axis_is_x => Some(BackgroundPosition::Start),
+                    "center" => Some(BackgroundPosition::Center),
+                    "right" if axis_is_x => Some(BackgroundPosition::End),
+                    "bottom" if !axis_is_x => Some(BackgroundPosition::End),
+                    // A horizontal keyword in the y slot (or vice
+                    // versa) is invalid CSS: `None` falls back to
+                    // centring at the call site.
+                    _ => dim_value(&parse_value(tok), style.font_size, root_font_size, viewport)
+                        .map(BackgroundPosition::Length),
+                }
+            };
+            let (x, y) = match value {
+                Value::Keyword(k) => (
+                    parse_pos(k, true).unwrap_or(BackgroundPosition::Start),
+                    BackgroundPosition::Center,
+                ),
+                Value::Raw(raw) => {
+                    let mut parts = raw.split_whitespace();
+                    let first = parts.next().unwrap_or("left");
+                    let second = parts.next();
+                    let x = parse_pos(first, true).unwrap_or(BackgroundPosition::Start);
+                    let y = match second {
+                        Some(tok) => parse_pos(tok, false).unwrap_or(BackgroundPosition::Center),
+                        None => BackgroundPosition::Center,
+                    };
+                    (x, y)
+                }
+                v => (
+                    dim_value(v, style.font_size, root_font_size, viewport)
+                        .map(BackgroundPosition::Length)
+                        .unwrap_or(BackgroundPosition::Start),
+                    BackgroundPosition::Center,
+                ),
+            };
+            style.background_position = (x, y);
+        }
         "text-align" => {
             if let Value::Keyword(k) = value {
                 style.text_align = match k.as_str() {
@@ -4808,5 +5203,217 @@ mod tests {
         assert_eq!(shaped.segments[0].len(), 2);
         assert!(shaped.min_content > 0.0);
         assert!(shaped.max_content >= shaped.min_content);
+    }
+
+    // ---- Stage 11 (M3): images in layout ----
+
+    fn img_tree(html: &str, images: &ImageMap) -> (Dom, LayoutTree) {
+        let dom = parse_html(html);
+        let sheet = Stylesheet::parse("");
+        let tree = LayoutTree::build_with_state_and_images(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            images,
+        )
+        .expect("layout builds");
+        (dom, tree)
+    }
+
+    fn find_img(dom: &Dom) -> DomId {
+        find_element(dom, dom.root().unwrap(), "img").expect("img in dom")
+    }
+
+    #[test]
+    fn img_uses_intrinsic_size_then_attrs_then_css() {
+        // No image yet: the 300x150 default.
+        let (dom, tree) = img_tree(
+            "<html><body><img src=\"a.png\"></body></html>",
+            &ImageMap::default(),
+        );
+        let img = box_for(&tree, &dom, "img");
+        assert_eq!((img.width, img.height), (300.0, 150.0));
+        assert_eq!(img.image, None);
+
+        // Decoded 400x100: intrinsic size, resource id on the box.
+        let html = "<html><body><img src=\"a.png\"></body></html>";
+        let dom2 = parse_html(html);
+        let mut images = ImageMap::default();
+        images.by_node.insert(
+            find_img(&dom2),
+            ImageInfo {
+                resource: 7,
+                width: 400,
+                height: 100,
+            },
+        );
+        let (dom, tree) = img_tree(html, &images);
+        let img = box_for(&tree, &dom, "img");
+        assert_eq!((img.width, img.height), (400.0, 100.0));
+        assert_eq!(img.image, Some(7));
+
+        // width attribute only: height scales by the intrinsic ratio.
+        let (dom, tree) = img_tree(
+            "<html><body><img src=\"a.png\" width=\"200\"></body></html>",
+            &images,
+        );
+        // The re-parsed dom gets the same slotmap ids (same
+        // insertion order), so the map built from the earlier
+        // parse still addresses this img.
+        assert_eq!(find_img(&dom), find_img(&dom2));
+        let img = box_for(&tree, &dom, "img");
+        assert_eq!((img.width, img.height), (200.0, 50.0));
+
+        // Both attributes: used as-is, no ratio scaling.
+        let (dom, tree) = img_tree(
+            "<html><body><img src=\"a.png\" width=\"200\" height=\"80\"></body></html>",
+            &images,
+        );
+        let img = box_for(&tree, &dom, "img");
+        assert_eq!((img.width, img.height), (200.0, 80.0));
+    }
+
+    #[test]
+    fn img_css_width_scales_height_by_ratio() {
+        let mut images = ImageMap::default();
+        let dom = parse_html("<html><body><img src=\"a.png\"></body></html>");
+        let img_id = find_element(&dom, dom.root().unwrap(), "img").expect("img in dom");
+        images.by_node.insert(
+            img_id,
+            ImageInfo {
+                resource: 3,
+                width: 400,
+                height: 100,
+            },
+        );
+        let sheet = Stylesheet::parse("img { width: 200px; }");
+        let tree = LayoutTree::build_with_state_and_images(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            &images,
+        )
+        .expect("layout builds");
+        let img = box_for(&tree, &dom, "img");
+        // CSS width 200 with auto height: aspect_ratio derives
+        // height 50 from the 4:1 intrinsic ratio.
+        assert_eq!((img.width, img.height), (200.0, 50.0));
+    }
+
+    #[test]
+    fn broken_img_renders_alt_text() {
+        let dom = parse_html("<html><body><img src=\"x.png\" alt=\"photo of a cat\"></body></html>");
+        let img_id = find_element(&dom, dom.root().unwrap(), "img").expect("img in dom");
+        let mut images = ImageMap::default();
+        images.broken.insert(img_id);
+        let sheet = Stylesheet::parse("");
+        let tree = LayoutTree::build_with_state_and_images(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            &images,
+        )
+        .expect("layout builds");
+        // The alt text is a text leaf on the img box itself.
+        let img = box_for(&tree, &dom, "img");
+        let alt = img
+            .text
+            .as_ref()
+            .expect("broken img with alt has a text leaf");
+        assert!(alt.spans.iter().any(|s| s.text == "photo of a cat"));
+        assert_eq!(img.image, None);
+
+        // Broken without alt: zero-size leaf, no text.
+        let dom = parse_html("<html><body><img src=\"x.png\"></body></html>");
+        let img_id = find_element(&dom, dom.root().unwrap(), "img").expect("img in dom");
+        let mut images = ImageMap::default();
+        images.broken.insert(img_id);
+        let tree = LayoutTree::build_with_state_and_images(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            &images,
+        )
+        .expect("layout builds");
+        let img = box_for(&tree, &dom, "img");
+        assert!(img.text.is_none());
+        assert_eq!((img.width, img.height), (0.0, 0.0));
+    }
+
+    #[test]
+    fn background_image_lands_on_box_with_intrinsic_size() {
+        let mut images = ImageMap::default();
+        images.backgrounds.insert(
+            "bg.png".to_string(),
+            ImageInfo {
+                resource: 9,
+                width: 800,
+                height: 600,
+            },
+        );
+        let dom = parse_html("<html><body><div></div></body></html>");
+        let sheet = Stylesheet::parse(
+            "div { width: 100px; height: 100px; background-image: url(bg.png); background-size: cover; }",
+        );
+        let tree = LayoutTree::build_with_state_and_images(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            &images,
+        )
+        .expect("layout builds");
+        let div = box_for(&tree, &dom, "div");
+        assert_eq!(div.background_image, Some(9));
+        assert_eq!(div.background_image_size, Some((800, 600)));
+        assert_eq!(div.style.background_size, BackgroundSize::Cover);
+        assert_eq!(div.style.background_image.as_deref(), Some("bg.png"));
+
+        // No decoded background yet: the box carries nothing.
+        let dom = parse_html("<html><body><div></div></body></html>");
+        let tree = LayoutTree::build_with_state_and_images(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            &ImageMap::default(),
+        )
+        .expect("layout builds");
+        let div = box_for(&tree, &dom, "div");
+        assert_eq!(div.background_image, None);
+        assert_eq!(div.background_image_size, None);
+    }
+
+    #[test]
+    fn background_position_and_repeat_parse() {
+        let dom = parse_html("<html><body><div></div></body></html>");
+        let div_id = find_element(&dom, dom.root().unwrap(), "div").expect("div in dom");
+        let styles = styles_for(
+            "<html><body><div></div></body></html>",
+            "div { background-position: right bottom; background-repeat: no-repeat; background-size: 50px 25px; }",
+            (1024.0, 768.0),
+        );
+        // styles_for re-parses, so the div id must match the
+        // fresh parse's (same insertion order → same slotmap ids).
+        let div = styles.get(&div_id).expect("div style");
+        assert_eq!(
+            div.background_position,
+            (BackgroundPosition::End, BackgroundPosition::End)
+        );
+        assert_eq!(div.background_repeat, BackgroundRepeat::NoRepeat);
+        assert_eq!(
+            div.background_size,
+            BackgroundSize::Lengths(Some(Dim::Px(50.0)), Some(Dim::Px(25.0)))
+        );
     }
 }

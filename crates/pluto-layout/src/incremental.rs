@@ -1086,6 +1086,9 @@ impl LayoutTree {
                 meta: &mut self.meta,
                 leaves: &mut new_leaves,
                 viewport,
+                // The retained tree's image map: a subtree rebuild
+                // keeps the images decoded so far (Stage 11, M3).
+                images: &self.images,
             };
             match new_style.display {
                 DisplayKind::None | DisplayKind::Inline => None,

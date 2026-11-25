@@ -22,7 +22,9 @@
 //! (emoji) yet.
 
 use pluto_css::{MAX_BOX_SHADOW_BLUR, ResolvedCorners, ResolvedShadow};
-use pluto_layout::LayoutTree;
+use pluto_layout::{
+    BackgroundPosition, BackgroundRepeat, BackgroundSize, Dim, LayoutBox, LayoutTree,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -34,9 +36,10 @@ pub mod renderer;
 
 pub use glyph_key::GlyphKey;
 pub use image::{
-    AnimatedImage, DecodedImage, IMAGE_CACHE_BYTE_CAP, ImageCache, ImageError, build_mip_chain,
-    decode_image, decode_images_parallel, downscale_rgba, mip_chain_bytes, mip_level_count_for,
-    mip_level_for_scale,
+    AnimatedFrames, AnimatedImage, DecodedImage, IMAGE_CACHE_BYTE_CAP, ImageCache, ImageError,
+    MAX_ANIMATED_FRAMES, MAX_ANIMATION_FPS, MAX_IMAGE_DIMENSION, MIN_FRAME_DELAY_MS,
+    build_mip_chain, decode_animated, decode_image, decode_images_parallel, decode_limits,
+    downscale_rgba, mip_chain_bytes, mip_level_count_for, mip_level_for_scale, resize_rgba,
 };
 
 /// One paint operation, in paint order. A closed vocabulary: every
@@ -244,6 +247,13 @@ pub enum Resource {
 /// [`DisplayItem::Image`]/[`DisplayItem::Blob`] id must resolve here.
 /// Owned by the browser (see [`ImageCache`]); at M5 it crosses IPC
 /// beside the list bytes, fed once over shared memory, not per frame.
+///
+/// M3 (Stage 11): resources cross IPC out-of-band, once each, in
+/// `RendererToBrowser::ResourceReady` — the worker sends
+/// `SubmitDisplayList.resources` empty and the shell accumulates
+/// the table per tab from those messages (see `pluto-ipc`'s module
+/// docs). This type is unchanged: it is the shell-side table now,
+/// filled from `ResourceReady`, not from the submit.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceTable {
     pub resources: HashMap<ResourceId, Resource>,
@@ -683,6 +693,48 @@ impl DisplayList {
             for shadow in shadows.iter().rev().filter(|s| s.inset) {
                 list.push(shadow_item(bx, *shadow));
             }
+            // Stage 11 Rec 1/3: images. The background image paints
+            // above the background fill and below the content, clipped
+            // to the box's padding box (with its border-radius, when
+            // set); the `<img>` content image paints as the content.
+            // The PushClip/PopClip pair is balanced inside this box's
+            // iteration, so the outer `current_clip` tracking above
+            // is unaffected.
+            if let Some(resource) = bx.background_image {
+                let tiles = background_tiles(bx, layout.viewport);
+                if !tiles.is_empty() {
+                    list.push(DisplayItem::PushClip {
+                        x: bx.x,
+                        y: bx.y,
+                        width: bx.width,
+                        height: bx.height,
+                        radii: if bx.radii.is_zero() {
+                            None
+                        } else {
+                            Some(bx.radii)
+                        },
+                    });
+                    for [x, y, w, h] in tiles {
+                        list.push(DisplayItem::Image {
+                            resource: ResourceId(resource),
+                            x,
+                            y,
+                            width: w,
+                            height: h,
+                        });
+                    }
+                    list.push(DisplayItem::PopClip);
+                }
+            }
+            if let Some(resource) = bx.image {
+                list.push(DisplayItem::Image {
+                    resource: ResourceId(resource),
+                    x: bx.x,
+                    y: bx.y,
+                    width: bx.width,
+                    height: bx.height,
+                });
+            }
             if !bx.glyphs.is_empty() {
                 // Group consecutive glyphs of the same color into one item.
                 let mut current_color = bx.glyphs[0].color;
@@ -790,6 +842,132 @@ fn rgba(c: [u8; 3]) -> [f32; 4] {
         c[2] as f32 / 255.0,
         1.0,
     ]
+}
+
+/// Resolve one [`Dim`] against a base length (a box side, or the
+/// `box - image` free space for percentage positions) and the
+/// viewport.
+fn resolve_dim(dim: Dim, base: f32, viewport: (f32, f32)) -> f32 {
+    match dim {
+        Dim::Px(v) => v,
+        Dim::Pct(f) => f * base,
+        Dim::Vh(v) => v / 100.0 * viewport.1,
+        Dim::Vw(v) => v / 100.0 * viewport.0,
+    }
+}
+
+/// Background-image tile rects for one box, in page coordinates
+/// (Stage 11 Rec 3): `background-size` (cover / contain / explicit
+/// lengths / intrinsic) decides the drawn size, `background-position`
+/// the offset of the first tile, `background-repeat` whether and
+/// how it tiles. Multiple backgrounds are staged (only the first
+/// image is modelled — layout keeps one `background_image` per
+/// box). The tile count is capped at 1024 so a 1px tile on a huge
+/// box cannot blow the display list up; the clip in `build` hides
+/// the seam either way.
+fn background_tiles(bx: &LayoutBox, viewport: (f32, f32)) -> Vec<[f32; 4]> {
+    const MAX_TILES: usize = 1024;
+    let Some((iw, ih)) = bx.background_image_size else {
+        return Vec::new();
+    };
+    let (iw, ih) = (iw as f32, ih as f32);
+    if iw <= 0.0 || ih <= 0.0 || bx.width <= 0.0 || bx.height <= 0.0 {
+        return Vec::new();
+    }
+    let (bw, bh) = (bx.width, bx.height);
+    let (dw, dh) = match bx.style.background_size {
+        BackgroundSize::Cover => {
+            let s = (bw / iw).max(bh / ih);
+            (iw * s, ih * s)
+        }
+        BackgroundSize::Contain => {
+            let s = (bw / iw).min(bh / ih);
+            (iw * s, ih * s)
+        }
+        BackgroundSize::Lengths(w, h) => {
+            let w = w.map(|d| resolve_dim(d, bw, viewport));
+            let h = h.map(|d| resolve_dim(d, bh, viewport));
+            match (w, h) {
+                (Some(w), Some(h)) => (w, h),
+                (Some(w), None) => (w, ih * (w / iw)),
+                (None, Some(h)) => (iw * (h / ih), h),
+                (None, None) => (iw, ih),
+            }
+        }
+        BackgroundSize::Auto => (iw, ih),
+    };
+    if dw <= 0.0 || dh <= 0.0 {
+        return Vec::new();
+    }
+    // Percentage positions resolve against the free space
+    // (box - image), per CSS; keywords pick an edge or the centre.
+    let pos = |p: BackgroundPosition, free: f32| -> f32 {
+        match p {
+            BackgroundPosition::Start => 0.0,
+            BackgroundPosition::Center => free / 2.0,
+            BackgroundPosition::End => free,
+            BackgroundPosition::Length(d) => resolve_dim(d, free, viewport),
+        }
+    };
+    let ox = pos(bx.style.background_position.0, bw - dw);
+    let oy = pos(bx.style.background_position.1, bh - dh);
+    let tile = |x: f32, y: f32| [bx.x + x, bx.y + y, dw, dh];
+    match bx.style.background_repeat {
+        BackgroundRepeat::NoRepeat => vec![tile(ox, oy)],
+        BackgroundRepeat::RepeatX => {
+            let mut out = Vec::new();
+            let mut k = (-ox / dw).floor() as i32;
+            while out.len() < MAX_TILES {
+                let x = ox + k as f32 * dw;
+                if x >= bw {
+                    break;
+                }
+                if x + dw > 0.0 {
+                    out.push(tile(x, oy));
+                }
+                k += 1;
+            }
+            out
+        }
+        BackgroundRepeat::RepeatY => {
+            let mut out = Vec::new();
+            let mut k = (-oy / dh).floor() as i32;
+            while out.len() < MAX_TILES {
+                let y = oy + k as f32 * dh;
+                if y >= bh {
+                    break;
+                }
+                if y + dh > 0.0 {
+                    out.push(tile(ox, y));
+                }
+                k += 1;
+            }
+            out
+        }
+        BackgroundRepeat::Repeat => {
+            let mut out = Vec::new();
+            let mut ky = (-oy / dh).floor() as i32;
+            while out.len() < MAX_TILES {
+                let y = oy + ky as f32 * dh;
+                if y >= bh {
+                    break;
+                }
+                let mut kx = (-ox / dw).floor() as i32;
+                while out.len() < MAX_TILES {
+                    let x = ox + kx as f32 * dw;
+                    if x >= bw {
+                        break;
+                    }
+                    if x + dw > 0.0 && y + dh > 0.0 {
+                        out.push(tile(x, y));
+                    }
+                    kx += 1;
+                }
+                ky += 1;
+            }
+            out
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1309,5 +1487,191 @@ mod tests {
             *blur = MAX_BOX_SHADOW_BLUR;
         }
         list.validate(&resources).expect("blur at the cap is valid");
+    }
+
+    // ---- Stage 11 (M3): image items in the display list ----
+
+    fn find_tag(dom: &pluto_html::Dom, tag: &str) -> pluto_html::NodeId {
+        fn walk(
+            dom: &pluto_html::Dom,
+            id: pluto_html::NodeId,
+            tag: &str,
+        ) -> Option<pluto_html::NodeId> {
+            if dom.tag(id) == Some(tag) {
+                return Some(id);
+            }
+            dom.children(id).iter().find_map(|&c| walk(dom, c, tag))
+        }
+        walk(dom, dom.root().unwrap(), tag).expect("tag in dom")
+    }
+
+    fn image_items(list: &DisplayList) -> Vec<(u32, f32, f32, f32, f32)> {
+        list.0
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Image {
+                    resource,
+                    x,
+                    y,
+                    width,
+                    height,
+                } => Some((resource.0, *x, *y, *width, *height)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn display_list_emits_img_image_item() {
+        use pluto_layout::{ElementState, ImageInfo, ImageMap};
+        let dom = parse_html("<html><body><img src=\"a.png\"></body></html>");
+        let mut images = ImageMap::default();
+        images.by_node.insert(
+            find_tag(&dom, "img"),
+            ImageInfo {
+                resource: 5,
+                width: 400,
+                height: 100,
+            },
+        );
+        let sheet = Stylesheet::parse("");
+        let tree = LayoutTree::build_with_state_and_images(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            &images,
+        )
+        .expect("layout builds");
+        let list = DisplayList::build(&tree);
+        let items = image_items(&list);
+        assert_eq!(items.len(), 1, "one image item: {items:?}");
+        assert_eq!(items[0].0, 5);
+        assert_eq!((items[0].3, items[0].4), (400.0, 100.0));
+        // The list validates against a table holding the pixels.
+        let mut resources = ResourceTable::new();
+        resources.insert(
+            ResourceId(5),
+            Resource::Image {
+                width: 400,
+                height: 100,
+                rgba: vec![0u8; 400 * 100 * 4],
+            },
+        );
+        list.validate(&resources).expect("image resolves");
+    }
+
+    #[test]
+    fn display_list_emits_background_image_cover_and_centered() {
+        use pluto_layout::{ElementState, ImageInfo, ImageMap};
+        // Cover: 800x600 into a 100x100 box scales to 133.3x100.
+        let dom = parse_html("<html><body><div></div></body></html>");
+        let mut images = ImageMap::default();
+        images.backgrounds.insert(
+            "bg.png".to_string(),
+            ImageInfo {
+                resource: 9,
+                width: 800,
+                height: 600,
+            },
+        );
+        let sheet = Stylesheet::parse(
+            "div { width: 100px; height: 100px; background-image: url(bg.png); background-size: cover; background-repeat: no-repeat; }",
+        );
+        let tree = LayoutTree::build_with_state_and_images(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            &images,
+        )
+        .expect("layout builds");
+        let list = DisplayList::build(&tree);
+        let items = image_items(&list);
+        assert_eq!(items.len(), 1, "one cover tile: {items:?}");
+        assert_eq!(items[0].0, 9);
+        assert!((items[0].3 - 800.0 / 6.0).abs() < 0.01, "cover width: {:?}", items[0]);
+        assert_eq!(items[0].4, 100.0);
+        // The background tile is wrapped in a PushClip/PopClip pair
+        // (cover overflows the box horizontally).
+        assert!(
+            list.0.iter().any(|i| matches!(i, DisplayItem::PushClip { .. })),
+            "background clip present"
+        );
+        assert!(
+            list.0.iter().any(|i| matches!(i, DisplayItem::PopClip)),
+            "background clip popped"
+        );
+
+        // Centred, intrinsic size: 50x50 in a 200x100 box centres
+        // at (+75, +25) relative to the box.
+        let dom = parse_html("<html><body><div></div></body></html>");
+        let mut images = ImageMap::default();
+        images.backgrounds.insert(
+            "bg.png".to_string(),
+            ImageInfo {
+                resource: 9,
+                width: 50,
+                height: 50,
+            },
+        );
+        let sheet = Stylesheet::parse(
+            "div { width: 200px; height: 100px; background-image: url(bg.png); background-position: center; background-repeat: no-repeat; }",
+        );
+        let tree = LayoutTree::build_with_state_and_images(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            &images,
+        )
+        .expect("layout builds");
+        let div = tree
+            .boxes()
+            .iter()
+            .find(|b| b.dom.is_some_and(|id| dom.tag(id) == Some("div")))
+            .expect("div box");
+        let list = DisplayList::build(&tree);
+        let items = image_items(&list);
+        assert_eq!(items.len(), 1, "one centred tile: {items:?}");
+        assert!((items[0].1 - (div.x + 75.0)).abs() < 0.01, "centred x: {:?}", items[0]);
+        assert!((items[0].2 - (div.y + 25.0)).abs() < 0.01, "centred y: {:?}", items[0]);
+        assert_eq!((items[0].3, items[0].4), (50.0, 50.0));
+    }
+
+    #[test]
+    fn display_list_tiles_repeating_background() {
+        use pluto_layout::{ElementState, ImageInfo, ImageMap};
+        // 30x30 tile repeated over a 100x100 box: 4x4 = 16 tiles.
+        let dom = parse_html("<html><body><div></div></body></html>");
+        let mut images = ImageMap::default();
+        images.backgrounds.insert(
+            "tile.png".to_string(),
+            ImageInfo {
+                resource: 4,
+                width: 30,
+                height: 30,
+            },
+        );
+        let sheet = Stylesheet::parse(
+            "div { width: 100px; height: 100px; background-image: url(tile.png); }",
+        );
+        let tree = LayoutTree::build_with_state_and_images(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            &images,
+        )
+        .expect("layout builds");
+        let list = DisplayList::build(&tree);
+        let items = image_items(&list);
+        assert_eq!(items.len(), 16, "4x4 tiles: {items:?}");
+        assert!(items.iter().all(|i| i.0 == 4));
+        assert!(items.iter().all(|i| (i.3, i.4) == (30.0, 30.0)));
     }
 }

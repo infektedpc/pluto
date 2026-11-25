@@ -31,6 +31,7 @@ pub mod blocker;
 pub mod cors;
 pub mod csp;
 pub mod decode;
+pub mod dns;
 pub mod hsts;
 pub mod https_only;
 pub mod jar;
@@ -54,10 +55,13 @@ use service::Scheduler;
 pub use blocker::Blocker;
 pub use cache::{CacheStats, HttpCache, Lookup};
 pub use client::{HttpsClient, shared_client};
+pub use dns::{CachedResolver, DNS_NEGATIVE_TTL, DNS_POSITIVE_TTL, DnsCache};
 pub use cors::PreflightCache;
 pub use hsts::HstsStore;
 pub use https_only::HttpsOnly;
+pub use jar::CookieJar;
 pub use referrer::{ReferrerContext, ReferrerPolicy};
+pub use service::SharedLoader;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
@@ -206,8 +210,16 @@ static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 impl ResourceLoader {
     pub fn new() -> Self {
+        Self::from_shared(&SharedLoader::new())
+    }
+
+    /// Build a per-tab loader sharing the stores of `shared`
+    /// (Stage 11 Rec 5): HSTS, blocker, cookie jar and HTTP cache
+    /// are the handle's Arcs; the rest of the scheduler state is
+    /// private to this tab.
+    pub fn from_shared(shared: &SharedLoader) -> Self {
         Self {
-            scheduler: Arc::new(Scheduler::new(shared_client().clone(), 5)),
+            scheduler: Arc::new(Scheduler::with_shared(shared_client().clone(), 5, shared)),
             max_redirects: 5,
         }
     }
@@ -233,11 +245,29 @@ impl ResourceLoader {
         request: ResourceRequest,
         cancel: CancellationToken,
     ) -> Result<Response, NetError> {
+        self.fetch_with_progress(request, cancel, |_, _| {}).await
+    }
+
+    /// Like [`fetch_with`](Self::fetch_with), but `on_progress`
+    /// is called with `(received_bytes, total_bytes)` as the body
+    /// streams in (Stage 11 Rec 9): `total` comes from the
+    /// `Content-Length` response header when present and is `None`
+    /// otherwise (indeterminate — chunked / compressed). The
+    /// callback runs on the fetch task, so it must be cheap and
+    /// non-blocking (the worker forwards to the shell over IPC).
+    pub async fn fetch_with_progress(
+        &self,
+        request: ResourceRequest,
+        cancel: CancellationToken,
+        on_progress: impl Fn(u64, Option<u64>) + Send + 'static,
+    ) -> Result<Response, NetError> {
         let final_url_hint = request.url.clone();
         let mut events = self.fetch_stream(request, cancel).await;
         let mut status = StatusCode::OK;
         let mut headers = HeaderMap::new();
         let mut body = Vec::new();
+        let mut total: Option<u64> = None;
+        let mut received: u64 = 0;
         let mut final_url = final_url_hint
             .parse()
             .unwrap_or_else(|_| http::Uri::from_static("/"));
@@ -258,11 +288,19 @@ impl ResourceLoader {
                             name.parse::<header::HeaderName>(),
                             value.parse::<header::HeaderValue>(),
                         ) {
+                            if n == header::CONTENT_LENGTH {
+                                total = v.to_str().ok().and_then(|s| s.parse().ok());
+                            }
                             headers.insert(n, v);
                         }
                     }
+                    on_progress(0, total);
                 }
-                ResourceEvent::BodyChunk { bytes, .. } => body.extend_from_slice(&bytes),
+                ResourceEvent::BodyChunk { bytes, .. } => {
+                    received += bytes.len() as u64;
+                    on_progress(received, total);
+                    body.extend_from_slice(&bytes);
+                }
                 ResourceEvent::Done { .. } => {
                     return Ok(Response {
                         status,
@@ -372,6 +410,91 @@ impl ResourceLoader {
     pub fn set_referrer_policy(&self, policy: ReferrerPolicy) {
         let ctx = self.scheduler.referrer_context();
         ctx.lock().unwrap().policy = policy;
+    }
+
+    /// Warm the connection for `url` (Stage 11 Rec 6): HSTS is
+    /// applied first, then the blocker gate, then DNS (via the
+    /// shared TTL cache) plus a TCP+TLS handshake through a
+    /// connector that shares the TLS config (session store) and
+    /// the DNS cache with the shared client. Returns `true` when
+    /// a handshake completed.
+    ///
+    /// Honest limitation, documented here and in the report:
+    /// hyper-util's legacy client exposes no API to park an
+    /// externally-warmed socket in its pool, so the warmed socket
+    /// is dropped after the handshake — the win is the cached DNS
+    /// answer plus a primed rustls session the follow-up fetch
+    /// resumes, not a reused socket. `http` origins warm TCP
+    /// only (no TLS); non-http(s) URLs and blocker-blocked
+    /// tracker origins are never warmed.
+    pub async fn preconnect(&self, url: &str) -> bool {
+        use tower_service::Service as _;
+        let Ok(mut uri) = url.parse::<http::Uri>() else {
+            return false;
+        };
+        // HSTS first: an `http` URL for a Known HSTS Host warms
+        // the `https` endpoint instead.
+        if uri.scheme_str() == Some("http") {
+            if let Some(host) = uri.host() {
+                let known = self
+                    .scheduler
+                    .hsts_store()
+                    .lock()
+                    .unwrap()
+                    .is_known(host, std::time::SystemTime::now());
+                if known {
+                    if let Some(upgraded) = crate::hsts::upgrade_http_uri(&uri) {
+                        uri = upgraded;
+                    }
+                }
+            }
+        }
+        match uri.scheme_str() {
+            Some("http") | Some("https") => {}
+            _ => return false,
+        }
+        let url_str = uri.to_string();
+        // Never warm a blocker-blocked tracker origin.
+        if self
+            .scheduler
+            .blocker()
+            .lock()
+            .unwrap()
+            .is_blocked(&url_str, Destination::Other, &url_str)
+            .is_some()
+        {
+            return false;
+        }
+        let mut connector = crate::client::build_connector();
+        if std::future::poll_fn(|cx| connector.poll_ready(cx))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        connector.call(uri).await.map(|_| ()).is_ok()
+    }
+
+    /// Resolve `url`'s host through the shared DNS TTL cache
+    /// only (Stage 11 Rec 6): no TCP connection is opened, so a
+    /// `<link rel="dns-prefetch">` costs one cache lookup (or one
+    /// `getaddrinfo` on a miss) and nothing else. Returns `true`
+    /// when the host resolves.
+    pub async fn dns_prefetch(&self, url: &str) -> bool {
+        use tower_service::Service as _;
+        let Ok(uri) = url.parse::<http::Uri>() else {
+            return false;
+        };
+        let Some(host) = uri.host() else {
+            return false;
+        };
+        let Ok(name) = host.parse::<hyper_util::client::legacy::connect::dns::Name>() else {
+            return false;
+        };
+        let mut resolver =
+            CachedResolver::new(crate::client::shared_dns_cache().clone());
+        let _ = std::future::poll_fn(|cx| resolver.poll_ready(cx)).await;
+        resolver.call(name).await.is_ok()
     }
 }
 
@@ -584,5 +707,123 @@ mod tests {
         }
         assert_eq!(NetError::TooManyRedirects(5).code(), "too_many_redirects");
         assert_eq!(NetError::Cancelled.code(), "cancelled");
+    }
+
+    // ---- Stage 11 Rec 6 + 9: preconnect, dns-prefetch, progress ----
+
+    /// Like [`test_server`], but counts accepted TCP connections —
+    /// the seam that proves dns-prefetch opens none and preconnect
+    /// opens exactly one.
+    async fn counting_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::AtomicUsize;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count2 = Arc::clone(&count);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                count2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    // A preconnect handshake sends no HTTP request:
+                    // just hold the socket briefly, then close.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{}/", addr.port()), count)
+    }
+
+    #[tokio::test]
+    async fn fetch_with_progress_reports_bytes_vs_content_length() {
+        let base = test_server().await;
+        let loader = ResourceLoader::new();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(u64, Option<u64>)>::new()));
+        let seen2 = Arc::clone(&seen);
+        let request = ResourceRequest {
+            request_id: 1,
+            tab_id: 0,
+            epoch: 1,
+            url: format!("{base}final"),
+            method: "GET".to_string(),
+            headers: Vec::new(),
+            is_imageset: false,
+            destination: Destination::Document,
+            priority: Priority::VeryHigh,
+            mode: RequestMode::Navigate,
+            credentials: CredentialsMode::SameOrigin,
+            origin: base.clone(),
+            top_level_site: base.clone(),
+            upgrade_insecure_requests: false,
+            integrity: None,
+        };
+        let response = loader
+            .fetch_with_progress(request, CancellationToken::new(), move |received, total| {
+                seen2.lock().unwrap().push((received, total));
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.body, b"hello");
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "progress was reported");
+        assert_eq!(seen[0], (0, Some(5)), "headers carry Content-Length: 5");
+        assert_eq!(*seen.last().unwrap(), (5, Some(5)), "all 5 bytes reported");
+        assert!(seen.iter().all(|(_, t)| *t == Some(5)));
+    }
+
+    #[tokio::test]
+    async fn dns_prefetch_opens_no_tcp_connection() {
+        let (base, count) = counting_server().await;
+        let loader = ResourceLoader::new();
+        assert!(loader.dns_prefetch(&base).await, "127.0.0.1 resolves");
+        // The host resolved (and the answer is cached now), but no
+        // socket was opened to the server.
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "dns-prefetch must not open a TCP connection"
+        );
+        // A second prefetch is a cache hit.
+        assert!(loader.dns_prefetch(&base).await);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn preconnect_opens_one_tcp_connection() {
+        let (base, count) = counting_server().await;
+        let loader = ResourceLoader::new();
+        assert!(loader.preconnect(&base).await, "http preconnect warms TCP");
+        // The TCP connect completes in the kernel before the
+        // server task's `accept()` runs, so poll the counter
+        // instead of asserting immediately.
+        let mut seen = 0;
+        for _ in 0..200 {
+            seen = count.load(std::sync::atomic::Ordering::SeqCst);
+            if seen == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            seen, 1,
+            "preconnect opens exactly one TCP connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn preconnect_refuses_non_http_and_blocked_origins() {
+        let loader = ResourceLoader::new();
+        assert!(!loader.preconnect("ftp://example.com").await);
+        assert!(!loader.preconnect("not a url").await);
+        // A blocker-blocked tracker origin is never warmed.
+        loader.blocker().lock().unwrap().load_list(
+            crate::blocker::ListSource::EasyList,
+            "||tracker.example^\n",
+        );
+        assert!(!loader.preconnect("https://tracker.example/").await);
+        assert!(!loader.preconnect("http://tracker.example/x.js").await);
     }
 }

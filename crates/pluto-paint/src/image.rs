@@ -24,6 +24,7 @@
 //! animation timing (loop counts, disposal modes) is out of scope.
 
 use crate::{Resource, ResourceId, ResourceTable};
+use image::AnimationDecoder;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -31,6 +32,44 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// matching the existing 64 MiB resource budget
 /// ([`crate::MAX_RESOURCE_BYTES`]).
 pub const IMAGE_CACHE_BYTE_CAP: usize = 64 * 1024 * 1024;
+
+/// Strict decode limits (Stage 11 Rec 12, bomb protection): no
+/// image may claim more than 8192 px on a side — above any real web
+/// image, below any bomb — and no decode may allocate more than the
+/// image-cache cap. The dimension limits are strict (the decoder
+/// rejects the header before allocating pixels); `max_alloc` is
+/// best-effort per decoder, so the cache also rejects an oversize
+/// result before inserting (see [`ImageCache::insert_decoded`]).
+pub const MAX_IMAGE_DIMENSION: u32 = 8192;
+
+/// The decode [`image::Limits`] for every Pluto decode: strict
+/// 8192 px dimension caps and `max_alloc` at the image-cache cap.
+/// (`Limits` is `#[non_exhaustive]`, so this builds from
+/// `Default` and sets fields instead of a struct literal.)
+pub fn decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(IMAGE_CACHE_BYTE_CAP as u64);
+    limits
+}
+
+/// Most frames an animated image may carry (Stage 11 Rec 11): a
+/// pathological GIF with thousands of frames is bounded before its
+/// pixels are all held — the per-frame byte total is still capped
+/// by [`IMAGE_CACHE_BYTE_CAP`] as well.
+pub const MAX_ANIMATED_FRAMES: usize = 256;
+
+/// Minimum frame delay for an animated image, in ms (Stage 11
+/// Rec 11): a 0-delay frame means "as fast as possible" in the
+/// format, which would spin the tab thread; browsers clamp it,
+/// and so does Pluto.
+pub const MIN_FRAME_DELAY_MS: u32 = 10;
+
+/// Maximum frame rate for an animated image (Stage 11 Rec 11):
+/// frames are never advanced faster than ~30 fps, whatever the
+/// file's delays say.
+pub const MAX_ANIMATION_FPS: u32 = 30;
 
 /// FNV-1a 64-bit hash (deterministic across runs, unlike the
 /// randomised `DefaultHasher` — dedup keys must compare equal for
@@ -82,13 +121,31 @@ pub enum ImageError {
     Empty,
     #[error("decoded image byte length {0} does not match {1}x{2} RGBA")]
     LengthMismatch(usize, u32, u32),
+    /// The decoded pixels would exceed the image-cache cap (Stage
+    /// 11 Rec 12): rejected before inserting, never after
+    /// allocating past the cap.
+    #[error("decoded image is {0} bytes, over the {IMAGE_CACHE_BYTE_CAP}-byte image cap")]
+    TooLarge(usize),
+    /// The animation has too many frames, or its frames' pixels
+    /// would exceed the image-cache cap (Stage 11 Rec 11/12).
+    #[error("animated image is too large: {0}")]
+    AnimatedTooLarge(String),
 }
 
 /// Decode one image's bytes (PNG, JPEG, GIF, WebP — the formats the
 /// workspace `image` dependency enables) to RGBA8. Pure and
 /// thread-safe: call it on the rayon pool, never on the UI thread.
+///
+/// Decodes through [`image::ImageReader`] with the strict
+/// [`decode_limits`] (Stage 11 Rec 12): a header claiming more
+/// than [`MAX_IMAGE_DIMENSION`] px on a side, or an allocation
+/// past the cache cap, is rejected before pixels are allocated.
 pub fn decode_image(bytes: &[u8]) -> Result<DecodedImage, ImageError> {
-    let dynamic = image::load_from_memory(bytes)?;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(image::ImageError::IoError)?;
+    reader.limits(decode_limits());
+    let dynamic = reader.decode()?;
     let rgba = dynamic.to_rgba8();
     let (width, height) = rgba.dimensions();
     if width == 0 || height == 0 {
@@ -98,10 +155,132 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedImage, ImageError> {
     if raw.len() != (width as usize) * (height as usize) * 4 {
         return Err(ImageError::LengthMismatch(raw.len(), width, height));
     }
+    if raw.len() > IMAGE_CACHE_BYTE_CAP {
+        return Err(ImageError::TooLarge(raw.len()));
+    }
     Ok(DecodedImage {
         width,
         height,
         rgba: raw,
+    })
+}
+
+/// One animated image's decoded frames (Stage 11 Rec 11): every
+/// frame at its per-frame delay, in order. `loop_count` is `None`
+/// for an infinite loop, `Some(n)` for n total plays (a GIF
+/// `Repeat::Finite` / APNG `num_plays`); a static image decodes
+/// to exactly one frame with `loop_count` `Some(1)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnimatedFrames {
+    pub frames: Vec<DecodedImage>,
+    pub delays_ms: Vec<u32>,
+    pub loop_count: Option<u32>,
+}
+
+/// Decode an image's frames: GIF via `AnimationDecoder`, APNG via
+/// `PngDecoder::apng`, anything else as a single frame (see
+/// [`decode_image`]). Frame delays are honoured (clamped to at
+/// least [`MIN_FRAME_DELAY_MS`]); loop counts are read from the
+/// file. Bounded before allocating past the cap: the dimension
+/// limits apply to the header, the frame count is capped at
+/// [`MAX_ANIMATED_FRAMES`], and the running pixel total is capped
+/// at [`IMAGE_CACHE_BYTE_CAP`] — a bomb fails partway with its
+/// partial frames dropped, never held.
+pub fn decode_animated(bytes: &[u8]) -> Result<AnimatedFrames, ImageError> {
+    use image::codecs::gif::GifDecoder;
+    use image::codecs::png::PngDecoder;
+    use image::ImageDecoder;
+
+    let format = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|r| r.format());
+    let single = |image: DecodedImage| AnimatedFrames {
+        frames: vec![image],
+        delays_ms: vec![100],
+        loop_count: Some(1),
+    };
+    match format {
+        Some(image::ImageFormat::Gif) => {
+            let mut decoder = GifDecoder::new(std::io::Cursor::new(bytes))?;
+            decoder.set_limits(decode_limits())?;
+            let loop_count = match decoder.loop_count() {
+                image::metadata::LoopCount::Infinite => None,
+                image::metadata::LoopCount::Finite(n) => Some(n.get()),
+            };
+            collect_frames(decoder, loop_count)
+        }
+        Some(image::ImageFormat::Png) => {
+            let mut decoder = PngDecoder::new(std::io::Cursor::new(bytes))?;
+            // The limits ride into the APNG decoder with the
+            // inner decoder (it wraps this same `PngDecoder`).
+            decoder.set_limits(decode_limits())?;
+            if decoder.is_apng()? {
+                let apng = decoder.apng()?;
+                let loop_count = match apng.loop_count() {
+                    image::metadata::LoopCount::Infinite => None,
+                    image::metadata::LoopCount::Finite(n) => Some(n.get()),
+                };
+                collect_frames(apng, loop_count)
+            } else {
+                Ok(single(decode_image(bytes)?))
+            }
+        }
+        _ => Ok(single(decode_image(bytes)?)),
+    }
+}
+
+/// Collect an animation decoder's frames into [`AnimatedFrames`],
+/// enforcing the frame-count and pixel-total caps as frames land.
+fn collect_frames<'a>(
+    decoder: impl AnimationDecoder<'a>,
+    loop_count: Option<u32>,
+) -> Result<AnimatedFrames, ImageError> {
+    let mut frames = Vec::new();
+    let mut delays_ms = Vec::new();
+    let mut total_bytes = 0usize;
+    for frame in decoder.into_frames() {
+        let frame = frame?;
+        let buffer = frame.buffer();
+        let (width, height) = buffer.dimensions();
+        if width == 0 || height == 0 {
+            return Err(ImageError::Empty);
+        }
+        let rgba = buffer.clone().into_raw();
+        if rgba.len() != (width as usize) * (height as usize) * 4 {
+            return Err(ImageError::LengthMismatch(rgba.len(), width, height));
+        }
+        total_bytes += rgba.len();
+        if total_bytes > IMAGE_CACHE_BYTE_CAP {
+            return Err(ImageError::AnimatedTooLarge(format!(
+                "frames total {total_bytes} bytes, over the {IMAGE_CACHE_BYTE_CAP}-byte cap"
+            )));
+        }
+        frames.push(DecodedImage {
+            width,
+            height,
+            rgba,
+        });
+        let (numer, denom) = frame.delay().numer_denom_ms();
+        let delay = if denom == 0 {
+            0
+        } else {
+            numer / denom
+        };
+        delays_ms.push(delay.max(MIN_FRAME_DELAY_MS));
+        if frames.len() > MAX_ANIMATED_FRAMES {
+            return Err(ImageError::AnimatedTooLarge(format!(
+                "more than {MAX_ANIMATED_FRAMES} frames"
+            )));
+        }
+    }
+    if frames.is_empty() {
+        return Err(ImageError::Empty);
+    }
+    Ok(AnimatedFrames {
+        frames,
+        delays_ms,
+        loop_count,
     })
 }
 
@@ -172,6 +351,55 @@ pub fn downscale_rgba(image: &DecodedImage) -> DecodedImage {
     DecodedImage {
         width: nw,
         height: nh,
+        rgba,
+    }
+}
+
+/// Resize an image to an exact size with an area-average (box)
+/// filter: each output pixel is the mean of the source pixels its
+/// rectangle covers. Used for favicons (downscale to 16×16 /
+/// 32×32, Stage 11 Rec 7) — unlike the mip chain's halving steps,
+/// this lands on the requested size exactly. Pure and thread-safe.
+pub fn resize_rgba(image: &DecodedImage, width: u32, height: u32) -> DecodedImage {
+    let (w, h) = (image.width, image.height);
+    if width == 0 || height == 0 || w == 0 || h == 0 {
+        return DecodedImage {
+            width,
+            height,
+            rgba: vec![0u8; (width as usize) * (height as usize) * 4],
+        };
+    }
+    if (w, h) == (width, height) {
+        return image.clone();
+    }
+    let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
+    for y in 0..height {
+        // Source rows covered by output row y: [y0, y1).
+        let y0 = (y as usize * h as usize) / height as usize;
+        let y1 = ((y as usize + 1) * h as usize / height as usize).max(y0 + 1);
+        for x in 0..width {
+            let x0 = (x as usize * w as usize) / width as usize;
+            let x1 = ((x as usize + 1) * w as usize / width as usize).max(x0 + 1);
+            let mut sum = [0u32; 4];
+            let mut count = 0u32;
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let off = (sy * w as usize + sx) * 4;
+                    for c in 0..4 {
+                        sum[c] += image.rgba[off + c] as u32;
+                    }
+                    count += 1;
+                }
+            }
+            let off = ((y as usize) * (width as usize) + (x as usize)) * 4;
+            for c in 0..4 {
+                rgba[off + c] = (sum[c] / count) as u8;
+            }
+        }
+    }
+    DecodedImage {
+        width,
+        height,
         rgba,
     }
 }
@@ -268,12 +496,12 @@ impl AnimatedImage {
 /// (0 is reserved as "no resource").
 ///
 /// Stage 8 Rec 12: byte-capped LRU. `bytes_used` never exceeds
-/// `cap_bytes` except for a single image larger than the cap, which
-/// is stored alone (evicting everything else) rather than refused —
-/// the display list already caps a single resource at 64 MiB, so
-/// this only bites under a test-sized cap. `get` does not touch
-/// recency (the table is read without the cache); [`get_touch`]
-/// does, for callers that count a read as use.
+/// `cap_bytes` — and Stage 11 Rec 12: a single image whose RGBA
+/// exceeds the cap is REFUSED before inserting (never stored
+/// alone, never allocated past the cap), so a bomb cannot land in
+/// the table at all. `get` does not touch recency (the table is
+/// read without the cache); [`get_touch`] does, for callers that
+/// count a read as use.
 #[derive(Debug, Default)]
 pub struct ImageCache {
     table: ResourceTable,
@@ -342,7 +570,9 @@ impl ImageCache {
 
     /// Decode `bytes` and store the result, returning its id.
     /// Identical source bytes return the existing id without
-    /// decoding again (decode-once, report §g).
+    /// decoding again (decode-once, report §g). `Err` when the
+    /// decode fails or the decoded pixels exceed the cap (Stage
+    /// 11 Rec 12 — refused before inserting).
     pub fn insert_bytes(&mut self, bytes: &[u8]) -> Result<ResourceId, ImageError> {
         let hash = fnv1a(bytes);
         if let Some(&id) = self.by_source.get(&hash)
@@ -353,12 +583,13 @@ impl ImageCache {
             return Ok(id);
         }
         let decoded = decode_image(bytes)?;
-        Ok(self.insert_decoded_with_source(decoded, Some(hash)))
+        self.insert_decoded_with_source(decoded, Some(hash))
     }
 
     /// Store an already-decoded image, returning its id. Identical
     /// pixels (same size and bytes) return the existing id.
-    pub fn insert_decoded(&mut self, image: DecodedImage) -> ResourceId {
+    /// `Err` when the pixels exceed the cap (Stage 11 Rec 12).
+    pub fn insert_decoded(&mut self, image: DecodedImage) -> Result<ResourceId, ImageError> {
         self.insert_decoded_with_source(image, None)
     }
 
@@ -366,7 +597,7 @@ impl ImageCache {
         &mut self,
         image: DecodedImage,
         source_hash: Option<u64>,
-    ) -> ResourceId {
+    ) -> Result<ResourceId, ImageError> {
         let phash = pixel_hash(&image);
         if let Some(&id) = self.by_pixels.get(&phash)
             && self.table.get(id).is_some()
@@ -377,9 +608,16 @@ impl ImageCache {
                 self.source_hash.insert(id, hash);
             }
             self.touch(id);
-            return id;
+            return Ok(id);
         }
         let size = image.byte_len();
+        // Stage 11 Rec 12: refuse an image larger than the cap
+        // before it lands in the table — no eviction dance can
+        // make room for it, and the IPC frame could not carry it
+        // either.
+        if size > self.cap_bytes {
+            return Err(ImageError::TooLarge(size));
+        }
         self.evict_until_fits(size);
         let id = ResourceId(self.next_id);
         // Ids are u32 and insertion is one-per-call; wrapping is not a
@@ -401,13 +639,14 @@ impl ImageCache {
             self.by_source.insert(hash, id);
             self.source_hash.insert(id, hash);
         }
-        id
+        Ok(id)
     }
 
     /// Store an animated image: frame 0 lands in the table under
     /// the returned id, the rest are held for
-    /// [`advance_animated`]. `None` when there are no frames or
-    /// the frames differ in size (see [`AnimatedImage::new`]).
+    /// [`advance_animated`]. `None` when there are no frames, the
+    /// frames differ in size (see [`AnimatedImage::new`]), or
+    /// frame 0's pixels exceed the cap (Stage 11 Rec 12).
     /// Animated inserts bypass dedup (frames are identity, not
     /// content) but still respect the byte cap.
     pub fn insert_animated(
@@ -418,6 +657,9 @@ impl ImageCache {
         let animated = AnimatedImage::new(frames, delays_ms)?;
         let first = animated.current_frame().clone();
         let size = first.byte_len();
+        if size > self.cap_bytes {
+            return None;
+        }
         self.evict_until_fits(size);
         let id = ResourceId(self.next_id);
         self.next_id = self.next_id.wrapping_add(1).max(1);
@@ -658,12 +900,12 @@ mod tests {
     fn image_cache_enforces_byte_cap_with_lru_eviction() {
         // 4x4 RGBA = 64 bytes each; a 128-byte cap holds exactly two.
         let mut cache = ImageCache::with_cap(128);
-        let a = cache.insert_decoded(solid(4, [255, 0, 0, 255]));
-        let b = cache.insert_decoded(solid(4, [0, 255, 0, 255]));
+        let a = cache.insert_decoded(solid(4, [255, 0, 0, 255])).expect("a inserts");
+        let b = cache.insert_decoded(solid(4, [0, 255, 0, 255])).expect("b inserts");
         assert_eq!(cache.bytes_used(), 128);
         assert_eq!(cache.evictions(), 0);
         // A third image evicts the least recently used (a).
-        let c = cache.insert_decoded(solid(4, [0, 0, 255, 255]));
+        let c = cache.insert_decoded(solid(4, [0, 0, 255, 255])).expect("c inserts");
         assert_eq!(cache.evictions(), 1);
         assert!(cache.get(a).is_none(), "LRU image a is evicted");
         assert!(cache.get(b).is_some());
@@ -672,7 +914,7 @@ mod tests {
         assert_eq!(cache.len(), 2);
         // Touching b makes c the LRU; the next insert evicts c, not b.
         cache.get_touch(b).expect("b is cached");
-        let d = cache.insert_decoded(solid(4, [255, 255, 0, 255]));
+        let d = cache.insert_decoded(solid(4, [255, 255, 0, 255])).expect("d inserts");
         assert!(cache.get(c).is_none(), "untouched c is evicted next");
         assert!(cache.get(b).is_some(), "touched b survives");
         assert!(cache.get(d).is_some());
@@ -691,20 +933,24 @@ mod tests {
         assert_eq!(cache.bytes_used(), 4);
         assert_eq!(cache.dedup_hits(), 1);
         // Same pixels via the decoded path dedup too.
-        let id3 = cache.insert_decoded(DecodedImage {
-            width: 1,
-            height: 1,
-            rgba: vec![255, 0, 0, 255],
-        });
+        let id3 = cache
+            .insert_decoded(DecodedImage {
+                width: 1,
+                height: 1,
+                rgba: vec![255, 0, 0, 255],
+            })
+            .expect("same pixels dedup");
         assert_eq!(id3, id1);
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.dedup_hits(), 2);
         // Different pixels are a different image.
-        let id4 = cache.insert_decoded(DecodedImage {
-            width: 1,
-            height: 1,
-            rgba: vec![0, 255, 0, 255],
-        });
+        let id4 = cache
+            .insert_decoded(DecodedImage {
+                width: 1,
+                height: 1,
+                rgba: vec![0, 255, 0, 255],
+            })
+            .expect("different pixels insert");
         assert_ne!(id4, id1);
         assert_eq!(cache.len(), 2);
     }
@@ -785,7 +1031,7 @@ mod tests {
         let animated = cache
             .insert_animated(vec![red.clone(), green.clone()], vec![100, 200])
             .expect("animated inserts");
-        let still = cache.insert_decoded(blue.clone());
+        let still = cache.insert_decoded(blue.clone()).expect("still inserts");
         assert_eq!(cache.animated_frame(animated), Some(0));
         assert!(!cache.is_frame_dirty(animated));
         assert!(!cache.is_frame_dirty(still));
@@ -829,5 +1075,185 @@ mod tests {
                 .is_none(),
             "frames must share one size"
         );
+    }
+
+    /// CRC-32 (IEEE) for the hand-built PNG headers below — the
+    /// test needs a valid IHDR CRC without pulling a CRC crate
+    /// into the test build.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut table = [0u32; 256];
+        for (i, entry) in table.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    0xedb8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+            }
+            *entry = c;
+        }
+        let mut crc = 0xffff_ffffu32;
+        for &b in data {
+            crc = table[((crc ^ b as u32) & 0xff) as usize] ^ (crc >> 8);
+        }
+        crc ^ 0xffff_ffff
+    }
+
+    /// A PNG whose IHDR claims `width` × `height` but carries no
+    /// pixel data: the decoder must reject the header before
+    /// allocating for it.
+    fn png_header_only(width: u32, height: u32) -> Vec<u8> {
+        let mut out = vec![137, 80, 78, 71, 13, 10, 26, 10];
+        // IHDR: length 13, type, width, height, bit depth 8,
+        // colour type 6 (RGBA), compression/filter/interlace 0.
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(b"IHDR");
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        out.extend_from_slice(&13u32.to_be_bytes());
+        out.extend_from_slice(&ihdr);
+        out.extend_from_slice(&crc32(&ihdr).to_be_bytes());
+        // IEND.
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(b"IEND");
+        out.extend_from_slice(&crc32(b"IEND").to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn decode_rejects_oversize_png_header_without_allocating() {
+        // A 200-megapixel header (200000 × 1000): the strict
+        // dimension limit rejects it at the header, before any
+        // pixel buffer exists — the error is a limits error, not
+        // an allocation failure.
+        let bomb = png_header_only(200_000, 1000);
+        let err = decode_image(&bomb).expect_err("200 MP header rejected");
+        assert!(
+            matches!(err, ImageError::Decode(_)),
+            "limits rejection surfaces as a decode error: {err:?}"
+        );
+        // And a header just over the 8192 px cap is rejected too.
+        assert!(decode_image(&png_header_only(8193, 10)).is_err());
+        // A header at the cap is NOT rejected for dimensions: it
+        // fails later, on the missing pixel data — the error is
+        // about the truncated file, never about a limit.
+        let at_cap = decode_image(&png_header_only(8192, 10)).expect_err("no pixels");
+        assert!(
+            !at_cap.to_string().to_ascii_lowercase().contains("limit"),
+            "at-cap header fails on missing data, not on a limit: {at_cap}"
+        );
+        // A normal 4K image decodes fine (small stand-in: 2x2
+        // PNG proves the limited path still decodes real files).
+        let bytes = png_bytes(2, 2, &[255u8; 16]);
+        assert!(decode_image(&bytes).is_ok());
+    }
+
+    #[test]
+    fn image_cache_refuses_image_over_the_cap() {
+        // A 128-byte cap: a 4x4 image (64 bytes) fits, an 8x8
+        // image (256 bytes) is refused before inserting — the
+        // table never holds an image over its cap.
+        let mut cache = ImageCache::with_cap(128);
+        let big = solid(8, [255, 0, 0, 255]);
+        assert_eq!(big.byte_len(), 256);
+        assert!(matches!(
+            cache.insert_decoded(big),
+            Err(ImageError::TooLarge(256))
+        ));
+        assert!(cache.is_empty());
+        assert_eq!(cache.bytes_used(), 0);
+        // The same refusal through the bytes path (a real PNG
+        // whose RGBA exceeds the cap).
+        let png = png_bytes(8, 8, &[1u8; 8 * 8 * 4]);
+        assert!(matches!(
+            cache.insert_bytes(&png),
+            Err(ImageError::TooLarge(256))
+        ));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn decode_animated_gif_reads_frames_delays_and_loop_count() {
+        use image::codecs::gif::{GifEncoder, Repeat};
+        use image::{Delay, Frame, RgbaImage};
+        // Two 2x2 frames: red for 100 ms, green for 250 ms,
+        // looping forever.
+        let mut bytes = Vec::new();
+        {
+            let mut enc = GifEncoder::new(&mut bytes);
+            enc.set_repeat(Repeat::Infinite).expect("repeat sets");
+            let red = RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+            let green = RgbaImage::from_pixel(2, 2, image::Rgba([0, 255, 0, 255]));
+            enc.encode_frame(Frame::from_parts(
+                red,
+                0,
+                0,
+                Delay::from_numer_denom_ms(100, 1),
+            ))
+            .expect("frame 0 encodes");
+            enc.encode_frame(Frame::from_parts(
+                green,
+                0,
+                0,
+                Delay::from_numer_denom_ms(250, 1),
+            ))
+            .expect("frame 1 encodes");
+        }
+        let animated = decode_animated(&bytes).expect("GIF decodes animated");
+        assert_eq!(animated.frames.len(), 2);
+        assert_eq!(animated.delays_ms, vec![100, 250]);
+        assert_eq!(animated.loop_count, None, "infinite loop");
+        assert_eq!(animated.frames[0].rgba, vec![255, 0, 0, 255].repeat(4));
+        assert_eq!(animated.frames[1].rgba, vec![0, 255, 0, 255].repeat(4));
+        // And the plain decode of the same GIF gives frame 0.
+        let still = decode_image(&bytes).expect("GIF decodes as a still");
+        assert_eq!(still.rgba, animated.frames[0].rgba);
+    }
+
+    #[test]
+    fn decode_animated_static_png_is_one_frame() {
+        // A static PNG is not APNG: one frame, one play.
+        let bytes = png_bytes(2, 2, &[9u8; 16]);
+        let animated = decode_animated(&bytes).expect("PNG decodes");
+        assert_eq!(animated.frames.len(), 1);
+        assert_eq!(animated.loop_count, Some(1));
+        assert_eq!(animated.frames[0].rgba, vec![9u8; 16]);
+    }
+
+    #[test]
+    fn resize_rgba_lands_on_exact_size() {
+        // A solid 4x4 red image resized to 16x16 stays solid red
+        // at exactly 16x16 (favicon downscale shape).
+        let image = solid(4, [255, 0, 0, 255]);
+        let resized = resize_rgba(&image, 16, 16);
+        assert_eq!((resized.width, resized.height), (16, 16));
+        assert!(resized.rgba.iter().all(|&b| b == 255 || b == 0));
+        assert_eq!(resized.rgba[0..4], [255, 0, 0, 255]);
+        // Quadrant colours average correctly on a downscale to
+        // 1x1 (the mean of the four quadrants).
+        let rgba: Vec<u8> = (0..16)
+            .map(|i| {
+                let (x, y) = (i % 4, i / 4);
+                match (x < 2, y < 2) {
+                    (true, true) => [255, 0, 0, 255],
+                    (false, true) => [0, 255, 0, 255],
+                    (true, false) => [0, 0, 255, 255],
+                    (false, false) => [255, 255, 255, 255],
+                }
+            })
+            .flatten()
+            .collect();
+        let quadrants = DecodedImage {
+            width: 4,
+            height: 4,
+            rgba,
+        };
+        let one = resize_rgba(&quadrants, 1, 1);
+        assert_eq!((one.width, one.height), (1, 1));
+        assert_eq!(one.rgba, [127, 127, 127, 255]);
+        // Same size is a clone, not a resample.
+        assert_eq!(resize_rgba(&image, 4, 4), image);
     }
 }

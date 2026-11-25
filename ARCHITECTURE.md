@@ -326,6 +326,40 @@ Goal: visual pages with raster/vector images and standard tab management.
   is per-tab.
 - **Done criteria**: pages with photos, icons, and multiple open tabs
   render cleanly without blocking the UI thread during image decoding.
+- **Built — Stage 11 (2026-11-25)**: all 12 Stage 11 recommendations
+  applied. Image fetch → decode → display is live: `<img>` and
+  `background-image` bytes reach the page (fetch through the Stage 9
+  gates, decode on the shared rayon pool, never on the tab or UI
+  thread); intrinsic sizing from decoded dimensions with alt text /
+  broken-image placeholder on failure; srcset/sizes/`<picture>`
+  selection before fetching (one candidate only); GIF + APNG driver
+  with per-frame delays, loop counts, ~30 fps cap, off-screen pause;
+  strict decode limits (8192 px, 64 MiB alloc cap, rejected before
+  allocating). IPC decision (documented in `pluto-ipc/src/lib.rs` and
+  `pluto-paint/src/lib.rs`): **decode worker-side, resources cross
+  IPC out-of-band, one `ResourceReady` frame per image**
+  (PROTOCOL_VERSION 4 → 5); a display list never carries decoded
+  pixels. Multi-tab shell: `Vec<Tab>` in the shell (own compositor,
+  history, title, favicon, renderer_tx per tab), one renderer process
+  per tab with a shell-assigned `tab_id`, tab strip above the address
+  bar, Ctrl+T / Ctrl+W / Ctrl+Tab, switching swaps the compositor
+  with no re-fetch and no re-layout. Loader promoted to a shared
+  handle (`SharedLoader`: HSTS, blocker, cookie jar, HTTP cache
+  shared; CSP/referrer/caps/dedup per tab); preconnect (max 3/page)
+  + DNS TTL cache (60 s positive / 5 s negative) with HSTS applied
+  before warming and no preconnect to blocked tracker origins.
+  Favicons (`link[rel=icon]` + `/favicon.ico` fallback, once per
+  origin per session, miss remembered, 32×32 downscale, shown in the
+  tab strip); `TitleChanged` coalesced onto the display-list submit;
+  loading progress (`LoadProgress` bytes vs Content-Length, thin bar
+  under the address bar). Deferred: dirty-subtree re-layout on image
+  arrival (full rebuild, coalesced to one per tick); HTTP cache
+  sharing across renderer processes (needs the M5 broker);
+  preconnect socket parking in the hyper-util pool (no public API);
+  full `background-position`/repeat/multiple backgrounds (cover /
+  contain + no-repeat first); per-tab `history.json` persistence
+  (only the active tab's history is saved); `document.images` /
+  JS `Image()` constructor.
 
 ### Milestone 4: Interactive JavaScript & Live DOM Mutation (rquickjs)
 

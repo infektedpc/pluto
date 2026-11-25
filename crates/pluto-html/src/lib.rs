@@ -81,7 +81,12 @@ pub use builder::{DomEvent, QName, SinkStats};
 pub use observers::{
     MutationObserverOptions, MutationObserverRegistry, ObserverMutationRecord, ObserverRecordKind,
 };
-pub use scanner::{Destination, DiscoveredResource, Priority, resolve_url, scan};
+pub use scanner::{
+    ConnectionHint, Destination, DiscoveredResource, HintKind, PictureSource, Priority,
+    SrcsetCandidate, SrcsetDescriptor, eval_sizes, media_matches, parse_srcset, resolve_url, scan,
+    scan_hints, scan_with_viewport, select_img_url, select_img_url_from_dom, select_srcset,
+    source_type_supported,
+};
 pub use scripts::{
     AsyncQueue, CloseOutcome, DeferQueue, DocumentWriter, DynamicMarkupError, OpenOutcome,
     QueuedScript, ScriptKind, ScriptQueues, StylesheetGate, WriteOutcome, classify_script,

@@ -26,3 +26,11 @@ ring = "0.17"
 # Stage 9 Rec 13: `http` types (`Uri`, `HeaderMap`) for the mixed-
 # download check, which reuses `pluto_net::mixed::is_mixed_download`.
 http.workspace = true
+# Stage 11 Rec 1: the shared rayon pool decodes images on the
+# worker (never the tab thread, never the UI thread).
+rayon.workspace = true
+
+[dev-dependencies]
+# Stage 11 Rec 11/12: the image-pipeline tests encode real GIF/PNG
+# bytes instead of hand-building them.
+image.workspace = true

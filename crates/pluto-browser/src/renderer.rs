@@ -56,19 +56,20 @@
 //! touches a socket, the disk, or the GPU directly: it asks the
 //! shell for nothing and draws nothing; it only builds lists.
 
+use crate::images::{ImageOutcome, ImageRequest, ImageStore, document_title};
 use crate::page::{self, Document};
 use cosmic::iced::futures::SinkExt;
 use cosmic::iced::futures::channel::mpsc;
 use pluto_html::NodeId;
 use pluto_ipc::{
     BrowserToRenderer, CommandReceiver, DeltaMode, InputEvent, PointerKind, RendererToBrowser,
-    WheelPhase,
+    WheelPhase, origin_of,
 };
 use pluto_ipc::transport::{recv_browser_message, Transport};
 use pluto_js::TabJs;
-use pluto_layout::{ElementState, LayoutTree, OverscrollBehavior};
-use pluto_net::ResourceLoader;
-use pluto_paint::{DisplayList, ResourceTable, perf};
+use pluto_layout::{ElementState, ImageMap, LayoutTree, OverscrollBehavior};
+use pluto_net::{ResourceLoader, SharedLoader};
+use pluto_paint::{DisplayList, Resource, ResourceId, ResourceTable, perf};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -83,36 +84,48 @@ use tokio_util::sync::CancellationToken;
 #[path = "observers.rs"]
 pub(crate) mod observers;
 
-/// The subscription that runs the worker. The shell's `Application`
-/// wires this in via `fn subscription`.
-pub fn renderer_subscription() -> cosmic::iced::Subscription<crate::Message> {
-    cosmic::iced::Subscription::run(worker_stream)
+/// The subscription that runs the worker for one tab (Stage 11
+/// Rec 4): each tab gets its own subscription, keyed by the
+/// shell-assigned tab id (`Subscription::run_with_id`), so the
+/// shell can tell the tabs' renderer events apart. The shell's
+/// `Application` wires one of these per tab in via `fn subscription`.
+pub fn renderer_subscription_for_tab(
+    tab_id: u64,
+) -> cosmic::iced::Subscription<crate::Message> {
+    // `run_with` keys the subscription by the tab id (the `D` in
+    // `run_with(data, builder)` is hashed for identity), so each
+    // tab's worker stream is distinct and iced starts/stops them
+    // as tabs open and close.
+    cosmic::iced::Subscription::run_with(tab_id, |tab_id| worker_stream(*tab_id))
 }
 
-/// The worker stream: create the command channel, hand its sender
-/// to the shell, then bridge the out-of-process renderer into the
-/// shell until the subscription ends (Stage 9 Rec 9).
-fn worker_stream() -> impl cosmic::iced::futures::stream::Stream<Item = crate::Message> {
-    cosmic::iced::stream::channel(100, async |mut output| {
+/// The worker stream for one tab: create the command channel, hand
+/// its sender to the shell, then bridge the out-of-process renderer
+/// into the shell until the subscription ends (Stage 9 Rec 9).
+/// The tab id rides the `RendererReady` message so the shell
+/// binds the command sender to the right tab.
+fn worker_stream(tab_id: u64) -> impl cosmic::iced::futures::stream::Stream<Item = crate::Message> {
+    cosmic::iced::stream::channel(100, async move |mut output| {
         let (cmd_tx, cmd_rx) = pluto_ipc::command_channel();
-        let _ = output.send(crate::Message::RendererReady(cmd_tx)).await;
+        let _ = output
+            .send(crate::Message::RendererReady(tab_id, cmd_tx))
+            .await;
         match std::env::current_exe() {
-            Ok(exe) => run_renderer_bridge(&exe, cmd_rx, output).await,
+            Ok(exe) => run_renderer_bridge(tab_id, &exe, cmd_rx, output).await,
             Err(e) => {
                 eprintln!(
                     "[pluto] cannot find own executable ({e}) — falling back to the in-process renderer"
                 );
-                run_worker(cmd_rx, output).await;
+                run_worker(tab_id, cmd_rx, output).await;
             }
         }
     })
 }
 
 /// Bridge one out-of-process renderer into the shell (Stage 9
-/// Rec 9): one `RendererProcess` per tab (one tab today; M3 grows
-/// this to a pool). Shell commands flow to the child over the
-/// socketpair; the child's events flow back as
-/// `Message::RendererEvent`.
+/// Rec 9): one `RendererProcess` per tab. Shell commands flow to
+/// the child over the socketpair; the child's events flow back as
+/// `Message::RendererEvent(tab_id, ...)`.
 ///
 /// If the child dies — clean EOF, a dead socket, or a malformed
 /// message the transport treats as compromised — the shell gets
@@ -126,20 +139,22 @@ fn worker_stream() -> impl cosmic::iced::futures::stream::Stream<Item = crate::M
 /// to the in-process worker (`run_worker`) so the browser still
 /// runs — loudly logged, never silent.
 async fn run_renderer_bridge(
+    tab_id: u64,
     exe: &std::path::Path,
     mut commands: CommandReceiver,
     mut output: mpsc::Sender<crate::Message>,
 ) {
-    let mut renderer = match crate::renderer_process::RendererProcess::spawn(exe).await {
-        Ok(renderer) => Some(renderer),
-        Err(e) => {
-            eprintln!(
-                "[pluto] renderer process spawn failed ({e}) — falling back to the in-process renderer"
-            );
-            run_worker(commands, output).await;
-            return;
-        }
-    };
+    let mut renderer =
+        match crate::renderer_process::RendererProcess::spawn(exe, tab_id).await {
+            Ok(renderer) => Some(renderer),
+            Err(e) => {
+                eprintln!(
+                    "[pluto] renderer process spawn failed ({e}) — falling back to the in-process renderer"
+                );
+                run_worker(tab_id, commands, output).await;
+                return;
+            }
+        };
     // Whether the shell has asked for shutdown: a clean EOF after
     // `Shutdown` is an orderly exit, not a crash.
     let mut shutting_down = false;
@@ -166,6 +181,7 @@ async fn run_renderer_bridge(
                         .is_err();
                     if send_failed {
                         report_renderer_crash(
+                            tab_id,
                             &mut output,
                             &mut renderer,
                             "renderer IPC send failed",
@@ -176,10 +192,11 @@ async fn run_renderer_bridge(
                 } else if matches!(cmd, BrowserToRenderer::CommitNavigation { .. }) {
                     // No renderer alive: a navigation revives it —
                     // a fresh child for a fresh page.
-                    match crate::renderer_process::RendererProcess::spawn(exe).await {
+                    match crate::renderer_process::RendererProcess::spawn(exe, tab_id).await {
                         Ok(mut fresh) => {
                             if fresh.send(&cmd).await.is_err() {
                                 report_renderer_crash(
+                                    tab_id,
                                     &mut output,
                                     &mut Some(fresh),
                                     "respawned renderer IPC send failed",
@@ -196,6 +213,7 @@ async fn run_renderer_bridge(
                             );
                             let _ = output
                                 .send(crate::Message::RendererEvent(
+                                    tab_id,
                                     RendererToBrowser::RendererCrashed {
                                         reason: format!("renderer respawn failed: {e}"),
                                     },
@@ -214,7 +232,7 @@ async fn run_renderer_bridge(
                 match event {
                     Ok(Some(event)) => {
                         if output
-                            .send(crate::Message::RendererEvent(event))
+                            .send(crate::Message::RendererEvent(tab_id, event))
                             .await
                             .is_err()
                         {
@@ -232,6 +250,7 @@ async fn run_renderer_bridge(
                         if !shutting_down {
                             let _ = output
                                 .send(crate::Message::RendererEvent(
+                                    tab_id,
                                     RendererToBrowser::RendererCrashed {
                                         reason: "renderer exited".to_string(),
                                     },
@@ -242,6 +261,7 @@ async fn run_renderer_bridge(
                     }
                     Err(e) => {
                         report_renderer_crash(
+                            tab_id,
                             &mut output,
                             &mut renderer,
                             &format!("renderer IPC receive failed: {e}"),
@@ -260,6 +280,7 @@ async fn run_renderer_bridge(
 /// shutdown-orderly death reports nothing. Dropping the handle
 /// SIGKILLs + reaps a still-alive child, so no zombie leaks.
 async fn report_renderer_crash(
+    tab_id: u64,
     output: &mut mpsc::Sender<crate::Message>,
     renderer: &mut Option<crate::renderer_process::RendererProcess>,
     reason: &str,
@@ -268,6 +289,7 @@ async fn report_renderer_crash(
     if !shutting_down {
         let _ = output
             .send(crate::Message::RendererEvent(
+                tab_id,
                 RendererToBrowser::RendererCrashed {
                     reason: reason.to_string(),
                 },
@@ -318,7 +340,19 @@ pub(crate) enum LayoutJob {
         /// document: the actor must full-rebuild. A failed
         /// incremental attempt falls back to a full rebuild
         /// either way.
+        ///
+        /// The incremental path does NOT take an image map (Stage
+        /// 11 Rec 2, deferred): it re-lays out the retained tree,
+        /// whose images are already current — the tab thread only
+        /// sends `incremental: true` when no image arrived since
+        /// the last layout, so the retained map is never stale.
+        /// `images` is used on the full-rebuild path only.
         incremental: bool,
+        /// The decoded-image map for this layout pass (Stage 11
+        /// Rec 1/2): per-`<img>` intrinsic sizes + background
+        /// images, built by the tab thread from its `ImageStore`.
+        /// Ignored on the incremental path (see above).
+        images: ImageMap,
         reply: oneshot::Sender<()>,
     },
     /// Build the display list from the actor's retained tree
@@ -521,24 +555,34 @@ fn geometry_of(tree: &LayoutTree, id: NodeId) -> Option<pluto_js::Geometry> {
 /// being replaced: its `FontSystem` is reused for the new build
 /// (Stage 8 Rec 9) — a fresh `FontSystem` re-scans the system
 /// fonts (~1.5 s), and a hover restyle that lands on the document
-/// root would otherwise pay that per pointer event.
+/// root would otherwise pay that per pointer event. `images` is
+/// the decoded-image map for this pass (Stage 11 Rec 1/2).
 fn build_full_tree(
     doc: &Document,
     viewport: (f32, f32),
     state: &ElementState,
     old_tree: Option<LayoutTree>,
+    images: &ImageMap,
 ) -> LayoutTree {
     let old_fonts = old_tree.and_then(|t| t.font_system);
     let result = match old_fonts {
-        Some(fonts) => LayoutTree::build_with_state_reusing_font_system(
+        Some(fonts) => LayoutTree::build_with_state_reusing_font_system_and_images(
             doc.dom(),
             doc.sheet(),
             viewport.0,
             viewport.1,
             state,
             fonts,
+            images,
         ),
-        None => LayoutTree::build_with_state(doc.dom(), doc.sheet(), viewport.0, viewport.1, state),
+        None => LayoutTree::build_with_state_and_images(
+            doc.dom(),
+            doc.sheet(),
+            viewport.0,
+            viewport.1,
+            state,
+            images,
+        ),
     };
     match result {
         Ok(tree) => tree,
@@ -547,12 +591,13 @@ fn build_full_tree(
                 "about:blank",
                 &format!("layout failed: {e}"),
             ));
-            LayoutTree::build_with_state(
+            LayoutTree::build_with_state_and_images(
                 err_doc.dom(),
                 err_doc.sheet(),
                 viewport.0,
                 viewport.1,
                 state,
+                images,
             )
             .unwrap_or_default()
         }
@@ -573,6 +618,7 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                 state,
                 offsets,
                 incremental,
+                images,
                 reply,
             } => {
                 if let Some(doc) = *new_document {
@@ -624,7 +670,8 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                     // rebuild (Stage 8 Rec 9): a fresh one would
                     // re-scan the system fonts per rebuild.
                     let old_tree = tree.take();
-                    let mut new_tree = build_full_tree(doc, viewport, &state, old_tree);
+                    let mut new_tree =
+                        build_full_tree(doc, viewport, &state, old_tree, &images);
                     if !offsets.is_empty() {
                         for (&id, &(x, y)) in &offsets {
                             new_tree.set_scroll_offset(id, x, y);
@@ -746,7 +793,16 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
             } => {
                 document = Some(*new_document);
                 let doc = document.as_ref().unwrap();
-                let (_, new_tree) = page::layout_document_with_state(doc, viewport, &state);
+                // A forced flush rebuilds the tree: keep the
+                // retained tree's images (Stage 11 Rec 1) — a
+                // flush that dropped them would un-render every
+                // image until the next tick's rebuild.
+                let old_tree = tree.take();
+                let images = old_tree
+                    .as_ref()
+                    .map(|t| t.images.clone())
+                    .unwrap_or_default();
+                let new_tree = build_full_tree(doc, viewport, &state, old_tree, &images);
                 let geometry = geometry_of(&new_tree, id);
                 tree = Some(new_tree);
                 let _ = reply.send(geometry);
@@ -1027,8 +1083,59 @@ enum LoadOutcome {
 
 /// The tab thread's state: everything the per-tab worker owns.
 struct TabState {
+    /// The shell-assigned tab id (Stage 11 Rec 4): echoed in
+    /// every fetch request and child-process arg, never
+    /// hardcoded 0.
+    tab_id: u64,
     layout_tx: std::sync::mpsc::Sender<LayoutJob>,
     loader: ResourceLoader,
+    /// The worker's image pipeline (Stage 11 Rec 1/7/11): decoded
+    /// pixels, per-URL state, animation timers, favicon
+    /// bookkeeping.
+    images: ImageStore,
+    /// The last submitted display list, cached so an animation
+    /// frame advance can re-submit it with fresh pixels and no
+    /// layout at all (Stage 11 Rec 11).
+    last_display: Option<Arc<DisplayList>>,
+    /// The last title sent to the shell (Stage 11 Rec 8):
+    /// `TitleChanged` fires at most once per submit, only when
+    /// the title actually changed.
+    last_title: String,
+    /// The favicon URL for the current page (Rec 7), if any.
+    favicon_url: Option<String>,
+    /// The favicon's resource id in the worker cache, once
+    /// decoded (sent to the shell via `FaviconChanged`).
+    favicon_resource: Option<ResourceId>,
+    /// Image requests reported by the load task (its sender is
+    /// cloned into each `LoadSinks`).
+    image_request_tx: tokio::sync::mpsc::UnboundedSender<ImageRequest>,
+    /// Image requests, received by the main loop (see `exec_rx`).
+    image_request_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ImageRequest>>,
+    /// Image fetch outcomes, sent back by fetch tasks.
+    image_outcome_tx: tokio::sync::mpsc::UnboundedSender<ImageOutcome>,
+    /// Image outcomes, received by the main loop (see `exec_rx`).
+    image_outcome_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ImageOutcome>>,
+    /// Document-load progress reports from the load task.
+    progress_tx: tokio::sync::mpsc::UnboundedSender<(u64, Option<u64>)>,
+    /// Load progress, received by the main loop (see `exec_rx`).
+    progress_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(u64, Option<u64>)>>,
+    /// The decoded-image map of the last layout pass (Stage 11
+    /// Rec 11): the animation visibility check walks it for
+    /// animated nodes.
+    last_image_map: ImageMap,
+    /// Animated resource ids currently on-screen (Stage 11 Rec
+    /// 11): refreshed by a `Geometry` job every ~30 ticks; the
+    /// advance step only runs for ids in this set.
+    animation_visible: HashSet<ResourceId>,
+    /// Pending animation-visibility `Geometry` replies: (cache
+    /// id, receiver). Polled non-blockingly every tick — the
+    /// `Geometry` job replies over a std channel, which cannot
+    /// join the `select!`.
+    animation_geometry_pending:
+        Vec<(ResourceId, std::sync::mpsc::Receiver<Option<pluto_js::Geometry>>)>,
+    /// Tick of the last animation-visibility check (every ~30
+    /// ticks, ~0.5 s).
+    last_animation_check_tick: u64,
     /// The tokio runtime handle the `fetch()` backend spawns its
     /// network tasks on (the tab thread's current-thread runtime —
     /// see `tab_thread_main`).
@@ -1148,6 +1255,8 @@ impl TabState {
     fn new(
         layout_tx: std::sync::mpsc::Sender<LayoutJob>,
         fetch_handle: tokio::runtime::Handle,
+        tab_id: u64,
+        shared: &SharedLoader,
     ) -> Self {
         let errors = Rc::new(std::sync::Mutex::new(Vec::new()));
         let render_requested = Rc::new(Cell::new(false));
@@ -1162,10 +1271,17 @@ impl TabState {
         )));
         let (exec_tx, exec_rx) = tokio::sync::mpsc::unbounded_channel();
         let (load_outcome_tx, load_outcome_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (image_request_tx, image_request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (image_outcome_tx, image_outcome_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel();
         // Stage 9 Rec 5: the tab's loader starts with the
         // persisted HSTS store + HTTPS-only preference/exceptions
         // from the browser profile (defaults when none exists).
-        let loader = ResourceLoader::new();
+        // Stage 11 Rec 5: the loader is built from the shared
+        // handle (HSTS store, blocker, cookie jar, HTTP cache
+        // shared; CSP, referrer, HTTPS-only, preflight cache,
+        // caps/dedup stay per-tab) instead of a fresh private one.
+        let loader = ResourceLoader::from_shared(shared);
         crate::security::load_into(&loader);
         // Stage 10 Rec 8: seed `:visited` from the persisted
         // history, so links to pages visited in a previous
@@ -1177,9 +1293,25 @@ impl TabState {
             .map(|url| visited_key(url).to_string())
             .collect();
         Self {
+            tab_id,
             layout_tx,
             loader,
             fetch_handle,
+            images: ImageStore::new(),
+            last_display: None,
+            last_title: String::new(),
+            favicon_url: None,
+            favicon_resource: None,
+            image_request_tx,
+            image_request_rx: Some(image_request_rx),
+            image_outcome_tx,
+            image_outcome_rx: Some(image_outcome_rx),
+            progress_tx,
+            progress_rx: Some(progress_rx),
+            last_image_map: ImageMap::new(),
+            animation_visible: HashSet::new(),
+            animation_geometry_pending: Vec::new(),
+            last_animation_check_tick: 0,
             tab_js: None,
             host,
             fetch_backend: None,
@@ -1230,6 +1362,7 @@ impl TabState {
                 self.loader.clone(),
                 self.fetch_handle.clone(),
                 "",
+                self.tab_id,
             ));
             js.set_fetch_backend(
                 std::sync::Arc::clone(&backend) as std::sync::Arc<dyn pluto_js::FetchBackend>,
@@ -1268,6 +1401,8 @@ fn tab_thread_main(
     commands: tokio::sync::mpsc::Receiver<BrowserToRenderer>,
     events: tokio::sync::mpsc::Sender<RendererToBrowser>,
     layout_tx: std::sync::mpsc::Sender<LayoutJob>,
+    tab_id: u64,
+    shared: SharedLoader,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1275,7 +1410,7 @@ fn tab_thread_main(
         .expect("tab thread runtime builds");
     runtime.block_on(async {
         tokio::task::LocalSet::new()
-            .run_until(tab_main(commands, events, layout_tx))
+            .run_until(tab_main(commands, events, layout_tx, tab_id, shared))
             .await;
     });
 }
@@ -1289,8 +1424,10 @@ async fn tab_main(
     mut commands: tokio::sync::mpsc::Receiver<BrowserToRenderer>,
     events: tokio::sync::mpsc::Sender<RendererToBrowser>,
     layout_tx: std::sync::mpsc::Sender<LayoutJob>,
+    tab_id: u64,
+    shared: SharedLoader,
 ) {
-    let mut state = TabState::new(layout_tx, tokio::runtime::Handle::current());
+    let mut state = TabState::new(layout_tx, tokio::runtime::Handle::current(), tab_id, &shared);
     // Stage 9 Rec 12: refresh the tracker lists in the
     // background (EasyList + EasyPrivacy, fetched by default).
     // The refresh works on its own copy — loaded from the
@@ -1318,6 +1455,18 @@ async fn tab_main(
         .load_outcome_rx
         .take()
         .expect("load outcome receiver present");
+    let mut image_request_rx = state
+        .image_request_rx
+        .take()
+        .expect("image request receiver present");
+    let mut image_outcome_rx = state
+        .image_outcome_rx
+        .take()
+        .expect("image outcome receiver present");
+    let mut progress_rx = state
+        .progress_rx
+        .take()
+        .expect("progress receiver present");
     let mut tick = tokio::time::interval(TAB_TICK);
     // `finish_page` blocks this loop for up to a second driving
     // the JS loop after a parse; a Burst interval would then fire
@@ -1346,6 +1495,61 @@ async fn tab_main(
                     }
                 }
                 drive_js(&mut state);
+                // Stage 11 Rec 11: advance due animations (the
+                // visible set is refreshed by a `Geometry` job
+                // every ~30 ticks — see below) and re-submit the
+                // cached display list with the fresh frame pixels:
+                // no layout is involved, and the rate is capped by
+                // the decoded per-frame delays plus the tick.
+                // Replies to pending visibility checks are polled
+                // first, so a just-measured node animates (or
+                // pauses) on this tick, not the next check.
+                poll_animation_geometry(&mut state);
+                if state.tick_count - state.last_animation_check_tick >= 30 {
+                    state.last_animation_check_tick = state.tick_count;
+                    check_animation_visibility(&mut state);
+                }
+                let now = std::time::Instant::now();
+                let advanced = state
+                    .images
+                    .advance_animations(now, &state.animation_visible);
+                if !advanced.is_empty()
+                    && let Some(display) = state.last_display.clone()
+                {
+                    // Fresh pixels for the advanced ids travel
+                    // in their own `ResourceReady` frames (same
+                    // ids, new pixels — the shell overwrites its
+                    // table entries), then the cached list
+                    // re-submits: the ids it names are unchanged.
+                    let mut sent = true;
+                    for id in advanced {
+                        if let Some(resource) = state.images.cache.get(id).cloned() {
+                            let fits = match &resource {
+                                Resource::Image { rgba, .. } => {
+                                    ImageStore::resource_fits_frame(rgba.len())
+                                }
+                            };
+                            if !fits {
+                                continue;
+                            }
+                            sent = emit_tab(
+                                &events,
+                                RendererToBrowser::ResourceReady {
+                                    epoch: state.nav_epoch,
+                                    resource_id: id,
+                                    resource,
+                                },
+                            )
+                            .await;
+                            if !sent {
+                                break;
+                            }
+                        }
+                    }
+                    if sent {
+                        submit(&mut state, &events, display).await;
+                    }
+                }
                 // Dirty-bit flow (Rec 7): a JS mutation sets the
                 // host's render flag / dirty bits and returns
                 // immediately (no layout); the frame tick re-lays
@@ -1363,7 +1567,12 @@ async fn tab_main(
                     .map(|js| js.is_visible())
                     .unwrap_or(true);
                 let dirty = state.render_requested.get()
-                    || state.host.lock().unwrap().dom_is_dirty();
+                    || state.host.lock().unwrap().dom_is_dirty()
+                    // Stage 11 Rec 1/2: a decoded image is dirty
+                    // too — the next layout pass gives it its
+                    // intrinsic size (full rebuild, coalesced to
+                    // one per tick by `layout_and_submit`).
+                    || state.images.images_dirty;
                 if visible && dirty {
                     state.render_requested.set(false);
                     relayout_and_submit(&mut state, &events, tick_started).await;
@@ -1400,6 +1609,28 @@ async fn tab_main(
             outcome = load_outcome_rx.recv() => {
                 let Some(outcome) = outcome else { break };
                 handle_nav_outcome(&mut state, &events, outcome).await;
+            }
+            req = image_request_rx.recv() => {
+                let Some(req) = req else { break };
+                handle_image_request(&mut state, req);
+            }
+            outcome = image_outcome_rx.recv() => {
+                let Some(outcome) = outcome else { break };
+                handle_image_outcome(&mut state, &events, outcome).await;
+            }
+            progress = progress_rx.recv() => {
+                let Some((received, total)) = progress else { break };
+                // Stage 11 Rec 9: document-load progress to the
+                // shell's progress bar (indeterminate when the
+                // server sent no Content-Length).
+                if !emit_tab(
+                    &events,
+                    RendererToBrowser::LoadProgress { received, total },
+                )
+                .await
+                {
+                    break;
+                }
             }
         }
     }
@@ -1608,8 +1839,12 @@ fn handle_exec(state: &mut TabState, msg: crate::js_host::ExecMsg) {
 /// Run the worker: forward shell commands to the tab thread and tab
 /// events to the shell. Ends when the command channel closes, the
 /// tab thread ends, or `Shutdown` arrives.
-pub async fn run_worker(mut commands: CommandReceiver, mut events: mpsc::Sender<crate::Message>) {
-    let threads = spawn_tab_threads();
+pub async fn run_worker(
+    tab_id: u64,
+    mut commands: CommandReceiver,
+    mut events: mpsc::Sender<crate::Message>,
+) {
+    let threads = spawn_tab_threads(tab_id);
     let tab_cmd_tx = threads.tab_cmd_tx;
     let mut tab_event_rx = threads.tab_event_rx;
     loop {
@@ -1630,7 +1865,7 @@ pub async fn run_worker(mut commands: CommandReceiver, mut events: mpsc::Sender<
             event = tab_event_rx.recv() => {
                 match event {
                     Some(event) => {
-                        if !emit(&mut events, event).await {
+                        if !emit(tab_id, &mut events, event).await {
                             break;
                         }
                     }
@@ -1660,8 +1895,12 @@ struct TabThreads {
 /// returning the channels between them and the worker bridge. Both
 /// threads are per-tab and outlive the bridge: the tab thread ends
 /// when its command channel closes (`Shutdown` / sender dropped),
-/// and the actor ends when its job channel closes with it.
-fn spawn_tab_threads() -> TabThreads {
+/// and the actor ends when its job channel closes with it. The
+/// shared loader (Stage 11 Rec 5) is built once here, per renderer
+/// process — one tab per process today, so one handle covers the
+/// tab — and handed to the tab thread, which builds its
+/// `ResourceLoader` from it instead of a fresh private one.
+fn spawn_tab_threads(tab_id: u64) -> TabThreads {
     let (layout_tx, layout_rx) = std::sync::mpsc::channel::<LayoutJob>();
     std::thread::Builder::new()
         .name("pluto-layout".to_string())
@@ -1670,9 +1909,10 @@ fn spawn_tab_threads() -> TabThreads {
     let (tab_cmd_tx, tab_cmd_rx) = tokio::sync::mpsc::channel::<BrowserToRenderer>(100);
     let (tab_event_tx, tab_event_rx) = tokio::sync::mpsc::channel::<RendererToBrowser>(100);
     let layout_tx2 = layout_tx.clone();
+    let shared = SharedLoader::new();
     std::thread::Builder::new()
         .name("pluto-tab".to_string())
-        .spawn(move || tab_thread_main(tab_cmd_rx, tab_event_tx, layout_tx2))
+        .spawn(move || tab_thread_main(tab_cmd_rx, tab_event_tx, layout_tx2, tab_id, shared))
         .expect("tab thread spawns");
     TabThreads {
         tab_cmd_tx,
@@ -1698,8 +1938,8 @@ fn spawn_tab_threads() -> TabThreads {
 /// The child never creates a window or a wgpu device: the tab thread
 /// only parses, lays out, runs JS, and builds display lists — the
 /// same work the in-process worker does, over a different carrier.
-pub(crate) async fn run_worker_transport<T: Transport>(mut transport: T) -> i32 {
-    let threads = spawn_tab_threads();
+pub(crate) async fn run_worker_transport<T: Transport>(mut transport: T, tab_id: u64) -> i32 {
+    let threads = spawn_tab_threads(tab_id);
     let tab_cmd_tx = threads.tab_cmd_tx;
     let mut tab_event_rx = threads.tab_event_rx;
     loop {
@@ -1814,6 +2054,18 @@ fn start_navigation(state: &mut TabState, url: String) {
     state.focused = None;
     state.wheel_chain.clear();
     state.wheel_idle_ticks = 0;
+    // Stage 11 Rec 1/7/8: a new page drops the old page's image
+    // state (in-flight fetches are stale — their outcomes carry
+    // the old epoch), its favicon, and its title (re-emitted when
+    // the new page's title is read after the first submit).
+    state.images.note_navigation();
+    state.favicon_url = None;
+    state.favicon_resource = None;
+    state.last_title = String::new();
+    state.last_display = None;
+    state.last_image_map = ImageMap::new();
+    state.animation_visible.clear();
+    state.animation_geometry_pending.clear();
     // The shell resets its scroll on commit; mirror it here (the
     // viewport scroll is mirrored, not messaged — see
     // `viewport_scroll`).
@@ -1848,9 +2100,28 @@ fn start_navigation(state: &mut TabState, url: String) {
     let exec_tx = state.exec_tx.clone();
     let outcome_tx = state.load_outcome_tx.clone();
     let host = Rc::clone(&state.host);
+    // Stage 11 Rec 1/9: the load reports image discoveries and
+    // document-fetch progress to the tab thread's sinks; the tab
+    // thread owns the image pipeline, the shell owns the bar.
+    let sinks = page::LoadSinks {
+        images: Some(state.image_request_tx.clone()),
+        progress: Some(state.progress_tx.clone()),
+    };
+    let tab_id = state.tab_id;
+    let viewport = state.viewport;
     let handle = tokio::task::spawn_local(async move {
         let hooks = crate::js_host::LoadHooks::new(epoch, exec_tx, host);
-        let outcome = page::load_page_cancellable_with_hooks(&loader, url.clone(), token, Some(Box::new(hooks))).await;
+        let outcome = page::load_page_cancellable_with_hooks(
+            &loader,
+            url.clone(),
+            token,
+            Some(Box::new(hooks)),
+            sinks,
+            tab_id,
+            epoch,
+            viewport,
+        )
+        .await;
         let outcome = match outcome {
             Ok((document, final_url)) => LoadOutcome::Loaded {
                 epoch,
@@ -1907,6 +2178,11 @@ async fn handle_nav_outcome(
                 .visited_urls
                 .insert(visited_key(&final_url).to_string());
             state.document = Some((*document).clone());
+            // Stage 11 Rec 7: determine the favicon now that the
+            // document is committed — link[rel=icon], else the
+            // origin's /favicon.ico, once per origin per session.
+            // A missing icon is remembered, never re-requested.
+            maybe_request_favicon(state, &final_url);
             if !emit_tab(events, RendererToBrowser::DidCommit {
                 url: final_url.clone(),
                 status: format!("Loaded {final_url}"),
@@ -1932,6 +2208,148 @@ async fn handle_nav_outcome(
     }
 }
 
+/// Stage 11 Rec 7: determine the favicon URL for the committed
+/// document and fetch it through the image pipeline — once per
+/// origin per session. A missing icon is remembered (in
+/// `favicon_missing`) and never re-requested; an attempt whose
+/// outcome went stale (a newer navigation superseded it) is
+/// un-marked in the outcome handler so a later visit retries.
+fn maybe_request_favicon(state: &mut TabState, final_url: &str) {
+    let Some(doc) = state.document.as_ref() else {
+        return;
+    };
+    let Some(favicon_url) = ImageStore::favicon_url_for(doc.dom(), final_url) else {
+        return;
+    };
+    let origin = origin_of(final_url);
+    if state.images.favicon_missing.contains(&origin) {
+        return;
+    }
+    if !state.images.favicon_attempted.insert(origin) {
+        return;
+    }
+    state.favicon_url = Some(favicon_url.clone());
+    let req = ImageRequest {
+        url: favicon_url,
+        base_url: final_url.to_string(),
+        is_imageset: false,
+        integrity: None,
+    };
+    if state.images.request(&req) {
+        ImageStore::spawn_fetch(
+            state.loader.clone(),
+            req,
+            state.tab_id,
+            state.nav_epoch,
+            CancellationToken::new(),
+            state.image_outcome_tx.clone(),
+        );
+    }
+}
+
+/// One image URL reported by the load (Stage 11 Rec 1): dedup
+/// by URL, then fetch + decode on detached tasks (the outcome
+/// arrives on `image_outcome_rx`). The fetch takes the current
+/// navigation's cancellation token, so a newer navigation aborts
+/// in-flight image fetches along with the document load; the
+/// epoch check in the outcome handler is the backstop.
+fn handle_image_request(state: &mut TabState, req: ImageRequest) {
+    if !state.images.request(&req) {
+        return;
+    }
+    let cancel = state
+        .nav_cancel
+        .clone()
+        .unwrap_or_else(CancellationToken::new);
+    ImageStore::spawn_fetch(
+        state.loader.clone(),
+        req,
+        state.tab_id,
+        state.nav_epoch,
+        cancel,
+        state.image_outcome_tx.clone(),
+    );
+}
+
+/// One image fetch + decode outcome landed on the tab thread
+/// (Stage 11 Rec 1/7/11). Stale epochs are dropped before
+/// applying — a newer navigation superseded the page that wanted
+/// the image — and a stale favicon attempt is un-marked so a
+/// later visit retries it. A decoded image is inserted into the
+/// cache and sent to the shell out-of-band in its own
+/// `ResourceReady` frame, but only when the encoded frame fits
+/// the IPC cap (oversize → broken placeholder; the layout rebuild
+/// still happens, so the alt text shows). A favicon outcome also
+/// emits `FaviconChanged`, after its `ResourceReady` (per the
+/// IPC docs). The `images_dirty` flag the apply sets drives the
+/// next tick's full rebuild — this handler never lays out.
+async fn handle_image_outcome(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    outcome: ImageOutcome,
+) {
+    let url = match &outcome {
+        ImageOutcome::Decoded { url, .. } | ImageOutcome::Failed { url, .. } => url.clone(),
+    };
+    let epoch = match &outcome {
+        ImageOutcome::Decoded { epoch, .. } | ImageOutcome::Failed { epoch, .. } => *epoch,
+    };
+    if epoch != state.nav_epoch {
+        state.images.favicon_attempted.remove(&origin_of(&url));
+        return;
+    }
+    let is_favicon = state.favicon_url.as_deref() == Some(url.as_str());
+    match state.images.apply_outcome(outcome, is_favicon) {
+        Some(applied) => {
+            if let Some(resource) = state.images.cache.get(applied.id).cloned() {
+                let fits = match &resource {
+                    Resource::Image { rgba, .. } => {
+                        ImageStore::resource_fits_frame(rgba.len())
+                    }
+                };
+                if fits {
+                    if !emit_tab(
+                        events,
+                        RendererToBrowser::ResourceReady {
+                            epoch,
+                            resource_id: applied.id,
+                            resource,
+                        },
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                } else {
+                    eprintln!(
+                        "[pluto] image {url} exceeds the IPC frame cap — broken placeholder"
+                    );
+                }
+            }
+            if is_favicon {
+                state.favicon_resource = Some(applied.id);
+                let _ = emit_tab(
+                    events,
+                    RendererToBrowser::FaviconChanged {
+                        resource_id: Some(applied.id),
+                    },
+                )
+                .await;
+            }
+        }
+        None => {
+            if is_favicon {
+                state.images.favicon_missing.insert(origin_of(&url));
+                let _ = emit_tab(
+                    events,
+                    RendererToBrowser::FaviconChanged { resource_id: None },
+                )
+                .await;
+            }
+        }
+    }
+}
+
 /// Emit one renderer event to the async worker (which forwards it
 /// to the shell). Returns false when the worker is gone.
 async fn emit_tab(
@@ -1943,15 +2361,22 @@ async fn emit_tab(
 
 /// Emit one renderer event to the shell (async worker side).
 /// Returns false when the shell is gone.
-async fn emit(events: &mut mpsc::Sender<crate::Message>, event: RendererToBrowser) -> bool {
+async fn emit(
+    tab_id: u64,
+    events: &mut mpsc::Sender<crate::Message>,
+    event: RendererToBrowser,
+) -> bool {
     events
-        .send(crate::Message::RendererEvent(event))
+        .send(crate::Message::RendererEvent(tab_id, event))
         .await
         .is_ok()
 }
 
 /// Submit a display list to the shell, stamping the next epoch.
-/// No images in M1, so the resource table travels empty.
+/// Stage 11 Rec 1: the resource table travels EMPTY — decoded
+/// resources crossed IPC out-of-band in `ResourceReady` frames,
+/// and the shell validates the list against the per-tab table it
+/// accumulated from them.
 async fn submit(
     state: &mut TabState,
     events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
@@ -2006,6 +2431,44 @@ async fn layout_and_submit(
     // document's links before the state is cloned into the
     // layout job, so `:visited` is fresh for every pass.
     refresh_visited(state);
+    // Stage 11 Rec 1/2: an image arrival forces a FULL rebuild
+    // with a fresh image map — the incremental path cannot take
+    // one (its retained tree keeps its old map). The map is built
+    // from the document this pass lays out (or the retained one
+    // on a resize, where `document` is `None`), and the dirty
+    // flag is consumed here: an image that lands mid-layout sets
+    // it again, and the next tick rebuilds.
+    let mut incremental = incremental;
+    let images = if incremental && !state.images.images_dirty {
+        ImageMap::new()
+    } else {
+        incremental = false;
+        state.images.images_dirty = false;
+        let doc = document.as_ref().or(state.document.as_ref());
+        match doc {
+            Some(doc) => state.images.build_image_map(
+                doc.dom(),
+                doc.sheet(),
+                doc.base_url(),
+                state.viewport.0,
+                1.0,
+            ),
+            None => ImageMap::new(),
+        }
+    };
+    if !incremental {
+        state.last_image_map = images.clone();
+    }
+    // Stage 11 Rec 8: read the title BEFORE the document moves
+    // into the layout job — it is compared after the submit, and
+    // `TitleChanged` fires at most once per submit, only when
+    // the title actually changed (a title-setting loop cannot
+    // spam IPC: one coalesced event per frame at most).
+    let title = document
+        .as_ref()
+        .or(state.document.as_ref())
+        .map(|doc| document_title(doc.dom()))
+        .unwrap_or_default();
     // Perf (Stage 8 Rec 5): the whole build — layout tree,
     // ResizeObserver step, IntersectionObserver step, display-list
     // collect — is the worker build span. The submit's postcard
@@ -2021,6 +2484,7 @@ async fn layout_and_submit(
         state: state.element_state.clone(),
         offsets: state.scroll_offsets.clone(),
         incremental,
+        images,
         reply: tree_tx,
     };
     if state.layout_tx.send(job).is_err() {
@@ -2104,8 +2568,21 @@ async fn layout_and_submit(
                 started.elapsed().as_secs_f32() * 1000.0,
             );
             state.host.lock().unwrap().clear_dirty();
+            // Stage 11 Rec 11: cache the submitted list so an
+            // animation frame advance can re-submit it with
+            // fresh pixels and no layout at all.
+            state.last_display = Some(Arc::clone(&display));
             let submit_started = std::time::Instant::now();
             let submitted = submit(state, events, display).await;
+            // Stage 11 Rec 8: the title is emitted here, after
+            // the submit, coalesced to one event per frame at
+            // most — only when it changed since the last submit.
+            if submitted && title != state.last_title {
+                state.last_title = title.clone();
+                if !emit_tab(events, RendererToBrowser::TitleChanged { title }).await {
+                    return false;
+                }
+            }
             // Stage 10 Rec 7: one ring write per submitted
             // frame — total is tick-to-submit (the caller's
             // clock), phases are layout / collect / submit.
@@ -2231,6 +2708,88 @@ async fn run_intersection_observer_step(state: &mut TabState) {
 /// Re-layout the live (possibly JS-mutated) document and submit.
 /// The document is re-synced from the host's live `Dom` first, so
 /// script mutations reach the actor.
+/// Stage 11 Rec 11: poll the pending animation-visibility
+/// `Geometry` replies (non-blocking — the job replies over a std
+/// channel). A reply updates the animated id's visibility: the
+/// node's border box, in page coordinates, against the viewport
+/// rect `[viewport_scroll, viewport_scroll + viewport]`. A node
+/// with no box (unrendered) is not visible. Replies are consumed
+/// in place; a still-pending job stays queued for the next tick.
+fn poll_animation_geometry(state: &mut TabState) {
+    let (vx, vy) = state.viewport_scroll;
+    let (vw, vh) = state.viewport;
+    let mut i = 0;
+    while i < state.animation_geometry_pending.len() {
+        let (id, rx) = &state.animation_geometry_pending[i];
+        match rx.try_recv() {
+            Ok(geometry) => {
+                let visible = match geometry {
+                    Some(g) => {
+                        let x0 = g.x as f32;
+                        let y0 = g.y as f32;
+                        let x1 = x0 + g.width as f32;
+                        let y1 = y0 + g.height as f32;
+                        x1 > vx && x0 < vx + vw && y1 > vy && y0 < vy + vh
+                    }
+                    None => false,
+                };
+                if visible {
+                    state.animation_visible.insert(*id);
+                } else {
+                    state.animation_visible.remove(id);
+                }
+                state.animation_geometry_pending.remove(i);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                i += 1;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // The actor is gone (or never answered): treat
+                // the animation as visible rather than freezing
+                // it forever on a dead reply.
+                state.animation_visible.insert(*id);
+                state.animation_geometry_pending.remove(i);
+            }
+        }
+    }
+}
+
+/// Stage 11 Rec 11: ask the layout actor for the geometry of
+/// every animated node in the last layout pass, so the advance
+/// step can pause off-screen animations. One `Geometry` job per
+/// node, every ~30 ticks (~0.5 s) — replies land on
+/// `animation_geometry_pending` and are polled by the tick.
+/// Nodes whose check is already pending are not re-asked until
+/// their reply lands.
+fn check_animation_visibility(state: &mut TabState) {
+    if !state.has_document {
+        return;
+    }
+    let pending: HashSet<ResourceId> = state
+        .animation_geometry_pending
+        .iter()
+        .map(|(id, _)| *id)
+        .collect();
+    let mut animated_nodes: Vec<(NodeId, ResourceId)> = Vec::new();
+    for (&node, info) in &state.last_image_map.by_node {
+        let id = ResourceId(info.resource);
+        if state.images.cache.is_animated(id) && !pending.contains(&id) {
+            animated_nodes.push((node, id));
+        }
+    }
+    for (node, id) in animated_nodes {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if state
+            .layout_tx
+            .send(LayoutJob::Geometry { id: node, reply: tx })
+            .is_err()
+        {
+            return;
+        }
+        state.animation_geometry_pending.push((id, rx));
+    }
+}
+
 async fn relayout_and_submit(
     state: &mut TabState,
     events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
@@ -3263,7 +3822,7 @@ mod tests {
         let home = worker_home();
         let (cmd_tx, cmd_rx) = pluto_ipc::command_channel();
         let (event_tx, event_rx) = mpsc::channel(100);
-        let handle = tokio::spawn(run_worker(cmd_rx, event_tx));
+        let handle = tokio::spawn(run_worker(0, cmd_rx, event_tx));
         (home, handle, cmd_tx, event_rx)
     }
 
@@ -3279,7 +3838,7 @@ mod tests {
         use pluto_ipc::transport::{channel_transport_pair, recv_renderer_message};
         let _home = worker_home();
         let (mut browser, renderer) = channel_transport_pair();
-        let handle = tokio::spawn(run_worker_transport(renderer));
+        let handle = tokio::spawn(run_worker_transport(renderer, 0));
         browser
             .send_message(&BrowserToRenderer::CommitNavigation {
                 url: "about:blank".to_string(),
@@ -3303,14 +3862,23 @@ mod tests {
             }
             other => panic!("expected SubmitDisplayList first, got {other:?}"),
         }
-        let second = tokio::time::timeout(
-            Duration::from_secs(20),
-            recv_renderer_message(&mut browser),
-        )
-        .await
-        .expect("second reply arrives in time")
-        .expect("recv succeeds")
-        .expect("a message arrives");
+        // The error page's title may interleave as a
+        // `TitleChanged` between the display list and the
+        // failure (the worker coalesces it onto the submit).
+        let mut second;
+        loop {
+            second = tokio::time::timeout(
+                Duration::from_secs(20),
+                recv_renderer_message(&mut browser),
+            )
+            .await
+            .expect("second reply arrives in time")
+            .expect("recv succeeds")
+            .expect("a message arrives");
+            if !matches!(second, RendererToBrowser::TitleChanged { .. }) {
+                break;
+            }
+        }
         match second {
             RendererToBrowser::LoadFailed { url, reason } => {
                 assert_eq!(url, "about:blank");
@@ -3339,6 +3907,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = pluto_ipc::command_channel();
         let (output_tx, mut output_rx) = mpsc::channel::<crate::Message>(100);
         let handle = tokio::spawn(run_renderer_bridge(
+            0,
             std::path::Path::new("/nonexistent/pluto-browser"),
             cmd_rx,
             output_tx,
@@ -3368,10 +3937,28 @@ mod tests {
             .expect("bridge task joins");
     }
 
+    /// Read the next *structural* worker event, skipping the
+    /// informational events that interleave freely with the
+    /// navigation sequence: `LoadProgress` (reported during the
+    /// document fetch, before `DidCommit`), `TitleChanged`
+    /// (coalesced onto the display-list submit, after it),
+    /// `FaviconChanged` (an async fetch that lands whenever it
+    /// lands), and `ResourceReady` (one per decoded image, in
+    /// arrival order). Tests that assert on progress, titles,
+    /// favicons, or resources read the raw channel instead of
+    /// this helper.
     async fn next_event(rx: &mut mpsc::Receiver<crate::Message>) -> RendererToBrowser {
-        match rx.next().await.expect("worker emits an event") {
-            crate::Message::RendererEvent(event) => event,
-            other => panic!("expected a RendererEvent, got {other:?}"),
+        loop {
+            match rx.next().await.expect("worker emits an event") {
+                crate::Message::RendererEvent(_, event) => match event {
+                    RendererToBrowser::LoadProgress { .. }
+                    | RendererToBrowser::TitleChanged { .. }
+                    | RendererToBrowser::FaviconChanged { .. }
+                    | RendererToBrowser::ResourceReady { .. } => continue,
+                    event => return event,
+                },
+                other => panic!("expected a RendererEvent, got {other:?}"),
+            }
         }
     }
 
@@ -4887,7 +5474,7 @@ mod tests {
         // A real tab: `TabState::new` reads the security profile,
         // `tab_js()` builds the tab backends, loading permissions.
         let (layout_tx, _layout_rx) = std::sync::mpsc::channel::<LayoutJob>();
-        let mut state = TabState::new(layout_tx, tokio::runtime::Handle::current());
+        let mut state = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new());
         state.tab_js();
         let backends = std::sync::Arc::new(
             state.tab_backends.take().expect("tab backends built"),
@@ -4964,7 +5551,7 @@ mod tests {
             "https://example.com/b#frag".to_string(),
         ]);
         let (layout_tx, _layout_rx) = std::sync::mpsc::channel::<LayoutJob>();
-        let state = TabState::new(layout_tx, tokio::runtime::Handle::current());
+        let state = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new());
         assert!(state.visited_urls.contains("https://example.com/a"));
         // The fragment is stripped on seed, as on commit.
         assert!(state.visited_urls.contains("https://example.com/b"));
@@ -4977,7 +5564,7 @@ mod tests {
                 .join(crate::history::HISTORY_FILE),
         );
         let (layout_tx, _layout_rx) = std::sync::mpsc::channel::<LayoutJob>();
-        let fresh = TabState::new(layout_tx, tokio::runtime::Handle::current());
+        let fresh = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new());
         assert!(fresh.visited_urls.is_empty());
     }
 
@@ -5166,7 +5753,7 @@ mod tests {
             .name("pluto-layout".to_string())
             .spawn(move || layout_thread(layout_rx))
             .expect("layout actor thread spawns");
-        let mut state = TabState::new(layout_tx, tokio::runtime::Handle::current());
+        let mut state = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new());
         let (events_tx, mut events_rx) =
             tokio::sync::mpsc::channel::<RendererToBrowser>(100);
         let doc = page::parse_document(EXAMPLE_COM);

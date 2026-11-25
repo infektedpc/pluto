@@ -537,6 +537,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_large_images_cross_ipc_in_separate_frames_under_the_cap() {
+        // M3 (Stage 11) resource decision, enforced: one decoded
+        // 4K image is ~33 MB of RGBA — two of them in ONE frame
+        // would exceed the 64 MiB cap and fail the send, so each
+        // decoded resource crosses in its own `ResourceReady`
+        // frame and the display list carries only ids. A page with
+        // two 4K images must therefore send three small-ish
+        // frames (two resources + one list), none over the cap.
+        let (mut browser, mut renderer) = SocketTransport::from_pair().expect("socketpair");
+        let mk_image = |id: u32| {
+            let mut rgba = vec![0u8; 3840 * 2160 * 4];
+            // Distinct pixels per image, so the frames are not
+            // trivially identical.
+            rgba[0] = id as u8;
+            RendererToBrowser::ResourceReady {
+                epoch: 1,
+                resource_id: ResourceId(id),
+                resource: Resource::Image {
+                    width: 3840,
+                    height: 2160,
+                    rgba,
+                },
+            }
+        };
+        for id in [1, 2] {
+            let message = mk_image(id);
+            let encoded = encode_message(&message);
+            assert!(
+                encoded.len() < MAX_FRAME_BYTES,
+                "one 4K ResourceReady frame must fit under the cap: {} bytes",
+                encoded.len()
+            );
+            // Send and receive CONCURRENTLY: a 33 MB frame does
+            // not fit in the socket buffer, so a sequential
+            // send-then-recv deadlocks — the writer blocks until
+            // the reader drains, and the reader never starts.
+            let (sent, received) = tokio::join!(
+                renderer.send_message(&message),
+                recv_renderer_message(&mut browser),
+            );
+            sent.expect("4K resource sends");
+            match received
+                .expect("recv succeeds")
+                .expect("a message arrives")
+            {
+                RendererToBrowser::ResourceReady {
+                    resource_id,
+                    resource,
+                    ..
+                } => {
+                    assert_eq!(resource_id, ResourceId(id));
+                    match resource {
+                        Resource::Image { width, height, .. } => {
+                            assert_eq!((width, height), (3840, 2160))
+                        }
+                    }
+                }
+                other => panic!("expected ResourceReady, got {other:?}"),
+            }
+        }
+        // And the display list that references both ids is a
+        // small frame on its own (ids only, empty table).
+        let mut list = example_list();
+        for id in [1, 2] {
+            list.push(DisplayItem::Image {
+                resource: ResourceId(id),
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            });
+        }
+        let submit = RendererToBrowser::SubmitDisplayList {
+            epoch: 1,
+            bytes: list.to_bytes(),
+            resources: ResourceTable::new(),
+        };
+        let encoded = encode_message(&submit);
+        assert!(
+            encoded.len() < MAX_FRAME_BYTES,
+            "display list frame must fit under the cap: {} bytes",
+            encoded.len()
+        );
+        // Small frame (ids only): it fits the socket buffer, so a
+        // sequential send-then-recv cannot deadlock here.
+        renderer.send_message(&submit).await.expect("list sends");
+        match recv_renderer_message(&mut browser)
+            .await
+            .expect("recv succeeds")
+            .expect("a message arrives")
+        {
+            RendererToBrowser::SubmitDisplayList { bytes, .. } => {
+                let back = DisplayList::from_bytes(&bytes).expect("list decodes");
+                assert_eq!(
+                    back.0
+                        .iter()
+                        .filter(|i| matches!(i, DisplayItem::Image { .. }))
+                        .count(),
+                    2
+                );
+            }
+            other => panic!("expected SubmitDisplayList, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn transport_rejects_oversize_frame_length() {
         // Announce a frame over the cap: the receiver must refuse
         // before allocating for it. The length prefix is written by

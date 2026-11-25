@@ -32,9 +32,12 @@
 //!   round trip.
 //! * `<template>` contents — not scanned (inert); the scanner tracks
 //!   template depth and skips discoveries inside it.
-//! * `srcset`/`sizes` — the scanner emits every `srcset` candidate
-//!   (it must guess the layout viewport before layout); candidate
-//!   selection by `sizes` is Stage 5 / scheduler work.
+//! * `srcset`/`sizes` — the scanner selects ONE candidate per
+//!   `<img>` / `<picture>` (Stage 11 Rec 10: `w` descriptors
+//!   against `sizes` + viewport, `x` against the DPR, `<source>`
+//!   media/type first); it guesses the layout viewport when the
+//!   caller does not pass one (`scan_with_viewport` takes the
+//!   real one).
 //! * `<base href>` appearing *after* resources it affects —
 //!   base-resolution hazard; URLs seen before the `<base>` resolve
 //!   against the document URL, and a later `<base>` does not rewrite
@@ -181,17 +184,391 @@ fn fetch_priority(attrs: &[(String, String)], default: Priority) -> Priority {
 /// discarded). Commas separate candidates; the URL is the first
 /// whitespace-separated token of each candidate.
 fn srcset_urls(srcset: &str) -> Vec<String> {
-    srcset
-        .split(',')
-        .filter_map(|cand| {
-            let url = cand.split_whitespace().next().unwrap_or("").trim();
-            if url.is_empty() || url.starts_with("data:") {
-                None
-            } else {
-                Some(url.to_string())
-            }
-        })
+    parse_srcset(srcset)
+        .into_iter()
+        .map(|c| c.url)
         .collect()
+}
+
+/// One `srcset` candidate: its URL and its descriptor (HTML
+/// Standard §4.8.4.3). `None` when the candidate carries no
+/// descriptor (bare URL — valid only as the sole candidate, but
+/// tolerated here as "pick me").
+#[derive(Debug, Clone, PartialEq)]
+pub struct SrcsetCandidate {
+    pub url: String,
+    pub descriptor: SrcsetDescriptor,
+}
+
+/// A `srcset` descriptor: `w` (intrinsic width in px) or `x`
+/// (pixel density), or none.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SrcsetDescriptor {
+    Width(u32),
+    Density(f32),
+    None,
+}
+
+/// Parse a `srcset` value into candidates with descriptors
+/// (Stage 11 Rec 10): commas separate candidates; each candidate
+/// is a URL followed by an optional `Nw` or `Nx` descriptor.
+/// Malformed candidates (empty URL, bad descriptor, mixed `w`
+/// and `x` in one candidate) are dropped, never fatal.
+pub fn parse_srcset(srcset: &str) -> Vec<SrcsetCandidate> {
+    let mut out = Vec::new();
+    for cand in srcset.split(',') {
+        let mut parts = cand.split_whitespace();
+        let Some(url) = parts.next().filter(|u| !u.is_empty()) else {
+            continue;
+        };
+        if url.starts_with("data:") {
+            continue;
+        }
+        let descriptor = match parts.next() {
+            None => SrcsetDescriptor::None,
+            Some(d) => {
+                let d = d.trim_end_matches(',');
+                if let Some(w) = d.strip_suffix('w')
+                    && let Ok(n) = w.parse::<u32>()
+                {
+                    SrcsetDescriptor::Width(n)
+                } else if let Some(x) = d.strip_suffix('x')
+                    && let Ok(n) = x.parse::<f32>()
+                    && n > 0.0
+                {
+                    SrcsetDescriptor::Density(n)
+                } else {
+                    // A bad descriptor invalidates the candidate.
+                    continue;
+                }
+            }
+        };
+        out.push(SrcsetCandidate {
+            url: url.to_string(),
+            descriptor,
+        });
+    }
+    out
+}
+
+/// Whether a simple media condition holds at `viewport_width`
+/// (Stage 11 Rec 10 — the subset `sizes` / `<source media>`
+/// need): `(max-width: Npx)` / `(min-width: Npx)` (px or em,
+/// 1em = 16px), `screen` / `all` (true), `print` (false), and
+/// `and` combinations. Anything else is unknown and does not
+/// match — an unknown condition never selects a candidate.
+pub fn media_matches(condition: &str, viewport_width: f32) -> bool {
+    let condition = condition.trim();
+    if condition.is_empty() {
+        return true;
+    }
+    condition.split("and").all(|part| {
+        let part = part.trim().trim_matches(|c| c == '(' || c == ')').trim();
+        if part.is_empty() {
+            return true;
+        }
+        if part.eq_ignore_ascii_case("screen") || part.eq_ignore_ascii_case("all") {
+            return true;
+        }
+        if part.eq_ignore_ascii_case("print") {
+            return false;
+        }
+        let Some((feature, value)) = part.split_once(':') else {
+            return false;
+        };
+        let value = value.trim();
+        let Ok(px) = media_length_px(value) else {
+            return false;
+        };
+        match feature.trim().to_ascii_lowercase().as_str() {
+            "max-width" => viewport_width <= px,
+            "min-width" => viewport_width >= px,
+            _ => false,
+        }
+    })
+}
+
+/// A media-query length in px: `Npx` or `Nem` (1em = 16px).
+fn media_length_px(value: &str) -> Result<f32, ()> {
+    let value = value.trim();
+    if let Some(n) = value.strip_suffix("px") {
+        n.trim().parse::<f32>().map_err(|_| ())
+    } else if let Some(n) = value.strip_suffix("em") {
+        n.trim().parse::<f32>().map(|v| v * 16.0).map_err(|_| ())
+    } else {
+        Err(())
+    }
+}
+
+/// A `sizes` length in px: `Npx`, `Nvw` (percent of the viewport
+/// width), `Nem` (16px each), or `N%` (percent of the viewport
+/// width — `sizes` percentages resolve against the viewport).
+fn sizes_length_px(value: &str, viewport_width: f32) -> Option<f32> {
+    let value = value.trim();
+    if let Some(n) = value.strip_suffix("px") {
+        n.trim().parse::<f32>().ok()
+    } else if let Some(n) = value.strip_suffix("vw") {
+        n.trim().parse::<f32>().ok().map(|v| v / 100.0 * viewport_width)
+    } else if let Some(n) = value.strip_suffix("em") {
+        n.trim().parse::<f32>().ok().map(|v| v * 16.0)
+    } else if let Some(n) = value.strip_suffix('%') {
+        n.trim().parse::<f32>().ok().map(|v| v / 100.0 * viewport_width)
+    } else {
+        None
+    }
+}
+
+/// Evaluate a `sizes` attribute to the source size in px (HTML
+/// Standard §4.8.4.3): the first entry whose media condition
+/// holds wins; the last entry (a bare length, no condition) is
+/// the fallback. `None` sizes means `100vw`.
+pub fn eval_sizes(sizes: Option<&str>, viewport_width: f32) -> f32 {
+    let Some(sizes) = sizes.filter(|s| !s.trim().is_empty()) else {
+        return viewport_width;
+    };
+    let entries: Vec<&str> = sizes.split(',').collect();
+    for (i, entry) in entries.iter().enumerate() {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if i + 1 == entries.len() {
+            // Last entry: a bare length, no media condition.
+            if let Some(px) = sizes_length_px(entry, viewport_width) {
+                return px;
+            }
+            continue;
+        }
+        // `<media-condition> <length>`: the length is the last
+        // whitespace-separated token.
+        let mut parts = entry.rsplitn(2, |c: char| c.is_whitespace());
+        let Some(length) = parts.next() else {
+            continue;
+        };
+        let Some(condition) = parts.next() else {
+            continue;
+        };
+        if media_matches(condition, viewport_width)
+            && let Some(px) = sizes_length_px(length, viewport_width)
+        {
+            return px;
+        }
+    }
+    viewport_width
+}
+
+/// Select the one `srcset` candidate to fetch (Stage 11 Rec 10):
+/// `w` descriptors against the `sizes` source size (smallest
+/// candidate at least as wide as the source, else the largest);
+/// `x` descriptors against the device pixel ratio (smallest
+/// density at least the DPR, else the largest); a bare candidate
+/// is picked as-is. `None` when there is no candidate. Only the
+/// selected URL is ever fetched — emitting every candidate was
+/// the bandwidth bug this replaces.
+pub fn select_srcset(
+    candidates: &[SrcsetCandidate],
+    sizes: Option<&str>,
+    viewport_width: f32,
+    dpr: f32,
+) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+    // `w` descriptors win when any are present (mixed `w`/`x`
+    // sets are invalid per spec; the `x` candidates are dropped).
+    let widths: Vec<(u32, &str)> = candidates
+        .iter()
+        .filter_map(|c| match c.descriptor {
+            SrcsetDescriptor::Width(w) => Some((w, c.url.as_str())),
+            _ => None,
+        })
+        .collect();
+    if !widths.is_empty() {
+        let source_size = eval_sizes(sizes, viewport_width);
+        let mut best: Option<(u32, &str)> = None;
+        for (w, url) in &widths {
+            if (*w as f32) >= source_size {
+                if best.is_none_or(|(bw, _)| *w < bw) {
+                    best = Some((*w, url));
+                }
+            }
+        }
+        if let Some((_, url)) = best {
+            return Some(url.to_string());
+        }
+        // None wide enough: the largest candidate.
+        return widths
+            .iter()
+            .max_by_key(|(w, _)| *w)
+            .map(|(_, url)| url.to_string());
+    }
+    let densities: Vec<(f32, &str)> = candidates
+        .iter()
+        .filter_map(|c| match c.descriptor {
+            SrcsetDescriptor::Density(x) => Some((x, c.url.as_str())),
+            _ => None,
+        })
+        .collect();
+    if !densities.is_empty() {
+        let mut best: Option<(f32, &str)> = None;
+        for (x, url) in &densities {
+            if *x >= dpr && best.is_none_or(|(bx, _)| *x < bx) {
+                best = Some((*x, url));
+            }
+        }
+        if let Some((_, url)) = best {
+            return Some(url.to_string());
+        }
+        return densities
+            .iter()
+            .max_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(_, url)| url.to_string());
+    }
+    // No descriptor at all: the (single) bare candidate.
+    candidates.first().map(|c| c.url.clone())
+}
+
+/// One `<source>` inside a `<picture>` (Stage 11 Rec 10): its
+/// `srcset` plus the `media` / `type` that decide whether it
+/// applies. Raw attribute values, unresolved.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PictureSource {
+    pub srcset: Option<String>,
+    pub media: Option<String>,
+    pub type_: Option<String>,
+}
+
+/// Whether a `<source type>` is a format Pluto decodes (Stage 11
+/// Rec 10): the `image` crate's formats. Parameters (`;...`) are
+/// stripped; an empty type always applies.
+pub fn source_type_supported(type_: Option<&str>) -> bool {
+    let Some(type_) = type_.filter(|t| !t.trim().is_empty()) else {
+        return true;
+    };
+    let mime = type_.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    matches!(
+        mime.as_str(),
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    )
+}
+
+/// Select the image URL for an `<img>` (Stage 11 Rec 10, HTML
+/// Standard §4.8.4): `<picture>` `<source>` media/type matching
+/// first, in document order — the first matching source's srcset
+/// selects; then the img's own srcset; then `img[src]`. Returns
+/// the selected URL plus whether it came from a srcset / source
+/// (an `imageset` initiator for the mixed-content gate) or from
+/// plain `src`.
+pub fn select_img_url(
+    sources: &[PictureSource],
+    img_srcset: Option<&str>,
+    img_sizes: Option<&str>,
+    img_src: Option<&str>,
+    viewport_width: f32,
+    dpr: f32,
+) -> Option<(String, bool)> {
+    for source in sources {
+        let media_ok = source
+            .media
+            .as_deref()
+            .is_none_or(|m| media_matches(m, viewport_width));
+        if !media_ok || !source_type_supported(source.type_.as_deref()) {
+            continue;
+        }
+        if let Some(srcset) = source.srcset.as_deref()
+            && let Some(url) = select_srcset(
+                &parse_srcset(srcset),
+                img_sizes,
+                viewport_width,
+                dpr,
+            )
+        {
+            return Some((url, true));
+        }
+    }
+    if let Some(srcset) = img_srcset.filter(|s| !s.trim().is_empty())
+        && let Some(url) = select_srcset(&parse_srcset(srcset), img_sizes, viewport_width, dpr)
+    {
+        return Some((url, true));
+    }
+    img_src
+        .filter(|s| !s.trim().is_empty() && !s.trim_start().starts_with("data:"))
+        .map(|s| (s.to_string(), false))
+}
+
+/// Whether a connection hint warms a hostname (Stage 11 Rec 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintKind {
+    /// DNS + TCP + TLS warm, socket parked in the pool.
+    Preconnect,
+    /// DNS resolve only, no connection.
+    DnsPrefetch,
+}
+
+/// One `preconnect` / `dns-prefetch` hint (Stage 11 Rec 6): a
+/// `<link>` the scanner records but never fetches — the tab
+/// thread acts on it (DNS-only for prefetch, full warm for
+/// preconnect). Resolved against the document base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionHint {
+    pub url: String,
+    pub kind: HintKind,
+}
+
+/// Scan buffered HTML bytes for connection hints (`<link
+/// rel="preconnect">` / `rel="dns-prefetch">`), resolved against
+/// `document_url` (and any `<base href>` in the scanned prefix).
+/// Hints are not fetches: the scanner never downloads them, and
+/// neither does the preload path — the tab thread warms them
+/// (Rec 6) after the blocker + HSTS gates.
+pub fn scan_hints(bytes: &[u8], document_url: &str) -> Vec<ConnectionHint> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut tokenizer = Tokenizer::new();
+    tokenizer.feed_str(&text);
+    tokenizer.set_eof();
+    let mut hints = Vec::new();
+    let mut base: Option<String> = None;
+    while let Some(token) = tokenizer.next_token() {
+        match token {
+            Token::Eof => break,
+            Token::StartTag(tag) => {
+                if tag.name == "base" {
+                    if base.is_none()
+                        && let Some(href) = attr(&tag.attrs, "href")
+                        && !href.trim().is_empty()
+                    {
+                        base = Some(resolve_url(document_url, href));
+                    }
+                    continue;
+                }
+                if tag.name != "link" {
+                    continue;
+                }
+                let rel = attr(&tag.attrs, "rel").unwrap_or("");
+                let rel_lc = rel.to_ascii_lowercase();
+                let rels: Vec<&str> = rel_lc.split_whitespace().collect();
+                let kind = if rels.contains(&"preconnect") {
+                    HintKind::Preconnect
+                } else if rels.contains(&"dns-prefetch") {
+                    HintKind::DnsPrefetch
+                } else {
+                    continue;
+                };
+                if let Some(href) = attr(&tag.attrs, "href")
+                    && !href.trim().is_empty()
+                    && !href.trim_start().starts_with("data:")
+                {
+                    let b = base.clone().unwrap_or_else(|| document_url.to_string());
+                    hints.push(ConnectionHint {
+                        url: resolve_url(&b, href),
+                        kind,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    hints
 }
 
 /// Classify one element's fetchable attributes. Shared by the preload
@@ -202,6 +579,14 @@ fn srcset_urls(srcset: &str) -> Vec<String> {
 /// `<video>`/`<audio>` it is media (`Destination::Other` — there is no
 /// audio/video destination in the v1 protocol).
 ///
+/// `viewport_width` / `dpr` drive `srcset` selection (Stage 11 Rec
+/// 10): an `<img>` with a `srcset` emits exactly ONE discovery —
+/// the selected candidate — never every candidate. An `<img>`
+/// inside a `<picture>` emits NOTHING here: its candidates live on
+/// sibling `<source>` elements, so the caller selects from them
+/// ([`select_img_url`] / [`select_img_url_from_dom`]) and emits the
+/// one selected URL itself.
+///
 /// Returns raw (unresolved) URLs; the caller resolves them against the
 /// document base with [`resolve_url`].
 pub fn classify_element(
@@ -209,6 +594,8 @@ pub fn classify_element(
     attrs: &[(String, String)],
     in_picture: bool,
     in_media: bool,
+    viewport_width: f32,
+    dpr: f32,
 ) -> Vec<RawDiscovery> {
     let mut out = Vec::new();
     let has = |name: &str| attr(attrs, name).is_some_and(|v| !v.trim().is_empty());
@@ -241,28 +628,53 @@ pub fn classify_element(
             }
         }
         "img" => {
-            if let Some(src) = attr(attrs, "src") {
+            // Stage 11 Rec 10: an <img> inside a <picture> emits
+            // nothing here — the caller selects from the picture's
+            // <source> siblings + this img (see the fn docs).
+            // Outside a picture, the srcset selects exactly one
+            // candidate; without a srcset the plain src is the
+            // discovery.
+            if in_picture {
+                // Caller-selected; nothing to emit.
+            } else if let Some(srcset) = attr(attrs, "srcset")
+                && !srcset.trim().is_empty()
+            {
+                let sizes = attr(attrs, "sizes");
+                if let Some(url) = select_srcset(
+                    &parse_srcset(srcset),
+                    sizes,
+                    viewport_width,
+                    dpr,
+                ) {
+                    out.push(RawDiscovery {
+                        url,
+                        destination: Destination::Image,
+                        priority: fetch_priority(attrs, Priority::Low),
+                        // Stage 9 Rec 6: a `srcset` candidate is
+                        // an `imageset` initiator (Mixed Content
+                        // L2 §3.1) — it blocks on a secure page,
+                        // never auto-upgrades.
+                        from: "imageset",
+                        integrity: integrity.clone(),
+                    });
+                } else if let Some(src) = attr(attrs, "src") {
+                    if !src.trim().is_empty() && !src.trim_start().starts_with("data:") {
+                        out.push(RawDiscovery {
+                            url: src.to_string(),
+                            destination: Destination::Image,
+                            priority: fetch_priority(attrs, Priority::Low),
+                            from: "img[src]",
+                            integrity: integrity.clone(),
+                        });
+                    }
+                }
+            } else if let Some(src) = attr(attrs, "src") {
                 if !src.trim().is_empty() && !src.trim_start().starts_with("data:") {
                     out.push(RawDiscovery {
                         url: src.to_string(),
                         destination: Destination::Image,
                         priority: fetch_priority(attrs, Priority::Low),
                         from: "img[src]",
-                        integrity: integrity.clone(),
-                    });
-                }
-            }
-            if let Some(srcset) = attr(attrs, "srcset") {
-                for url in srcset_urls(srcset) {
-                    out.push(RawDiscovery {
-                        url,
-                        destination: Destination::Image,
-                        priority: fetch_priority(attrs, Priority::Low),
-                        // Stage 9 Rec 6: a `srcset` candidate is an
-                        // `imageset` initiator (Mixed Content L2
-                        // §3.1) — it blocks on a secure page, never
-                        // auto-upgrades.
-                        from: "imageset",
                         integrity: integrity.clone(),
                     });
                 }
@@ -281,6 +693,12 @@ pub fn classify_element(
                         });
                     }
                 }
+            } else if in_picture {
+                // Stage 11 Rec 10: a `<source>` inside a
+                // `<picture>` is consumed by the `<img>`'s
+                // candidate selection (media/type matching, then
+                // srcset selection) — it emits nothing on its own,
+                // or every picture would fetch every source.
             } else {
                 if let Some(src) = attr(attrs, "src") {
                     if !src.trim().is_empty() {
@@ -292,11 +710,7 @@ pub fn classify_element(
                             // `<picture>` is an `imageset` initiator
                             // (L2 §3.1); outside one it is a plain
                             // image fetch.
-                            from: if in_picture {
-                                "imageset"
-                            } else {
-                                "source[src]"
-                            },
+                            from: "source[src]",
                             integrity: integrity.clone(),
                         });
                     }
@@ -345,7 +759,16 @@ pub fn classify_element(
                             integrity: integrity.clone(),
                         });
                         if let Some(srcset) = attr(attrs, "imagesrcset") {
-                            for url in srcset_urls(srcset) {
+                            // Stage 11 Rec 10: one selected
+                            // candidate, not every candidate —
+                            // `imagesizes` is this link's `sizes`.
+                            let sizes = attr(attrs, "imagesizes");
+                            if let Some(url) = select_srcset(
+                                &parse_srcset(srcset),
+                                sizes,
+                                viewport_width,
+                                dpr,
+                            ) {
                                 out.push(RawDiscovery {
                                     url,
                                     destination: Destination::Image,
@@ -449,6 +872,51 @@ pub fn classify_element(
     out
 }
 
+/// Select the image URL for an `<img>` node from the finished DOM
+/// (Stage 11 Rec 10): the `<picture>` parent's `<source>` children
+/// (media/type matching, in document order), then the img's own
+/// `srcset`, then `src` — the same selection [`select_img_url`]
+/// performs, read off the DOM instead of a tracked source list.
+/// The streaming parser calls this when it creates an `<img>`,
+/// so the parser path selects exactly one candidate too.
+pub fn select_img_url_from_dom(
+    dom: &crate::Dom,
+    img: crate::NodeId,
+    viewport_width: f32,
+    dpr: f32,
+) -> Option<(String, bool)> {
+    let srcset = dom.attr(img, "srcset").map(str::to_string);
+    let sizes = dom.attr(img, "sizes").map(str::to_string);
+    let src = dom.attr(img, "src").map(str::to_string);
+    let mut sources = Vec::new();
+    if let Some(parent) = dom.get(img).and_then(|n| n.parent)
+        && dom.tag(parent) == Some("picture")
+    {
+        for &child in dom.children(parent) {
+            if dom.tag(child) == Some("source") {
+                sources.push(PictureSource {
+                    // A <source> with only `src` (no `srcset`)
+                    // counts as a single bare candidate.
+                    srcset: dom
+                        .attr(child, "srcset")
+                        .map(str::to_string)
+                        .or_else(|| dom.attr(child, "src").map(str::to_string)),
+                    media: dom.attr(child, "media").map(str::to_string),
+                    type_: dom.attr(child, "type").map(str::to_string),
+                });
+            }
+        }
+    }
+    select_img_url(
+        &sources,
+        srcset.as_deref(),
+        sizes.as_deref(),
+        src.as_deref(),
+        viewport_width,
+        dpr,
+    )
+}
+
 /// Scan buffered HTML bytes for fetchable subresources, resolved
 /// against `document_url` (and any `<base href>` in the scanned
 /// prefix). Best-effort: undecodable bytes become U+FFFD (the
@@ -456,8 +924,26 @@ pub fn classify_element(
 /// ignored — the main parser re-reads the same bytes authoritatively.
 ///
 /// The scanner emits in document order and does not dedup (the Stage
-/// 5 scheduler dedups by URL + destination + epoch).
+/// 5 scheduler dedups by URL + destination + epoch). It DOES select
+/// (Stage 11 Rec 10): an `<img>` with a `srcset` / `<picture>`
+/// emits exactly ONE discovery — the selected candidate — at the
+/// default viewport (1024 px, DPR 1.0). Callers with the real
+/// viewport use [`scan_with_viewport`].
 pub fn scan(bytes: &[u8], document_url: &str) -> Vec<DiscoveredResource> {
+    scan_with_viewport(bytes, document_url, 1024.0, 1.0)
+}
+
+/// Like [`scan`], with the layout viewport width (CSS px) and
+/// device pixel ratio that `srcset` / `sizes` / `<picture>`
+/// selection evaluates against. The preload path calls this with
+/// the shell's real viewport, so a responsive image preloads the
+/// candidate the page will actually use.
+pub fn scan_with_viewport(
+    bytes: &[u8],
+    document_url: &str,
+    viewport_width: f32,
+    dpr: f32,
+) -> Vec<DiscoveredResource> {
     let text = String::from_utf8_lossy(bytes);
     let mut tokenizer = Tokenizer::new();
     tokenizer.feed_str(&text);
@@ -467,6 +953,10 @@ pub fn scan(bytes: &[u8], document_url: &str) -> Vec<DiscoveredResource> {
     let mut template_depth: usize = 0;
     let mut picture_depth: usize = 0;
     let mut media_depth: usize = 0;
+    // The current <picture>'s <source> elements, in document
+    // order (Stage 11 Rec 10): an <img> inside the picture
+    // selects from these, so they are tracked, not emitted.
+    let mut picture_sources: Vec<PictureSource> = Vec::new();
     let effective_base = |base: &Option<String>| -> String {
         base.clone().unwrap_or_else(|| document_url.to_string())
     };
@@ -477,7 +967,10 @@ pub fn scan(bytes: &[u8], document_url: &str) -> Vec<DiscoveredResource> {
                 let name = tag.name.clone();
                 match name.as_str() {
                     "template" => template_depth += 1,
-                    "picture" => picture_depth += 1,
+                    "picture" => {
+                        picture_depth += 1;
+                        picture_sources.clear();
+                    }
                     "video" | "audio" => media_depth += 1,
                     _ => {}
                 }
@@ -495,7 +988,51 @@ pub fn scan(bytes: &[u8], document_url: &str) -> Vec<DiscoveredResource> {
                     let in_picture = picture_depth > 0;
                     let in_media = media_depth > 0;
                     let b = effective_base(&base);
-                    for raw in classify_element(&name, &tag.attrs, in_picture, in_media) {
+                    if name == "source" && in_picture {
+                        // Tracked for the <img>'s selection, not
+                        // emitted (see `classify_element`).
+                        picture_sources.push(PictureSource {
+                            srcset: attr(&tag.attrs, "srcset")
+                                .map(str::to_string)
+                                .or_else(|| attr(&tag.attrs, "src").map(str::to_string)),
+                            media: attr(&tag.attrs, "media").map(str::to_string),
+                            type_: attr(&tag.attrs, "type").map(str::to_string),
+                        });
+                        continue;
+                    }
+                    if name == "img" && in_picture {
+                        // Stage 11 Rec 10: one selected candidate
+                        // for the whole <picture> (source media /
+                        // type first, then the img's own srcset,
+                        // then src).
+                        let integrity = attr(&tag.attrs, "integrity").map(str::to_string);
+                        let selected = select_img_url(
+                            &picture_sources,
+                            attr(&tag.attrs, "srcset"),
+                            attr(&tag.attrs, "sizes"),
+                            attr(&tag.attrs, "src"),
+                            viewport_width,
+                            dpr,
+                        );
+                        if let Some((url, is_imageset)) = selected {
+                            discoveries.push(DiscoveredResource {
+                                url: resolve_url(&b, &url),
+                                destination: Destination::Image,
+                                priority: Priority::Low,
+                                from: if is_imageset { "imageset" } else { "img[src]" },
+                                integrity,
+                            });
+                        }
+                        continue;
+                    }
+                    for raw in classify_element(
+                        &name,
+                        &tag.attrs,
+                        in_picture,
+                        in_media,
+                        viewport_width,
+                        dpr,
+                    ) {
                         discoveries.push(DiscoveredResource {
                             url: resolve_url(&b, &raw.url),
                             destination: raw.destination,
@@ -508,7 +1045,12 @@ pub fn scan(bytes: &[u8], document_url: &str) -> Vec<DiscoveredResource> {
             }
             Token::EndTag(tag) => match tag.name.as_str() {
                 "template" => template_depth = template_depth.saturating_sub(1),
-                "picture" => picture_depth = picture_depth.saturating_sub(1),
+                "picture" => {
+                    picture_depth = picture_depth.saturating_sub(1);
+                    if picture_depth == 0 {
+                        picture_sources.clear();
+                    }
+                }
                 "video" | "audio" => media_depth = media_depth.saturating_sub(1),
                 _ => {}
             },
@@ -551,6 +1093,8 @@ mod tests {
 
     #[test]
     fn discovers_preload_srcset_poster() {
+        // Stage 11 Rec 10: a srcset selects ONE candidate (dpr
+        // 1.0 → the 1x), not every candidate.
         let found = scan(
             br#"<link rel=preload as=font href="f.woff2"><img srcset="a.png 1x, b.png 2x"><video poster="p.jpg"></video>"#,
             DOC,
@@ -559,13 +1103,10 @@ mod tests {
         assert_eq!(found[0].url, "https://example.com/dir/f.woff2");
         assert_eq!(
             urls(&found[1..]),
-            vec![
-                "https://example.com/dir/a.png",
-                "https://example.com/dir/b.png",
-                "https://example.com/dir/p.jpg",
-            ]
+            vec!["https://example.com/dir/a.png", "https://example.com/dir/p.jpg",]
         );
-        assert_eq!(found[3].from, "video[poster]");
+        assert_eq!(found[1].from, "imageset");
+        assert_eq!(found[2].from, "video[poster]");
     }
 
     #[test]
@@ -637,13 +1178,22 @@ mod tests {
     }
 
     #[test]
-    fn source_in_picture_is_image_in_video_is_other() {
+    fn source_in_picture_is_selected_by_the_img_in_video_is_other() {
+        // Stage 11 Rec 10: a <picture> <source> emits nothing on
+        // its own — the <img> selects from it. A <source> in a
+        // <video> is still media (Other).
         let found = scan(
-            br#"<picture><source srcset="p.webp"></picture><video><source src="v.mp4"></video>"#,
+            br#"<picture><source srcset="p.webp"><img src="fallback.png"></picture><video><source src="v.mp4"></video>"#,
             DOC,
         );
+        assert_eq!(found.len(), 2, "{found:?}");
         assert_eq!(found[0].destination, Destination::Image);
+        assert_eq!(found[0].url, "https://example.com/dir/p.webp");
+        assert_eq!(found[0].from, "imageset");
         assert_eq!(found[1].destination, Destination::Other);
+        // And a <picture> with no <img> selects nothing.
+        let found = scan(br#"<picture><source srcset="p.webp"></picture>"#, DOC);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
@@ -652,7 +1202,9 @@ mod tests {
         // `<picture>` image candidates carry the `imageset`
         // initiator label, so the mixed-content gate can block
         // them instead of auto-upgrading. Plain `img[src]` keeps
-        // its own label (and keeps auto-upgrading).
+        // its own label (and keeps auto-upgrading). Stage 11 Rec
+        // 10: each srcset selects ONE candidate, and a <picture>
+        // with no <img> selects nothing.
         let found = scan(
             br#"<img src="plain.png"><img srcset="a.png 1x, b.png 2x"><picture><source src="p.jpg"><source srcset="q.webp"></picture><link rel="preload" as="image" href="h.png" imagesrcset="i.png 1x">"#,
             DOC,
@@ -660,16 +1212,17 @@ mod tests {
         let labels: Vec<&str> = found.iter().map(|d| d.from).collect();
         assert_eq!(
             labels,
-            vec![
-                "img[src]",
-                "imageset",
-                "imageset",
-                "imageset",
-                "imageset",
-                "link[rel=preload]",
-                "imageset",
-            ],
+            vec!["img[src]", "imageset", "link[rel=preload]", "imageset",],
             "srcset/picture candidates are imageset: {found:?}"
+        );
+        assert_eq!(
+            urls(&found),
+            vec![
+                "https://example.com/dir/plain.png",
+                "https://example.com/dir/a.png",
+                "https://example.com/dir/h.png",
+                "https://example.com/dir/i.png",
+            ]
         );
         // And a `<source>` outside a `<picture>` is not.
         let found = scan(br#"<source src="s.jpg">"#, DOC);
@@ -691,14 +1244,16 @@ mod tests {
         assert_eq!(found[1].from, "img[src]");
         assert_eq!(found[2].integrity.as_deref(), Some("sha512-ghi"));
         assert_eq!(found[2].from, "link[rel=stylesheet]");
-        // A srcset candidate shares its <img>'s integrity value.
+        // A srcset candidate shares its <img>'s integrity value
+        // (and only the selected candidate is emitted).
         let found = scan(
             br#"<img srcset="a.png 1x, b.png 2x" integrity="sha256-xyz">"#,
             DOC,
         );
-        assert_eq!(found.len(), 2);
-        assert!(found.iter().all(|d| d.integrity.as_deref() == Some("sha256-xyz")));
-        assert!(found.iter().all(|d| d.from == "imageset"));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].url, "https://example.com/dir/a.png");
+        assert_eq!(found[0].integrity.as_deref(), Some("sha256-xyz"));
+        assert_eq!(found[0].from, "imageset");
     }
 
     #[test]
@@ -738,5 +1293,146 @@ mod tests {
             resolve_url("https://example.com/dir/page.html", "../up.css"),
             "https://example.com/up.css"
         );
+    }
+
+    // Stage 11 Rec 10: srcset / sizes / <picture> selection.
+
+    #[test]
+    fn srcset_w_selection_uses_sizes_and_viewport() {
+        // sizes="(max-width: 600px) 400px, 800px": at a 500px
+        // viewport the source size is 400px → the smallest
+        // candidate ≥ 400px (800w); at 1024px the source is
+        // 800px → the 800w candidate exactly.
+        let found = scan_with_viewport(
+            br#"<img srcset="small.png 200w, medium.png 800w, large.png 1600w" sizes="(max-width: 600px) 400px, 800px">"#,
+            DOC,
+            500.0,
+            1.0,
+        );
+        assert_eq!(urls(&found), vec!["https://example.com/dir/medium.png"]);
+        let found = scan_with_viewport(
+            br#"<img srcset="small.png 200w, medium.png 800w, large.png 1600w" sizes="(max-width: 600px) 400px, 800px">"#,
+            DOC,
+            1024.0,
+            1.0,
+        );
+        assert_eq!(urls(&found), vec!["https://example.com/dir/medium.png"]);
+        // No candidate wide enough: the largest.
+        let found = scan_with_viewport(
+            br#"<img srcset="small.png 200w, medium.png 800w" sizes="2000px">"#,
+            DOC,
+            1024.0,
+            1.0,
+        );
+        assert_eq!(urls(&found), vec!["https://example.com/dir/medium.png"]);
+        // No sizes: 100vw.
+        let found = scan_with_viewport(
+            br#"<img srcset="small.png 200w, medium.png 800w, large.png 1600w">"#,
+            DOC,
+            500.0,
+            1.0,
+        );
+        assert_eq!(urls(&found), vec!["https://example.com/dir/medium.png"]);
+    }
+
+    #[test]
+    fn srcset_x_selection_uses_device_pixel_ratio() {
+        let html = br#"<img srcset="a.png 1x, b.png 2x, c.png 3x">"#;
+        // DPR 1.0 → 1x; DPR 2.0 → 2x; DPR 2.5 → 3x (smallest ≥ dpr).
+        assert_eq!(
+            urls(&scan_with_viewport(html, DOC, 1024.0, 1.0)),
+            vec!["https://example.com/dir/a.png"]
+        );
+        assert_eq!(
+            urls(&scan_with_viewport(html, DOC, 1024.0, 2.0)),
+            vec!["https://example.com/dir/b.png"]
+        );
+        assert_eq!(
+            urls(&scan_with_viewport(html, DOC, 1024.0, 2.5)),
+            vec!["https://example.com/dir/c.png"]
+        );
+        // DPR past the largest: the largest.
+        assert_eq!(
+            urls(&scan_with_viewport(html, DOC, 1024.0, 4.0)),
+            vec!["https://example.com/dir/c.png"]
+        );
+    }
+
+    #[test]
+    fn picture_source_media_and_type_matching() {
+        // The first source whose media matches AND whose type is
+        // supported wins; a WebP source is picked on this build,
+        // an SVG source is skipped for the img fallback.
+        let found = scan_with_viewport(
+            br#"<picture><source media="(max-width: 600px)" srcset="small.webp" type="image/webp"><source srcset="big.png"><img src="fallback.png"></picture>"#,
+            DOC,
+            500.0,
+            1.0,
+        );
+        assert_eq!(urls(&found), vec!["https://example.com/dir/small.webp"]);
+        // At a wide viewport the first source's media fails, so
+        // the second source wins.
+        let found = scan_with_viewport(
+            br#"<picture><source media="(max-width: 600px)" srcset="small.webp" type="image/webp"><source srcset="big.png"><img src="fallback.png"></picture>"#,
+            DOC,
+            1024.0,
+            1.0,
+        );
+        assert_eq!(urls(&found), vec!["https://example.com/dir/big.png"]);
+        // An unsupported type is skipped even when its media holds.
+        let found = scan_with_viewport(
+            br#"<picture><source srcset="vector.svg" type="image/svg+xml"><img src="fallback.png"></picture>"#,
+            DOC,
+            1024.0,
+            1.0,
+        );
+        assert_eq!(urls(&found), vec!["https://example.com/dir/fallback.png"]);
+    }
+
+    #[test]
+    fn select_img_url_from_dom_reads_picture_sources() {
+        // The DOM path (streaming parser): same selection, read
+        // off the finished DOM.
+        let dom = crate::parse(
+            r#"<picture><source media="(max-width: 600px)" srcset="small.webp"><img src="fallback.png"></picture>"#,
+        );
+        let img = {
+            let mut found = None;
+            let mut stack = vec![dom.root().unwrap()];
+            while let Some(id) = stack.pop() {
+                if dom.tag(id) == Some("img") {
+                    found = Some(id);
+                    break;
+                }
+                stack.extend(dom.children(id).iter().rev());
+            }
+            found.expect("img in DOM")
+        };
+        assert_eq!(
+            select_img_url_from_dom(&dom, img, 500.0, 1.0),
+            Some(("small.webp".to_string(), true))
+        );
+        assert_eq!(
+            select_img_url_from_dom(&dom, img, 1024.0, 1.0),
+            Some(("fallback.png".to_string(), false))
+        );
+    }
+
+    // Stage 11 Rec 6: connection hints.
+
+    #[test]
+    fn scan_hints_finds_preconnect_and_dns_prefetch() {
+        let hints = scan_hints(
+            br#"<link rel="preconnect" href="https://cdn.example.com"><link rel="dns-prefetch" href="//fonts.example.com"><link rel="stylesheet" href="a.css">"#,
+            DOC,
+        );
+        assert_eq!(hints.len(), 2);
+        assert_eq!(hints[0].kind, HintKind::Preconnect);
+        assert_eq!(hints[0].url, "https://cdn.example.com/");
+        assert_eq!(hints[1].kind, HintKind::DnsPrefetch);
+        assert_eq!(hints[1].url, "https://fonts.example.com/");
+        // No hints on a page without them — and a stylesheet is
+        // not a hint.
+        assert!(scan_hints(br#"<link rel="stylesheet" href="a.css">"#, DOC).is_empty());
     }
 }

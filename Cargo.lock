@@ -4146,6 +4146,7 @@ name = "pluto-browser"
 version = "0.1.0"
 dependencies = [
  "http",
+ "image",
  "libc",
  "libcosmic",
  "pluto-css",
@@ -4155,6 +4156,7 @@ dependencies = [
  "pluto-layout",
  "pluto-net",
  "pluto-paint",
+ "rayon",
  "ring",
  "tokio",
  "tokio-util",
@@ -4245,6 +4247,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
+ "tower-service",
  "tracing",
  "url",
  "webpki-roots",

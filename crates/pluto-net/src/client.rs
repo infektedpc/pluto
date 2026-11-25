@@ -12,7 +12,7 @@
 //! and the pool timer is unset, so idle eviction never runs unless
 //! it is set here.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -21,12 +21,16 @@ use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 
+use crate::dns::{CachedResolver, DnsCache};
+
 /// Body type for the shared client: empty request bodies (GET only
 /// for now; POST bodies arrive with forms at M5).
 pub type Body = Full<Bytes>;
 /// The shared client type: hyper-util legacy client over a
-/// rustls-backed HTTPS connector.
-pub type HttpsClient = Client<HttpsConnector<HttpConnector>, Body>;
+/// rustls-backed HTTPS connector. The connector's resolver is
+/// Pluto's [`CachedResolver`] (Stage 11 Rec 6) — DNS answers are
+/// cached in front of `GaiResolver`, not re-queried per connect.
+pub type HttpsClient = Client<HttpsConnector<HttpConnector<CachedResolver>>, Body>;
 
 /// Maximum idle connections kept per host. Matches the per-origin
 /// HTTP/1.1 concurrency limit (6) — a host cannot accumulate more
@@ -78,12 +82,37 @@ pub fn tls_config() -> Result<rustls::ClientConfig, rustls::Error> {
     Ok(config)
 }
 
-/// Build the HTTPS connector: the explicit TLS config above over a
+/// The one shared TLS config for the whole browser process
+/// (Stage 11 Rec 6): built once, so every connector built from
+/// it — the shared client and the preconnect path — shares the
+/// same rustls session-resumption store (`ClientConfig` clones
+/// share the store's Arc). A fresh config per connector would
+/// prime a store nobody else reads.
+pub fn shared_tls_config() -> &'static Arc<rustls::ClientConfig> {
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        Arc::new(tls_config().expect("rustls safe-default protocol versions always build"))
+    })
+}
+
+/// The one shared DNS cache for the whole browser process
+/// (Stage 11 Rec 6): the shared client's connector and the
+/// preconnect / dns-prefetch paths resolve through this table.
+pub fn shared_dns_cache() -> &'static DnsCache {
+    static CACHE: OnceLock<DnsCache> = OnceLock::new();
+    CACHE.get_or_init(DnsCache::new)
+}
+
+/// Build the HTTPS connector: the shared TLS config above over a
 /// hand-built `HttpConnector` (connect timeout + Happy Eyeballs at
 /// hyper-util's default 300 ms race — verified in the hyper-util
-/// 0.1.21 source; DNS itself stays the OS resolver).
-pub fn build_connector() -> Result<HttpsConnector<HttpConnector>, rustls::Error> {
-    let mut http = HttpConnector::new();
+/// 0.1.21 source; DNS goes through Pluto's [`CachedResolver`]
+/// (Stage 11 Rec 6), so a name resolved once is not re-queried
+/// on the next connect — the old "DNS cache" comment on
+/// [`shared_client`] was wrong: hyper-util's `GaiResolver` calls
+/// `getaddrinfo` per connect, and no cache existed at all).
+pub fn build_connector() -> HttpsConnector<HttpConnector<CachedResolver>> {
+    let mut http = HttpConnector::new_with_resolver(CachedResolver::new(shared_dns_cache().clone()));
     http.set_connect_timeout(Some(CONNECT_TIMEOUT));
     // `HttpConnector::new()` enforces http-only URIs by default
     // (`enforce_http: true`) and rejects https URIs with
@@ -92,33 +121,34 @@ pub fn build_connector() -> Result<HttpsConnector<HttpConnector>, rustls::Error>
     // https navigation. hyper-rustls's own `build()` disables it;
     // a hand-built connector must do the same, or no site loads.
     http.enforce_http(false);
-    Ok(HttpsConnectorBuilder::new()
-        .with_tls_config(tls_config()?)
+    HttpsConnectorBuilder::new()
+        .with_tls_config((**shared_tls_config()).clone())
         .https_or_http()
         .enable_http1()
         .enable_http2()
-        .wrap_connector(http))
+        .wrap_connector(http)
 }
 
 /// Build the shared client with explicit pool caps. Cheap to clone;
 /// clones share the pool.
-pub fn build_client() -> Result<HttpsClient, rustls::Error> {
-    let connector = build_connector()?;
-    Ok(Client::builder(TokioExecutor::new())
+pub fn build_client() -> HttpsClient {
+    let connector = build_connector();
+    Client::builder(TokioExecutor::new())
         .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         .pool_timer(TokioTimer::new())
         .retry_canceled_requests(true)
-        .build(connector))
+        .build(connector)
 }
 
 /// The one shared client for the whole browser process. Built once;
-/// the pool, the TLS resumption store and the DNS cache all live
-/// behind this handle.
+/// the pool and the TLS resumption store live behind this handle.
+/// The DNS cache does NOT live here — it lives in the connector's
+/// resolver ([`shared_dns_cache`]); the old comment claiming
+/// otherwise was wrong (see [`build_connector`]).
 pub fn shared_client() -> &'static HttpsClient {
     static CLIENT: OnceLock<HttpsClient> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| build_client().expect("rustls safe-default protocol versions always build"))
+    CLIENT.get_or_init(build_client)
 }
 
 #[cfg(test)]

@@ -40,3 +40,8 @@ cookie = "0.18"
 # domains for same-site checks, partition keys, and public-suffix
 # rejection in jar.rs.
 psl = "2"
+# `tower-service` 0.3: the `Service<Name>` trait the DNS cache's
+# resolver implements (Stage 11 Rec 6). hyper-util's sealed
+# `Resolve` is implemented for any `Service<Name>`, so this is the
+# hook a Pluto-owned resolver uses.
+tower-service = "0.3"

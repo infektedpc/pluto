@@ -1,6 +1,7 @@
 mod bookmarks;
 mod compositor;
 mod history;
+mod images;
 mod js_host;
 mod page;
 mod renderer;
@@ -33,20 +34,104 @@ use cosmic::app::{Core, Task};
 use cosmic::iced::{Alignment, Length};
 use cosmic::{Application, Element, executor, widget};
 use pluto_ipc::{BrowserToRenderer, CommandSender, InputEvent, RendererToBrowser};
-use pluto_paint::{perf, DisplayList};
+use pluto_paint::{DisplayList, ResourceId, ResourceTable, perf};
 use std::sync::Arc;
 use viewport::WebViewport;
 
+/// One tab (Stage 11 Rec 4): its own compositor holder, history,
+/// title, favicon, renderer channel, and load state. The worker
+/// owns the document; the shell never lays out. Switching tabs
+/// swaps the active compositor — no re-fetch, no re-layout — and
+/// closing a tab kills its renderer (see `close_tab`).
+struct Tab {
+    /// Shell-assigned id, echoed by the worker (never hardcoded 0).
+    id: u64,
+    /// The tab's compositor holder (Stage 4 #3): the last-good
+    /// display list, its resource table, and the scroll offset.
+    compositor: Compositor,
+    /// The tab's renderer command channel, once its subscription
+    /// starts it (`RendererReady`). `None` until then.
+    renderer_tx: Option<CommandSender>,
+    /// The tab's decoded resources, accumulated from the
+    /// worker's `ResourceReady` frames (Stage 11 Rec 1): the
+    /// display list validates against this table, never against
+    /// the (empty) table in the submit message. Held as an `Arc`
+    /// so a submit clones the pointer, not the pixels; a
+    /// `ResourceReady` insert uses `Arc::make_mut` (one map copy
+    /// per insert batch after a submit — the M5 broker moves
+    /// resources to shared memory and removes this copy).
+    resources: Arc<ResourceTable>,
+    /// Minimal session history (R17), per tab: every committed
+    /// URL, in order, plus the index of the current entry.
+    /// Address-bar navigation and link clicks push entries (in
+    /// `DidCommit`); Back/Forward move the index and navigate
+    /// with `history_nav` set, so the commit they cause does not
+    /// push a duplicate. `:visited` reads the same committed
+    /// URLs worker-side — the worker's set and this history hold
+    /// the same URLs, with no IPC change. Stage 10 Rec 8:
+    /// `history.json` in the profile (newest 50) is saved on
+    /// every push of the ACTIVE tab only — per-tab persistence
+    /// is a follow-up, so a background tab's history does not
+    /// survive a restart.
+    history: Vec<String>,
+    history_index: usize,
+    history_nav: bool,
+    /// The page title, from the worker's `TitleChanged` (Stage
+    /// 11 Rec 8); the URL until the first title arrives. Shown
+    /// in the tab strip and, for the active tab, the window title.
+    title: String,
+    /// The favicon's resource id in this tab's table (Stage 11
+    /// Rec 7), if the site has one.
+    favicon_id: Option<ResourceId>,
+    /// The address bar's text for this tab.
+    url_input: String,
+    /// The committed URL for this tab.
+    active_url: String,
+    /// The status line's text for this tab.
+    status: String,
+    /// A navigation that arrived before the tab's worker started
+    /// (the first load), flushed on `RendererReady`.
+    pending_url: Option<String>,
+    /// Document-load progress, if a load is in flight (Stage 11
+    /// Rec 9): bytes received vs `Content-Length` (`None` =
+    /// indeterminate). Cleared on commit.
+    progress: Option<(u64, Option<u64>)>,
+}
+
+impl Tab {
+    /// A fresh tab for `url` (not yet navigated — the
+    /// subscription starts its renderer, and `pending_url` is
+    /// flushed on `RendererReady`).
+    fn new(id: u64, url: String) -> Self {
+        Self {
+            id,
+            compositor: Compositor::new(),
+            renderer_tx: None,
+            resources: Arc::new(ResourceTable::new()),
+            history: Vec::new(),
+            history_index: 0,
+            history_nav: false,
+            title: url.clone(),
+            favicon_id: None,
+            url_input: url.clone(),
+            active_url: url.clone(),
+            status: format!("Loading {url}…"),
+            pending_url: Some(url),
+            progress: None,
+        }
+    }
+}
+
 pub struct PlutoBrowser {
     core: Core,
-    url_input: String,
-    active_url: String,
-    /// The shell's compositor holder (Stage 4 #3): the last-good
-    /// display list, its resource table, and the scroll offset.
-    /// The worker owns the document; the shell never lays out.
-    compositor: Compositor,
-    status: String,
-    /// Last viewport sent to the worker (CSS px, logical — the page
+    /// The tabs, in strip order (Stage 11 Rec 4). Exactly one
+    /// is active; switching swaps the compositor with no
+    /// re-fetch and no re-layout.
+    tabs: Vec<Tab>,
+    active_tab: usize,
+    /// The next shell-assigned tab id.
+    next_tab_id: u64,
+    /// Last viewport sent to the workers (CSS px, logical — the page
     /// area of the window). Starts at the default window size; the
     /// viewport widget corrects it on the first frame.
     viewport: (f32, f32),
@@ -56,28 +141,6 @@ pub struct PlutoBrowser {
     /// lists (the worker still runs JS timers), and the flag is
     /// re-synced to a restarted worker on `RendererReady`.
     visible: bool,
-    /// The worker's command channel, once the subscription starts
-    /// it (`RendererReady`). `None` until then.
-    renderer_tx: Option<CommandSender>,
-    /// A navigation that arrived before the worker started (the
-    /// first load), flushed on `RendererReady`.
-    pending_url: Option<String>,
-    /// Minimal session history (R17): every committed URL, in order,
-    /// plus the index of the current entry. Address-bar navigation
-    /// and link clicks push entries (in `DidCommit`); Back/Forward
-    /// move the index and navigate with `history_nav` set, so the
-    /// commit they cause does not push a duplicate. `:visited` reads
-    /// the same committed URLs worker-side (`TabState::visited_urls`
-    /// in renderer.rs, projected into `ElementState::visited` before
-    /// each layout pass) — the worker's set and this history hold
-    /// the same URLs, with no IPC change. Stage 10 Rec 8: the
-    /// history is persisted to `history.json` in the profile
-    /// (newest 50, see `history.rs`) — loaded at startup, saved on
-    /// every push — so it (and `:visited`, seeded from it
-    /// worker-side) survives a restart.
-    history: Vec<String>,
-    history_index: usize,
-    history_nav: bool,
     /// The persisted bookmarks (nav feature): toggled by the
     /// star, listed in the hamburger menu's Bookmarks panel.
     bookmarks: BookmarkStore,
@@ -86,7 +149,7 @@ pub struct PlutoBrowser {
     menu_open: bool,
     /// The open Bookmarks/History list panel, if any. The lists
     /// read the real stores: bookmarks from the profile store,
-    /// history from the session history above.
+    /// history from the active tab's session history.
     panel: Option<Panel>,
     /// The modifier keys currently held, as of the last key event
     /// (Stage 8 Rec 9): pointer/wheel messages carry no modifiers
@@ -128,10 +191,21 @@ pub enum Message {
     RemoveBookmark(String),
     /// Menu: open a second Pluto window (a new process).
     NewWindow,
-    /// The worker subscription started: this is its command sender.
-    RendererReady(CommandSender),
-    /// One event from the worker (commit, display list, failure...).
-    RendererEvent(RendererToBrowser),
+    /// Open a new tab (Stage 11 Rec 4): the tab strip's "+" and
+    /// the menu's "New Tab" item, plus Ctrl+T.
+    NewTab,
+    /// Close the tab at this strip index (Stage 11 Rec 4): the
+    /// tab's "×" button, plus Ctrl+W. The last tab cannot close.
+    CloseTab(usize),
+    /// Select the tab at this strip index (Stage 11 Rec 4):
+    /// clicking its tab-strip button, plus Ctrl+Tab to cycle.
+    SelectTab(usize),
+    /// A tab's worker subscription started: the tab id and its
+    /// command sender.
+    RendererReady(u64, CommandSender),
+    /// One event from a tab's worker (commit, display list,
+    /// failure...), tagged with the tab id.
+    RendererEvent(u64, RendererToBrowser),
     /// The viewport widget's bounds changed (window resize, or the
     /// first frame reporting the real page area).
     ViewportResized(f32, f32),
@@ -177,41 +251,131 @@ pub enum Message {
 }
 
 impl PlutoBrowser {
-    /// Post one command to the worker, if it is running. A failed
-    /// send means the worker is gone; the subscription restarts it
-    /// and `RendererReady` re-syncs state.
+    /// The active tab (read-only).
+    fn active(&self) -> &Tab {
+        &self.tabs[self.active_tab]
+    }
+
+    /// The active tab (mutable).
+    fn active_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active_tab]
+    }
+
+    /// The tab with this shell-assigned id, if it still exists
+    /// (a `RendererReady` for a tab closed before its worker
+    /// started finds nothing here and is ignored).
+    fn tab_mut(&mut self, id: u64) -> Option<&mut Tab> {
+        self.tabs.iter_mut().find(|tab| tab.id == id)
+    }
+
+    /// The strip index of the tab with this id, if it exists.
+    fn tab_index(&self, id: u64) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == id)
+    }
+
+    /// The window title follows the active tab (Stage 11 Rec 8):
+    /// its page title once known, else its URL — "Pluto" only
+    /// when the tab has neither.
+    fn sync_window_title(&mut self) {
+        let title = self.active().title.clone();
+        self.core.window.header_title = if title.is_empty() {
+            "Pluto".to_string()
+        } else {
+            title
+        };
+    }
+
+    /// Open a new tab on `url` and select it (Stage 11 Rec 4).
+    /// The tab's renderer starts with the subscription (its id
+    /// keys it), and the pending navigation flushes on
+    /// `RendererReady` — the new tab loads without disturbing
+    /// the tab it came from.
+    fn new_tab(&mut self, url: String) {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.push(Tab::new(id, url));
+        self.active_tab = self.tabs.len() - 1;
+        self.sync_window_title();
+    }
+
+    /// Close the tab at `index` (Stage 11 Rec 4): ask its
+    /// renderer to shut down, then drop the tab. The last tab
+    /// cannot close — there is always at least one. The neighbour
+    /// takes over (same index, or the one before it when the
+    /// last tab closed).
+    fn close_tab(&mut self, index: usize) {
+        if self.tabs.len() <= 1 || index >= self.tabs.len() {
+            return;
+        }
+        let mut tab = self.tabs.remove(index);
+        if let Some(tx) = tab.renderer_tx.take() {
+            let _ = tx.send(BrowserToRenderer::Shutdown);
+        }
+        // The tab's renderer is dropped with the tab: its child
+        // process is SIGKILLed on drop (see `renderer_process`),
+        // so a closed tab leaks no process.
+        if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        } else if index < self.active_tab {
+            self.active_tab -= 1;
+        }
+        self.sync_window_title();
+    }
+
+    /// Post one command to the active tab's worker, if it is
+    /// running. A failed send means the worker is gone; the
+    /// subscription restarts it and `RendererReady` re-syncs state.
     fn send_command(&mut self, command: BrowserToRenderer) {
-        if let Some(tx) = &self.renderer_tx
+        let tab = self.active_mut();
+        if let Some(tx) = &tab.renderer_tx
             && tx.send(command).is_err()
         {
-            self.renderer_tx = None;
+            tab.renderer_tx = None;
         }
     }
 
-    /// Start a navigation: update the address bar and status, reset
-    /// the scroll, and hand the URL to the worker — or hold it until
-    /// the worker starts. The old page stays visible until the new
-    /// list lands: the holder keeps the last-good list.
-    fn commit(&mut self, url: String) {
-        self.active_url = url.clone();
-        self.url_input = url.clone();
-        self.compositor.reset_scroll();
-        // A navigation expects a new display list: until it
-        // activates, frames presenting the old list count as
-        // deadline-missed (Stage 8 Rec 2).
-        self.compositor.note_expected_list();
-        // Perf (Stage 8 Rec 5): the page being left gets its
-        // summary line first, then the new navigation starts the
-        // clock for first paint / first contentful paint.
-        eprintln!("{}", perf::summary());
-        if let Ok(mut counters) = perf::global().lock() {
-            counters.note_navigation_start();
+    /// Post one command to one tab's worker, by id.
+    fn send_command_to(&mut self, tab_id: u64, command: BrowserToRenderer) {
+        if let Some(tab) = self.tab_mut(tab_id) {
+            if let Some(tx) = &tab.renderer_tx
+                && tx.send(command).is_err()
+            {
+                tab.renderer_tx = None;
+            }
         }
-        self.status = format!("Loading {url}…");
-        if self.renderer_tx.is_some() {
+    }
+
+    /// Start a navigation in the active tab: update the address
+    /// bar and status, reset the scroll, and hand the URL to the
+    /// worker — or hold it until the worker starts. The old page
+    /// stays visible until the new list lands: the holder keeps
+    /// the last-good list.
+    fn commit(&mut self, url: String) {
+        let has_renderer = {
+            let tab = self.active_mut();
+            tab.active_url = url.clone();
+            tab.url_input = url.clone();
+            tab.title = url.clone();
+            tab.compositor.reset_scroll();
+            // A navigation expects a new display list: until it
+            // activates, frames presenting the old list count as
+            // deadline-missed (Stage 8 Rec 2).
+            tab.compositor.note_expected_list();
+            // Perf (Stage 8 Rec 5): the page being left gets its
+            // summary line first, then the new navigation starts the
+            // clock for first paint / first contentful paint.
+            eprintln!("{}", perf::summary());
+            if let Ok(mut counters) = perf::global().lock() {
+                counters.note_navigation_start();
+            }
+            tab.status = format!("Loading {url}…");
+            tab.progress = None;
+            tab.renderer_tx.is_some()
+        };
+        if has_renderer {
             self.send_command(BrowserToRenderer::CommitNavigation { url });
         } else {
-            self.pending_url = Some(url);
+            self.active_mut().pending_url = Some(url);
         }
     }
 
@@ -227,6 +391,10 @@ impl PlutoBrowser {
                 .into(),
             widget::button::text("History")
                 .on_press(Message::ShowHistory)
+                .width(Length::Fill)
+                .into(),
+            widget::button::text("New Tab")
+                .on_press(Message::NewTab)
                 .width(Length::Fill)
                 .into(),
             widget::button::text("New Window")
@@ -287,13 +455,14 @@ impl PlutoBrowser {
                 }
             }
             Panel::History => {
-                if self.history.is_empty() {
+                let history = &self.active().history;
+                if history.is_empty() {
                     children.push(
                         widget::text("No history yet — pages you visit will appear here.")
                             .into(),
                     );
                 }
-                for url in self.history.iter().rev().take(HISTORY_PANEL_LIMIT) {
+                for url in history.iter().rev().take(HISTORY_PANEL_LIMIT) {
                     children.push(
                         widget::button::text(url.clone())
                             .on_press(Message::NavigateTo(url.clone()))
@@ -323,22 +492,22 @@ pub const HISTORY_PANEL_LIMIT: usize = 50;
 /// items with a working backend behind them (Joel's rule): each
 /// entry here names an action the shell really performs —
 /// Bookmarks opens the persistent bookmark list, History opens
-/// the session-history list, New Window spawns a second Pluto
-/// process. Nothing else from the reference screenshot qualifies
-/// (no multi-tab shell for New Tab, no download-prompt UI, no
-/// settings / zoom / find / sync / profiles / passwords /
-/// extensions / print / save-page / translate backend, and Porn
-/// Mode is M12, not built), so none of it is listed. No
-/// shortcuts are shown next to the items: none of the
-/// screenshot's shortcuts are wired.
+/// the session-history list, New Tab opens a tab in this window
+/// (Stage 11 Rec 4), New Window spawns a second Pluto process.
+/// Nothing else from the reference screenshot qualifies
+/// (no download-prompt UI, no settings / zoom / find / sync /
+/// profiles / passwords / extensions / print / save-page /
+/// translate backend, and Porn Mode is M12, not built), so none
+/// of it is listed. No shortcuts are shown next to the items:
+/// none of the screenshot's shortcuts are wired.
 pub fn menu_items() -> &'static [&'static str] {
-    &["Bookmarks", "History", "New Window"]
+    &["Bookmarks", "History", "New Tab", "New Window"]
 }
 
 /// The command a New Window spawns: this executable, with no
 /// arguments — a bare launch opens the default start page in its
 /// own window. A separate process is a real second window, not a
-/// tab (multi-tab is M3, not built).
+/// tab (New Tab opens a tab in this window instead).
 fn new_window_command() -> std::io::Result<std::process::Command> {
     Ok(std::process::Command::new(std::env::current_exe()?))
 }
@@ -510,25 +679,22 @@ impl Application for PlutoBrowser {
         // starts the pipeline, and the first navigation is flushed
         // to it as `pending_url` when it reports ready.
         // Stage 10 Rec 8: the persisted history (newest 50) is
-        // the starting session history — the History panel simply
-        // sees it pre-populated. The index starts on the newest
-        // entry, so Back from a fresh launch goes to the previous
-        // visit.
+        // the first tab's starting session history — the History
+        // panel simply sees it pre-populated. The index starts on
+        // the newest entry, so Back from a fresh launch goes to
+        // the previous visit.
         let history = load_history();
         let history_index = history.len().saturating_sub(1);
+        let mut first_tab = Tab::new(0, url.clone());
+        first_tab.history = history;
+        first_tab.history_index = history_index;
         let app = Self {
             core,
-            url_input: url.clone(),
-            active_url: url.clone(),
-            compositor: Compositor::new(),
-            status: format!("Loading {url}…"),
+            tabs: vec![first_tab],
+            active_tab: 0,
+            next_tab_id: 1,
             viewport: page::DEFAULT_VIEWPORT,
             visible: true,
-            renderer_tx: None,
-            pending_url: Some(url),
-            history,
-            history_index,
-            history_nav: false,
             bookmarks: load_bookmarks(),
             menu_open: false,
             panel: None,
@@ -539,24 +705,30 @@ impl Application for PlutoBrowser {
         (app, Task::none())
     }
 
-    /// The renderer worker subscription (Stage 4 #2): the page
-    /// pipeline runs there, off the UI thread — plus the window
-    /// focus subscription (Stage 8 Rec 1), which is the shell's
-    /// visibility signal for the worker, and the keyboard
-    /// subscription (Stage 8 Rec 9), which forwards page keys.
+    /// The renderer worker subscriptions (Stage 4 #2, Stage 11
+    /// Rec 4): one per tab, keyed by the shell-assigned tab id —
+    /// plus the window focus subscription (Stage 8 Rec 1), which
+    /// is the shell's visibility signal for the workers, and the
+    /// keyboard subscription (Stage 8 Rec 9), which forwards page
+    /// keys. The page pipeline runs in the workers, off the UI
+    /// thread.
     fn subscription(&self) -> cosmic::iced::Subscription<Self::Message> {
-        cosmic::iced::Subscription::batch([
-            renderer::renderer_subscription(),
-            cosmic::iced::event::listen_with(window_visibility),
-            cosmic::iced::event::listen_with(keyboard_event),
-        ])
+        let mut subscriptions: Vec<cosmic::iced::Subscription<Self::Message>> = self
+            .tabs
+            .iter()
+            .map(|tab| renderer::renderer_subscription_for_tab(tab.id))
+            .collect();
+        subscriptions.push(cosmic::iced::event::listen_with(window_visibility));
+        subscriptions.push(cosmic::iced::event::listen_with(keyboard_event));
+        cosmic::iced::Subscription::batch(subscriptions)
     }
 
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
         match message {
-            Message::UrlChanged(val) => self.url_input = val,
+            Message::UrlChanged(val) => self.active_mut().url_input = val,
             Message::Navigate => {
-                match page::normalize_url(&self.url_input) {
+                let input = self.active().url_input.clone();
+                match page::normalize_url(&input) {
                     Ok(url) => self.commit(url),
                     Err(reason) => {
                         // Stage 9 Rec 7 (T11): a disallowed scheme
@@ -568,153 +740,250 @@ impl Application for PlutoBrowser {
                         // then renders the error page with this
                         // reason (`LoadOutcome::Failed`).
                         eprintln!("[pluto] blocked navigation: {reason}");
-                        self.commit(self.url_input.trim().to_string());
+                        self.commit(input.trim().to_string());
                     }
                 }
             }
             Message::Reload => {
-                let url = self.active_url.clone();
+                let url = self.active().active_url.clone();
                 self.commit(url);
             }
-            Message::RendererReady(tx) => {
-                // The worker is up: sync its viewport first (it
-                // starts at the default size), then its visibility
-                // (a restarted worker defaults to visible), then
-                // flush the pending navigation.
-                self.renderer_tx = Some(tx);
-                self.send_command(BrowserToRenderer::Resize {
-                    width: self.viewport.0,
-                    height: self.viewport.1,
-                });
-                self.send_command(BrowserToRenderer::SetVisible {
-                    visible: self.visible,
-                });
-                self.send_command(BrowserToRenderer::SetFocused {
-                    focused: self.visible,
-                });
-                if let Some(url) = self.pending_url.take() {
+            Message::NewTab => {
+                self.menu_open = false;
+                self.new_tab(page::DEFAULT_URL.to_string());
+            }
+            Message::CloseTab(index) => {
+                self.close_tab(index);
+            }
+            Message::SelectTab(index) => {
+                if index < self.tabs.len() && index != self.active_tab {
+                    self.active_tab = index;
+                    // The newly active tab's compositor is already
+                    // holding its last-good list — switching shows
+                    // it at once, with no re-fetch and no re-layout.
+                    // Its worker already knows the window size
+                    // (resizes go to every tab), so there is
+                    // nothing to re-sync here.
+                    self.sync_window_title();
+                }
+            }
+            Message::RendererReady(tab_id, tx) => {
+                // One tab's worker is up: sync its viewport first
+                // (it starts at the default size), then its
+                // visibility (a restarted worker defaults to
+                // visible), then flush the pending navigation. A
+                // ready for a closed tab is ignored.
+                let viewport = self.viewport;
+                let visible = self.visible;
+                let pending = {
+                    let Some(tab) = self.tab_mut(tab_id) else {
+                        return Task::none();
+                    };
+                    tab.renderer_tx = Some(tx);
+                    tab.pending_url.take()
+                };
+                self.send_command_to(
+                    tab_id,
+                    BrowserToRenderer::Resize {
+                        width: viewport.0,
+                        height: viewport.1,
+                    },
+                );
+                self.send_command_to(tab_id, BrowserToRenderer::SetVisible { visible });
+                self.send_command_to(tab_id, BrowserToRenderer::SetFocused { focused: visible });
+                if let Some(url) = pending {
                     // The first navigation expects a list too, and
                     // starts the first-paint clock (no previous
                     // page to summarise yet).
-                    self.compositor.note_expected_list();
+                    if let Some(tab) = self.tab_mut(tab_id) {
+                        tab.compositor.note_expected_list();
+                    }
                     if let Ok(mut counters) = perf::global().lock() {
                         counters.note_navigation_start();
                     }
-                    self.send_command(BrowserToRenderer::CommitNavigation { url });
+                    self.send_command_to(tab_id, BrowserToRenderer::CommitNavigation { url });
                 }
             }
             Message::WindowFocused(visible) => {
                 // Stage 8 Rec 1 + Rec 9: forward a real visibility
-                // change to the worker; a repeat of the current state
-                // is not re-sent (iced may deliver focus events more
-                // than once per change). The same event sets the
-                // worker's keyboard focus — a single-window shell
-                // has no separate focus target, so focus and
-                // visibility move together.
+                // change to EVERY tab's worker; a repeat of the
+                // current state is not re-sent (iced may deliver
+                // focus events more than once per change). The
+                // same event sets each worker's keyboard focus — a
+                // single-window shell has no separate focus target,
+                // so focus and visibility move together.
                 if visible != self.visible {
                     self.visible = visible;
-                    self.send_command(BrowserToRenderer::SetVisible { visible });
-                    self.send_command(BrowserToRenderer::SetFocused { focused: visible });
-                }
-            }
-            Message::RendererEvent(event) => match event {
-                RendererToBrowser::DidCommit { url, status } => {
-                    eprintln!("[pluto] page loaded: {url}");
-                    self.active_url = url.clone();
-                    self.url_input = url.clone();
-                    self.status = status;
-                    // History (R17): a back/forward commit only
-                    // moves the index (already done in Back/Forward);
-                    // any other commit — address bar, reload, link
-                    // click — pushes a new entry after truncating
-                    // the forward entries, unless it is the entry
-                    // we are already on (a reload).
-                    if self.history_nav {
-                        self.history_nav = false;
-                    } else if self.history.is_empty()
-                        || self.history[self.history_index] != url
-                    {
-                        self.history.truncate(self.history_index + 1);
-                        self.history.push(url);
-                        self.history_index = self.history.len() - 1;
-                        // Stage 10 Rec 8: persist on every push
-                        // (the profile pattern: save on every
-                        // mutation, like bookmarks).
-                        save_history(&self.history);
+                    for tab in &mut self.tabs {
+                        if let Some(tx) = &tab.renderer_tx {
+                            let _ = tx.send(BrowserToRenderer::SetVisible { visible });
+                            let _ = tx.send(BrowserToRenderer::SetFocused { focused: visible });
+                        }
                     }
                 }
-                RendererToBrowser::SubmitDisplayList {
-                    epoch,
-                    bytes,
-                    resources,
-                } => {
-                    // The list crosses as postcard bytes even
-                    // in-process — the same bytes that cross IPC at
-                    // M5. Decode and validate before installing: a
-                    // corrupt or out-of-bounds list never reaches
-                    // the GPU.
-                    match DisplayList::from_bytes(&bytes) {
-                        Ok(list) => match list.validate(&resources) {
-                            Ok(()) => {
-                                if self.compositor.submit(
-                                    epoch,
-                                    Arc::new(list),
-                                    Arc::new(resources),
-                                ) {
-                                    // Pending, not active yet: the
-                                    // next frame boundary activates
-                                    // it (Stage 8 Rec 2).
-                                    eprintln!(
-                                        "[pluto] display list pending: epoch {epoch} (active {})",
-                                        self.compositor.epoch()
-                                    );
+            }
+            Message::RendererEvent(tab_id, event) => {
+                let Some(tab_index) = self.tab_index(tab_id) else {
+                    // An event for a closed tab: ignored.
+                    return Task::none();
+                };
+                let is_active = tab_index == self.active_tab;
+                match event {
+                    RendererToBrowser::DidCommit { url, status } => {
+                        eprintln!("[pluto] page loaded: {url}");
+                        let tab = &mut self.tabs[tab_index];
+                        tab.active_url = url.clone();
+                        tab.url_input = url.clone();
+                        tab.title = url.clone();
+                        tab.status = status;
+                        tab.progress = None;
+                        // History (R17): a back/forward commit only
+                        // moves the index (already done in Back/Forward);
+                        // any other commit — address bar, reload, link
+                        // click — pushes a new entry after truncating
+                        // the forward entries, unless it is the entry
+                        // we are already on (a reload).
+                        if tab.history_nav {
+                            tab.history_nav = false;
+                        } else if tab.history.is_empty()
+                            || tab.history[tab.history_index] != url
+                        {
+                            tab.history.truncate(tab.history_index + 1);
+                            tab.history.push(url);
+                            tab.history_index = tab.history.len() - 1;
+                            // Stage 10 Rec 8: persist on every push
+                            // of the ACTIVE tab only (the profile
+                            // pattern: save on every mutation, like
+                            // bookmarks) — a background tab's history
+                            // does not overwrite the file.
+                            if is_active {
+                                save_history(&tab.history);
+                            }
+                        }
+                        if is_active {
+                            self.sync_window_title();
+                        }
+                    }
+                    RendererToBrowser::SubmitDisplayList {
+                        epoch,
+                        bytes,
+                        resources: _,
+                    } => {
+                        // The list crosses as postcard bytes even
+                        // in-process — the same bytes that cross IPC at
+                        // M5. Decode and validate before installing: a
+                        // corrupt or out-of-bounds list never reaches
+                        // the GPU. Stage 11 Rec 1: the submit's own
+                        // `resources` field travels EMPTY — the list
+                        // validates against the tab's accumulated
+                        // table, built from `ResourceReady` frames.
+                        match DisplayList::from_bytes(&bytes) {
+                            Ok(list) => {
+                                let tab = &mut self.tabs[tab_index];
+                                let resources = Arc::clone(&tab.resources);
+                                match list.validate(&resources) {
+                                    Ok(()) => {
+                                        if tab.compositor.submit(epoch, Arc::new(list), resources)
+                                        {
+                                            // Pending, not active yet: the
+                                            // next frame boundary activates
+                                            // it (Stage 8 Rec 2).
+                                            eprintln!(
+                                                "[pluto] display list pending: epoch {epoch} (active {})",
+                                                tab.compositor.epoch()
+                                            );
+                                        }
+                                    }
+                                    Err(err) => eprintln!(
+                                        "[pluto] ignoring invalid display list (epoch {epoch}): {err:?}"
+                                    ),
                                 }
                             }
                             Err(err) => eprintln!(
-                                "[pluto] ignoring invalid display list (epoch {epoch}): {err:?}"
+                                "[pluto] ignoring undecodable display list (epoch {epoch}): {err:?}"
                             ),
-                        },
-                        Err(err) => eprintln!(
-                            "[pluto] ignoring undecodable display list (epoch {epoch}): {err:?}"
-                        ),
+                        }
+                    }
+                    RendererToBrowser::ResourceReady {
+                        epoch: _,
+                        resource_id,
+                        resource,
+                    } => {
+                        // One decoded resource, out-of-band (Stage
+                        // 11 Rec 1): accumulate it into the tab's
+                        // table, so the next submit validates
+                        // against it. The `epoch` is the navigation
+                        // epoch — staleness is enforced worker-side
+                        // (the worker drops stale outcomes before
+                        // sending); the shell inserts what arrives.
+                        // `Arc::make_mut` clones the table only
+                        // when a submitted list still holds it.
+                        let tab = &mut self.tabs[tab_index];
+                        Arc::make_mut(&mut tab.resources)
+                            .resources
+                            .insert(resource_id, resource);
+                    }
+                    RendererToBrowser::LoadProgress { received, total } => {
+                        // Stage 11 Rec 9: document-load progress —
+                        // the thin bar under the nav bar (see
+                        // `view`) plus the status text. Cleared on
+                        // the next commit.
+                        let tab = &mut self.tabs[tab_index];
+                        tab.progress = Some((received, total));
+                    }
+                    RendererToBrowser::TitleChanged { title } => {
+                        // Stage 11 Rec 8: the tab's title, shown
+                        // in the tab strip — and the window title,
+                        // when this is the active tab.
+                        let tab = &mut self.tabs[tab_index];
+                        tab.title = title;
+                        if is_active {
+                            self.sync_window_title();
+                        }
+                    }
+                    RendererToBrowser::FaviconChanged { resource_id } => {
+                        // Stage 11 Rec 7: the tab's favicon, shown
+                        // in the tab strip (`None` = default icon).
+                        self.tabs[tab_index].favicon_id = resource_id;
+                    }
+                    RendererToBrowser::LoadFailed { reason, .. } => {
+                        // The worker already submitted the error page as
+                        // a display list; the status line says why.
+                        let tab = &mut self.tabs[tab_index];
+                        tab.status = format!("Failed: {reason}");
+                        tab.progress = None;
+                    }
+                    RendererToBrowser::CancelResource { request_id } => {
+                        // The worker cancels its own fetches by token
+                        // (Stage 5 #5); the shell holds no loader, so
+                        // there is nothing to cancel here. At M5, when
+                        // the fetch lives browser-side behind
+                        // `RequestResource`, this is where the shell
+                        // cancels it on the scheduler.
+                        eprintln!(
+                            "[pluto] ignoring CancelResource {request_id} (no shell-side loader)"
+                        );
+                    }
+                    RendererToBrowser::RendererCrashed { reason } => {
+                        eprintln!("[pluto] renderer crashed: {reason}");
+                        let tab = &mut self.tabs[tab_index];
+                        tab.status = format!("Renderer crashed: {reason}");
+                        tab.renderer_tx = None;
+                        // The stale list stays visible; the next
+                        // navigation recovers (the bridge respawns
+                        // the renderer on `CommitNavigation`).
+                    }
+                    RendererToBrowser::ScrollViewport { dx, dy } => {
+                        // Stage 8 Rec 9: the worker owns the wheel —
+                        // containers first, and only the leftover delta
+                        // comes back here as the viewport scroll.
+                        self.tabs[tab_index].compositor.scroll_by(dx, dy);
+                    }
+                    RendererToBrowser::RequestResource(..) => {
+                        // M2 (subresources) fetches these; ignored now.
                     }
                 }
-                RendererToBrowser::LoadFailed { reason, .. } => {
-                    // The worker already submitted the error page as
-                    // a display list; the status line says why.
-                    self.status = format!("Failed: {reason}");
-                }
-                RendererToBrowser::TitleChanged { .. } => {
-                    // M3 (multi-tab) reads the title; the shell
-                    // ignores it for now.
-                }
-                RendererToBrowser::CancelResource { request_id } => {
-                    // The worker cancels its own fetches by token
-                    // (Stage 5 #5); the shell holds no loader, so
-                    // there is nothing to cancel here. At M5, when
-                    // the fetch lives browser-side behind
-                    // `RequestResource`, this is where the shell
-                    // cancels it on the scheduler.
-                    eprintln!(
-                        "[pluto] ignoring CancelResource {request_id} (no shell-side loader)"
-                    );
-                }
-                RendererToBrowser::RendererCrashed { reason } => {
-                    eprintln!("[pluto] renderer crashed: {reason}");
-                    self.status = format!("Renderer crashed: {reason}");
-                    // The stale list stays visible; the next
-                    // navigation recovers.
-                }
-                RendererToBrowser::ScrollViewport { dx, dy } => {
-                    // Stage 8 Rec 9: the worker owns the wheel —
-                    // containers first, and only the leftover delta
-                    // comes back here as the viewport scroll.
-                    self.compositor.scroll_by(dx, dy);
-                }
-                RendererToBrowser::RequestResource(..) => {
-                    // M2 (subresources) fetches these; ignored now.
-                }
-            },
+            }
             Message::ViewportResized(width, height) => {
                 // Degenerate sizes (minimised window) carry no layout;
                 // a real size arrives when the window is restored.
@@ -728,9 +997,17 @@ impl Application for PlutoBrowser {
                     return Task::none();
                 }
                 self.viewport = (width, height);
-                // A resize re-lays out, so a new list is expected.
-                self.compositor.note_expected_list();
-                self.send_command(BrowserToRenderer::Resize { width, height });
+                // A resize re-lays out, so a new list is expected —
+                // on the active tab, the one presenting frames. The
+                // resize itself goes to EVERY tab's worker: they all
+                // share the window size, and a background tab must
+                // not keep a stale viewport for when it is selected.
+                self.active_mut().compositor.note_expected_list();
+                for tab in &mut self.tabs {
+                    if let Some(tx) = &tab.renderer_tx {
+                        let _ = tx.send(BrowserToRenderer::Resize { width, height });
+                    }
+                }
             }
             Message::Scrolled {
                 x,
@@ -756,7 +1033,7 @@ impl Application for PlutoBrowser {
                     _ => pluto_ipc::WheelPhase::Began,
                 };
                 self.last_wheel = Some(now);
-                let (sx, sy) = self.compositor.scroll();
+                let (sx, sy) = self.active().compositor.scroll();
                 self.send_command(BrowserToRenderer::InputEvent(InputEvent::Wheel {
                     x: x + sx,
                     y: y + sy,
@@ -774,7 +1051,7 @@ impl Application for PlutoBrowser {
                 // moves to the latest per frame. `button` is None
                 // (a move presses nothing); `buttons` is the mask
                 // of buttons currently held (for dragging).
-                let (sx, sy) = self.compositor.scroll();
+                let (sx, sy) = self.active().compositor.scroll();
                 self.send_command(BrowserToRenderer::InputEvent(InputEvent::Pointer {
                     kind: pluto_ipc::PointerKind::Move,
                     x: x + sx,
@@ -790,7 +1067,7 @@ impl Application for PlutoBrowser {
                 // Record the held button before forwarding, so the
                 // event's own `buttons` mask includes it.
                 self.buttons_held |= 1 << button;
-                let (sx, sy) = self.compositor.scroll();
+                let (sx, sy) = self.active().compositor.scroll();
                 self.send_command(BrowserToRenderer::InputEvent(InputEvent::Pointer {
                     kind: pluto_ipc::PointerKind::Down,
                     x: x + sx,
@@ -806,7 +1083,7 @@ impl Application for PlutoBrowser {
                 // Clear the released button before forwarding, so
                 // the event's own `buttons` mask excludes it.
                 self.buttons_held &= !(1 << button);
-                let (sx, sy) = self.compositor.scroll();
+                let (sx, sy) = self.active().compositor.scroll();
                 self.send_command(BrowserToRenderer::InputEvent(InputEvent::Pointer {
                     kind: pluto_ipc::PointerKind::Up,
                     x: x + sx,
@@ -829,6 +1106,33 @@ impl Application for PlutoBrowser {
                 // shell's copy stays current for pointer/wheel
                 // events, which carry no modifiers of their own.
                 self.modifiers = modifiers;
+                // Stage 11 Rec 4: tab shortcuts, intercepted here
+                // — never forwarded to the page. Ctrl+T opens a
+                // tab, Ctrl+W closes the active tab, Ctrl+Tab
+                // cycles to the next tab. Only on press (not
+                // release, not auto-repeat).
+                if pressed && !repeat && modifiers.ctrl {
+                    match key.as_str() {
+                        "t" | "T" => {
+                            self.new_tab(page::DEFAULT_URL.to_string());
+                            return Task::none();
+                        }
+                        "w" | "W" => {
+                            let index = self.active_tab;
+                            self.close_tab(index);
+                            return Task::none();
+                        }
+                        "Tab" => {
+                            let next = (self.active_tab + 1) % self.tabs.len();
+                            if next != self.active_tab {
+                                self.active_tab = next;
+                                self.sync_window_title();
+                            }
+                            return Task::none();
+                        }
+                        _ => {}
+                    }
+                }
                 self.send_command(BrowserToRenderer::InputEvent(InputEvent::Key {
                     key,
                     code,
@@ -839,27 +1143,33 @@ impl Application for PlutoBrowser {
                 }));
             }
             Message::Back => {
-                if self.history_index > 0 {
-                    self.history_index -= 1;
-                    self.history_nav = true;
-                    let url = self.history[self.history_index].clone();
+                let tab = self.active_mut();
+                if tab.history_index > 0 {
+                    tab.history_index -= 1;
+                    tab.history_nav = true;
+                    let url = tab.history[tab.history_index].clone();
+                    drop(tab);
                     self.commit(url);
                 }
             }
             Message::Forward => {
-                if self.history_index + 1 < self.history.len() {
-                    self.history_index += 1;
-                    self.history_nav = true;
-                    let url = self.history[self.history_index].clone();
+                let tab = self.active_mut();
+                if tab.history_index + 1 < tab.history.len() {
+                    tab.history_index += 1;
+                    tab.history_nav = true;
+                    let url = tab.history[tab.history_index].clone();
+                    drop(tab);
                     self.commit(url);
                 }
             }
             Message::ToggleBookmark => {
                 // The star toggles a bookmark for the current
                 // page and persists it at once (the profile
-                // pattern: save on every mutation).
-                if !self.active_url.is_empty() {
-                    let url = self.active_url.clone();
+                // pattern: save on every mutation). The bookmark
+                // title is the URL for now — real page titles
+                // from `TitleChanged` are a small follow-up.
+                let url = self.active().active_url.clone();
+                if !url.is_empty() {
                     self.bookmarks.toggle(&url, &url);
                     save_bookmarks(&self.bookmarks);
                 }
@@ -895,7 +1205,7 @@ impl Application for PlutoBrowser {
                 self.menu_open = false;
                 if let Err(e) = spawn_new_window() {
                     eprintln!("[pluto] could not open a new window: {e}");
-                    self.status = format!("Could not open a new window: {e}");
+                    self.active_mut().status = format!("Could not open a new window: {e}");
                 }
             }
         }
@@ -910,11 +1220,8 @@ impl Application for PlutoBrowser {
         // The icons are bundled SVGs (see `bundled_icon`): a
         // `from_name` lookup only searches the Cosmic icon theme and
         // draws a blank button where that theme is not installed.
-        // The bookmark star (filled when the current page is
-        // bookmarked) and the hamburger menu, both right after
-        // Go. Round icon buttons like the other nav icons; Go
-        // stays a text button.
-        let star = if self.bookmarks.is_bookmarked(&self.active_url) {
+        let active = self.active();
+        let star = if self.bookmarks.is_bookmarked(&active.active_url) {
             widget::button::icon(bundled_icon(include_bytes!(
                 "../assets/icons/star-filled-symbolic.svg"
             )))
@@ -923,6 +1230,59 @@ impl Application for PlutoBrowser {
                 "../assets/icons/star-symbolic.svg"
             )))
         };
+        // The tab strip (Stage 11 Rec 4): one button per tab —
+        // favicon (when the site has one) plus title — the active
+        // tab's button is marked selected; every tab carries a
+        // "×" close button. "+" opens a new tab. Clicking a tab
+        // swaps the active compositor with no re-fetch and no
+        // re-layout.
+        let mut tab_row: Vec<Element<'_, Message>> = Vec::new();
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let mut tab_children: Vec<Element<'_, Message>> = Vec::new();
+            if let Some(favicon_id) = tab.favicon_id
+                && let Some(pluto_paint::Resource::Image {
+                    width,
+                    height,
+                    rgba,
+                }) = tab.resources.resources.get(&favicon_id)
+            {
+                // A fresh handle per frame: the favicon is 32x32
+                // (4 KiB), so the re-upload is negligible — but
+                // the atlas never dedups it, by design of
+                // `from_pixels` (a new id per handle).
+                let handle = cosmic::iced::widget::image::Handle::from_rgba(
+                    *width,
+                    *height,
+                    rgba.clone(),
+                );
+                tab_children.push(
+                    cosmic::iced::widget::image(handle)
+                        .width(Length::Fixed(16.0))
+                        .height(Length::Fixed(16.0))
+                        .into(),
+                );
+            }
+            tab_children.push(widget::text(tab.title.clone()).into());
+            tab_children.push(
+                widget::button::text("×")
+                    .on_press(Message::CloseTab(index))
+                    .into(),
+            );
+            let tab_button = widget::button::custom(widget::row(tab_children).spacing(4))
+                .selected(index == self.active_tab)
+                .on_press(Message::SelectTab(index));
+            tab_row.push(tab_button.into());
+        }
+        tab_row.push(
+            widget::button::text("+")
+                .on_press(Message::NewTab)
+                .into(),
+        );
+        let tab_strip = widget::row(tab_row).spacing(4).padding(4);
+        // The bookmark star (filled when the current page is
+        // bookmarked) and the hamburger menu, both right after
+        // Go. Round icon buttons like the other nav icons; Go
+        // stays a text button.
         let nav_bar = widget::row([
             widget::button::icon(bundled_icon(include_bytes!(
                 "../assets/icons/go-previous-symbolic.svg"
@@ -939,7 +1299,7 @@ impl Application for PlutoBrowser {
             )))
             .on_press(Message::Reload)
             .into(),
-            widget::text_input("Enter URL...", &self.url_input)
+            widget::text_input("Enter URL...", &active.url_input)
                 .on_input(Message::UrlChanged)
                 .on_submit(|_| Message::Navigate)
                 .width(Length::Fill)
@@ -962,24 +1322,51 @@ impl Application for PlutoBrowser {
         // currently holds; the worker updates it from its thread.
         let web_view = cosmic::iced::widget::Shader::new(WebViewport {
             clear_color: [1.0, 1.0, 1.0, 1.0],
-            display: self.compositor.display(),
-            resources: self.compositor.resources(),
-            scroll: self.compositor.scroll(),
+            display: active.compositor.display(),
+            resources: active.compositor.resources(),
+            scroll: active.compositor.scroll(),
         })
         .width(Length::Fill)
         .height(Length::Fill);
 
         // The status line sits at the bottom of the window, below the
         // page — like a browser status bar — not under the nav bar.
-        let status = widget::row([widget::text(&self.status).size(12).into()]).padding(4);
+        // While a load is in flight it shows the progress instead
+        // of the last status text (Stage 11 Rec 9).
+        let status_text = match active.progress {
+            Some((received, Some(total))) => {
+                format!("Loading… {received} / {total} bytes")
+            }
+            Some((received, None)) => format!("Loading… {received} bytes"),
+            None => active.status.clone(),
+        };
+        let status = widget::row([widget::text(status_text).size(12).into()]).padding(4);
 
         // The menu and list panels render in-column below the
         // nav bar while open; the web view and status line sit
         // below them.
         let mut children: Vec<Element<'_, Self::Message>> = vec![
+            tab_strip.into(),
+            widget::divider::horizontal::default().into(),
             nav_bar.into(),
             widget::divider::horizontal::default().into(),
         ];
+        // Stage 11 Rec 9: the thin progress bar under the nav
+        // bar, while a document load is in flight. Indeterminate
+        // (no Content-Length) shows as a half bar, not a
+        // percentage — the status text carries the byte count.
+        if let Some((received, total)) = active.progress {
+            let fraction = total.map_or(0.5, |t| {
+                if t == 0 {
+                    1.0
+                } else {
+                    (received as f32 / t as f32).clamp(0.0, 1.0)
+                }
+            });
+            children.push(
+                cosmic::iced::widget::progress_bar(0.0..=1.0, fraction).into(),
+            );
+        }
         if self.menu_open {
             children.push(self.menu_panel());
             children.push(widget::divider::horizontal::default().into());
@@ -1004,8 +1391,8 @@ pub fn run() -> cosmic::iced::Result {
     // window, no wgpu device, no libcosmic — so it is dispatched
     // before any GUI setup. The child only parses, lays out, runs
     // JS, and builds display lists over the inherited IPC socket.
-    if let Some(fd) = renderer_process::parse_renderer_args() {
-        std::process::exit(renderer_process::run_renderer_child(fd));
+    if let Some((fd, tab_id)) = renderer_process::parse_renderer_args() {
+        std::process::exit(renderer_process::run_renderer_child(fd, tab_id));
     }
     // NOTE: this libcosmic pin has no `Settings::size()` builder (the field
     // is pub(crate)); the default window is 1024x768. Resize after launch
@@ -1133,11 +1520,15 @@ mod tests {
         // screenshot item whose backend does not exist. If a new
         // backend lands, this test is the place that grows the
         // menu (add the item to `menu_items` and the case here).
-        assert_eq!(menu_items(), &["Bookmarks", "History", "New Window"]);
+        // Stage 11 Rec 4: New Tab has a backend now (the
+        // multi-tab shell), so it is listed, not excluded.
+        assert_eq!(
+            menu_items(),
+            &["Bookmarks", "History", "New Tab", "New Window"]
+        );
         for forbidden in [
             "Sync and save data",
             "Profiles",
-            "New Tab",
             "Porn Mode",
             "Downloads",
             "Passwords",

@@ -95,6 +95,10 @@ use pluto_ipc::{BrowserToRenderer, RendererToBrowser};
 /// The child-mode flag: `pluto-browser --renderer <fd>`, where
 /// `<fd>` is the number of the inherited IPC socketpair end.
 pub const RENDERER_ARG: &str = "--renderer";
+/// The shell-assigned tab id the `--renderer` child runs as
+/// (Stage 11 Rec 4): `--tab-id <n>`, echoed by the worker in
+/// every fetch request instead of the old hardcoded 0.
+pub const TAB_ID_ARG: &str = "--tab-id";
 
 /// How long the spawn handshake may take before the child is
 /// treated as failed (and killed). A healthy child handshakes in
@@ -146,18 +150,26 @@ pub const SANDBOX_NETNS_ENV: &str = "PLUTO_SANDBOX_NET_NS";
 /// Set to `"0"` (child only) to skip the chroot layer.
 pub const SANDBOX_CHROOT_ENV: &str = "PLUTO_SANDBOX_CHROOT";
 
-/// Parse the `--renderer <fd>` arguments, if present. Returns the
-/// inherited IPC socket fd, or `None` for a normal browser launch.
-/// Any other flag (e.g. `--csd`) is ignored here — the decorations
-/// parser in `main.rs` handles those.
-pub fn parse_renderer_args() -> Option<RawFd> {
+/// Parse the `--renderer <fd> [--tab-id <n>]` arguments, if
+/// present. Returns the inherited IPC socket fd and the shell-
+/// assigned tab id (Stage 11 Rec 4: the id is assigned by the
+/// shell and echoed by the worker — nothing hardcodes 0
+/// anymore), or `None` for a normal browser launch. `--tab-id`
+/// defaults to 0 when absent, for children spawned before the
+/// flag existed. Any other flag (e.g. `--csd`) is ignored here —
+/// the decorations parser in `main.rs` handles those.
+pub fn parse_renderer_args() -> Option<(RawFd, u64)> {
     let mut args = std::env::args().skip(1);
+    let mut fd: Option<RawFd> = None;
+    let mut tab_id: u64 = 0;
     while let Some(arg) = args.next() {
         if arg == RENDERER_ARG {
-            return args.next().and_then(|fd| fd.parse().ok());
+            fd = args.next().and_then(|fd| fd.parse().ok());
+        } else if arg == TAB_ID_ARG {
+            tab_id = args.next().and_then(|id| id.parse().ok()).unwrap_or(0);
         }
     }
-    None
+    fd.map(|fd| (fd, tab_id))
 }
 
 /// Whether the sandbox escape hatch is set: `PLUTO_NO_SANDBOX`
@@ -1131,32 +1143,39 @@ impl RendererProcess {
     /// binary, re-executed — see the module docs for the fd
     /// mechanism). Handshakes before returning; a child that fails
     /// to handshake is killed and reaped, and the error returned.
-    pub async fn spawn(exe: &Path) -> io::Result<Self> {
-        Self::spawn_with_env(exe, &[]).await
+    /// `tab_id` is the shell-assigned tab id (Stage 11 Rec 4),
+    /// passed to the child as `--tab-id <n>`.
+    pub async fn spawn(exe: &Path, tab_id: u64) -> io::Result<Self> {
+        Self::spawn_with_env(exe, &[], tab_id).await
     }
 
     /// [`RendererProcess::spawn`] with extra environment variables
     /// set on the child only. Used by tests for the
     /// [`TEST_GARBAGE_ENV`] / [`TEST_HANG_ENV`] hooks; production
     /// callers use [`RendererProcess::spawn`].
-    pub async fn spawn_with_env(exe: &Path, envs: &[(&str, &str)]) -> io::Result<Self> {
-        Self::spawn_inner(exe, envs, &[]).await
+    pub async fn spawn_with_env(
+        exe: &Path,
+        envs: &[(&str, &str)],
+        tab_id: u64,
+    ) -> io::Result<Self> {
+        Self::spawn_inner(exe, envs, &[], tab_id).await
     }
 
     /// Spawn with the `--no-sandbox` escape hatch: the child
     /// skips the whole sandbox hook and runs unconfined. UNSAFE,
     /// debugging only — see [`NO_SANDBOX_ARG`]. Never used by
     /// production callers; tests prove the hatch works.
-    pub async fn spawn_unsandboxed(exe: &Path) -> io::Result<Self> {
-        Self::spawn_inner(exe, &[], &[NO_SANDBOX_ARG]).await
+    pub async fn spawn_unsandboxed(exe: &Path, tab_id: u64) -> io::Result<Self> {
+        Self::spawn_inner(exe, &[], &[NO_SANDBOX_ARG], tab_id).await
     }
 
     /// The shared spawn implementation: `extra_args` are appended
-    /// after `--renderer <fd>` on the child command line.
+    /// after `--renderer <fd> --tab-id <n>` on the child command line.
     async fn spawn_inner(
         exe: &Path,
         envs: &[(&str, &str)],
         extra_args: &[&str],
+        tab_id: u64,
     ) -> io::Result<Self> {
         let (parent_end, child_end) = StdUnixStream::pair()?;
         let child_fd = child_end.as_raw_fd();
@@ -1165,7 +1184,11 @@ impl RendererProcess {
         // keeps a non-CLOEXEC fd open across exec.
         clear_cloexec(child_fd)?;
         let mut command = Command::new(exe);
-        command.arg(RENDERER_ARG).arg(child_fd.to_string());
+        command
+            .arg(RENDERER_ARG)
+            .arg(child_fd.to_string())
+            .arg(TAB_ID_ARG)
+            .arg(tab_id.to_string());
         for arg in extra_args {
             command.arg(arg);
         }
@@ -1324,7 +1347,7 @@ fn clear_cloexec(fd: RawFd) -> io::Result<()> {
 /// touches libcosmic. It only parses, lays out, runs JS, and builds
 /// display lists, exactly like the in-process worker thread, with
 /// the socket transport in place of the iced command channel.
-pub fn run_renderer_child(fd: RawFd) -> i32 {
+pub fn run_renderer_child(fd: RawFd, tab_id: u64) -> i32 {
     let stream = unsafe { StdUnixStream::from_raw_fd(fd) };
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1379,7 +1402,7 @@ pub fn run_renderer_child(fd: RawFd) -> i32 {
         // layer degrades, it never fails the spawn. The IPC fd is
         // passed so the FD-close layer knows what to keep.
         install_sandbox_hook(fd);
-        crate::renderer::run_worker_transport(transport).await
+        crate::renderer::run_worker_transport(transport, tab_id).await
     })
 }
 
@@ -1390,7 +1413,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_with_missing_binary_errors() {
         assert!(
-            RendererProcess::spawn(Path::new("/nonexistent/pluto-browser"))
+            RendererProcess::spawn(Path::new("/nonexistent/pluto-browser"), 0)
                 .await
                 .is_err(),
             "spawning a missing binary fails instead of hanging"

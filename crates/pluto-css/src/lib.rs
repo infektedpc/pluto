@@ -54,9 +54,45 @@ pub enum Value {
     BorderRadius(BorderRadius),
     /// `box-shadow: <shadow>, ...` (`none` is the empty list).
     BoxShadow(Vec<BoxShadow>),
-    /// Anything not modelled yet (`calc(...)`, `url(...)`, font stacks,
-    /// ...), kept verbatim.
+    /// `url(...)` — a resource reference, unquoted (Stage 11 Rec 3:
+    /// `background-image`). The URL is stored verbatim; resolution
+    /// against the document base is the caller's job.
+    Url(String),
+    /// Anything not modelled yet (`calc(...)`, font stacks, ...),
+    /// kept verbatim.
     Raw(String),
+}
+
+/// Every `url(...)` reference in a raw CSS value, in order
+/// (Stage 11 Rec 3): quoted or unquoted, `url(` matched
+/// case-insensitively. Used for `background` shorthand values
+/// (where the URL hides inside a multi-token `Raw`) and for
+/// collecting background-image URLs from a stylesheet.
+pub fn extract_css_urls(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let lower = raw.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+    let mut offset = 0usize;
+    while let Some(pos) = rest.find("url(") {
+        let start = offset + pos + 4;
+        let inner = &raw[start..];
+        let end = inner.find(')').unwrap_or(inner.len());
+        let url = inner[..end]
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .trim()
+            .to_string();
+        if !url.is_empty() {
+            out.push(url);
+        }
+        let next = start + end + 1;
+        if next >= raw.len() {
+            break;
+        }
+        rest = &lower[next..];
+        offset = next;
+    }
+    out
 }
 
 /// One length that can appear inside a structured value
@@ -804,6 +840,10 @@ pub const KNOWN_PROPERTIES: &[&str] = &[
     "color",
     "background",
     "background-color",
+    "background-image",
+    "background-size",
+    "background-repeat",
+    "background-position",
     "font",
     "font-family",
     "font-size",
@@ -1126,6 +1166,36 @@ impl Stylesheet {
                 .map(|i| i as i32)
                 .unwrap_or(self.layers.len() as i32),
         }
+    }
+
+    /// Every `background-image` URL this sheet references, in rule
+    /// order, deduped (Stage 11 Rec 3): `background-image:
+    /// url(...)` declarations (typed [`Value::Url`]) plus URLs
+    /// hiding in `background` shorthand values (scanned with
+    /// [`extract_css_urls`]). The worker fetches + decodes these
+    /// through the image pipeline, so a background image is a
+    /// resource like any other — `none` contributes nothing. URLs
+    /// are returned verbatim (unresolved); the caller resolves
+    /// them against the document base.
+    pub fn background_image_urls(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for rule in &self.rules {
+            for decl in &rule.declarations {
+                let urls: Vec<String> = match (&decl.property[..], &decl.value) {
+                    ("background-image", Value::Url(url)) => vec![url.clone()],
+                    ("background-image", Value::Keyword(k)) if k == "none" => Vec::new(),
+                    ("background-image", Value::Raw(raw)) => extract_css_urls(raw),
+                    ("background", Value::Raw(raw)) => extract_css_urls(raw),
+                    _ => Vec::new(),
+                };
+                for url in urls {
+                    if !out.contains(&url) {
+                        out.push(url);
+                    }
+                }
+            }
+        }
+        out
     }
 }
 
@@ -3410,6 +3480,18 @@ pub fn parse_value(raw: &str) -> Value {
     if let Some(c) = named_color(&lower) {
         return Value::Color(c.0, c.1, c.2);
     }
+    if lower.starts_with("url(") && lower.ends_with(')') {
+        // Stage 11 Rec 3: `background-image: url(...)` parses to
+        // a typed value instead of `Raw`, so the cascade can read
+        // it without re-parsing text.
+        let inner = s[4..s.len() - 1]
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .trim();
+        if !inner.is_empty() {
+            return Value::Url(inner.to_string());
+        }
+    }
     if s.split_whitespace().count() == 1
         && s.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
     {
@@ -3640,6 +3722,7 @@ impl fmt::Display for Value {
                 }
                 Ok(())
             }
+            Value::Url(url) => write!(f, "url({url})"),
             Value::Raw(r) => write!(f, "{r}"),
         }
     }
@@ -4798,5 +4881,60 @@ mod tests {
             .pseudo_class_index
             .has
             .could_affect(&HasArgFeature::type_selector("img")));
+    }
+
+    // Stage 11 Rec 3: background-image parsing + URL collection.
+
+    #[test]
+    fn background_image_url_value_parses() {
+        assert_eq!(
+            parse_value("url(bg.png)"),
+            Value::Url("bg.png".to_string())
+        );
+        assert_eq!(
+            parse_value("url(\"quoted.png\")"),
+            Value::Url("quoted.png".to_string())
+        );
+        assert_eq!(
+            parse_value("URL('UP.PNG')"),
+            Value::Url("UP.PNG".to_string())
+        );
+        assert_eq!(parse_value("none"), Value::Keyword("none".to_string()));
+        assert_eq!(
+            parse_value("url(  spaced.png  )"),
+            Value::Url("spaced.png".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_css_urls_finds_shorthand_urls() {
+        assert_eq!(
+            extract_css_urls("url(a.png) no-repeat center"),
+            vec!["a.png".to_string()]
+        );
+        assert_eq!(
+            extract_css_urls("url(a.png), url(b.png)"),
+            vec!["a.png".to_string(), "b.png".to_string()]
+        );
+        assert!(extract_css_urls("red").is_empty());
+        assert!(extract_css_urls("none").is_empty());
+    }
+
+    #[test]
+    fn background_image_urls_collects_from_rules() {
+        let sheet = Stylesheet::parse(
+            "div { background-image: url(hero.png); } \
+             p { background: url(tile.png) repeat; } \
+             span { background-image: none; } \
+             a { background-image: url(hero.png); }",
+        );
+        assert!(sheet.errors.is_empty(), "errors: {:?}", sheet.errors);
+        // Deduped, in rule order; `none` contributes nothing.
+        assert_eq!(
+            sheet.background_image_urls(),
+            vec!["hero.png".to_string(), "tile.png".to_string()]
+        );
+        let plain = Stylesheet::parse("p { color: red; }");
+        assert!(plain.background_image_urls().is_empty());
     }
 }

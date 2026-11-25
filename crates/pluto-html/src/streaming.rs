@@ -200,6 +200,12 @@ pub struct Parser {
     /// write. `None` between pauses — a write then falls back to
     /// the tokenizer's current read position.
     insertion_point: Option<usize>,
+    /// The layout viewport width (CSS px) `srcset` / `<picture>`
+    /// selection evaluates against (Stage 11 Rec 10); the device
+    /// pixel ratio alongside it. Defaults are the startup
+    /// viewport (1024 px, DPR 1.0); see [`Parser::set_viewport`].
+    viewport_width: f32,
+    viewport_dpr: f32,
     /// Paused at a parser-blocking `<script>`, awaiting execution.
     paused: bool,
     /// The parse was aborted (`document.open()` mid-parse, or
@@ -239,6 +245,8 @@ impl Parser {
             stylesheet_gate: StylesheetGate::default(),
             writer,
             insertion_point: None,
+            viewport_width: 1024.0,
+            viewport_dpr: 1.0,
             paused: false,
             aborted: false,
             finished: false,
@@ -251,6 +259,17 @@ impl Parser {
             .as_ref()
             .map(|b| b.shared_dom())
             .unwrap_or_else(|| Arc::new(Mutex::new(Dom::new())))
+    }
+
+    /// The layout viewport `srcset` / `<picture>` selection
+    /// evaluates against (Stage 11 Rec 10): CSS px wide, at this
+    /// device pixel ratio. Defaults to the startup viewport
+    /// (1024 px, DPR 1.0); the load path sets the real one before
+    /// the first chunk is fed, so a responsive image selects the
+    /// candidate the page will actually use.
+    pub fn set_viewport(&mut self, width: f32, dpr: f32) {
+        self.viewport_width = width;
+        self.viewport_dpr = dpr;
     }
 
     /// `defer` (and `type="module"`) scripts seen so far, document order.
@@ -561,24 +580,86 @@ impl Parser {
                     }
                 }
                 let base = self.effective_base();
-                for raw in classify_element(tag, &attrs, false, false) {
-                    let resolved = resolve_url(&base, &raw.url);
-                    if tag == "link" && raw.destination == Destination::Stylesheet {
-                        // The sheet blocks parser-blocking scripts
-                        // until the browser reports it loaded/failed.
-                        self.stylesheet_gate.note_discovered(&resolved);
-                        out.push(DomEvent::StylesheetDiscovered {
-                            node,
-                            href: resolved.clone(),
-                        });
+                // Stage 11 Rec 10: an <img> inside a <picture>
+                // selects ONE candidate from the DOM (its
+                // <source> siblings + its own srcset/src) instead
+                // of emitting every candidate — the classifier
+                // cannot see siblings, so the drain does this
+                // selection itself. Any other element classifies
+                // with its real picture/media context (walked from
+                // the DOM), not the old hardcoded false/false.
+                let (in_picture, in_media) = {
+                    let dom = self.shared_dom();
+                    let dom = dom.lock().unwrap();
+                    let mut parent = dom.get(node).and_then(|n| n.parent);
+                    let mut picture = false;
+                    let mut media = false;
+                    while let Some(p) = parent {
+                        match dom.tag(p) {
+                            Some("picture") => {
+                                picture = true;
+                                break;
+                            }
+                            Some("video" | "audio") => {
+                                media = true;
+                                break;
+                            }
+                            _ => parent = dom.get(p).and_then(|n| n.parent),
+                        }
                     }
-                    out.push(DomEvent::ResourceDiscovered(DiscoveredResource {
-                        url: resolved,
-                        destination: raw.destination,
-                        priority: raw.priority,
-                        from: raw.from,
-                        integrity: raw.integrity.clone(),
-                    }));
+                    (picture, media)
+                };
+                if tag == "img" && in_picture {
+                    let (selected, integrity) = {
+                        let dom = self.shared_dom();
+                        let dom = dom.lock().unwrap();
+                        let selected = crate::scanner::select_img_url_from_dom(
+                            &dom,
+                            node,
+                            self.viewport_width,
+                            self.viewport_dpr,
+                        );
+                        let integrity = dom
+                            .attr(node, "integrity")
+                            .map(str::to_string);
+                        (selected, integrity)
+                    };
+                    if let Some((url, is_imageset)) = selected {
+                        out.push(DomEvent::ResourceDiscovered(DiscoveredResource {
+                            url: resolve_url(&base, &url),
+                            destination: Destination::Image,
+                            priority: Priority::Low,
+                            from: if is_imageset { "imageset" } else { "img[src]" },
+                            integrity,
+                        }));
+                    }
+                } else {
+                    for raw in classify_element(
+                        tag,
+                        &attrs,
+                        in_picture,
+                        in_media,
+                        self.viewport_width,
+                        self.viewport_dpr,
+                    ) {
+                        let resolved = resolve_url(&base, &raw.url);
+                        if tag == "link" && raw.destination == Destination::Stylesheet {
+                            // The sheet blocks parser-blocking scripts
+                            // until the browser reports it loaded/failed.
+                            self.stylesheet_gate.note_discovered(&resolved);
+                            out.push(DomEvent::StylesheetDiscovered {
+                                node,
+                                href: resolved.clone(),
+                            });
+                        }
+                        out.push(DomEvent::ResourceDiscovered(DiscoveredResource {
+                            url: resolved,
+                            destination: raw.destination,
+                            priority: raw.priority,
+                            from: raw.from,
+                            integrity: raw.integrity.clone(),
+                        }));
+                    }
                 }
             }
             out.push(event);

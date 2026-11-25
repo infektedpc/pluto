@@ -20,6 +20,31 @@
 //! same bytes the shell validates ([`DisplayList::validate`]) before
 //! installing. The list is *not* re-serialised per hop: the worker
 //! serialises once, the shell deserialises once.
+//!
+//! ## M3 (Stage 11) resource decision — decoded pixels cross IPC out-of-band
+//!
+//! IPC frames are capped at 64 MiB (`transport::MAX_FRAME_BYTES`)
+//! and one decoded 4K image is ~33 MB of RGBA, so a display list
+//! carrying decoded pixels can exceed the cap and fail the send at
+//! submit time, far from the decode that caused it. M3 therefore
+//! chose option (b) from the Stage 11 research report: decode
+//! worker-side on the rayon pool, and deliver each decoded resource
+//! exactly once, out-of-band, in its own
+//! [`RendererToBrowser::ResourceReady`] frame — the frame carries
+//! only that one resource, so any single resource under the cap
+//! always fits, and two large images on one page are two frames,
+//! not one over-cap frame. The display list itself carries only
+//! ids; its `resources` field is sent empty by the worker, and the
+//! shell validates the list against the per-tab resource table it
+//! accumulated from `ResourceReady` messages. The worker refuses
+//! to send a resource whose encoded frame would exceed the cap
+//! (oversize → broken-image placeholder, never a failed submit).
+//! The rejected alternative (a) — encoded bytes across IPC, decode
+//! shell-side — would have made the shell own the `ImageCache` and
+//! delayed every first paint on the shell's decode; (b) keeps the
+//! existing cache ownership and the existing submit path. Shared
+//! memory (the M5 design) is not needed for M3: one resource per
+//! frame is enough.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -33,18 +58,25 @@ pub mod transport;
 /// The protocol version every encoded message carries. Bump on any
 /// breaking change to the enums below.
 ///
-/// v4 (Stage 9 Rec 9) moves the transport cross-process: the
-/// per-tab worker thread becomes a `--renderer` child process over
-/// a Unix socketpair (`transport::SocketTransport`), with a
-/// version handshake before the first frame. The message enums
-/// themselves are unchanged from v3 — the bump is the transport
-/// break, and v3 bytes are rejected by [`decode_message`]. v3
-/// (Stage 8 Rec 9) reworked `InputEvent` (pointer/wheel/keyboard
-/// with position, modifiers, timestamp, pointer id, delta mode and
-/// gesture phase), adds `SetFocused` and `ScrollViewport`. v2 bytes
-/// are rejected by [`decode_message`] — Pluto ships one binary, so
-/// a bump is a clean break, not a migration.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// v5 (Stage 11, M3) adds three renderer messages, appended at
+/// the end so existing variants keep their postcard discriminants:
+/// [`RendererToBrowser::ResourceReady`] (one decoded resource per
+/// frame, out-of-band — see the module docs), `LoadProgress`
+/// (document-load progress), and `FaviconChanged` (the tab's
+/// favicon resource id). The bump is the shape change; v4 bytes
+/// are rejected by [`decode_message`]. v4 (Stage 9 Rec 9) moves
+/// the transport cross-process: the per-tab worker thread becomes
+/// a `--renderer` child process over a Unix socketpair
+/// (`transport::SocketTransport`), with a version handshake before
+/// the first frame. The message enums themselves are unchanged
+/// from v3 — the bump is the transport break, and v3 bytes are
+/// rejected by [`decode_message`]. v3 (Stage 8 Rec 9) reworked
+/// `InputEvent` (pointer/wheel/keyboard with position, modifiers,
+/// timestamp, pointer id, delta mode and gesture phase), adds
+/// `SetFocused` and `ScrollViewport`. v2 bytes are rejected by
+/// [`decode_message`] — Pluto ships one binary, so a bump is a
+/// clean break, not a migration.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// What went wrong decoding a versioned message.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -126,6 +158,14 @@ pub enum RendererToBrowser {
     /// worker's monotonically increasing frame id; the shell only
     /// installs a list newer than the one it holds, so a slow worker
     /// can never resurrect a stale frame.
+    ///
+    /// M3 (Stage 11): the worker sends `resources` EMPTY — decoded
+    /// resources travel out-of-band, once each, in
+    /// [`RendererToBrowser::ResourceReady`], and the shell validates
+    /// the list against the per-tab table it accumulated from those
+    /// messages (see the module docs). The field stays so the wire
+    /// shape keeps a table slot for tests and for a future inline
+    /// small-resource path; production submits never fill it.
     SubmitDisplayList {
         epoch: u64,
         bytes: Vec<u8>,
@@ -162,6 +202,42 @@ pub enum RendererToBrowser {
     /// viewport scroll (shader uniform) and clamps it; the worker
     /// never scrolls the viewport itself.
     ScrollViewport { dx: f32, dy: f32 },
+    /// One decoded resource, delivered out-of-band exactly once
+    /// (M3, Stage 11 — see the module docs): the worker decoded
+    /// the image on the rayon pool and sends its pixels here, in a
+    /// frame of their own, BEFORE the `SubmitDisplayList` that
+    /// references the id — both messages travel the same channel
+    /// in order, so the shell's per-tab table holds the resource
+    /// before the list that names it arrives. `epoch` is the
+    /// navigation epoch the resource belongs to; a resource whose
+    /// epoch is no longer current is stale and must be dropped.
+    /// An animated frame advance re-sends the same id with the new
+    /// frame's pixels. A resource the worker cannot send (its
+    /// encoded frame would exceed the IPC cap) is never sent at
+    /// all — the page shows the broken-image placeholder instead.
+    ResourceReady {
+        epoch: u64,
+        resource_id: pluto_paint::ResourceId,
+        resource: pluto_paint::Resource,
+    },
+    /// Document-load progress (M3, Stage 11): bytes of the
+    /// document body received so far, against the `Content-Length`
+    /// when the server sent one (`None` = indeterminate — the
+    /// shell shows a spinner, not a percentage). Document load
+    /// only; subresource progress is out of scope.
+    LoadProgress {
+        received: u64,
+        total: Option<u64>,
+    },
+    /// The tab's favicon changed (M3, Stage 11): `Some(id)` names
+    /// the favicon image in the tab's resource table (delivered
+    /// by `ResourceReady` before this message), `None` means the
+    /// site has no icon and the tab strip shows the default. Sent
+    /// once per navigation (link[rel=icon] or the /favicon.ico
+    /// fallback), not per frame.
+    FaviconChanged {
+        resource_id: Option<pluto_paint::ResourceId>,
+    },
 }
 
 /// A resource ask, frozen as v1 in Stage 5. This is the payload of
@@ -171,7 +247,8 @@ pub enum RendererToBrowser {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResourceRequest {
     pub request_id: u64,
-    /// Which tab asked (0 while Pluto is single-tab).
+    /// Which tab asked (assigned by the shell, M3; echoed by the
+    /// worker — never hardcoded 0 in production).
     pub tab_id: u64,
     /// The navigation epoch the ask belongs to. A reply whose epoch
     /// is no longer current is stale and must be dropped.
@@ -662,8 +739,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_four() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+    fn protocol_version_is_five() {
+        assert_eq!(PROTOCOL_VERSION, 5);
     }
 
     #[test]
@@ -821,6 +898,29 @@ mod tests {
             // Stage 8 Rec 9 (v3): the worker asks the shell to
             // scroll the viewport by the wheel remainder.
             RendererToBrowser::ScrollViewport { dx: 0.0, dy: 48.0 },
+            // Stage 11 (M3): one decoded resource per frame,
+            // out-of-band, plus load progress and the favicon.
+            RendererToBrowser::ResourceReady {
+                epoch: 3,
+                resource_id: ResourceId(1),
+                resource: Resource::Image {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![255, 0, 0, 255],
+                },
+            },
+            RendererToBrowser::LoadProgress {
+                received: 4096,
+                total: Some(16384),
+            },
+            RendererToBrowser::LoadProgress {
+                received: 4096,
+                total: None,
+            },
+            RendererToBrowser::FaviconChanged {
+                resource_id: Some(ResourceId(2)),
+            },
+            RendererToBrowser::FaviconChanged { resource_id: None },
         ] {
             let bytes = encode_message(&message);
             let _: RendererToBrowser = decode_message(&bytes).expect("renderer message decodes");

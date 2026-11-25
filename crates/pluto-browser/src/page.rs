@@ -72,10 +72,11 @@
 //! `base_url` (the final URL after redirects), which relative URLs
 //! resolve against.
 
+use crate::images::ImageRequest;
 use pluto_css::{MediaCondition, Stylesheet};
 use pluto_html::DomEvent;
 use pluto_html::{
-    Dom, NodeId, Parser, resolve_url, scan as preload_scan,
+    Dom, NodeId, Parser, resolve_url, scan_hints, scan_with_viewport,
 };
 use pluto_html::{Destination as HtmlDestination, Priority as HtmlPriority};
 use pluto_ipc::{
@@ -88,7 +89,34 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
+
+/// Sinks a load reports into while it runs (Stage 11 Rec 1/9):
+/// image discoveries go to the tab thread's image pipeline
+/// (fetch + decode, owned by the tab thread — the load task
+/// never fetches image bytes itself), and document-fetch
+/// progress goes to the shell's progress bar. Both optional:
+/// `None` keeps the old behaviour (images never fetched,
+/// no progress reported). The senders are `UnboundedSender`s so
+/// a slow tab thread never blocks the load.
+#[derive(Default)]
+pub struct LoadSinks {
+    pub images: Option<UnboundedSender<ImageRequest>>,
+    pub progress: Option<UnboundedSender<(u64, Option<u64>)>>,
+}
+
+impl LoadSinks {
+    /// No sinks: the load behaves as before Stage 11.
+    pub fn none() -> Self {
+        Self::default()
+    }
+}
+
+/// Maximum preconnects per page (Stage 11 Rec 6): only the
+/// critical-path origins get a full DNS+TCP+TLS warm; the rest
+/// get DNS-only prefetch.
+pub const MAX_PRECONNECTS_PER_PAGE: usize = 3;
 
 /// Startup guess for the layout viewport: the default window size (no
 /// `Settings::size()` in this libcosmic pin, so the window opens
@@ -295,12 +323,14 @@ fn subresource_request(
     base_url: &str,
     is_imageset: bool,
     integrity: Option<String>,
+    tab_id: u64,
+    epoch: u64,
 ) -> ResourceRequest {
     let origin = origin_of(base_url);
     ResourceRequest {
         request_id: next_request_id(),
-        tab_id: 0,
-        epoch: 0,
+        tab_id,
+        epoch,
         url: url.to_string(),
         method: "GET".to_string(),
         headers: Vec::new(),
@@ -458,6 +488,10 @@ pub async fn load_page_cancellable_with_hooks(
     url: String,
     cancel: CancellationToken,
     mut hooks: Option<Box<dyn ScriptHooks + '_>>,
+    sinks: LoadSinks,
+    tab_id: u64,
+    epoch: u64,
+    viewport: (f32, f32),
 ) -> Result<(Document, String), String> {
     // Stage 9 Rec 7 (T11): scheme allowlist at the load entry
     // point — defence in depth behind `normalize_url` (link clicks
@@ -468,9 +502,20 @@ pub async fn load_page_cancellable_with_hooks(
         eprintln!("[pluto] blocked navigation: {reason}");
         return Err(reason);
     }
-    let request = ResourceRequest::navigate(next_request_id(), 0, 0, &url);
+    let request = ResourceRequest::navigate(next_request_id(), tab_id, epoch, &url);
     eprintln!("[pluto] fetching {url}");
-    let response = match loader.fetch_with(request, cancel.clone()).await {
+    // Stage 11 Rec 9: the document fetch streams its progress
+    // (bytes vs Content-Length) to the shell's progress bar via
+    // the sink; without a sink the callback is a no-op.
+    let progress_tx = sinks.progress.clone();
+    let response = match loader
+        .fetch_with_progress(request, cancel.clone(), move |received, total| {
+            if let Some(tx) = &progress_tx {
+                let _ = tx.send((received, total));
+            }
+        })
+        .await
+    {
         Ok(response) => response,
         Err(e) => {
             eprintln!("[pluto] fetch failed: {e}");
@@ -556,19 +601,47 @@ pub async fn load_page_cancellable_with_hooks(
     // dedups these against the parser-driven fetches below. True
     // network streaming (feed chunks as they arrive) is the
     // follow-up — see the module docs.
-    fire_preloads(loader, &response.body, &final_url, cancel.clone());
+    fire_preloads(
+        loader,
+        &response.body,
+        &final_url,
+        cancel.clone(),
+        &sinks,
+        tab_id,
+        epoch,
+        viewport,
+    );
+    // Stage 11 Rec 6: warm the connection hints the scanner
+    // recorded (`<link rel="preconnect">` / `dns-prefetch`) on a
+    // detached task — the parse must not wait on a TLS handshake.
+    fire_connection_hints(loader, &response.body, &final_url);
     // Wave 2b: the parser lives in an `Rc<RefCell>` so the script
     // runner (via the host) can reach its `DocumentWriter` while
     // the load drives it.
     let parser = std::rc::Rc::new(std::cell::RefCell::new(Parser::with_document_url(
         &final_url,
     )));
+    // Stage 11 Rec 10: the parser selects srcset / <picture>
+    // candidates against the real viewport, so its viewport must
+    // be the tab's, not the scanner default. DPR is 1.0: the
+    // worker has no HiDPI plumbing yet (the shell's scale factor
+    // never reaches it) — a follow-up threads it through.
+    parser.borrow_mut().set_viewport(viewport.0, 1.0);
     // The runner attaches the host to this parser's shared `Dom`
     // before the first chunk is fed (see `parser_created`).
     if let Some(hooks) = hooks.as_mut() {
         hooks.parser_created(&parser);
     }
-    let mut load = StreamingLoad::new(loader, cancel.clone(), final_url.clone(), parser, hooks);
+    let mut load = StreamingLoad::new(
+        loader,
+        cancel.clone(),
+        final_url.clone(),
+        parser,
+        hooks,
+        sinks,
+        tab_id,
+        epoch,
+    );
     for chunk in response.body.chunks(FEED_CHUNK_BYTES) {
         if cancel.is_cancelled() {
             return Err("navigation cancelled".to_string());
@@ -607,19 +680,40 @@ pub async fn load_page_cancellable_with_hooks(
 }
 
 /// Fire-and-forget fetches for the preload scanner's discoveries.
-/// Each runs on its own task and its bytes are discarded: the point
-/// is warming the scheduler / connection so the parser-driven fetch
-/// that follows dedups onto an in-flight (or just-completed) request
-/// instead of starting cold. `data:` URLs are never fetched (the
-/// scanner already skips most of them; this is the belt).
+/// Non-image discoveries run on their own tasks and their bytes
+/// are discarded: the point is warming the scheduler / connection
+/// so the parser-driven fetch that follows dedups onto an
+/// in-flight (or just-completed) request instead of starting
+/// cold. Image discoveries are NOT fetched here: they go to the
+/// tab thread's image pipeline via the sink (fetch + decode,
+/// owned by the tab thread — fetching-and-discarding them here
+/// would download the bytes twice). `data:` URLs are never
+/// fetched (the scanner already skips most of them; this is the
+/// belt). The scan runs at the tab's real viewport (Stage 11 Rec
+/// 10), so a srcset candidate is selected for the actual page
+/// width, not the 1024 px default.
 fn fire_preloads(
     loader: &ResourceLoader,
     body: &[u8],
     base_url: &str,
     cancel: CancellationToken,
+    sinks: &LoadSinks,
+    tab_id: u64,
+    epoch: u64,
+    viewport: (f32, f32),
 ) {
-    for found in preload_scan(body, base_url) {
+    for found in scan_with_viewport(body, base_url, viewport.0, 1.0) {
         if found.url.trim_start().starts_with("data:") {
+            continue;
+        }
+        // Stage 11 Rec 1/10: images are NOT fired here. The
+        // streaming parser reports every `<img>` / `<picture>`
+        // image exactly once, during the parse, through the same
+        // `classify_element` selection — a scan report here would
+        // be a duplicate of the parser's (the tab thread dedups
+        // by URL, but the sink contract is one report per image).
+        // The scan's job is the non-image preloads below.
+        if found.destination == HtmlDestination::Image {
             continue;
         }
         let loader = loader.clone();
@@ -640,11 +734,47 @@ fn fire_preloads(
             // this request is always first — the parser's later
             // duplicate dedups to it, integrity included.
             found.integrity.clone(),
+            tab_id,
+            epoch,
         );
         tokio::spawn(async move {
             let _ = loader.fetch_with(request, cancel).await;
         });
     }
+}
+
+/// Warm connection hints (Stage 11 Rec 6): the first
+/// [`MAX_PRECONNECTS_PER_PAGE`] preconnect origins get a full
+/// DNS+TCP+TLS warm through the shared client pool; every other
+/// hint (further preconnects + all dns-prefetch) gets DNS-only.
+/// Runs detached — a TLS handshake must never stall the parse —
+/// on `tokio::spawn` (not `spawn_local`: tests drive this load
+/// outside a `LocalSet`, and the hint task owns only `Send`
+/// values). `preconnect` itself applies HSTS and refuses
+/// blocker-blocked tracker origins, so this needs no extra
+/// gating here.
+fn fire_connection_hints(loader: &ResourceLoader, body: &[u8], base_url: &str) {
+    use pluto_html::HintKind;
+    let loader = loader.clone();
+    let hints = scan_hints(body, base_url);
+    if hints.is_empty() {
+        return;
+    }
+    tokio::task::spawn(async move {
+        let mut preconnected = 0usize;
+        for hint in hints {
+            match hint.kind {
+                HintKind::Preconnect if preconnected < MAX_PRECONNECTS_PER_PAGE => {
+                    if loader.preconnect(&hint.url).await {
+                        preconnected += 1;
+                    }
+                }
+                _ => {
+                    let _ = loader.dns_prefetch(&hint.url).await;
+                }
+            }
+        }
+    });
 }
 
 /// The streaming load's mutable state: the parser, the caches that
@@ -661,6 +791,14 @@ struct StreamingLoad<'a, 'h> {
     parser: std::rc::Rc<std::cell::RefCell<Parser>>,
     /// The script runner (wave 2b), if JS is attached to this load.
     hooks: Option<Box<dyn ScriptHooks + 'h>>,
+    /// Where image discoveries and load progress are reported
+    /// (Stage 11 Rec 1/9): the tab thread owns the image
+    /// pipeline, so this load only reports URLs, never fetches.
+    sinks: LoadSinks,
+    /// The shell-assigned tab id + navigation epoch stamped on
+    /// every subresource request (Stage 11 Rec 4).
+    tab_id: u64,
+    epoch: u64,
     /// Fetched stylesheet text by absolute URL (includes `@import`
     /// targets, fetched recursively when their parent sheet loaded).
     sheet_cache: HashMap<String, String>,
@@ -686,6 +824,9 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
         base_url: String,
         parser: std::rc::Rc<std::cell::RefCell<Parser>>,
         hooks: Option<Box<dyn ScriptHooks + 'h>>,
+        sinks: LoadSinks,
+        tab_id: u64,
+        epoch: u64,
     ) -> Self {
         Self {
             loader,
@@ -693,6 +834,9 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
             base_url: base_url.clone(),
             parser,
             hooks,
+            sinks,
+            tab_id,
+            epoch,
             sheet_cache: HashMap::new(),
             sheet_attempted: HashSet::new(),
             script_bytes: HashMap::new(),
@@ -743,6 +887,26 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
                             self.fetch_stylesheet(&href).await;
                         }
                         DomEvent::ResourceDiscovered(found) => {
+                            // Stage 11 Rec 1/10: images are
+                            // reported to the tab thread's image
+                            // pipeline (fetch + decode there) —
+                            // never fetched here, and never fetched
+                            // twice: the scheduler dedups this
+                            // report against the preload scan's
+                            // earlier one for the same URL.
+                            if found.destination == HtmlDestination::Image
+                                && !found.url.trim_start().starts_with("data:")
+                            {
+                                if let Some(tx) = &self.sinks.images {
+                                    let _ = tx.send(ImageRequest {
+                                        url: found.url.clone(),
+                                        base_url: self.base_url.clone(),
+                                        is_imageset: found.from == "imageset",
+                                        integrity: found.integrity.clone(),
+                                    });
+                                }
+                                continue;
+                            }
                             // Scripts are fetched (async/defer, and
                             // classic ones the pause below also reports).
                             // Everything else the preload scanner already
@@ -927,8 +1091,16 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
         destination: Destination,
         priority: Priority,
     ) -> Option<String> {
-        let request =
-            subresource_request(url, destination, priority, &self.base_url, false, None);
+        let request = subresource_request(
+            url,
+            destination,
+            priority,
+            &self.base_url,
+            false,
+            None,
+            self.tab_id,
+            self.epoch,
+        );
         let fetch = self.loader.fetch_with(request, self.cancel.clone());
         match tokio::time::timeout_at(self.blocking_deadline, fetch).await {
             Ok(Ok(response)) => Some(response.text()),
@@ -964,6 +1136,8 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
             &self.base_url,
             false,
             integrity,
+            self.tab_id,
+            self.epoch,
         );
         match self.loader.fetch_with(request, self.cancel.clone()).await {
             Ok(response) => {
@@ -1707,7 +1881,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{}/", addr.port());
         let loader = ResourceLoader::new();
         let (doc, final_url) =
-            load_page_cancellable_with_hooks(&loader, url.clone(), CancellationToken::new(), None)
+            load_page_cancellable_with_hooks(&loader, url.clone(), CancellationToken::new(), None, LoadSinks::none(), 0, 0, DEFAULT_VIEWPORT)
                 .await
                 .expect("page loads");
         assert_eq!(final_url, url);
@@ -1758,13 +1932,78 @@ mod tests {
         tokio::spawn(serve_attachment(listener));
         let url = format!("http://127.0.0.1:{}/", addr.port());
         let loader = ResourceLoader::new();
-        let err = load_page_cancellable_with_hooks(&loader, url, CancellationToken::new(), None)
+        let err = load_page_cancellable_with_hooks(&loader, url, CancellationToken::new(), None, LoadSinks::none(), 0, 0, DEFAULT_VIEWPORT)
             .await
             .expect_err("an attachment must not load as a page");
         assert!(
             err.starts_with("download: evil.html"),
             "the load fails naming the file, never parsing it: {err}"
         );
+    }
+
+    /// Stage 11 Rec 1/9/10: a load reports image discoveries to
+    /// the image sink (exactly ONE — the selected srcset
+    /// candidate, never every candidate) and document-fetch
+    /// progress to the progress sink (bytes vs Content-Length).
+    #[tokio::test]
+    async fn load_page_reports_images_and_progress_via_sinks() {
+        const BODY: &str = "<!doctype html><title>Sink page</title>\
+            <img src=\"/a.png\" srcset=\"/small.png 1x, /big.png 2x\" alt=\"pic\">";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let Ok(_) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        BODY.len(),
+                        BODY
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        let loader = ResourceLoader::new();
+        let (img_tx, mut img_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sinks = LoadSinks {
+            images: Some(img_tx),
+            progress: Some(prog_tx),
+        };
+        let (_, _) = load_page_cancellable_with_hooks(
+            &loader,
+            url.clone(),
+            CancellationToken::new(),
+            None,
+            sinks,
+            3,
+            1,
+            DEFAULT_VIEWPORT,
+        )
+        .await
+        .expect("page loads");
+        // Exactly one image report: the 1x candidate for DPR 1.0 —
+        // the 2x candidate and the plain src are never reported.
+        let req = img_rx.try_recv().expect("one image report");
+        assert_eq!(req.url, format!("http://127.0.0.1:{}/small.png", addr.port()));
+        assert!(req.is_imageset, "srcset selection rides the imageset label");
+        assert!(img_rx.try_recv().is_err(), "no second image report");
+        // Progress: (0, total) on headers, then the full body.
+        let (first, total) = prog_rx.try_recv().expect("progress on headers");
+        assert_eq!((first, total), (0, Some(BODY.len() as u64)));
+        let mut last = (first, total);
+        while let Ok(p) = prog_rx.try_recv() {
+            last = p;
+        }
+        assert_eq!(last, (BODY.len() as u64, Some(BODY.len() as u64)));
     }
 
     #[tokio::test]
@@ -1785,6 +2024,10 @@ mod tests {
                     url.to_string(),
                     CancellationToken::new(),
                     None,
+                    LoadSinks::none(),
+                    0,
+                    0,
+                    DEFAULT_VIEWPORT,
                 )
                 .await
                 .is_err(),
@@ -1871,7 +2114,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{}/", addr.port());
         let loader = ResourceLoader::new();
         let (doc, _final_url) =
-            load_page_cancellable_with_hooks(&loader, url.clone(), CancellationToken::new(), None)
+            load_page_cancellable_with_hooks(&loader, url.clone(), CancellationToken::new(), None, LoadSinks::none(), 0, 0, DEFAULT_VIEWPORT)
                 .await
                 .expect("page loads");
         assert_eq!(doc.base_url, url);
@@ -1954,7 +2197,7 @@ mod tests {
         });
         let url = format!("http://127.0.0.1:{}/", addr.port());
         let loader = ResourceLoader::new();
-        let (doc, _) = load_page_cancellable_with_hooks(&loader, url, CancellationToken::new(), None)
+        let (doc, _) = load_page_cancellable_with_hooks(&loader, url, CancellationToken::new(), None, LoadSinks::none(), 0, 0, DEFAULT_VIEWPORT)
             .await
             .expect("page loads");
         // Both paragraphs rendered (the parser resumed past the
@@ -2019,7 +2262,7 @@ mod tests {
         });
         let url = format!("http://127.0.0.1:{}/", addr.port());
         let loader = ResourceLoader::new();
-        let (doc, _) = load_page_cancellable_with_hooks(&loader, url, CancellationToken::new(), None)
+        let (doc, _) = load_page_cancellable_with_hooks(&loader, url, CancellationToken::new(), None, LoadSinks::none(), 0, 0, DEFAULT_VIEWPORT)
             .await
             .expect("page loads despite the missing sheet");
         let display = layout_for(&doc, (800.0, 600.0));

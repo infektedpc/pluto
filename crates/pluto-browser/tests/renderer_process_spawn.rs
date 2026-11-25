@@ -28,7 +28,7 @@ async fn spawned_renderer_child_exchanges_messages_headless() {
         "renderer binary exists at {} (cargo builds it for integration tests)",
         exe.display()
     );
-    let mut renderer = RendererProcess::spawn(&exe)
+    let mut renderer = RendererProcess::spawn(&exe, 7)
         .await
         .expect("renderer child spawns and handshakes");
     assert!(renderer.is_alive(), "child is alive after handshake");
@@ -57,7 +57,9 @@ async fn spawned_renderer_child_exchanges_messages_headless() {
         .await
         .expect("navigation sends");
     // The error page arrives as a display list first, then the
-    // reason for the status line.
+    // reason for the status line. A `TitleChanged` for the error
+    // page's title may interleave between the two (the worker
+    // coalesces it onto the submit) — skip it here.
     let first = tokio::time::timeout(Duration::from_secs(20), renderer.recv())
         .await
         .expect("first reply arrives in time")
@@ -69,11 +71,17 @@ async fn spawned_renderer_child_exchanges_messages_headless() {
     };
     let list = DisplayList::from_bytes(&bytes).expect("list bytes decode");
     assert!(!list.is_empty(), "error page still paints");
-    let second = tokio::time::timeout(Duration::from_secs(20), renderer.recv())
-        .await
-        .expect("second reply arrives in time")
-        .expect("recv succeeds")
-        .expect("a message arrives");
+    let mut second;
+    loop {
+        second = tokio::time::timeout(Duration::from_secs(20), renderer.recv())
+            .await
+            .expect("second reply arrives in time")
+            .expect("recv succeeds")
+            .expect("a message arrives");
+        if !matches!(second, RendererToBrowser::TitleChanged { .. }) {
+            break;
+        }
+    }
     match second {
         RendererToBrowser::LoadFailed { url, reason } => {
             assert_eq!(url, "about:blank");
@@ -92,7 +100,7 @@ async fn spawned_renderer_child_exchanges_messages_headless() {
 #[tokio::test]
 async fn malformed_message_from_renderer_kills_it_never_recovers() {
     let exe = renderer_exe_for_test();
-    let mut renderer = RendererProcess::spawn_with_env(&exe, &[(TEST_GARBAGE_ENV, "1")])
+    let mut renderer = RendererProcess::spawn_with_env(&exe, &[(TEST_GARBAGE_ENV, "1")], 7)
         .await
         .expect("renderer child spawns and handshakes");
     // The child sends one garbage frame after the handshake. The
@@ -117,7 +125,7 @@ async fn malformed_message_from_renderer_kills_it_never_recovers() {
 #[tokio::test]
 async fn hung_renderer_killed_on_tab_close() {
     let exe = renderer_exe_for_test();
-    let mut renderer = RendererProcess::spawn_with_env(&exe, &[(TEST_HANG_ENV, "1")])
+    let mut renderer = RendererProcess::spawn_with_env(&exe, &[(TEST_HANG_ENV, "1")], 7)
         .await
         .expect("renderer child spawns and handshakes");
     assert!(renderer.is_alive(), "child is alive before close");
@@ -148,7 +156,7 @@ async fn hung_renderer_killed_on_tab_close() {
 #[tokio::test]
 async fn sandboxed_renderer_exchange_under_trap_diagnostics() {
     let exe = renderer_exe_for_test();
-    let mut renderer = RendererProcess::spawn_with_env(&exe, &[(SANDBOX_TRAP_ENV, "1")])
+    let mut renderer = RendererProcess::spawn_with_env(&exe, &[(SANDBOX_TRAP_ENV, "1")], 7)
         .await
         .expect("sandboxed renderer child spawns and handshakes");
     assert!(renderer.is_alive(), "child is alive after handshake");
@@ -192,7 +200,7 @@ async fn sandboxed_renderer_exchange_under_trap_diagnostics() {
 #[tokio::test]
 async fn no_sandbox_hatch_spawns_working_renderer() {
     let exe = renderer_exe_for_test();
-    let mut renderer = RendererProcess::spawn_unsandboxed(&exe)
+    let mut renderer = RendererProcess::spawn_unsandboxed(&exe, 7)
         .await
         .expect("unsandboxed renderer child spawns and handshakes");
     assert!(renderer.is_alive(), "child is alive after handshake");
@@ -215,7 +223,7 @@ async fn no_sandbox_hatch_spawns_working_renderer() {
 #[tokio::test]
 async fn no_sandbox_env_hatch_spawns_working_renderer() {
     let exe = renderer_exe_for_test();
-    let mut renderer = RendererProcess::spawn_with_env(&exe, &[(NO_SANDBOX_ENV, "1")])
+    let mut renderer = RendererProcess::spawn_with_env(&exe, &[(NO_SANDBOX_ENV, "1")], 7)
         .await
         .expect("unsandboxed renderer child spawns and handshakes");
     assert!(renderer.is_alive(), "child is alive after handshake");

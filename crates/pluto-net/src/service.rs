@@ -174,9 +174,10 @@ pub struct Scheduler {
     https_only: Arc<std::sync::Mutex<HttpsOnly>>,
     referrer: Arc<std::sync::Mutex<ReferrerContext>>,
     preflight: Arc<PreflightCache>,
-    // Stage 9 Rec 3: the cookie jar for this loader (per-tab
-    // until M3 promotes the loader to a shared handle — same
-    // placement as the HSTS store above).
+    // Stage 9 Rec 3: the cookie jar, shared across tabs via the
+    // `SharedLoader` handle (Stage 11 Rec 5) — partitioned by
+    // top-level site, so sharing never leaks one site's cookies
+    // into another's partition.
     jar: Arc<std::sync::Mutex<CookieJar>>,
     // Stage 9 Rec 8: the current document's CSP policy
     // container, stored when the document response arrives and
@@ -187,31 +188,91 @@ pub struct Scheduler {
     // refreshed in the background by the tab thread.
     blocker: Arc<std::sync::Mutex<Blocker>>,
     // Stage 10 Rec 1: the in-memory partitioned HTTP cache
-    // (`cache.rs`). Per-tab until M3 promotes the loader to a
-    // shared handle — same placement as the cookie jar above;
-    // the key already carries the partition, so the move needs
-    // no key-scheme change.
+    // (`cache.rs`), shared across tabs via the `SharedLoader`
+    // handle (Stage 11 Rec 5); the key already carries the
+    // partition, so sharing needs no key-scheme change. Sharing
+    // across renderer *processes* is deferred to the M5 broker —
+    // in-process, two loaders from one handle share one cache.
     cache: Arc<std::sync::Mutex<HttpCache>>,
 }
 
-impl Scheduler {
-    pub fn new(client: HttpsClient, max_redirects: usize) -> Self {
+/// The shared half of a loader (Stage 11 Rec 5, report §2.3):
+/// the stores tabs share — HSTS, the tracker blocker, the cookie
+/// jar, and the partitioned HTTP cache. One handle per process:
+/// the shell owns it and hands a clone to each tab's worker, and
+/// [`Scheduler::with_shared`] / [`ResourceLoader::from_shared`]
+/// build per-tab loaders that clone these Arcs instead of
+/// building private ones. CSP, referrer, HTTPS-only, the
+/// preflight cache and the caps/dedup state stay per tab —
+/// per-document state that must not leak across tabs.
+///
+/// Out-of-process reality: renderer children are separate
+/// processes, so these Arcs cannot literally cross tabs — what
+/// crosses processes is the profile-dir persistence (HSTS and
+/// cookies already persist to disk and are re-read per tab; the
+/// in-memory HTTP cache is per-process until the M5 broker
+/// shares it). The handle is still the one construction site for
+/// the shared stores, and the tests prove the sharing semantics
+/// in-process: two loaders from one handle see each other's
+/// cookies, HSTS entries and cache entries, while the jar's
+/// partition keying keeps one top-level site's cookies out of
+/// another's.
+#[derive(Clone)]
+pub struct SharedLoader {
+    pub hsts: Arc<std::sync::Mutex<HstsStore>>,
+    pub blocker: Arc<std::sync::Mutex<Blocker>>,
+    pub jar: Arc<std::sync::Mutex<CookieJar>>,
+    pub cache: Arc<std::sync::Mutex<HttpCache>>,
+}
+
+impl SharedLoader {
+    pub fn new() -> Self {
         Self {
-            state: Arc::new(Mutex::new(SchedulerState::new())),
-            client,
-            max_redirects,
             hsts: Arc::new(std::sync::Mutex::new(HstsStore::new())),
-            https_only: Arc::new(std::sync::Mutex::new(HttpsOnly::new())),
-            referrer: Arc::new(std::sync::Mutex::new(ReferrerContext::new())),
-            preflight: Arc::new(PreflightCache::new()),
-            jar: Arc::new(std::sync::Mutex::new(CookieJar::new())),
-            csp: Arc::new(std::sync::Mutex::new(PolicySet::new())),
             blocker: Arc::new(std::sync::Mutex::new(
                 profile_list_dir()
                     .map(|dir| Blocker::load_from_dir(&dir))
                     .unwrap_or_default(),
             )),
+            jar: Arc::new(std::sync::Mutex::new(CookieJar::new())),
             cache: Arc::new(std::sync::Mutex::new(HttpCache::new())),
+        }
+    }
+}
+
+impl Default for SharedLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Scheduler {
+    pub fn new(client: HttpsClient, max_redirects: usize) -> Self {
+        Self::with_shared(client, max_redirects, &SharedLoader::new())
+    }
+
+    /// Build a per-tab scheduler sharing the stores of `shared`
+    /// (Stage 11 Rec 5): HSTS, blocker, cookie jar and HTTP cache
+    /// are the handle's Arcs; CSP, referrer, HTTPS-only, the
+    /// preflight cache and the caps/dedup state are private to
+    /// this tab.
+    pub fn with_shared(
+        client: HttpsClient,
+        max_redirects: usize,
+        shared: &SharedLoader,
+    ) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(SchedulerState::new())),
+            client,
+            max_redirects,
+            hsts: Arc::clone(&shared.hsts),
+            https_only: Arc::new(std::sync::Mutex::new(HttpsOnly::new())),
+            referrer: Arc::new(std::sync::Mutex::new(ReferrerContext::new())),
+            preflight: Arc::new(PreflightCache::new()),
+            jar: Arc::clone(&shared.jar),
+            csp: Arc::new(std::sync::Mutex::new(PolicySet::new())),
+            blocker: Arc::clone(&shared.blocker),
+            cache: Arc::clone(&shared.cache),
         }
     }
 
@@ -3494,6 +3555,104 @@ mod tests {
             state.count(),
             3,
             "the evicted entry must be fetched from the network again"
+        );
+    }
+
+    // ---- Stage 11 Rec 5: the shared loader handle ----
+
+    #[test]
+    fn shared_loader_shares_stores_but_not_document_state() {
+        let shared = SharedLoader::new();
+        let a = Scheduler::with_shared(shared_client().clone(), 5, &shared);
+        let b = Scheduler::with_shared(shared_client().clone(), 5, &shared);
+        // The §2.3 sharing map: these four are the same Arcs.
+        assert!(Arc::ptr_eq(&a.hsts_store(), &b.hsts_store()));
+        assert!(Arc::ptr_eq(&a.blocker(), &b.blocker()));
+        assert!(Arc::ptr_eq(&a.jar(), &b.jar()));
+        assert!(Arc::ptr_eq(&a.http_cache(), &b.http_cache()));
+        // Per-tab state stays private: CSP, referrer, HTTPS-only
+        // and the preflight cache are different Arcs.
+        assert!(!Arc::ptr_eq(&a.csp_policies(), &b.csp_policies()));
+        assert!(!Arc::ptr_eq(&a.referrer_context(), &b.referrer_context()));
+        assert!(!Arc::ptr_eq(&a.https_only(), &b.https_only()));
+        assert!(!Arc::ptr_eq(&a.preflight_cache(), &b.preflight_cache()));
+        // And a loader built the old way gets its own stores.
+        let solo = Scheduler::new(shared_client().clone(), 5);
+        assert!(!Arc::ptr_eq(&a.jar(), &solo.jar()));
+        assert!(!Arc::ptr_eq(&a.http_cache(), &solo.http_cache()));
+    }
+
+    #[test]
+    fn shared_loader_cookie_visible_across_tabs_partition_isolated() {
+        let shared = SharedLoader::new();
+        let a = Scheduler::with_shared(shared_client().clone(), 5, &shared);
+        let b = Scheduler::with_shared(shared_client().clone(), 5, &shared);
+        // A Set-Cookie stored through tab A's jar is sent by tab B
+        // under the same top-level-site partition ...
+        a.jar().lock().unwrap().store_set_cookie(
+            "https://example.com/",
+            "https://example.com",
+            &["sessionid=abc; Path=/".to_string()],
+        );
+        let header = b.jar().lock().unwrap().cookie_header(
+            "https://example.com/",
+            "https://example.com",
+            true,
+            true,
+            true,
+        );
+        assert_eq!(header.as_deref(), Some("sessionid=abc"));
+        // ... but never under another site's partition.
+        let other = b.jar().lock().unwrap().cookie_header(
+            "https://example.com/",
+            "https://other.example",
+            true,
+            true,
+            true,
+        );
+        assert_eq!(other, None);
+    }
+
+    #[test]
+    fn shared_loader_hsts_and_cache_visible_across_tabs() {
+        let shared = SharedLoader::new();
+        let a = Scheduler::with_shared(shared_client().clone(), 5, &shared);
+        let b = Scheduler::with_shared(shared_client().clone(), 5, &shared);
+        // HSTS learned in one tab applies in the other.
+        a.hsts_store().lock().unwrap().record(
+            "example.com",
+            true,
+            Some("max-age=31536000"),
+            SystemTime::now(),
+        );
+        assert!(b
+            .hsts_store()
+            .lock()
+            .unwrap()
+            .is_known("example.com", SystemTime::now()));
+        // A fresh cache entry stored by one tab hits in the other.
+        let mut resp_headers = http::HeaderMap::new();
+        resp_headers.insert(header::CACHE_CONTROL, "max-age=60".parse().unwrap());
+        resp_headers.insert(header::CONTENT_TYPE, "text/html".parse().unwrap());
+        let stored = a.http_cache().lock().unwrap().store(
+            "https://example.com",
+            "GET",
+            "https://example.com/page",
+            200,
+            &resp_headers,
+            &http::HeaderMap::new(),
+            Bytes::from_static(b"hello"),
+        );
+        assert!(stored, "the response is storable");
+        let lookup = b.http_cache().lock().unwrap().lookup(
+            "https://example.com",
+            "GET",
+            "https://example.com/page",
+            &http::HeaderMap::new(),
+        );
+        assert!(
+            matches!(lookup, Lookup::Fresh(_)),
+            "shared cache hits across tabs: {lookup:?}"
         );
     }
 }
