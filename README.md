@@ -12,13 +12,17 @@ cd pluto
 cargo run -p pluto-browser
 ```
 
-The window opens with a nav bar (Back / Forward / Reload / URL / Go), a
-status line, and a viewport that loads https://example.com on startup —
+The window opens with a tab strip (one tab per page, favicon +
+title, Ctrl+T / Ctrl+W / Ctrl+Tab), a nav bar (Back / Forward /
+Reload / URL / Go, bookmark star, menu), a thin progress bar under
+the nav bar, a status line, and a viewport that loads
+https://example.com on startup —
 grey page, white centered box, "Example Domain" heading, paragraph, and
 link. The status line reads `Loaded https://example.com` when the page
 is up. Type a URL and press Go to navigate (a bare host works:
 `example.com` becomes `https://example.com`). A failed fetch renders
-an error page instead of a blank window.
+an error page instead of a blank window. The window title follows the
+active tab's page title.
 
 The window frame follows the desktop: the window manager draws it
 where it provides one (KDE, Xfce, sway...), and libcosmic draws it
@@ -72,10 +76,22 @@ during bootstrap, verified against the actual sources:
   (field is `pub(crate)`), so the window opens at the default 1024x768
   instead of 1280x800.
 
-## Next step — Milestone 2
+## Milestones
 
-Full selectors and specificity, UA stylesheet, external `<link>` CSS,
-grid, border-radius, box-shadow, overflow/scroll, hit-testing,
-clickable links, and Back/Forward history (see `ARCHITECTURE.md` for
-the full M1–M10 roadmap). Done means 60+ FPS browsing of info.cern.ch,
-Hacker News, and Rust docs.
+- **M1 — done.** "Hello, example.com": fetch + render through the
+  worker/renderer split.
+- **M2 — done.** Real-world CSS: full selectors and specificity, UA
+  stylesheet, external `<link>` CSS, grid, border-radius, box-shadow,
+  overflow/scroll, hit-testing, clickable links, Back/Forward history —
+  plus a partitioned HTTP cache, `:visited`, persisted history, and a
+  frame-time histogram for the 60 FPS bar.
+- **M3 — done.** Images and the multi-tab shell: PNG/JPEG/WebP/GIF
+  decode, intrinsic sizing, `background-image`, `srcset`/`<picture>`
+  selection, favicons, page titles, loading progress, preconnect +
+  DNS cache, animated images, strict decode limits.
+- **M4 — next.** JavaScript leftovers: the engine (rquickjs) landed
+  early, so this is the audit-and-finish pass — dirty-subtree re-layout
+  on DOM mutation, binding coverage, ES conformance gaps.
+
+Full workspace suite: 762 tests, all passing. See `ARCHITECTURE.md`
+for the full M1–M12 roadmap.
