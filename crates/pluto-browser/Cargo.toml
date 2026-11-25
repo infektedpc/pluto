@@ -17,3 +17,12 @@ pluto-css.workspace = true
 pluto-layout.workspace = true
 pluto-ipc.workspace = true
 pluto-js.workspace = true
+# Stage 9 Rec 9: fcntl (CLOEXEC) on the renderer spawn path.
+libc.workspace = true
+# Stage 9 Rec 13: ring::digest for the download SHA-256 (computed
+# as the temp file is written). ring 0.17 is already in the lock
+# via rustls; named directly here.
+ring = "0.17"
+# Stage 9 Rec 13: `http` types (`Uri`, `HeaderMap`) for the mixed-
+# download check, which reuses `pluto_net::mixed::is_mixed_download`.
+http.workspace = true

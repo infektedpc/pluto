@@ -86,7 +86,7 @@ pub use scripts::{
     AsyncQueue, CloseOutcome, DeferQueue, DocumentWriter, DynamicMarkupError, OpenOutcome,
     QueuedScript, ScriptKind, ScriptQueues, StylesheetGate, WriteOutcome, classify_script,
 };
-pub use streaming::{Parser, ParsedStream, ScriptPaused};
+pub use streaming::{Parser, ParsedStream, ReferrerPolicy, ScriptPaused};
 
 new_key_type! {
     /// Handle to a node in the [`Dom`] arena.

@@ -11,7 +11,11 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc;
 
-use crate::bindings::fetch::{FetchBackend, FetchCompletion, FetchError, FetchRequest, FetchResponse};
+use pluto_ipc::{Origin, RequestMode};
+
+use crate::bindings::fetch::{
+    FetchBackend, FetchCompletion, FetchError, FetchRequest, FetchResponse, ResponseType,
+};
 use crate::bindings::test_host::TestHost;
 use crate::engine::JsValue;
 use crate::observers::ComputedIntersection;
@@ -64,10 +68,24 @@ struct FakeBackend {
     requests: Arc<Mutex<Vec<FetchRequest>>>,
     response: FetchResponse,
     error: Option<FetchError>,
+    /// The document origin this backend fetches for, if any:
+    /// `fetch_impl` reads it for the realm-side gate call
+    /// (`check_fetch_allowed`), which since the Stage 9 Rec 2
+    /// completion is a pass-through — cross-origin enforcement
+    /// lives browser-side, not in the realm. `None` means the
+    /// realm cannot know the origin.
+    origin: Option<Origin>,
 }
 
 impl FakeBackend {
     fn ok(body: &str) -> (Arc<Self>, Arc<Mutex<Vec<FetchRequest>>>) {
+        Self::ok_with_origin(body, None)
+    }
+
+    fn ok_with_origin(
+        body: &str,
+        origin: Option<Origin>,
+    ) -> (Arc<Self>, Arc<Mutex<Vec<FetchRequest>>>) {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let backend = Arc::new(Self {
             requests: Arc::clone(&requests),
@@ -79,8 +97,10 @@ impl FakeBackend {
                     ("x-test".to_string(), "yes".to_string()),
                 ],
                 body: body.as_bytes().to_vec(),
+                response_type: ResponseType::Basic,
             },
             error: None,
+            origin,
         });
         (backend, requests)
     }
@@ -93,13 +113,19 @@ impl FakeBackend {
                 status_text: String::new(),
                 headers: Vec::new(),
                 body: Vec::new(),
+                response_type: ResponseType::Opaque,
             },
             error: Some(error),
+            origin: None,
         })
     }
 }
 
 impl FetchBackend for FakeBackend {
+    fn document_origin(&self) -> Option<Origin> {
+        self.origin.clone()
+    }
+
     fn start_fetch(&self, request: FetchRequest, done: mpsc::Sender<FetchCompletion>) {
         let id = request.id;
         self.requests.lock().unwrap().push(request);
@@ -781,6 +807,121 @@ fn fetch_json_parse_error_rejects() {
         "fetch('/x').then((r) => r.json()).catch((e) => { globalThis.__caught = e.name; });",
     );
     assert_eq!(read_str(&mut tab, "__caught"), "SyntaxError");
+}
+
+// Stage 9 Rec 1: the realm-side gate compares parsed `Origin`s.
+// The backend never sees a rejected fetch.
+
+#[test]
+fn fetch_absolute_same_origin_allowed() {
+    let (backend, requests) = FakeBackend::ok_with_origin(
+        "ok",
+        Some(Origin::from_url("https://example.com/page")),
+    );
+    let mut tab = test_tab();
+    tab.set_fetch_backend(backend);
+    run(
+        &mut tab,
+        "fetch('https://example.com/api') \
+           .then((r) => r.text()) \
+           .then((t) => { globalThis.__body = t; }) \
+           .catch((e) => { globalThis.__caught = e.message; });",
+    );
+    assert_eq!(read_str(&mut tab, "__body"), "ok");
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn fetch_absolute_same_origin_default_port_allowed() {
+    // `https://example.com:443` is the same origin as
+    // `https://example.com` (default-port normalization) — the
+    // gate must not falsely reject it.
+    let (backend, requests) = FakeBackend::ok_with_origin(
+        "ok",
+        Some(Origin::from_url("https://example.com")),
+    );
+    let mut tab = test_tab();
+    tab.set_fetch_backend(backend);
+    run(
+        &mut tab,
+        "fetch('https://example.com:443/api') \
+           .then((r) => r.text()) \
+           .then((t) => { globalThis.__body = t; });",
+    );
+    assert_eq!(read_str(&mut tab, "__body"), "ok");
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn fetch_absolute_cross_origin_passes_through_to_backend() {
+    // Stage 9 Rec 2 completion: the realm-side gate is a
+    // pass-through — cross-origin enforcement lives in the
+    // browser-side backend + pluto-net CORS, not in the realm.
+    // A default-mode (`cors`) cross-origin fetch therefore
+    // reaches the backend; the backend decides (here the fake
+    // answers 200, so the promise resolves).
+    let (backend, requests) = FakeBackend::ok_with_origin(
+        "ok",
+        Some(Origin::from_url("https://example.com/page")),
+    );
+    let mut tab = test_tab();
+    tab.set_fetch_backend(backend);
+    run(
+        &mut tab,
+        "fetch('https://evil.example/x') \
+           .then((r) => r.text()) \
+           .then((t) => { globalThis.__body = t; });",
+    );
+    assert_eq!(read_str(&mut tab, "__body"), "ok");
+    let seen = requests.lock().unwrap();
+    assert_eq!(seen.len(), 1, "the backend sees the cross-origin fetch");
+    assert_eq!(seen[0].url, "https://evil.example/x");
+    assert_eq!(seen[0].mode, RequestMode::Cors, "default mode is cors");
+}
+
+#[test]
+fn fetch_absolute_cross_origin_port_passes_through_to_backend() {
+    // A different port is a different origin, even on the same
+    // host — but at the realm the fetch still passes through;
+    // the origin distinction is enforced browser-side.
+    let (backend, requests) = FakeBackend::ok_with_origin(
+        "ok",
+        Some(Origin::from_url("https://example.com/")),
+    );
+    let mut tab = test_tab();
+    tab.set_fetch_backend(backend);
+    run(
+        &mut tab,
+        "fetch('https://example.com:8443/x') \
+           .then((r) => r.text()) \
+           .then((t) => { globalThis.__body = t; });",
+    );
+    assert_eq!(read_str(&mut tab, "__body"), "ok");
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "the backend sees the cross-origin-port fetch"
+    );
+}
+
+#[test]
+fn fetch_relative_allowed_with_origin_tracked() {
+    // Relative URLs resolve against the document base browser-side,
+    // so the realm-side gate passes them through.
+    let (backend, requests) = FakeBackend::ok_with_origin(
+        "ok",
+        Some(Origin::from_url("https://example.com/page")),
+    );
+    let mut tab = test_tab();
+    tab.set_fetch_backend(backend);
+    run(
+        &mut tab,
+        "fetch('/api/items') \
+           .then((r) => r.text()) \
+           .then((t) => { globalThis.__body = t; });",
+    );
+    assert_eq!(read_str(&mut tab, "__body"), "ok");
+    assert_eq!(requests.lock().unwrap().len(), 1);
 }
 
 // ---------------------------------------------------------------- misc

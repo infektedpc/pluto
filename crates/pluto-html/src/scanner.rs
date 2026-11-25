@@ -45,6 +45,10 @@
 //!   early in the document delays everything after it.
 //! * Client-rendered SPA shells — near-empty document; the scanner
 //!   finds the bundle and then runs out of document.
+//! * `<iframe src>` — deliberately NOT discovered (Stage 9 Rec 7,
+//!   T12): iframes parse as raw text today, so the fetch would be a
+//!   wasted request and a minor information leak. Re-add when
+//!   iframes render.
 //! * `<noscript>` contents are scanned as tags: the raw tokenizer has
 //!   no scripting flag, so with scripting enabled the real parser
 //!   treats noscript content as raw text while the scanner may
@@ -93,9 +97,24 @@ pub struct DiscoveredResource {
     pub url: String,
     pub destination: Destination,
     pub priority: Priority,
-    /// Where it was found, e.g. `"img[src]"`, `"link[rel=stylesheet]"`,
-    /// `"img[srcset]"`. Debugging aid, not load-bearing.
+    /// Where it was found, e.g. `"img[src]"`, `"link[rel=stylesheet]"`.
+    /// Debugging aid, not load-bearing — with one load-bearing
+    /// exception: `"imageset"` (Stage 9 Rec 6, Mixed Content L2
+    /// §3.1). A `srcset` / `<picture>` image candidate is labelled
+    /// `"imageset"`, the L2 initiator name: unlike a plain
+    /// `img[src]` it must BLOCK on a secure page, never
+    /// auto-upgrade to https. The browser-side call site that turns
+    /// a discovery into a `ResourceRequest` (`page.rs`,
+    /// `subresource_request`) reads the label into
+    /// `ResourceRequest.is_imageset`.
     pub from: &'static str,
+    /// The element's `integrity` attribute (Stage 9 Rec 14, SRI),
+    /// verbatim as written — the fetch layer parses it into hash
+    /// entries and verifies the streamed bytes against them. Only
+    /// `img` / `script` / `link` discoveries carry it (those are
+    /// the elements the HTML spec gives integrity metadata to);
+    /// every other discovery has `None`.
+    pub integrity: Option<String>,
 }
 
 /// Resolve `raw` against `base` (RFC 3986 join). Absolute URLs pass
@@ -135,6 +154,10 @@ pub struct RawDiscovery {
     pub destination: Destination,
     pub priority: Priority,
     pub from: &'static str,
+    /// The element's `integrity` attribute, verbatim (Stage 9 Rec
+    /// 14, SRI) — `Some` only for `img` / `script` / `link`
+    /// elements, `None` otherwise.
+    pub integrity: Option<String>,
 }
 
 fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -189,6 +212,15 @@ pub fn classify_element(
 ) -> Vec<RawDiscovery> {
     let mut out = Vec::new();
     let has = |name: &str| attr(attrs, name).is_some_and(|v| !v.trim().is_empty());
+    // Stage 9 Rec 14 (SRI): the element's `integrity` attribute
+    // rides every discovery the element makes. Only `img` /
+    // `script` / `link` carry integrity metadata per the HTML
+    // spec; every other element's discoveries get `None`.
+    let integrity = if matches!(tag, "img" | "script" | "link") {
+        attr(attrs, "integrity").map(|s| s.to_string())
+    } else {
+        None
+    };
     match tag {
         "script" => {
             if let Some(src) = attr(attrs, "src") {
@@ -203,6 +235,7 @@ pub fn classify_element(
                             if blocking { Priority::High } else { Priority::Medium },
                         ),
                         from: "script[src]",
+                        integrity: integrity.clone(),
                     });
                 }
             }
@@ -215,6 +248,7 @@ pub fn classify_element(
                         destination: Destination::Image,
                         priority: fetch_priority(attrs, Priority::Low),
                         from: "img[src]",
+                        integrity: integrity.clone(),
                     });
                 }
             }
@@ -224,7 +258,12 @@ pub fn classify_element(
                         url,
                         destination: Destination::Image,
                         priority: fetch_priority(attrs, Priority::Low),
-                        from: "img[srcset]",
+                        // Stage 9 Rec 6: a `srcset` candidate is an
+                        // `imageset` initiator (Mixed Content L2
+                        // §3.1) — it blocks on a secure page, never
+                        // auto-upgrades.
+                        from: "imageset",
+                        integrity: integrity.clone(),
                     });
                 }
             }
@@ -238,6 +277,7 @@ pub fn classify_element(
                             destination: Destination::Other,
                             priority: Priority::Low,
                             from: "source[src]",
+                            integrity: integrity.clone(),
                         });
                     }
                 }
@@ -248,7 +288,16 @@ pub fn classify_element(
                             url: src.to_string(),
                             destination: Destination::Image,
                             priority: fetch_priority(attrs, Priority::Low),
-                            from: "source[src]",
+                            // Stage 9 Rec 6: a `<source>` inside a
+                            // `<picture>` is an `imageset` initiator
+                            // (L2 §3.1); outside one it is a plain
+                            // image fetch.
+                            from: if in_picture {
+                                "imageset"
+                            } else {
+                                "source[src]"
+                            },
+                            integrity: integrity.clone(),
                         });
                     }
                 }
@@ -258,7 +307,8 @@ pub fn classify_element(
                             url,
                             destination: Destination::Image,
                             priority: fetch_priority(attrs, Priority::Low),
-                            from: "source[srcset]",
+                            from: "imageset",
+                            integrity: integrity.clone(),
                         });
                     }
                 }
@@ -276,6 +326,7 @@ pub fn classify_element(
                             destination: Destination::Stylesheet,
                             priority: fetch_priority(attrs, Priority::High),
                             from: "link[rel=stylesheet]",
+                            integrity: integrity.clone(),
                         });
                     } else if rels.contains(&"preload") {
                         let dest = match attr(attrs, "as") {
@@ -291,6 +342,7 @@ pub fn classify_element(
                             destination: dest,
                             priority: fetch_priority(attrs, Priority::High),
                             from: "link[rel=preload]",
+                            integrity: integrity.clone(),
                         });
                         if let Some(srcset) = attr(attrs, "imagesrcset") {
                             for url in srcset_urls(srcset) {
@@ -298,7 +350,11 @@ pub fn classify_element(
                                     url,
                                     destination: Destination::Image,
                                     priority: fetch_priority(attrs, Priority::High),
-                                    from: "link[imagesrcset]",
+                                    // Stage 9 Rec 6: a preload
+                                    // `imagesrcset` candidate is an
+                                    // `imageset` initiator (L2 §3.1).
+                                    from: "imageset",
+                                    integrity: integrity.clone(),
                                 });
                             }
                         }
@@ -308,6 +364,7 @@ pub fn classify_element(
                             destination: Destination::Script,
                             priority: fetch_priority(attrs, Priority::Medium),
                             from: "link[rel=modulepreload]",
+                            integrity: integrity.clone(),
                         });
                     } else if rels.contains(&"icon")
                         || rels.contains(&"apple-touch-icon")
@@ -318,6 +375,7 @@ pub fn classify_element(
                             destination: Destination::Image,
                             priority: Priority::VeryLow,
                             from: "link[rel=icon]",
+                            integrity: integrity.clone(),
                         });
                     }
                     // preconnect / dns-prefetch are not fetches; no
@@ -334,22 +392,17 @@ pub fn classify_element(
                         destination: Destination::Image,
                         priority: Priority::Low,
                         from: "video[poster]",
+                        integrity: integrity.clone(),
                     });
                 }
             }
         }
-        "iframe" => {
-            if let Some(src) = attr(attrs, "src") {
-                if !src.trim().is_empty() && !src.trim_start().starts_with("data:") {
-                    out.push(RawDiscovery {
-                        url: src.to_string(),
-                        destination: Destination::Other,
-                        priority: Priority::Low,
-                        from: "iframe[src]",
-                    });
-                }
-            }
-        }
+        // No `iframe[src]` discovery (Stage 9 Rec 7, T12): iframes
+        // parse as raw text today — there is no nested browsing
+        // context — so fetching the `src` is a wasted request and a
+        // minor information leak (a page could make the browser fetch
+        // arbitrary URLs whose bytes are never rendered). Re-add an
+        // `iframe` arm here when iframes render, and only then.
         "embed" => {
             if let Some(src) = attr(attrs, "src") {
                 if !src.trim().is_empty() {
@@ -358,6 +411,7 @@ pub fn classify_element(
                         destination: Destination::Other,
                         priority: Priority::Low,
                         from: "embed[src]",
+                        integrity: integrity.clone(),
                     });
                 }
             }
@@ -370,6 +424,7 @@ pub fn classify_element(
                         destination: Destination::Other,
                         priority: Priority::Low,
                         from: "object[data]",
+                        integrity: integrity.clone(),
                     });
                 }
             }
@@ -383,6 +438,7 @@ pub fn classify_element(
                             destination: Destination::Image,
                             priority: Priority::Low,
                             from: "input[type=image][src]",
+                            integrity: integrity.clone(),
                         });
                     }
                 }
@@ -445,6 +501,7 @@ pub fn scan(bytes: &[u8], document_url: &str) -> Vec<DiscoveredResource> {
                             destination: raw.destination,
                             priority: raw.priority,
                             from: raw.from,
+                            integrity: raw.integrity.clone(),
                         });
                     }
                 }
@@ -512,6 +569,30 @@ mod tests {
     }
 
     #[test]
+    fn iframe_src_is_not_discovered() {
+        // Stage 9 Rec 7 (T12): an <iframe src> must never become a
+        // fetch — iframes parse as raw text today, so the bytes
+        // would be fetched and discarded. Other subresources in the
+        // same document still are.
+        let found = scan(
+            br#"<img src="i.png"><iframe src="https://evil.example.com/x"></iframe><script src="s.js"></script><link rel=stylesheet href="a.css">"#,
+            DOC,
+        );
+        assert_eq!(
+            urls(&found),
+            vec![
+                "https://example.com/dir/i.png",
+                "https://example.com/dir/s.js",
+                "https://example.com/dir/a.css",
+            ]
+        );
+        assert!(
+            found.iter().all(|d| d.from != "iframe[src]"),
+            "no iframe[src] discovery: {found:?}"
+        );
+    }
+
+    #[test]
     fn template_contents_are_skipped() {
         // Blind spot, by design: <template> is inert.
         let found = scan(
@@ -563,6 +644,80 @@ mod tests {
         );
         assert_eq!(found[0].destination, Destination::Image);
         assert_eq!(found[1].destination, Destination::Other);
+    }
+
+    #[test]
+    fn srcset_and_picture_candidates_are_labelled_imageset() {
+        // Stage 9 Rec 6 (Mixed Content L2 §3.1): `srcset` /
+        // `<picture>` image candidates carry the `imageset`
+        // initiator label, so the mixed-content gate can block
+        // them instead of auto-upgrading. Plain `img[src]` keeps
+        // its own label (and keeps auto-upgrading).
+        let found = scan(
+            br#"<img src="plain.png"><img srcset="a.png 1x, b.png 2x"><picture><source src="p.jpg"><source srcset="q.webp"></picture><link rel="preload" as="image" href="h.png" imagesrcset="i.png 1x">"#,
+            DOC,
+        );
+        let labels: Vec<&str> = found.iter().map(|d| d.from).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "img[src]",
+                "imageset",
+                "imageset",
+                "imageset",
+                "imageset",
+                "link[rel=preload]",
+                "imageset",
+            ],
+            "srcset/picture candidates are imageset: {found:?}"
+        );
+        // And a `<source>` outside a `<picture>` is not.
+        let found = scan(br#"<source src="s.jpg">"#, DOC);
+        assert_eq!(found[0].from, "source[src]");
+    }
+
+    #[test]
+    fn integrity_attribute_lands_on_discoveries() {
+        // Stage 9 Rec 14 (SRI): the `integrity` attribute on an
+        // img / script / link rides its discovery verbatim.
+        let found = scan(
+            br#"<script src="s.js" integrity="sha256-abc"></script><img src="i.png" integrity="sha384-def"><link rel=stylesheet href="a.css" integrity="sha512-ghi">"#,
+            DOC,
+        );
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[0].integrity.as_deref(), Some("sha256-abc"));
+        assert_eq!(found[0].from, "script[src]");
+        assert_eq!(found[1].integrity.as_deref(), Some("sha384-def"));
+        assert_eq!(found[1].from, "img[src]");
+        assert_eq!(found[2].integrity.as_deref(), Some("sha512-ghi"));
+        assert_eq!(found[2].from, "link[rel=stylesheet]");
+        // A srcset candidate shares its <img>'s integrity value.
+        let found = scan(
+            br#"<img srcset="a.png 1x, b.png 2x" integrity="sha256-xyz">"#,
+            DOC,
+        );
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|d| d.integrity.as_deref() == Some("sha256-xyz")));
+        assert!(found.iter().all(|d| d.from == "imageset"));
+    }
+
+    #[test]
+    fn integrity_absent_without_the_attribute() {
+        // No `integrity` attribute: None, not an empty string.
+        let found = scan(
+            br#"<script src="s.js"></script><img src="i.png"><link rel=stylesheet href="a.css">"#,
+            DOC,
+        );
+        assert_eq!(found.len(), 3);
+        assert!(found.iter().all(|d| d.integrity.is_none()));
+        // Elements that never carry integrity metadata per the
+        // HTML spec don't get it even when the attribute is present.
+        let found = scan(
+            br#"<video poster="p.jpg" integrity="sha256-abc"></video><embed src="e.swf" integrity="sha256-abc"><source src="s.jpg" integrity="sha256-abc">"#,
+            DOC,
+        );
+        assert!(!found.is_empty());
+        assert!(found.iter().all(|d| d.integrity.is_none()), "{found:?}");
     }
 
     #[test]

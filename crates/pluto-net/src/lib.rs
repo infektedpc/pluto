@@ -26,10 +26,18 @@
 //! proven here, against a local test server (see the tests below).
 
 pub mod client;
+pub mod blocker;
+pub mod cors;
+pub mod csp;
 pub mod decode;
+pub mod hsts;
+pub mod https_only;
+pub mod jar;
 pub mod mixed;
 pub mod redirect;
+pub mod referrer;
 pub mod service;
+pub mod sri;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,7 +50,12 @@ use tokio_util::sync::CancellationToken;
 
 use service::Scheduler;
 
+pub use blocker::Blocker;
 pub use client::{HttpsClient, shared_client};
+pub use cors::PreflightCache;
+pub use hsts::HstsStore;
+pub use https_only::HttpsOnly;
+pub use referrer::{ReferrerContext, ReferrerPolicy};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
@@ -67,12 +80,42 @@ pub enum NetError {
     /// A blockable http subresource on an https page (Stage 5 #6).
     #[error("mixed content blocked: {0}")]
     MixedContentBlocked(String),
+    /// A CORS failure (Stage 9 Rec 2): the preflight failed, the
+    /// response failed the CORS check, or the request's mode does
+    /// not permit the crossing (e.g. `SameOrigin` mode to another
+    /// origin, or an opaque origin attempting a CORS fetch). Fail
+    /// closed: a CORS failure is a network error, never a
+    /// pass-through, and script sees only the rejection.
+    #[error("CORS blocked: {0}")]
+    CorsBlocked(String),
     /// A redirect downgraded https to http (Stage 5 #7).
     #[error("insecure redirect refused: {0}")]
     InsecureRedirect(String),
     /// A per-request timeout fired (time to first byte, or total).
     #[error("timed out: {0}")]
     Timeout(String),
+    /// A transport (TLS/cert) failure talking to a Known HSTS Host
+    /// (Stage 9 Rec 5, RFC 6797 §8.4): the connection is terminated
+    /// with no click-through and no HTTP fallback. There is no
+    /// click-through UI in Pluto at all, so this is simply fatal.
+    #[error("TLS error on a Known HSTS Host {0}: connection terminated, no fallback to HTTP")]
+    HstsTlsFailure(String),
+    /// An HTTPS-only rewrite (Stage 9 Rec 5) of a top-level
+    /// navigation failed: the secure version could not be reached.
+    /// The browser shows its error page with this reason; the
+    /// escape hatch is a per-site HTTPS-only exception.
+    #[error("HTTPS-only upgrade failed for {0}: the secure version could not be reached (add a per-site exception to load it over HTTP)")]
+    HttpsOnlyFailed(String),
+    /// A request blocked by the tracker filter lists (Stage 9
+    /// Rec 12, Round 1 basic): an EasyList / EasyPrivacy network
+    /// rule matched. A network error, never a pass-through.
+    #[error("blocked by filter list: {0}")]
+    BlockedByFilter(String),
+    /// Subresource Integrity verification failed (Stage 9 Rec 14):
+    /// the fetched bytes did not match the element's `integrity`
+    /// metadata. A network error — the resource is not used.
+    #[error("subresource integrity check failed: {0}")]
+    SriFailed(String),
 }
 
 impl NetError {
@@ -88,8 +131,13 @@ impl NetError {
             NetError::Cancelled => "cancelled",
             NetError::TooLarge { .. } => "too_large",
             NetError::MixedContentBlocked(_) => "mixed_content",
+            NetError::CorsBlocked(_) => "cors_blocked",
             NetError::InsecureRedirect(_) => "insecure_redirect",
             NetError::Timeout(_) => "timeout",
+            NetError::HstsTlsFailure(_) => "hsts_tls_error",
+            NetError::HttpsOnlyFailed(_) => "https_only_failed",
+            NetError::BlockedByFilter(_) => "blocked_by_filter",
+            NetError::SriFailed(_) => "sri_failed",
         }
     }
 
@@ -100,8 +148,13 @@ impl NetError {
             "cancelled" => NetError::Cancelled,
             "too_large" => NetError::Body(reason.to_string()),
             "mixed_content" => NetError::MixedContentBlocked(reason.to_string()),
+            "cors_blocked" => NetError::CorsBlocked(reason.to_string()),
             "insecure_redirect" => NetError::InsecureRedirect(reason.to_string()),
             "timeout" => NetError::Timeout(reason.to_string()),
+            "hsts_tls_error" => NetError::HstsTlsFailure(reason.to_string()),
+            "https_only_failed" => NetError::HttpsOnlyFailed(reason.to_string()),
+            "blocked_by_filter" => NetError::BlockedByFilter(reason.to_string()),
+            "sri_failed" => NetError::SriFailed(reason.to_string()),
             "body" => NetError::Body(reason.to_string()),
             _ => NetError::Request(reason.to_string()),
         }
@@ -246,6 +299,67 @@ impl ResourceLoader {
     pub async fn cancel(&self, request_id: u64) {
         self.scheduler.cancel(request_id).await;
     }
+
+    /// The shared HSTS store this loader's scheduler consults
+    /// (Stage 9 Rec 5). `pluto-browser` loads it from the profile
+    /// at startup and saves it back after navigations.
+    pub fn hsts_store(&self) -> Arc<std::sync::Mutex<HstsStore>> {
+        self.scheduler.hsts_store()
+    }
+
+    /// Replace this loader's HSTS store contents (profile load).
+    pub fn set_hsts_store(&self, store: HstsStore) {
+        *self.scheduler.hsts_store().lock().unwrap() = store;
+    }
+
+    /// The tracker blocker for this loader (Stage 9 Rec 12,
+    /// Round 1 basic): loaded from the profile list dir at
+    /// construction, refreshed in the background by the tab
+    /// thread (see `renderer::tab_main`).
+    pub fn blocker(&self) -> Arc<std::sync::Mutex<Blocker>> {
+        self.scheduler.blocker()
+    }
+
+    /// The shared HTTPS-only preference + exception store
+    /// (Stage 9 Rec 5). Default-on; see [`HttpsOnly`].
+    pub fn https_only(&self) -> Arc<std::sync::Mutex<HttpsOnly>> {
+        self.scheduler.https_only()
+    }
+
+    /// Replace this loader's HTTPS-only preference + exceptions
+    /// (profile load).
+    pub fn set_https_only(&self, mode: HttpsOnly) {
+        *self.scheduler.https_only().lock().unwrap() = mode;
+    }
+
+    /// The shared referrer context (Stage 9 Rec 15): the current
+    /// document URL + the policy in effect for it. `pluto-browser`
+    /// updates it on navigation (document URL), on the document
+    /// response (header policy), and during the parse (`<meta
+    /// name="referrer">`).
+    pub fn referrer_context(&self) -> Arc<std::sync::Mutex<ReferrerContext>> {
+        self.scheduler.referrer_context()
+    }
+
+    /// Point the referrer context at a new document (navigation):
+    /// the previous document stays the referrer for the
+    /// navigation request itself; the context is re-pointed to the
+    /// new document when its response headers arrive (see
+    /// `service.rs`).
+    pub fn set_referrer_document(&self, document_url: &str) {
+        let ctx = self.scheduler.referrer_context();
+        let mut ctx = ctx.lock().unwrap();
+        ctx.document_url = Some(document_url.to_string());
+    }
+
+    /// Update the policy in effect for the current document
+    /// (document `Referrer-Policy` header, or `<meta
+    /// name="referrer">` during the parse). The document URL is
+    /// left untouched.
+    pub fn set_referrer_policy(&self, policy: ReferrerPolicy) {
+        let ctx = self.scheduler.referrer_context();
+        ctx.lock().unwrap().policy = policy;
+    }
 }
 
 #[cfg(test)]
@@ -355,6 +469,9 @@ mod tests {
             tab_id: 0,
             epoch: 1,
             url: format!("{base}final"),
+                method: "GET".to_string(),
+                headers: Vec::new(),
+                is_imageset: false,
             destination: Destination::Document,
             priority: Priority::VeryHigh,
             mode: RequestMode::Navigate,
@@ -362,6 +479,7 @@ mod tests {
             origin: base.clone(),
             top_level_site: base.clone(),
             upgrade_insecure_requests: false,
+            integrity: None,
         };
         let mut events = loader.fetch_stream(request, CancellationToken::new()).await;
         let mut saw_headers = false;
@@ -393,6 +511,9 @@ mod tests {
             tab_id: 0,
             epoch: 1,
             url: format!("{base}final"),
+                method: "GET".to_string(),
+                headers: Vec::new(),
+                is_imageset: false,
             destination: Destination::Document,
             priority: Priority::VeryHigh,
             mode: RequestMode::Navigate,
@@ -400,6 +521,7 @@ mod tests {
             origin: base.clone(),
             top_level_site: base.clone(),
             upgrade_insecure_requests: false,
+            integrity: None,
         };
         let mut rx1 = loader
             .fetch_stream(request.clone(), CancellationToken::new())
@@ -435,8 +557,11 @@ mod tests {
             ("too_many_redirects", "loop"),
             ("cancelled", ""),
             ("mixed_content", "http://x/y.js"),
+            ("cors_blocked", "cross-origin fetch failed the CORS check"),
             ("insecure_redirect", "https -> http"),
             ("timeout", "slow"),
+            ("hsts_tls_error", "https://example.com/"),
+            ("https_only_failed", "http://example.com/"),
             ("body", "bad gzip"),
             ("request", "boom"),
             ("unknown-code", "boom"),

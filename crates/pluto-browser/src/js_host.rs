@@ -31,10 +31,10 @@ use pluto_html::{
     Dom, NodeId, NodeKind, Parser, QueuedScript, ScriptPaused, parse_fragment,
     resolve_url,
 };
-use pluto_ipc::{CredentialsMode, Destination, Priority, RequestMode, ResourceRequest, origin_of};
+use pluto_ipc::{Destination, Origin, Priority, RequestMode, ResourceRequest};
 use pluto_js::{
     DomHost, DomHostError, DomKey, FetchBackend, FetchCompletion, FetchError, FetchRequest,
-    FetchResponse, Geometry, JsError, RealmConfig, TabJs,
+    FetchResponse, Geometry, JsError, RealmConfig, ResponseType, TabJs,
 };
 use pluto_layout::{ElementState, selector_matches};
 use pluto_net::ResourceLoader;
@@ -1165,6 +1165,89 @@ pub fn new_tab_js() -> Result<TabJs, JsError> {
     TabJs::new(&RealmConfig::default())
 }
 
+// ------------------------------------------------------------------ storage
+// + permissions backends (Stage 9 Rec 4 + Rec 11)
+//
+// The browser-side stores live in `storage.rs` / `permissions.rs`
+// next to this file. They are declared here (rather than in
+// `main.rs`) so this wave touches no file outside its scope:
+// `crate::js_host::storage` / `crate::js_host::permissions`.
+// A later tidy-up may move the two `mod` lines into `main.rs` and
+// drop the `#[path]` attributes; the module paths are the only
+// thing that would change.
+//
+// `localStorage` is shared across tabs and persisted to the
+// profile; `sessionStorage` is per tab (a fresh store per
+// [`TabBackends`], dropped — hence cleared — when the tab
+// closes); permissions are shared and persisted, with grants
+// expiring after ~90 days without a visit.
+
+#[path = "storage.rs"]
+pub mod storage;
+
+#[path = "permissions.rs"]
+pub mod permissions;
+
+/// The per-tab storage + permissions backends: the shared,
+/// profile-backed local store and permission store, plus this
+/// tab's own session store. Built once per tab (in
+/// `renderer.rs`, next to the `PlutoFetchBackend`); the tab
+/// thread owns it for the tab's lifetime.
+pub struct TabBackends {
+    /// Shared `localStorage` + this tab's `sessionStorage`.
+    pub storage: Arc<storage::PlutoStorageBackend>,
+    /// Shared permission store.
+    pub permissions: Arc<permissions::PlutoPermissionsBackend>,
+}
+
+/// Build the backends for a new tab: load the persisted local
+/// storage + permission stores from the profile (empty when none
+/// exists yet) and give the tab a fresh session store.
+pub fn new_tab_backends() -> TabBackends {
+    let local = Arc::new(Mutex::new(storage::load_local_storage()));
+    let perms = Arc::new(Mutex::new(permissions::load_permissions()));
+    TabBackends {
+        storage: Arc::new(storage::PlutoStorageBackend::new(local)),
+        permissions: Arc::new(permissions::PlutoPermissionsBackend::new(perms)),
+    }
+}
+
+/// Persist the shared stores to the profile now (called after a
+/// permission change lands through the backend, and — once the
+/// wiring below lands — when a tab closes; `localStorage`
+/// writes already save themselves on every mutation).
+pub fn save_tab_backends(backends: &TabBackends) {
+    backends.storage.save_local();
+    backends.permissions.save();
+}
+
+// FOLLOW-UP WIRING (not done here — it needs `TabJs` setters
+// plus the renderer call, both outside this wave's file scope):
+//
+// 1. `pluto-js/src/tab.rs` — add to `TabJs`:
+//      `pub fn set_storage_backend(&mut self, backend: Arc<dyn StorageBackend>)`
+//      `pub fn set_permissions_backend(&mut self, backend: Arc<dyn PermissionsBackend>)`
+//    storing them like `fetch_backend`, and re-attach them in
+//    `TabJs::navigate` next to the existing `fetch_backend`
+//    re-attach, so a navigation keeps the same stores (the
+//    `localStorage` sharing + `sessionStorage` survival across
+//    reloads both depend on this).
+// 2. `pluto-browser/src/renderer.rs` — in `TabState::tab_js`,
+//    next to the existing `set_fetch_backend` call:
+//      `let backends = crate::js_host::new_tab_backends();`
+//      `js.set_storage_backend(Arc::clone(&backends.storage) as Arc<dyn pluto_js::bindings::storage::StorageBackend>);`
+//      `js.set_permissions_backend(Arc::clone(&backends.permissions) as Arc<dyn pluto_js::bindings::permissions::PermissionsBackend>);`
+//      `self.tab_backends = Some(backends);` (a new `TabState` field)
+//    and call `backends.permissions.note_visit(&origin)` on
+//    navigation (refreshing the ~90-day grant clock) plus
+//    `crate::js_host::save_tab_backends(&backends)` when the tab
+//    closes.
+// Until that lands, realms use the `pluto-js` in-memory
+// defaults: `localStorage` shared process-wide (correct
+// behaviour, not yet on disk) and `sessionStorage` per realm
+// (lost on navigation — the one behavioural gap this follow-up
+// closes).
+
 // ------------------------------------------------------------------ fetch
 //
 // `fetch()` over `pluto-net` (Recommendation 8): the binding builds
@@ -1172,23 +1255,34 @@ pub fn new_tab_js() -> Result<TabJs, JsError> {
 // promise — never the backend, never inline on a network thread.
 
 /// The `fetch()` backend for one tab: a [`ResourceLoader`] plus the
-/// document origin / epoch the same-origin gate checks against.
+/// document origin / epoch the CORS gate checks against.
 ///
-/// # Same-origin gate (M4)
+/// # CORS gate (Stage 9 Rec 2, replacing the M4 same-origin gate)
 ///
-/// Relative URLs resolve against the document base; an absolute
-/// cross-origin URL is rejected here, before any network access —
-/// the promise rejects with a `TypeError` (the binding maps a
-/// backend error to a rejection). This gate IS the M4 origin check
-/// the bindings agent warned was a precondition for wiring `fetch`
-/// to a real backend. It is not CORS:
+/// Relative URLs resolve against the document base; the gate
+/// compares parsed [`Origin`]s structurally (default-port
+/// normalized, so `https://example.com:443` is same origin as
+/// `https://example.com`), never serialized strings — two different
+/// opaque origins both serialize to `"null"` but are never same
+/// origin. An absolute cross-origin URL is NO LONGER rejected here:
+/// it goes to `pluto-net` as a CORS fetch (`RequestMode::Cors`),
+/// where the preflight / CORS check / opaque filtering run — the
+/// real check lives browser-side in `pluto-net`, never in the realm
+/// (`check_fetch_allowed` in `pluto-js` stays a pass-through; this
+/// backend's gate stays authoritative).
 ///
-/// TODO(M5): CORS — full preflight / `mode` / credentials handling
-/// lands at this gate (the `RequestMode::Cors` path, opaque
-/// `no-cors` responses, and the preflight cache).
-/// TODO(M10): CSP — the `connect-src` check lands at this gate,
-/// before the origin check (gate order when it lands: HSTS →
-/// blocker → CSP → CORS → cache → network).
+/// `init.mode` / `init.credentials` are parsed in `pluto-js`
+/// and ride `FetchRequest` (Stage 9 Rec 2): the backend enforces
+/// `same-origin` mode here and threads `mode` / `credentials` /
+/// `method` / `headers` to `pluto-net`, which runs the preflight
+/// / CORS check / opaque filtering and the credentials rules.
+/// `CredentialsMode::Include` is fully honoured by `pluto-net`
+/// for any request that carries it.
+///
+/// Gate order at this hook point: scheme check → mixed-content
+/// check → CORS (in `pluto-net`) → network. CSP `connect-src`
+/// (M10) slots in BEFORE the CORS decision when it lands; the
+/// no-op hook for it is `csp_pre_request_check` in `pluto-net`.
 pub struct PlutoFetchBackend {
     loader: ResourceLoader,
     /// The tab thread's tokio runtime handle: `start_fetch` spawns
@@ -1197,8 +1291,11 @@ pub struct PlutoFetchBackend {
     handle: tokio::runtime::Handle,
     /// Document base URL, updated by the tab thread on navigation.
     base_url: Arc<Mutex<String>>,
-    /// Document origin (`scheme://authority`), from `base_url`.
-    origin: Arc<Mutex<String>>,
+    /// Document origin, from `base_url` via
+    /// [`Origin::for_document`] (top-level navigation, no creator):
+    /// a top-level `about:blank` or `data:` document is opaque, a
+    /// normal URL is its tuple origin.
+    origin: Arc<Mutex<Origin>>,
     /// Navigation epoch; a completion for a stale epoch resolves
     /// as `Cancelled` (the loop drops it anyway — belt and braces).
     epoch: Arc<AtomicU64>,
@@ -1215,16 +1312,40 @@ impl PlutoFetchBackend {
             loader,
             handle,
             base_url: Arc::new(Mutex::new(base_url.to_string())),
-            origin: Arc::new(Mutex::new(origin_of(base_url))),
+            origin: Arc::new(Mutex::new(Origin::from_url(base_url))),
             epoch: Arc::new(AtomicU64::new(0)),
             next_request_id: AtomicU64::new(1),
         }
     }
 
-    /// Re-point the gate at a new document (navigation).
+    /// Re-point the gate at a new document (top-level navigation):
+    /// the origin is the document origin of `url` with no creator
+    /// (see [`Origin::for_document`]).
     pub fn set_base_url(&self, url: &str) {
         *self.base_url.lock().unwrap() = url.to_string();
-        *self.origin.lock().unwrap() = origin_of(url);
+        *self.origin.lock().unwrap() = Origin::for_document(url, None, false);
+    }
+
+    /// Re-point the gate at a new document created by another
+    /// document (`creator`): an `about:blank` iframe / popup or a
+    /// `srcdoc` document inherits the creator's origin, unless
+    /// `sandboxed` (a sandboxed iframe always gets a fresh opaque
+    /// origin). No caller yet — iframes render no nested browsing
+    /// context — but the seam is here so the iframe work does not
+    /// have to re-derive the rule.
+    pub fn set_base_url_with_creator(
+        &self,
+        url: &str,
+        creator: Option<&Origin>,
+        sandboxed: bool,
+    ) {
+        *self.base_url.lock().unwrap() = url.to_string();
+        *self.origin.lock().unwrap() = Origin::for_document(url, creator, sandboxed);
+    }
+
+    /// The document origin the gate checks against.
+    pub fn document_origin(&self) -> Origin {
+        self.origin.lock().unwrap().clone()
     }
 
     /// Bump the epoch (navigation): in-flight fetches for the old
@@ -1235,6 +1356,14 @@ impl PlutoFetchBackend {
 }
 
 impl FetchBackend for PlutoFetchBackend {
+    /// The document origin, for the realm-side gate's early
+    /// same-origin check (`check_fetch_allowed` in `pluto-js`).
+    /// That check is defense in depth only — this backend's own
+    /// gate above stays authoritative.
+    fn document_origin(&self) -> Option<Origin> {
+        Some(self.origin.lock().unwrap().clone())
+    }
+
     fn start_fetch(&self, request: FetchRequest, done: mpsc::Sender<FetchCompletion>) {
         let id = request.id;
         let send = |result: Result<FetchResponse, FetchError>| {
@@ -1257,18 +1386,42 @@ impl FetchBackend for PlutoFetchBackend {
             ))));
             return;
         }
-        // Same-origin gate (M4): absolute cross-origin fetch MUST
-        // fail, not silently succeed. TODO(M5): CORS replaces this
-        // hard reject with the preflight / safelist check.
+        // Same-origin gate (M4) → CORS gate (Stage 9 Rec 2): an
+        // absolute cross-origin URL is NOT rejected here anymore.
+        // It goes to `pluto-net` as a CORS fetch, where the
+        // preflight / CORS check / opaque filtering run. The
+        // comparison below still uses parsed `Origin`s
+        // (default-port normalized), never serialized strings —
+        // and an opaque document origin can never pass a CORS
+        // check, so an opaque document fetching cross-origin
+        // fails fast here, before any network access (fail
+        // closed: the CORS code cannot classify an opaque
+        // origin's cross-origin fetch as anything but an error).
+        // TODO(M10): CSP `connect-src` check goes here, before the
+        // network, once CSP lands — it slots in BEFORE the CORS
+        // decision (see the struct docs).
         let doc_origin = self.origin.lock().unwrap().clone();
-        if origin_of(&absolute) != doc_origin {
+        if doc_origin.is_opaque()
+            && !Origin::from_url(&absolute).is_same_origin(&doc_origin)
+        {
             send(Err(FetchError::InvalidUrl(format!(
-                "cross-origin fetch blocked in M4 (same-origin only; TODO(M5) CORS): {absolute}"
+                "cross-origin fetch from an opaque origin is blocked: {absolute}"
             ))));
             return;
         }
-        // TODO(M10): CSP `connect-src` check goes here, before the
-        // network, once CSP lands.
+        // `mode: "same-origin"` is enforced here, before any
+        // network access: a cross-origin URL with that mode is a
+        // TypeError, not a CORS request (Fetch §4.2). `mode:
+        // "no-cors"` and `"cors"` go to `pluto-net`, which runs the
+        // preflight / CORS check / opaque filtering.
+        if request.mode == RequestMode::SameOrigin
+            && !Origin::from_url(&absolute).is_same_origin(&doc_origin)
+        {
+            send(Err(FetchError::InvalidUrl(format!(
+                "same-origin fetch to a cross-origin URL is blocked: {absolute}"
+            ))));
+            return;
+        }
         let resource = ResourceRequest {
             request_id: self.next_request_id.fetch_add(1, Ordering::Relaxed),
             tab_id: 0,
@@ -1276,38 +1429,65 @@ impl FetchBackend for PlutoFetchBackend {
             url: absolute,
             destination: Destination::Fetch,
             priority: Priority::Medium,
-            // Same-origin only in M4: cross-origin fails before the
-            // network (see the gate above), so `SameOrigin` mode is
-            // the honest request mode here.
-            mode: RequestMode::SameOrigin,
-            credentials: CredentialsMode::SameOrigin,
-            origin: doc_origin.clone(),
-            top_level_site: doc_origin,
+            // Stage 9 Rec 2: `init.method` / `init.headers` /
+            // `init.mode` / `init.credentials` ride the wire —
+            // `pluto-net` validates the method/headers (CORS
+            // safelists, forbidden headers, preflight) and applies
+            // the mode/credentials rules. Nothing here decides
+            // CORS; this backend only enforces the same-origin
+            // mode above and the opaque-origin fail-closed rule.
+            method: request.method.clone(),
+            headers: request.headers.clone(),
+            // `fetch()` is never an imageset fetch.
+            is_imageset: false,
+            mode: request.mode,
+            credentials: request.credentials,
+            origin: doc_origin.serialize(),
+            top_level_site: doc_origin.serialize(),
             upgrade_insecure_requests: false,
+            integrity: None,
         };
         let loader = self.loader.clone();
         let epoch = Arc::clone(&self.epoch);
         let start_epoch = epoch.load(Ordering::SeqCst);
+        // `Response.type` (Stage 9 Rec 2): the backend computes it
+        // from the final URL's origin against the document origin —
+        // `pluto-net` zeroed the response (status 0, no headers, no
+        // body) for opaque tainting, so status 0 is the opaque
+        // signal; anything else is basic (same-origin) or cors.
+        let doc_origin_for_type = doc_origin.clone();
         self.handle.spawn(async move {
             let outcome = match loader
                 .fetch_with(resource, CancellationToken::new())
                 .await
             {
-                Ok(response) => Ok(FetchResponse {
-                    status: response.status.as_u16(),
-                    status_text: String::new(),
-                    headers: response
-                        .headers
-                        .iter()
-                        .map(|(name, value)| {
-                            (
-                                name.to_string(),
-                                value.to_str().unwrap_or("").to_string(),
-                            )
-                        })
-                        .collect(),
-                    body: response.body,
-                }),
+                Ok(response) => {
+                    let response_type = if response.status.as_u16() == 0 {
+                        ResponseType::Opaque
+                    } else if Origin::from_url(&response.final_url.to_string())
+                        .is_same_origin(&doc_origin_for_type)
+                    {
+                        ResponseType::Basic
+                    } else {
+                        ResponseType::Cors
+                    };
+                    Ok(FetchResponse {
+                        status: response.status.as_u16(),
+                        status_text: String::new(),
+                        headers: response
+                            .headers
+                            .iter()
+                            .map(|(name, value)| {
+                                (
+                                    name.to_string(),
+                                    value.to_str().unwrap_or("").to_string(),
+                                )
+                            })
+                            .collect(),
+                        body: response.body,
+                        response_type,
+                    })
+                }
                 Err(e) => Err(FetchError::Network(e.to_string())),
             };
             // Navigation epoch: a completion for the old document
@@ -1663,6 +1843,7 @@ impl ScriptExecutor {
 mod tests {
     use super::*;
     use crate::renderer::{layout_thread, LayoutJob};
+    use pluto_ipc::CredentialsMode;
     use pluto_js::{RealmConfig, TabJs};
     use std::sync::mpsc;
 
@@ -1731,5 +1912,235 @@ mod tests {
         let host = host.lock().unwrap();
         let key = host.get_element_by_id("box").expect("box still there");
         assert_eq!(host.text_content(key).as_deref(), Some("y4"));
+    }
+
+    // ------------------------------------------------------------ fetch gate
+    //
+    // Stage 9 Rec 1: the same-origin gate compares parsed `Origin`s.
+
+    /// A fetch backend over a real (never used) loader: the gate
+    /// rejects before any network access, so these tests need no
+    /// network. The runtime is kept alive for the backend's handle.
+    fn fetch_backend(base_url: &str) -> (PlutoFetchBackend, tokio::runtime::Runtime) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime builds");
+        let backend =
+            PlutoFetchBackend::new(ResourceLoader::new(), rt.handle().clone(), base_url);
+        (backend, rt)
+    }
+
+    fn fetch_request(url: &str) -> FetchRequest {
+        FetchRequest {
+            id: 1,
+            url: url.to_string(),
+            method: "GET".to_string(),
+            headers: Vec::new(),
+            body: None,
+            // Stage 9 Rec 2: the `fetch()` defaults — mode `cors`,
+            // credentials `same-origin`.
+            mode: RequestMode::Cors,
+            credentials: CredentialsMode::SameOrigin,
+        }
+    }
+
+    /// The gate's synchronous answer to one `start_fetch`, if any
+    /// (rejections answer synchronously; an allowed fetch spawns a
+    /// network task and answers later, so these tests only assert
+    /// rejections).
+    fn gate_answer(
+        backend: &PlutoFetchBackend,
+        url: &str,
+    ) -> Option<Result<FetchResponse, FetchError>> {
+        let (tx, rx) = mpsc::channel();
+        backend.start_fetch(fetch_request(url), tx);
+        rx.try_recv().ok().map(|c| c.result)
+    }
+
+    #[test]
+    fn fetch_gate_passes_cross_origin_to_the_cors_backend() {
+        // Stage 9 Rec 2: the M4 hard reject is gone — a
+        // cross-origin fetch goes to `pluto-net` as a CORS fetch,
+        // so there is no synchronous rejection (the network task
+        // decides: preflight / CORS check / opaque filtering).
+        let (backend, _rt) = fetch_backend("https://example.com/page");
+        assert!(gate_answer(&backend, "https://evil.example/x").is_none());
+        // A different port is a different origin — same treatment.
+        assert!(gate_answer(&backend, "https://example.com:8443/x").is_none());
+        // ...but the default port is the SAME origin, so the gate
+        // lets it through (no synchronous answer: it goes to the
+        // network task, which this test never awaits).
+        assert!(gate_answer(&backend, "https://example.com:443/x").is_none());
+        // Relative URLs resolve against the document base and pass
+        // the gate the same way.
+        assert!(gate_answer(&backend, "/api/items").is_none());
+        // An opaque document fetching cross-origin fails fast (fail
+        // closed — an opaque origin can never pass a CORS check).
+        let (opaque, _rt2) = fetch_backend("about:blank");
+        assert!(matches!(
+            gate_answer(&opaque, "https://example.com/x"),
+            Some(Err(FetchError::InvalidUrl(_)))
+        ));
+    }
+
+    #[test]
+    fn fetch_gate_same_origin_mode_rejects_cross_origin() {
+        // Stage 9 Rec 2: `mode: "same-origin"` is enforced here,
+        // before any network access — a cross-origin URL with
+        // that mode answers synchronously with a rejection, while
+        // the same URL in default `cors` mode passes through to
+        // the CORS backend (see the test above).
+        let (backend, _rt) = fetch_backend("https://example.com/page");
+        let answer_with_mode = |url: &str, mode: RequestMode| {
+            let (tx, rx) = mpsc::channel();
+            let mut request = fetch_request(url);
+            request.mode = mode;
+            backend.start_fetch(request, tx);
+            rx.try_recv().ok().map(|c| c.result)
+        };
+        assert!(
+            matches!(
+                answer_with_mode("https://evil.example/x", RequestMode::SameOrigin),
+                Some(Err(FetchError::InvalidUrl(_)))
+            ),
+            "same-origin mode rejects a cross-origin URL synchronously"
+        );
+        // Same mode, same origin: no synchronous rejection (the
+        // network task runs; this test never awaits it).
+        assert!(
+            answer_with_mode("https://example.com/x", RequestMode::SameOrigin).is_none(),
+            "same-origin mode allows a same-origin URL"
+        );
+        // A different port is a different origin here too.
+        assert!(
+            matches!(
+                answer_with_mode("https://example.com:8443/x", RequestMode::SameOrigin),
+                Some(Err(FetchError::InvalidUrl(_)))
+            ),
+            "same-origin mode rejects a cross-origin port"
+        );
+    }
+
+    /// Tiny local server for the CORS round-trip test: `/data` is
+    /// granted to any origin, `/no-cors` to none.
+    async fn serve_cors(listener: tokio::net::TcpListener) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let Ok(n) = stream.read(&mut buf).await else {
+                    return;
+                };
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/");
+                let response = match path {
+                    "/data" => {
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhello-cors"
+                            .to_string()
+                    }
+                    _ => {
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: close\r\n\r\nno-cors"
+                            .to_string()
+                    }
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    }
+
+    #[test]
+    fn fetch_gate_cross_origin_cors_round_trip() {
+        // Stage 9 Rec 2, end to end: a cross-origin `fetch()`
+        // through the real loader resolves when the server grants
+        // CORS, and rejects (network error) when it does not. The
+        // document base is a different origin from the server (a
+        // different port), so this is a genuine cross-origin fetch.
+        let (backend, rt) = fetch_backend("http://127.0.0.1:1/page");
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(serve_cors(listener));
+            let fetch = |url: String| {
+                let (tx, rx) = mpsc::channel();
+                backend.start_fetch(fetch_request(&url), tx);
+                tokio::task::spawn_blocking(move || {
+                    rx.recv_timeout(Duration::from_secs(10))
+                })
+            };
+            // Granted: resolves with the body.
+            let completion = fetch(format!("http://127.0.0.1:{port}/data"))
+                .await
+                .expect("spawn_blocking runs")
+                .expect("a completion arrives");
+            let response = completion.result.expect("CORS-granted fetch resolves");
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body, b"hello-cors");
+            // Refused: rejects with a network error.
+            let completion = fetch(format!("http://127.0.0.1:{port}/no-cors"))
+                .await
+                .expect("spawn_blocking runs")
+                .expect("a completion arrives");
+            assert!(
+                matches!(completion.result, Err(FetchError::Network(_))),
+                "CORS-refused fetch must reject, got {:?}", 
+                completion.result
+            );
+        });
+    }
+
+    #[test]
+    fn fetch_gate_still_rejects_mixed_content_and_bad_schemes() {
+        let (backend, _rt) = fetch_backend("https://example.com/page");
+        assert!(matches!(
+            gate_answer(&backend, "http://example.com/x"),
+            Some(Err(FetchError::Network(_)))
+        ));
+        assert!(matches!(
+            gate_answer(&backend, "data:text/html,<p>x</p>"),
+            Some(Err(FetchError::InvalidUrl(_)))
+        ));
+    }
+
+    #[test]
+    fn fetch_backend_tracks_document_origin_on_navigation() {
+        let (backend, _rt) = fetch_backend("https://example.com:443/page");
+        // Default-port normalization: the stored origin has no port.
+        assert_eq!(
+            backend.document_origin(),
+            Origin::from_url("https://example.com")
+        );
+        backend.set_base_url("https://other.example:8443/x");
+        assert_eq!(
+            backend.document_origin().serialize(),
+            "https://other.example:8443"
+        );
+        // A top-level `about:blank` is opaque...
+        backend.set_base_url("about:blank");
+        let blank = backend.document_origin();
+        assert!(blank.is_opaque());
+        // ...and a `data:` document is a *different* opaque origin.
+        backend.set_base_url("data:text/html,<p>x</p>");
+        let data = backend.document_origin();
+        assert!(data.is_opaque());
+        assert_ne!(data, blank);
+        // `about:blank` created by a page inherits the creator.
+        let creator = Origin::from_url("https://example.com/");
+        backend.set_base_url_with_creator("about:blank", Some(&creator), false);
+        assert_eq!(backend.document_origin(), creator);
+        // A sandboxed document is opaque even with a creator.
+        backend.set_base_url_with_creator("about:blank", Some(&creator), true);
+        assert!(backend.document_origin().is_opaque());
     }
 }

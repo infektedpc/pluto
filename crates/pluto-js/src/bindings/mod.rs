@@ -47,11 +47,14 @@
 //! # What is NOT built here (Rec 11)
 //!
 //! Full WebIDL/codegen, workers, Shadow DOM, `IntersectionObserver`,
-//! import maps, storage APIs, full fetch/CORS (CORS is M5 — see the
-//! `TODO(M5)` at the fetch gate in `fetch.rs`), CSP (M10 — see the
-//! `TODO(M10)` at the same gate). `MutationObserver` /
-//! `ResizeObserver` landed in Stage 8 (see [`observers`]); each
-//! remaining item gets a one-line `TODO(stage)` at its hook point.
+//! import maps, full fetch/CORS (CORS is M5 — see the `TODO(M5)` at
+//! the fetch gate in `fetch.rs`), CSP (M10 — see the `TODO(M10)` at
+//! the same gate). `MutationObserver` / `ResizeObserver` landed in
+//! Stage 8 (see [`observers`]); storage (`localStorage` /
+//! `sessionStorage`, Stage 9 Rec 4) and `navigator.permissions`
+//! (Stage 9 Rec 11) landed in Stage 9 — see [`storage`] and
+//! [`permissions`]. Each remaining item gets a one-line
+//! `TODO(stage)` at its hook point.
 //!
 //! TODO(M5): WebIDL/codegen — the bindings in this module are
 //! hand-written per interface; a generator would replace them when
@@ -61,6 +64,8 @@ pub mod dom;
 pub mod events;
 pub mod fetch;
 pub mod observers;
+pub mod permissions;
+pub mod storage;
 #[cfg(test)]
 pub mod test_host;
 #[cfg(test)]
@@ -73,13 +78,15 @@ use std::rc::Rc;
 use rquickjs::function::This;
 use rquickjs::{Atom, Ctx, FromJs, Function, Object, Symbol, Value};
 
+use crate::bindings::permissions::{MemoryPermissionsBackend, PermissionName, PermissionsBackend};
+use crate::bindings::storage::{MemoryStorageBackend, StorageBackend};
 use crate::error::JsError;
 use crate::event_loop::LoopState;
 use crate::host::{DomHost, DomKey};
 use crate::observers::{IntersectionObserverRegistry, ResizeObserverRegistry};
 use crate::realm::TabRealm;
 
-pub use fetch::{FetchBackend, FetchCompletion, FetchError, FetchRequest, FetchResponse};
+pub use fetch::{FetchBackend, FetchCompletion, FetchError, FetchRequest, FetchResponse, ResponseType};
 
 /// `Symbol.for("pluto.registry")` — the registry key. Reconstructed
 /// on every entry (a global symbol), so Rust never has to store it.
@@ -157,6 +164,28 @@ pub struct BindingState {
     /// task. The `TabJs` rendering step drives its gather; the
     /// delivery task drains the pending queue after paint.
     pub intersection_registry: IntersectionObserverRegistry,
+    /// The storage backend behind `localStorage` /
+    /// `sessionStorage` (Stage 9 Rec 4). Default: the in-memory
+    /// [`MemoryStorageBackend`] (process-shared local buckets,
+    /// per-realm session buckets). The integration wave replaces
+    /// this with its profile-backed backends once `TabJs` gains a
+    /// setter (see the wiring note in
+    /// `pluto-browser::js_host`); `TabJs::navigate` re-attaches
+    /// whatever backend is set there, like the fetch backend.
+    pub storage_backend: std::sync::Arc<dyn StorageBackend>,
+    /// The permission store behind `navigator.permissions`
+    /// (Stage 9 Rec 11). Default: the in-memory
+    /// [`MemoryPermissionsBackend`]. Replaced by the
+    /// profile-persisted store the same way as
+    /// [`BindingState::storage_backend`].
+    pub permissions_backend: std::sync::Arc<dyn PermissionsBackend>,
+    /// Next `PermissionStatus` id (sequential; exact in an f64 JS
+    /// Map key). The status objects live in the registry's
+    /// `permissionStatuses` Map.
+    pub next_permission_status_id: u64,
+    /// `PermissionStatus` id → (feature, sysex), so a state
+    /// change can dispatch `onchange` to the right statuses.
+    pub permission_status_features: HashMap<u64, (PermissionName, bool)>,
 }
 
 impl BindingState {
@@ -179,6 +208,10 @@ impl BindingState {
             resize_registry: ResizeObserverRegistry::default(),
             next_intersection_observer_id: 1,
             intersection_registry: IntersectionObserverRegistry::default(),
+            storage_backend: std::sync::Arc::new(MemoryStorageBackend::default_for_realm()),
+            permissions_backend: std::sync::Arc::new(MemoryPermissionsBackend::new()),
+            next_permission_status_id: 1,
+            permission_status_features: HashMap::new(),
         }
     }
 }
@@ -223,6 +256,9 @@ pub fn registry<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
         "resizeObserverInstances",
         "intersectionObservers",
         "intersectionObserverInstances",
+        // Stage 9 Rec 11: live `PermissionStatus` objects, by id,
+        // so a state change can dispatch `onchange` to them.
+        "permissionStatuses",
         // Loop-driven modules (wave 2b): the module promise lives
         // here while its top-level await waits on a host event; the
         // loop polls it by id (see `TabRealm::poll_module`).
@@ -451,7 +487,10 @@ pub fn format_console_arg<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> String {
 ///
 /// Installs, in order: the registry + prototypes, `window`/`self`,
 /// `document`, `console`, `fetch`/`Response`/`Headers`,
-/// `Event`/`CustomEvent`, and the `window.onerror` property.
+/// `localStorage`/`sessionStorage` (Stage 9 Rec 4),
+/// `navigator.permissions` + `navigator.storage` + the
+/// deferred-device stubs (Stage 9 Rec 11), `Event`/`CustomEvent`,
+/// and the `window.onerror` property.
 pub fn install_bindings(
     realm: &mut TabRealm,
     state: &Rc<RefCell<LoopState>>,
@@ -478,6 +517,8 @@ fn install_bindings_in<'js>(
     dom::install_window(&ctx, bindings).map_err(|e| format!("install window: {e}"))?;
     dom::install_console(&ctx, bindings).map_err(|e| format!("install console: {e}"))?;
     fetch::install_fetch(&ctx, state, bindings, fetch_tx).map_err(|e| format!("install fetch: {e}"))?;
+    storage::install_storage(&ctx, bindings).map_err(|e| format!("install storage: {e}"))?;
+    permissions::install_permissions(&ctx, bindings).map_err(|e| format!("install permissions: {e}"))?;
     observers::install_observers(&ctx, bindings).map_err(|e| format!("install observers: {e}"))?;
     Ok(())
 }

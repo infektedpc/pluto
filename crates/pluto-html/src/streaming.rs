@@ -59,6 +59,58 @@ use crate::scripts::{
 use crate::tokenizer::{Token, Tokenizer};
 use crate::{Dom, NodeId};
 
+/// The referrer policy for a document (Stage 9 Rec 15) — the two
+/// values Pluto implements. This mirrors
+/// `pluto_net::ReferrerPolicy` (same tokens, same parse); the two
+/// enums are kept in sync by hand because neither crate may depend
+/// on the other — `pluto-browser` maps between them when it pushes
+/// the policy into the loader. Do not add a third value to one
+/// without the other.
+///
+/// A document with no `<meta name="referrer">` (and no
+/// `Referrer-Policy` header, applied net-side) uses the default,
+/// `no-referrer-when-downgrade`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReferrerPolicy {
+    /// Send the full URL same-origin, only the origin
+    /// cross-origin, and nothing on an https→http downgrade.
+    #[default]
+    NoReferrerWhenDowngrade,
+    /// Send the full URL same-origin (even on a downgrade), only
+    /// the origin cross-origin, and nothing on a cross-origin
+    /// downgrade.
+    StrictOriginWhenCrossOrigin,
+}
+
+impl ReferrerPolicy {
+    /// Parse a `<meta name="referrer">` content value. A
+    /// comma-separated list takes the last recognised token, like
+    /// the header form; unknown tokens are skipped; `None` when
+    /// no token is recognised.
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut found = None;
+        for token in value.split(',') {
+            let token = token.trim().to_ascii_lowercase();
+            found = match token.as_str() {
+                "no-referrer-when-downgrade" => Some(Self::NoReferrerWhenDowngrade),
+                "strict-origin-when-cross-origin" => {
+                    Some(Self::StrictOriginWhenCrossOrigin)
+                }
+                _ => found,
+            };
+        }
+        found
+    }
+
+    /// The header/meta token for this policy.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoReferrerWhenDowngrade => "no-referrer-when-downgrade",
+            Self::StrictOriginWhenCrossOrigin => "strict-origin-when-cross-origin",
+        }
+    }
+}
+
 /// What a parser-blocking `<script>` pause carries. The worker fetches
 /// `src` (if external), waits for the pending-stylesheet gate to
 /// clear when `stylesheets_pending` is set, executes the script
@@ -105,6 +157,11 @@ pub struct ParsedStream {
     /// queue (arrival order). New code should use these, not the
     /// legacy `Vec<NodeId>` views above.
     pub script_queues: ScriptQueues,
+    /// The document's referrer policy (Stage 9 Rec 15): the last
+    /// recognised `<meta name="referrer">` content value, or
+    /// `None` when the document carries none (the default policy
+    /// then applies).
+    pub referrer_policy: Option<ReferrerPolicy>,
 }
 
 /// Direct `Tokenizer` + `TreeBuilder` driver over a shared `Dom`.
@@ -127,6 +184,12 @@ pub struct Parser {
     /// The `Vec<NodeId>` fields above are legacy views of these,
     /// kept for the current `pluto-browser` load path.
     script_queues: ScriptQueues,
+    /// The document's referrer policy (Stage 9 Rec 15): the last
+    /// recognised `<meta name="referrer">` content value seen so
+    /// far, or `None` when the document carries none. A `<meta
+    /// http-equiv="Strict-Transport-Security">` never lands here
+    /// — HSTS is never recorded from markup (RFC 6797 §8.1).
+    referrer_policy: Option<ReferrerPolicy>,
     /// Render-blocking stylesheets discovered so far and not yet
     /// resolved; a parser-blocking script waits on this gate.
     stylesheet_gate: StylesheetGate,
@@ -172,6 +235,7 @@ impl Parser {
             defer_scripts: Vec::new(),
             async_scripts: Vec::new(),
             script_queues: ScriptQueues::default(),
+            referrer_policy: None,
             stylesheet_gate: StylesheetGate::default(),
             writer,
             insertion_point: None,
@@ -335,6 +399,14 @@ impl Parser {
         self.encoding_label.as_deref()
     }
 
+    /// The document's referrer policy from `<meta
+    /// name="referrer">` seen so far (`None` = no such meta yet;
+    /// the default policy applies). The browser polls this after
+    /// each feed and pushes it into the loader.
+    pub fn referrer_policy(&self) -> Option<ReferrerPolicy> {
+        self.referrer_policy
+    }
+
     /// Every byte fed so far, in order. On an encoding indicator the
     /// caller re-parses from scratch by feeding this prefix to a fresh
     /// `Parser`.
@@ -397,6 +469,16 @@ impl Parser {
         events: &mut Vec<DomEvent>,
     ) -> Option<ScriptPaused> {
         let paused = self.classify_script(handle);
+        // Stage 9 Rec 14 (SRI): the script's `integrity` attribute
+        // rides the discovery so the fetch can verify the streamed
+        // bytes against it.
+        let integrity = {
+            let dom = self.shared_dom();
+            let dom = dom.lock().unwrap();
+            dom.get(handle)
+                .and_then(|n| n.attr("integrity"))
+                .map(str::to_string)
+        };
         if paused.is_async {
             let queued = QueuedScript::new(
                 handle,
@@ -416,6 +498,7 @@ impl Parser {
                         destination: Destination::Script,
                         priority: Priority::Medium,
                         from: "script[src]",
+                        integrity: integrity.clone(),
                     }));
                 }
             }
@@ -436,6 +519,7 @@ impl Parser {
                         destination: Destination::Script,
                         priority: Priority::Medium,
                         from: "script[src]",
+                        integrity: integrity.clone(),
                     }));
                 }
             }
@@ -467,6 +551,14 @@ impl Parser {
                         self.encoding_label = Some(label.clone());
                         out.push(DomEvent::EncodingIndicator { label });
                     }
+                    // Stage 9 Rec 15: <meta name="referrer">
+                    // sets the document's referrer policy (last
+                    // recognised one wins). A <meta http-equiv>
+                    // carrying STS is deliberately NOT read here:
+                    // HSTS is never recorded from markup.
+                    if let Some(policy) = meta_referrer(&attrs) {
+                        self.referrer_policy = Some(policy);
+                    }
                 }
                 let base = self.effective_base();
                 for raw in classify_element(tag, &attrs, false, false) {
@@ -485,6 +577,7 @@ impl Parser {
                         destination: raw.destination,
                         priority: raw.priority,
                         from: raw.from,
+                        integrity: raw.integrity.clone(),
                     }));
                 }
             }
@@ -604,6 +697,10 @@ impl Parser {
                 let builder = self.builder.as_mut().unwrap();
                 builder.process(token, &mut self.tokenizer)
             };
+            // Drain builder events here too (same as `feed`): a
+            // `<meta name="referrer">` completed only by EOF must
+            // still be captured into `self.referrer_policy`.
+            self.drain_builder_events(&mut queued_events);
             match outcome {
                 ProcessOutcome::Script(handle) => {
                     // A parser-blocking script at EOF has nothing
@@ -627,8 +724,28 @@ impl Parser {
             defer_scripts: std::mem::take(&mut self.defer_scripts),
             async_scripts: std::mem::take(&mut self.async_scripts),
             script_queues: std::mem::take(&mut self.script_queues),
+            referrer_policy: self.referrer_policy,
         }
     }
+}
+
+/// Extract a referrer policy from a `<meta name="referrer">`
+/// element's attributes (`name="referrer"`, `content="<policy>"`).
+/// Returns `None` when the element is not a referrer meta or its
+/// content names no policy Pluto implements.
+fn meta_referrer(attrs: &[(String, String)]) -> Option<ReferrerPolicy> {
+    let get = |name: &str| {
+        attrs
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    };
+    if get("name").is_some_and(|n| n.eq_ignore_ascii_case("referrer")) {
+        if let Some(content) = get("content") {
+            return ReferrerPolicy::parse(content);
+        }
+    }
+    None
 }
 
 /// Extract a charset label from a `<meta>` element's attributes:
@@ -1038,6 +1155,63 @@ mod tests {
             urls,
             vec!["https://example.com/m.js", "https://example.com/other.js"]
         );
+    }
+
+    #[test]
+    fn meta_referrer_policy_is_captured() {
+        use crate::ReferrerPolicy;
+        // Strict policy via meta.
+        let mut p = Parser::new();
+        let _ = p.feed(b"<meta name=\"referrer\" content=\"strict-origin-when-cross-origin\">");
+        assert_eq!(
+            p.referrer_policy(),
+            Some(ReferrerPolicy::StrictOriginWhenCrossOrigin)
+        );
+        let done = p.finish();
+        assert_eq!(
+            done.referrer_policy,
+            Some(ReferrerPolicy::StrictOriginWhenCrossOrigin)
+        );
+
+        // Default policy via meta; last recognised meta wins.
+        let mut p = Parser::new();
+        let _ = p.feed(
+            b"<meta name=\"referrer\" content=\"strict-origin-when-cross-origin\">\
+              <meta name=\"referrer\" content=\"no-referrer-when-downgrade\">",
+        );
+        assert_eq!(
+            p.referrer_policy(),
+            Some(ReferrerPolicy::NoReferrerWhenDowngrade)
+        );
+        let _ = p.finish();
+
+        // An unrecognised value is ignored (previous policy kept).
+        let mut p = Parser::new();
+        let _ = p.feed(
+            b"<meta name=\"referrer\" content=\"strict-origin-when-cross-origin\">\
+              <meta name=\"referrer\" content=\"unsafe-url\">",
+        );
+        assert_eq!(
+            p.referrer_policy(),
+            Some(ReferrerPolicy::StrictOriginWhenCrossOrigin)
+        );
+        let _ = p.finish();
+
+        // No meta at all: no policy (the default applies net-side).
+        let mut p = Parser::new();
+        let _ = p.feed(b"<p>hello</p>");
+        assert_eq!(p.referrer_policy(), None);
+        let done = p.finish();
+        assert_eq!(done.referrer_policy, None);
+
+        // A <meta http-equiv="Strict-Transport-Security"> is NOT a
+        // referrer policy — and HSTS is never recorded from markup.
+        let mut p = Parser::new();
+        let _ = p.feed(
+            b"<meta http-equiv=\"Strict-Transport-Security\" content=\"max-age=31536000\">",
+        );
+        assert_eq!(p.referrer_policy(), None);
+        let _ = p.finish();
     }
 
     #[test]

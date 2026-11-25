@@ -49,6 +49,8 @@ use rquickjs::{Ctx, Function, Object};
 use crate::bindings::{
     BindingState, FetchBackend, FetchCompletion, call_onerror, install_bindings, registry_map,
 };
+use crate::bindings::permissions::PermissionsBackend;
+use crate::bindings::storage::StorageBackend;
 use crate::bytecode::{BytecodeCache, CacheHit};
 use crate::engine::{EvalKind, JsEngine, JsValue};
 use crate::error::JsError;
@@ -105,6 +107,13 @@ pub struct TabJs {
     host: Option<Rc<RefCell<Box<dyn DomHost>>>>,
     /// The fetch backend, re-attached the same way.
     fetch_backend: Option<std::sync::Arc<dyn FetchBackend>>,
+    /// The storage backend, re-attached the same way (Stage 9
+    /// Rec 4: the shell attaches its profile-backed backend).
+    storage_backend: Option<std::sync::Arc<dyn StorageBackend>>,
+    /// The permissions backend, re-attached the same way
+    /// (Stage 9 Rec 11: the shell attaches its profile-backed
+    /// backend).
+    permissions_backend: Option<std::sync::Arc<dyn PermissionsBackend>>,
     /// Fetch outcomes delivered by backends (any thread). Drained
     /// each turn into Networking-source resolution tasks.
     fetch_tx: std::sync::mpsc::Sender<FetchCompletion>,
@@ -140,6 +149,8 @@ impl TabJs {
             bindings,
             host: None,
             fetch_backend: None,
+            storage_backend: None,
+            permissions_backend: None,
             fetch_tx,
             fetch_rx,
             pending_modules: Vec::new(),
@@ -161,6 +172,26 @@ impl TabJs {
     pub fn set_fetch_backend(&mut self, backend: std::sync::Arc<dyn FetchBackend>) {
         self.fetch_backend = Some(std::sync::Arc::clone(&backend));
         self.bindings.borrow_mut().fetch_backend = Some(backend);
+    }
+
+    /// Attach the storage backend (Stage 9 Rec 4: the shell's
+    /// profile-backed `PlutoStorageBackend`). Until it is
+    /// attached, storage bindings use the in-memory default.
+    pub fn set_storage_backend(&mut self, backend: std::sync::Arc<dyn StorageBackend>) {
+        self.storage_backend = Some(std::sync::Arc::clone(&backend));
+        self.bindings.borrow_mut().storage_backend = backend;
+    }
+
+    /// Attach the permissions backend (Stage 9 Rec 11: the
+    /// shell's profile-backed `PlutoPermissionsBackend`).
+    /// Until it is attached, permission queries use the
+    /// in-memory default.
+    pub fn set_permissions_backend(
+        &mut self,
+        backend: std::sync::Arc<dyn PermissionsBackend>,
+    ) {
+        self.permissions_backend = Some(std::sync::Arc::clone(&backend));
+        self.bindings.borrow_mut().permissions_backend = backend;
     }
 
     /// Ask for a rendering opportunity at the next frame, even with
@@ -369,6 +400,12 @@ impl TabJs {
         }
         if let Some(backend) = &self.fetch_backend {
             new_bindings.borrow_mut().fetch_backend = Some(std::sync::Arc::clone(backend));
+        }
+        if let Some(backend) = &self.storage_backend {
+            new_bindings.borrow_mut().storage_backend = std::sync::Arc::clone(backend);
+        }
+        if let Some(backend) = &self.permissions_backend {
+            new_bindings.borrow_mut().permissions_backend = std::sync::Arc::clone(backend);
         }
         let (fetch_tx, fetch_rx) = std::sync::mpsc::channel();
         let mut new_realm = TabRealm::new(&self.config)?;

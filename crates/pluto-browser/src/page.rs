@@ -203,17 +203,77 @@ enum StyleSource {
 /// The page loaded at startup and when the address bar is empty.
 pub const DEFAULT_URL: &str = "https://example.com";
 
+/// The scheme of `url` (lowercased), if it has one: the part before
+/// the first `:` when it is valid scheme syntax — and not a
+/// `host:port`. A colon followed only by digits up to a `/`, `?`,
+/// `#`, or the end of the string is a port, not a scheme, so
+/// `localhost:8080` and `example.com:8080/path` stay bare hosts
+/// (Stage 9 Rec 7: without this, `localhost:8080` would read as the
+/// unknown scheme `localhost` and be rejected).
+fn url_scheme(url: &str) -> Option<String> {
+    let (candidate, rest) = url.split_once(':')?;
+    if candidate.is_empty()
+        || !candidate
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic())
+        || !candidate
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    let port_part = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if !port_part.is_empty() && port_part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(candidate.to_ascii_lowercase())
+}
+
 /// Turn address-bar input into a fetchable URL. A bare host gets
-/// `https://`; anything with a scheme is left alone.
-pub fn normalize_url(input: &str) -> String {
+/// `https://`. Only `http:` / `https:` may navigate — plus the
+/// internal `about:blank`. Anything else (`javascript:`, `data:`,
+/// `file:`, `ftp:`, any other scheme) is rejected (Stage 9 Rec 7,
+/// T11: the address bar used to pass "anything with a scheme"
+/// through, so `javascript:alert(1)`, `data:text/html,…`, and
+/// `file:///etc/passwd` all reached the fetch layer); `file:` stays
+/// disallowed (Joel). The caller shows the error page for the `Err`
+/// instead of fetching — the worker-side guard in
+/// [`load_page_cancellable_with_hooks`] enforces the same allowlist
+/// again, so a rejected scheme never reaches a fetch even from a
+/// caller that bypasses this function. The scheme check is
+/// case-insensitive (`JAVASCRIPT:` is rejected too).
+pub fn normalize_url(input: &str) -> Result<String, String> {
     let input = input.trim();
     if input.is_empty() {
-        return DEFAULT_URL.to_string();
+        return Ok(DEFAULT_URL.to_string());
     }
-    if input.contains("://") {
-        return input.to_string();
+    match url_scheme(input).as_deref() {
+        None => Ok(format!("https://{input}")),
+        Some("http") | Some("https") => Ok(input.to_string()),
+        Some("about") if input.eq_ignore_ascii_case("about:blank") => {
+            Ok("about:blank".to_string())
+        }
+        Some(scheme) => Err(format!(
+            "Pluto cannot open {scheme}: URLs — only http:, https:, and about:blank are allowed for navigation"
+        )),
     }
-    format!("https://{input}")
+}
+
+/// The load-path half of the navigation scheme allowlist: `url` must
+/// already be normalized (see [`normalize_url`]) — `http:` / `https:`
+/// or exactly `about:blank`. Anything else fails before any fetch.
+fn check_navigation_url(url: &str) -> Result<(), String> {
+    match url_scheme(url.trim()).as_deref() {
+        Some("http") | Some("https") => Ok(()),
+        Some("about") if url.trim().eq_ignore_ascii_case("about:blank") => Ok(()),
+        Some(scheme) => Err(format!(
+            "Pluto cannot open {scheme}: URLs — only http:, https:, and about:blank are allowed for navigation"
+        )),
+        None => Err(format!(
+            "Pluto cannot open {url} — only http:, https:, and about:blank are allowed for navigation"
+        )),
+    }
 }
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -233,6 +293,8 @@ fn subresource_request(
     destination: Destination,
     priority: Priority,
     base_url: &str,
+    is_imageset: bool,
+    integrity: Option<String>,
 ) -> ResourceRequest {
     let origin = origin_of(base_url);
     ResourceRequest {
@@ -240,6 +302,13 @@ fn subresource_request(
         tab_id: 0,
         epoch: 0,
         url: url.to_string(),
+        method: "GET".to_string(),
+        headers: Vec::new(),
+        // Stage 9 Rec 2/6: the preload scanner's `from:
+        // "imageset"` label rides the wire so the mixed-content
+        // gate BLOCKS (never auto-upgrades) srcset / <picture>
+        // images on a secure page.
+        is_imageset,
         destination,
         priority,
         mode: RequestMode::NoCors,
@@ -247,6 +316,10 @@ fn subresource_request(
         origin: origin.clone(),
         top_level_site: origin,
         upgrade_insecure_requests: false,
+        // Stage 9 Rec 14 (SRI): the element's `integrity`
+        // attribute, verified over the decoded bytes in
+        // `pluto-net` before `Done`.
+        integrity,
     }
 }
 
@@ -269,6 +342,24 @@ fn map_html_priority(p: HtmlPriority) -> Priority {
         HtmlPriority::Medium => Priority::Medium,
         HtmlPriority::Low => Priority::Low,
         HtmlPriority::VeryLow => Priority::VeryLow,
+    }
+}
+
+/// Map the document's referrer policy (captured by `pluto-html`
+/// from `<meta name="referrer">`) onto the policy `pluto-net`
+/// enforces when building the `Referer` header (Stage 9 Rec 15).
+/// The two enums carry the same two values by design — neither
+/// crate may depend on the other, so the mapping lives here.
+fn map_html_referrer_policy(
+    policy: pluto_html::ReferrerPolicy,
+) -> pluto_net::ReferrerPolicy {
+    match policy {
+        pluto_html::ReferrerPolicy::NoReferrerWhenDowngrade => {
+            pluto_net::ReferrerPolicy::NoReferrerWhenDowngrade
+        }
+        pluto_html::ReferrerPolicy::StrictOriginWhenCrossOrigin => {
+            pluto_net::ReferrerPolicy::StrictOriginWhenCrossOrigin
+        }
     }
 }
 
@@ -368,6 +459,15 @@ pub async fn load_page_cancellable_with_hooks(
     cancel: CancellationToken,
     mut hooks: Option<Box<dyn ScriptHooks + '_>>,
 ) -> Result<(Document, String), String> {
+    // Stage 9 Rec 7 (T11): scheme allowlist at the load entry
+    // point — defence in depth behind `normalize_url` (link clicks
+    // and other callers reach here without it). A disallowed scheme
+    // fails here, before any fetch, and the caller renders the error
+    // page from this `Err` (`LoadOutcome::Failed` → `error_document`).
+    if let Err(reason) = check_navigation_url(&url) {
+        eprintln!("[pluto] blocked navigation: {reason}");
+        return Err(reason);
+    }
     let request = ResourceRequest::navigate(next_request_id(), 0, 0, &url);
     eprintln!("[pluto] fetching {url}");
     let response = match loader.fetch_with(request, cancel.clone()).await {
@@ -383,6 +483,74 @@ pub async fn load_page_cancellable_with_hooks(
         final_url,
         response.body.len()
     );
+    // Stage 9 Rec 13 (downloads): decide render-vs-download
+    // BEFORE parsing — a response that says "download" must
+    // never render as a page (an attachment served as text/html
+    // must not execute). The mixed-download block runs first
+    // (the net layer already refused attachment-disposition
+    // mixed downloads; this also catches an octet-stream
+    // download served over http from a secure context).
+    // The save itself needs the prompt UI (M10): the report
+    // forbids silent auto-save, so until the prompt exists the
+    // load fails with the filename — the bytes are never parsed
+    // and nothing is written to disk.
+    {
+        use crate::downloads::{DownloadDecision, decide_with_sniff, is_mixed_download_blocked};
+        let disposition = response
+            .headers
+            .get("content-disposition")
+            .and_then(|v| v.to_str().ok());
+        let content_type = response
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok());
+        let nosniff = response
+            .headers
+            .get("x-content-type-options")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("nosniff"));
+        // The previous document is the secure context a mixed
+        // download is judged against; a typed first navigation
+        // has none, so the mixed check passes through to `decide`.
+        let page_origin = loader
+            .referrer_context()
+            .lock()
+            .unwrap()
+            .document_url
+            .clone()
+            .unwrap_or_default();
+        if is_mixed_download_blocked(&page_origin, &final_url, disposition) {
+            return Err(format!("mixed download blocked: {final_url}"));
+        }
+        let prefix_len = response.body.len().min(1445);
+        match decide_with_sniff(
+            disposition,
+            content_type,
+            &final_url,
+            // `<a download>` forces download, but navigations
+            // carry no download attribute (the IPC shape has no
+            // such flag — threading it is a follow-up).
+            false,
+            &response.body[..prefix_len],
+            nosniff,
+        ) {
+            DownloadDecision::RenderInline => {}
+            DownloadDecision::BlockMixed => {
+                return Err(format!("mixed download blocked: {final_url}"));
+            }
+            DownloadDecision::Download(prompt) => {
+                let size = response
+                    .headers
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("unknown");
+                return Err(format!(
+                    "download: {} ({} bytes) from {} — saving needs the download prompt (M10)",
+                    prompt.filename, size, prompt.origin
+                ));
+            }
+        }
+    }
     // Preload scan (R4): run over the whole fetched body before
     // parsing and fire off fetches for what it finds. The scheduler
     // dedups these against the parser-driven fetches below. True
@@ -461,6 +629,17 @@ fn fire_preloads(
             map_html_destination(found.destination),
             map_html_priority(found.priority),
             base_url,
+            // Stage 9 Rec 6: the scanner labels srcset /
+            // <picture> candidates `"imageset"`; the label rides
+            // the wire so the mixed-content gate blocks (never
+            // auto-upgrades) them on a secure page.
+            found.from == "imageset",
+            // Stage 9 Rec 14 (SRI): the scanner reads the
+            // element's `integrity` attribute. The preload scan
+            // runs over the whole body before parsing starts, so
+            // this request is always first — the parser's later
+            // duplicate dedups to it, integrity included.
+            found.integrity.clone(),
         );
         tokio::spawn(async move {
             let _ = loader.fetch_with(request, cancel).await;
@@ -548,6 +727,15 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
                     return Err("navigation cancelled".to_string());
                 }
                 let events = self.parser.borrow_mut().feed(&bytes);
+                // Stage 9 Rec 15: a `<meta name="referrer">` seen
+                // in this chunk updates the loader's policy for
+                // subresources discovered after it (last one seen
+                // wins; the response header's policy was already
+                // applied when the document response arrived).
+                if let Some(policy) = self.parser.borrow().referrer_policy() {
+                    self.loader
+                        .set_referrer_policy(map_html_referrer_policy(policy));
+                }
                 let mut resume = false;
                 for event in events {
                     match event {
@@ -565,7 +753,19 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
                             if found.destination == HtmlDestination::Script
                                 && !found.url.trim_start().starts_with("data:")
                             {
-                                self.fetch_script(&found.url, Priority::Medium).await;
+                                self.fetch_script(
+                                    &found.url,
+                                    Priority::Medium,
+                                    // Stage 9 Rec 14 (SRI): the
+                                    // discovery carries the
+                                    // element's `integrity`
+                                    // attribute; the preload
+                                    // request for the same URL
+                                    // already carries it too, and
+                                    // the scheduler dedups the two.
+                                    found.integrity.clone(),
+                                )
+                                .await;
                                 if let Some(hooks) = self.hooks.as_mut() {
                                     let ready = self
                                         .parser
@@ -590,7 +790,12 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
                             if let Some(src) = &paused.src
                                 && !src.trim_start().starts_with("data:")
                             {
-                                self.fetch_script(src, Priority::High).await;
+                                // Stage 9 Rec 14 (SRI): `ScriptPaused`
+                                // carries no `integrity` — the preload
+                                // request for the same `src` already
+                                // carries it, and the scheduler dedups
+                                // this fetch to it.
+                                self.fetch_script(src, Priority::High, None).await;
                                 bytes = self
                                     .script_bytes
                                     .get(src)
@@ -722,7 +927,8 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
         destination: Destination,
         priority: Priority,
     ) -> Option<String> {
-        let request = subresource_request(url, destination, priority, &self.base_url);
+        let request =
+            subresource_request(url, destination, priority, &self.base_url, false, None);
         let fetch = self.loader.fetch_with(request, self.cancel.clone());
         match tokio::time::timeout_at(self.blocking_deadline, fetch).await {
             Ok(Ok(response)) => Some(response.text()),
@@ -742,11 +948,23 @@ impl<'a, 'h> StreamingLoad<'a, 'h> {
     /// `ScriptPaused` both ask, but only the first downloads.
     /// Script fetches are NOT render-blocking — the scheduler's own
     /// timeouts bound them, so no deadline applies here.
-    async fn fetch_script(&mut self, src: &str, priority: Priority) {
+    async fn fetch_script(
+        &mut self,
+        src: &str,
+        priority: Priority,
+        integrity: Option<String>,
+    ) {
         if self.script_bytes.contains_key(src) {
             return;
         }
-        let request = subresource_request(src, Destination::Script, priority, &self.base_url);
+        let request = subresource_request(
+            src,
+            Destination::Script,
+            priority,
+            &self.base_url,
+            false,
+            integrity,
+        );
         match self.loader.fetch_with(request, self.cancel.clone()).await {
             Ok(response) => {
                 self.script_bytes.insert(src.to_string(), response.body);
@@ -1236,14 +1454,62 @@ mod tests {
 
     #[test]
     fn normalize_url_cases() {
-        assert_eq!(normalize_url("example.com"), "https://example.com");
         assert_eq!(
-            normalize_url("https://example.com"),
+            normalize_url("example.com").unwrap(),
             "https://example.com"
         );
-        assert_eq!(normalize_url("http://localhost:8080/"), "http://localhost:8080/");
-        assert_eq!(normalize_url("  example.com  "), "https://example.com");
-        assert_eq!(normalize_url(""), DEFAULT_URL);
+        assert_eq!(
+            normalize_url("https://example.com").unwrap(),
+            "https://example.com"
+        );
+        assert_eq!(
+            normalize_url("http://localhost:8080/").unwrap(),
+            "http://localhost:8080/"
+        );
+        assert_eq!(
+            normalize_url("  example.com  ").unwrap(),
+            "https://example.com"
+        );
+        assert_eq!(normalize_url("").unwrap(), DEFAULT_URL);
+        // A bare `host:port` is a host, not a scheme.
+        assert_eq!(
+            normalize_url("localhost:8080").unwrap(),
+            "https://localhost:8080"
+        );
+        assert_eq!(
+            normalize_url("example.com:8080/path").unwrap(),
+            "https://example.com:8080/path"
+        );
+        // The internal blank page is allowed.
+        assert_eq!(normalize_url("about:blank").unwrap(), "about:blank");
+        assert_eq!(normalize_url("ABOUT:BLANK").unwrap(), "about:blank");
+    }
+
+    /// Stage 9 Rec 7 (T11): every non-http(s) scheme is rejected —
+    /// `javascript:`, `data:`, `file:`, `ftp:`, and anything else —
+    /// whatever the case, and whether or not it carries `://`.
+    #[test]
+    fn normalize_url_rejects_other_schemes() {
+        for input in [
+            "javascript:alert(1)",
+            "JAVASCRIPT:alert(1)",
+            "data:text/html,<h1>hi</h1>",
+            "DATA:text/html,<h1>hi</h1>",
+            "file:///etc/passwd",
+            "FILE:///etc/passwd",
+            "ftp://example.com/file.txt",
+            "mailto:someone@example.com",
+            "blob:https://example.com/1234",
+            "view-source:https://example.com/",
+            "about:config",
+            "chrome://settings",
+        ] {
+            assert!(
+                normalize_url(input).is_err(),
+                "{input} must be rejected, got {:?}",
+                normalize_url(input)
+            );
+        }
     }
 
     #[test]
@@ -1272,11 +1538,22 @@ mod tests {
     /// and the text must rewrap when the viewport narrows.
     const NEW_EXAMPLE_COM: &str = "<!doctype html><html lang=en><head><meta charset=utf-8><link rel=icon href=data:,><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Example Domain</title><style>html{color-scheme:light dark;background:light-dark(#eee,#222)}body{font:16px/1.6 system-ui,sans-serif;max-width:26em;margin:auto;padding:25vh 2em 2em;text-align:center}</style></head><body><p>This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.</p><script src=/s.js></script></body></html>";
 
-    fn glyph_max_y(list: &DisplayList) -> f32 {
-        list.0.iter().fold(0.0f32, |acc, item| match item {
-            DisplayItem::Glyphs { glyphs, .. } => glyphs.iter().fold(acc, |a, g| a.max(g.y)),
-            _ => acc,
-        })
+    /// Number of text lines in a display list, counted as distinct
+    /// glyph Y values. Glyphs on one line share a Y; a rewrap adds a
+    /// line, so this is the direct measure of "wraps into more lines".
+    fn line_count(list: &DisplayList) -> usize {
+        let mut ys: Vec<f32> = list
+            .0
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Glyphs { glyphs, .. } => Some(glyphs.iter().map(|g| g.y)),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        ys.sort_by(|a, b| a.total_cmp(b));
+        ys.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        ys.len()
     }
 
     #[test]
@@ -1295,31 +1572,44 @@ mod tests {
                 } if width == w
             ));
         }
-        // Same text in both, but the narrow viewport wraps it into
-        // more lines, so the lowest glyph sits lower — and each wrap
-        // consumes the space at the break, so the narrow layout has
-        // (slightly) fewer glyph entries, not the same count.
+        // NOTE (2026-11-24): this test used to assert
+        // `glyph_total(&narrow) < glyph_total(&wide)` and a 150..=160
+        // range for the wide total. Both assumed the sandbox font's
+        // wrap points and failed on the CI runner (ubuntu-24.04) while
+        // passing in the sandbox: the runner shapes with a different
+        // system font, so the text wraps at different points.
+        // Reproduced in-sandbox by shaping with DejaVu Sans only
+        // (FONTCONFIG_FILE pointing at a DejaVu-only config): wide and
+        // narrow both wrap into 4 lines and the totals are equal
+        // (153 == 153), so the strict `<` fails — and the old
+        // max-glyph-Y assertion would fail too, since equal line
+        // counts put the lowest glyph at the same height.
+        // What is actually invariant across fonts: the glyph total is
+        // (non-space glyphs, constant across wraps for a fixed font)
+        // + (surviving spaces), and each line break consumes the
+        // space at the break — so the narrow layout, which wraps into
+        // at least as many lines as the wide one (a narrower box can
+        // never fit more words per line), has at most as many glyphs,
+        // with equality when both viewports wrap into the same number
+        // of lines. So the font-independent statements are `<=` on
+        // totals and `>=` on line counts, not the strict versions.
         let glyph_total = |list: &DisplayList| {
             list.0.iter().fold(0, |acc, item| match item {
                 DisplayItem::Glyphs { glyphs, .. } => acc + glyphs.len(),
                 _ => acc,
             })
         };
-        // 154 at this viewport: 132 non-space glyphs (constant across
-        // wraps) + 22 surviving spaces — `max-width: 26em` is honoured
-        // now, so the paragraph wraps at 416px and two spaces are
-        // consumed at line breaks (the old 155 predates max-width).
-        // A range, not an exact wrap-dependent count: any other wrap
-        // still lands near 132 non-space glyphs.
         let wide_total = glyph_total(&wide);
+        let narrow_total = glyph_total(&narrow);
+        assert!(wide_total > 0, "wide layout shaped no glyphs");
+        assert!(narrow_total > 0, "narrow layout shaped no glyphs");
         assert!(
-            (150..=160).contains(&wide_total),
-            "wide glyph total {wide_total} outside the expected wrap range"
+            narrow_total <= wide_total,
+            "narrow layout ({narrow_total} glyphs) must not gain glyphs over wide ({wide_total})"
         );
-        assert!(glyph_total(&narrow) < glyph_total(&wide));
         assert!(
-            glyph_max_y(&narrow) > glyph_max_y(&wide),
-            "narrow layout should wrap into more lines"
+            line_count(&narrow) >= line_count(&wide),
+            "narrow layout must wrap into at least as many lines as wide"
         );
     }
 
@@ -1435,19 +1725,72 @@ mod tests {
         ));
     }
 
+    /// Stage 9 Rec 13 (downloads): a navigation whose response
+    /// says "download" (`Content-Disposition: attachment`) is
+    /// never parsed as a page — the load fails with the filename
+    /// instead of rendering the bytes.
+    async fn serve_attachment(listener: TcpListener) {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let Ok(n) = stream.read(&mut buf).await else {
+                    return;
+                };
+                let _ = n;
+                let body = b"<html><body><script>alert(1)</script></body></html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Disposition: attachment; filename=\"evil.html\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn load_page_attachment_is_not_parsed_as_a_page() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_attachment(listener));
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        let loader = ResourceLoader::new();
+        let err = load_page_cancellable_with_hooks(&loader, url, CancellationToken::new(), None)
+            .await
+            .expect_err("an attachment must not load as a page");
+        assert!(
+            err.starts_with("download: evil.html"),
+            "the load fails naming the file, never parsing it: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn load_page_invalid_url_errors() {
         let loader = ResourceLoader::new();
-        assert!(
-            load_page_cancellable_with_hooks(
-                &loader,
-                "ftp://example.com/".to_string(),
-                CancellationToken::new(),
-                None,
-            )
-            .await
-            .is_err()
-        );
+        // Stage 9 Rec 7 (T11): disallowed schemes fail in the load
+        // entry point, before any fetch — the caller renders the
+        // error page from this `Err`.
+        for url in [
+            "ftp://example.com/",
+            "javascript:alert(1)",
+            "data:text/html,<h1>hi</h1>",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                load_page_cancellable_with_hooks(
+                    &loader,
+                    url.to_string(),
+                    CancellationToken::new(),
+                    None,
+                )
+                .await
+                .is_err(),
+                "{url} must fail before fetching"
+            );
+        }
     }
 
     /// Multi-route local server for the external-CSS / script tests:

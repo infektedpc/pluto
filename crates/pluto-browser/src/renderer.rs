@@ -50,10 +50,11 @@
 //! receives [`BrowserToRenderer`] commands and emits
 //! [`RendererToBrowser`] events. The display list crosses to the
 //! shell as postcard bytes plus its resource table — the same bytes
-//! that cross IPC at M5, when this worker task is promoted to a
-//! process. The worker never touches a socket, the disk, or the GPU
-//! directly: it asks the shell for nothing and draws nothing; it
-//! only builds lists.
+//! that cross IPC now that the worker runs out-of-process (Stage 9
+//! Rec 9: the subscription spawns one `RendererProcess` per tab
+//! and bridges it — see [`run_renderer_bridge`]). The worker never
+//! touches a socket, the disk, or the GPU directly: it asks the
+//! shell for nothing and draws nothing; it only builds lists.
 
 use crate::page::{self, Document};
 use cosmic::iced::futures::SinkExt;
@@ -63,6 +64,7 @@ use pluto_ipc::{
     BrowserToRenderer, CommandReceiver, DeltaMode, InputEvent, PointerKind, RendererToBrowser,
     WheelPhase,
 };
+use pluto_ipc::transport::{recv_browser_message, Transport};
 use pluto_js::TabJs;
 use pluto_layout::{ElementState, LayoutTree, OverscrollBehavior};
 use pluto_net::ResourceLoader;
@@ -88,13 +90,191 @@ pub fn renderer_subscription() -> cosmic::iced::Subscription<crate::Message> {
 }
 
 /// The worker stream: create the command channel, hand its sender
-/// to the shell, then run the worker until it ends.
+/// to the shell, then bridge the out-of-process renderer into the
+/// shell until the subscription ends (Stage 9 Rec 9).
 fn worker_stream() -> impl cosmic::iced::futures::stream::Stream<Item = crate::Message> {
     cosmic::iced::stream::channel(100, async |mut output| {
         let (cmd_tx, cmd_rx) = pluto_ipc::command_channel();
         let _ = output.send(crate::Message::RendererReady(cmd_tx)).await;
-        run_worker(cmd_rx, output).await;
+        match std::env::current_exe() {
+            Ok(exe) => run_renderer_bridge(&exe, cmd_rx, output).await,
+            Err(e) => {
+                eprintln!(
+                    "[pluto] cannot find own executable ({e}) — falling back to the in-process renderer"
+                );
+                run_worker(cmd_rx, output).await;
+            }
+        }
     })
+}
+
+/// Bridge one out-of-process renderer into the shell (Stage 9
+/// Rec 9): one `RendererProcess` per tab (one tab today; M3 grows
+/// this to a pool). Shell commands flow to the child over the
+/// socketpair; the child's events flow back as
+/// `Message::RendererEvent`.
+///
+/// If the child dies — clean EOF, a dead socket, or a malformed
+/// message the transport treats as compromised — the shell gets
+/// `RendererCrashed` (the stale list stays visible, per the
+/// shell's existing crash handling) and the bridge stays alive:
+/// the next `CommitNavigation` spawns a fresh renderer and the
+/// page recovers. Commands other than navigation are dropped
+/// while no renderer is alive — there is no page to act on.
+///
+/// If the child cannot be spawned at all, the bridge falls back
+/// to the in-process worker (`run_worker`) so the browser still
+/// runs — loudly logged, never silent.
+async fn run_renderer_bridge(
+    exe: &std::path::Path,
+    mut commands: CommandReceiver,
+    mut output: mpsc::Sender<crate::Message>,
+) {
+    let mut renderer = match crate::renderer_process::RendererProcess::spawn(exe).await {
+        Ok(renderer) => Some(renderer),
+        Err(e) => {
+            eprintln!(
+                "[pluto] renderer process spawn failed ({e}) — falling back to the in-process renderer"
+            );
+            run_worker(commands, output).await;
+            return;
+        }
+    };
+    // Whether the shell has asked for shutdown: a clean EOF after
+    // `Shutdown` is an orderly exit, not a crash.
+    let mut shutting_down = false;
+    loop {
+        tokio::select! {
+            cmd = commands.recv() => {
+                let Some(cmd) = cmd else {
+                    // The shell is gone: shut the renderer down
+                    // gracefully, then end the bridge.
+                    if let Some(renderer) = renderer.take() {
+                        renderer.close().await;
+                    }
+                    return;
+                };
+                if matches!(cmd, BrowserToRenderer::Shutdown) {
+                    shutting_down = true;
+                }
+                if renderer.is_some() {
+                    let send_failed = renderer
+                        .as_mut()
+                        .unwrap()
+                        .send(&cmd)
+                        .await
+                        .is_err();
+                    if send_failed {
+                        report_renderer_crash(
+                            &mut output,
+                            &mut renderer,
+                            "renderer IPC send failed",
+                            shutting_down,
+                        )
+                        .await;
+                    }
+                } else if matches!(cmd, BrowserToRenderer::CommitNavigation { .. }) {
+                    // No renderer alive: a navigation revives it —
+                    // a fresh child for a fresh page.
+                    match crate::renderer_process::RendererProcess::spawn(exe).await {
+                        Ok(mut fresh) => {
+                            if fresh.send(&cmd).await.is_err() {
+                                report_renderer_crash(
+                                    &mut output,
+                                    &mut Some(fresh),
+                                    "respawned renderer IPC send failed",
+                                    false,
+                                )
+                                .await;
+                            } else {
+                                renderer = Some(fresh);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[pluto] renderer respawn failed ({e}) — page stays crashed"
+                            );
+                            let _ = output
+                                .send(crate::Message::RendererEvent(
+                                    RendererToBrowser::RendererCrashed {
+                                        reason: format!("renderer respawn failed: {e}"),
+                                    },
+                                ))
+                                .await;
+                        }
+                    }
+                }
+            }
+            event = async {
+                match renderer.as_mut() {
+                    Some(renderer) => renderer.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match event {
+                    Ok(Some(event)) => {
+                        if output
+                            .send(crate::Message::RendererEvent(event))
+                            .await
+                            .is_err()
+                        {
+                            // The shell is gone.
+                            if let Some(renderer) = renderer.take() {
+                                renderer.close().await;
+                            }
+                            return;
+                        }
+                    }
+                    Ok(None) => {
+                        // Clean EOF: the renderer exited on its
+                        // own. After `Shutdown` that is orderly;
+                        // otherwise it is a crash.
+                        if !shutting_down {
+                            let _ = output
+                                .send(crate::Message::RendererEvent(
+                                    RendererToBrowser::RendererCrashed {
+                                        reason: "renderer exited".to_string(),
+                                    },
+                                ))
+                                .await;
+                        }
+                        renderer = None;
+                    }
+                    Err(e) => {
+                        report_renderer_crash(
+                            &mut output,
+                            &mut renderer,
+                            &format!("renderer IPC receive failed: {e}"),
+                            shutting_down,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Report a renderer death to the shell and drop the dead handle
+/// (the bridge stays alive; the next navigation respawns). A
+/// shutdown-orderly death reports nothing. Dropping the handle
+/// SIGKILLs + reaps a still-alive child, so no zombie leaks.
+async fn report_renderer_crash(
+    output: &mut mpsc::Sender<crate::Message>,
+    renderer: &mut Option<crate::renderer_process::RendererProcess>,
+    reason: &str,
+    shutting_down: bool,
+) {
+    if !shutting_down {
+        let _ = output
+            .send(crate::Message::RendererEvent(
+                RendererToBrowser::RendererCrashed {
+                    reason: reason.to_string(),
+                },
+            ))
+            .await;
+    }
+    renderer.take();
 }
 
 /// A job for the layout-actor thread, which owns the `!Send`
@@ -615,6 +795,10 @@ struct TabState {
     host: Rc<std::sync::Mutex<crate::js_host::BrowserDomHost>>,
     /// The `fetch()` backend, shared with the `TabJs`.
     fetch_backend: Option<std::sync::Arc<crate::js_host::PlutoFetchBackend>>,
+    /// The storage + permissions backends (Stage 9 Rec 4/11),
+    /// created once per tab and shared with the `TabJs`;
+    /// persisted when the tab thread ends.
+    tab_backends: Option<crate::js_host::TabBackends>,
     /// The current document (re-synced from the host's live `Dom`
     /// on every re-layout, so JS mutations reach the actor).
     document: Option<Document>,
@@ -706,13 +890,19 @@ impl TabState {
         )));
         let (exec_tx, exec_rx) = tokio::sync::mpsc::unbounded_channel();
         let (load_outcome_tx, load_outcome_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Stage 9 Rec 5: the tab's loader starts with the
+        // persisted HSTS store + HTTPS-only preference/exceptions
+        // from the browser profile (defaults when none exists).
+        let loader = ResourceLoader::new();
+        crate::security::load_into(&loader);
         Self {
             layout_tx,
-            loader: ResourceLoader::new(),
+            loader,
             fetch_handle,
             tab_js: None,
             host,
             fetch_backend: None,
+            tab_backends: None,
             document: None,
             has_document: false,
             element_state: ElementState::default(),
@@ -753,6 +943,20 @@ impl TabState {
             js.set_fetch_backend(
                 std::sync::Arc::clone(&backend) as std::sync::Arc<dyn pluto_js::FetchBackend>,
             );
+            // Stage 9 Rec 4/11: attach the profile-backed
+            // storage + permissions backends (created once per
+            // tab; `TabJs::navigate` re-attaches them to the
+            // fresh realm on every navigation).
+            let backends = crate::js_host::new_tab_backends();
+            js.set_storage_backend(
+                std::sync::Arc::clone(&backends.storage)
+                    as std::sync::Arc<dyn pluto_js::bindings::storage::StorageBackend>,
+            );
+            js.set_permissions_backend(
+                std::sync::Arc::clone(&backends.permissions)
+                    as std::sync::Arc<dyn pluto_js::bindings::permissions::PermissionsBackend>,
+            );
+            self.tab_backends = Some(backends);
             self.fetch_backend = Some(backend);
             self.tab_js = Some(js);
         }
@@ -796,6 +1000,24 @@ async fn tab_main(
     layout_tx: std::sync::mpsc::Sender<LayoutJob>,
 ) {
     let mut state = TabState::new(layout_tx, tokio::runtime::Handle::current());
+    // Stage 9 Rec 12: refresh the tracker lists in the
+    // background (EasyList + EasyPrivacy, fetched by default).
+    // The refresh works on its own copy — loaded from the
+    // profile dir — and swaps it in at the end, so page loads
+    // never wait on it and never see an empty blocker
+    // mid-refresh; it is freshness-gated (~4 h), so only the
+    // first tab in the window actually fetches.
+    {
+        let blocker = state.loader.blocker();
+        tokio::task::spawn(async move {
+            let Some(dir) = pluto_net::blocker::profile_list_dir() else {
+                return;
+            };
+            let mut fresh = pluto_net::blocker::Blocker::load_from_dir(&dir);
+            fresh.refresh(&dir).await;
+            *blocker.lock().unwrap() = fresh;
+        });
+    }
     // The receivers are taken out of the state so the `select!`
     // arms can hold them without borrowing `state` — the arm bodies
     // borrow it mutably, and `select!` builds all arm futures up
@@ -871,6 +1093,12 @@ async fn tab_main(
                 handle_nav_outcome(&mut state, &events, outcome).await;
             }
         }
+    }
+    // Stage 9 Rec 4/11: the tab thread is ending (tab close /
+    // shutdown) — persist the tab's storage + permissions
+    // backends to the profile.
+    if let Some(backends) = state.tab_backends.take() {
+        crate::js_host::save_tab_backends(&backends);
     }
 }
 
@@ -1072,20 +1300,9 @@ fn handle_exec(state: &mut TabState, msg: crate::js_host::ExecMsg) {
 /// events to the shell. Ends when the command channel closes, the
 /// tab thread ends, or `Shutdown` arrives.
 pub async fn run_worker(mut commands: CommandReceiver, mut events: mpsc::Sender<crate::Message>) {
-    // The layout actor owns the !Send tree/document on its thread;
-    // dropping this sender (worker end) ends the actor.
-    let (layout_tx, layout_rx) = std::sync::mpsc::channel::<LayoutJob>();
-    std::thread::Builder::new()
-        .name("pluto-layout".to_string())
-        .spawn(move || layout_thread(layout_rx))
-        .expect("layout actor thread spawns");
-    let (tab_cmd_tx, tab_cmd_rx) = tokio::sync::mpsc::channel::<BrowserToRenderer>(100);
-    let (tab_event_tx, mut tab_event_rx) = tokio::sync::mpsc::channel::<RendererToBrowser>(100);
-    let layout_tx2 = layout_tx.clone();
-    std::thread::Builder::new()
-        .name("pluto-tab".to_string())
-        .spawn(move || tab_thread_main(tab_cmd_rx, tab_event_tx, layout_tx2))
-        .expect("tab thread spawns");
+    let threads = spawn_tab_threads();
+    let tab_cmd_tx = threads.tab_cmd_tx;
+    let mut tab_event_rx = threads.tab_event_rx;
     loop {
         tokio::select! {
             cmd = commands.recv() => {
@@ -1120,6 +1337,124 @@ pub async fn run_worker(mut commands: CommandReceiver, mut events: mpsc::Sender<
     }
 }
 
+/// The channels to a freshly spawned tab-thread pair (layout actor
+/// + tab thread), shared by the in-process worker ([`run_worker`])
+/// and the cross-process renderer child ([`run_worker_transport`]).
+/// The layout actor owns the `!Send` tree/document on its thread;
+/// dropping the tab command sender (worker end) ends the actor.
+struct TabThreads {
+    tab_cmd_tx: tokio::sync::mpsc::Sender<BrowserToRenderer>,
+    tab_event_rx: tokio::sync::mpsc::Receiver<RendererToBrowser>,
+}
+
+/// Spawn the layout-actor thread and the tab thread for one tab,
+/// returning the channels between them and the worker bridge. Both
+/// threads are per-tab and outlive the bridge: the tab thread ends
+/// when its command channel closes (`Shutdown` / sender dropped),
+/// and the actor ends when its job channel closes with it.
+fn spawn_tab_threads() -> TabThreads {
+    let (layout_tx, layout_rx) = std::sync::mpsc::channel::<LayoutJob>();
+    std::thread::Builder::new()
+        .name("pluto-layout".to_string())
+        .spawn(move || layout_thread(layout_rx))
+        .expect("layout actor thread spawns");
+    let (tab_cmd_tx, tab_cmd_rx) = tokio::sync::mpsc::channel::<BrowserToRenderer>(100);
+    let (tab_event_tx, tab_event_rx) = tokio::sync::mpsc::channel::<RendererToBrowser>(100);
+    let layout_tx2 = layout_tx.clone();
+    std::thread::Builder::new()
+        .name("pluto-tab".to_string())
+        .spawn(move || tab_thread_main(tab_cmd_rx, tab_event_tx, layout_tx2))
+        .expect("tab thread spawns");
+    TabThreads {
+        tab_cmd_tx,
+        tab_event_rx,
+    }
+}
+
+/// Run the worker against a cross-process transport (Stage 9 Rec 9:
+/// the `--renderer` child). The same tab thread + layout actor as
+/// [`run_worker`], but commands arrive over `transport` and events
+/// go back over it — the tab thread itself never knows the difference
+/// (it only ever sees tokio channels).
+///
+/// Returns the process exit code: 0 for a clean shutdown (the
+/// browser closed the socket, `Shutdown` ended the tab thread, or
+/// the tab thread ended on its own), 1 when the transport failed
+/// (a malformed message from the browser, or a dead tab thread — the
+/// browser treats the EOF / dead child as a crash either way). A
+/// malformed message from the *browser* is never recovered from
+/// here either: the trusted peer is gone or corrupt, so the child
+/// exits instead of guessing.
+///
+/// The child never creates a window or a wgpu device: the tab thread
+/// only parses, lays out, runs JS, and builds display lists — the
+/// same work the in-process worker does, over a different carrier.
+pub(crate) async fn run_worker_transport<T: Transport>(mut transport: T) -> i32 {
+    let threads = spawn_tab_threads();
+    let tab_cmd_tx = threads.tab_cmd_tx;
+    let mut tab_event_rx = threads.tab_event_rx;
+    loop {
+        tokio::select! {
+            cmd = recv_browser_message(&mut transport) => {
+                match cmd {
+                    Ok(Some(BrowserToRenderer::Shutdown)) => {
+                        // Forward the shutdown, then drain the tab
+                        // thread's final events (bounded: a tab
+                        // thread that will not die cannot hold the
+                        // process open) before exiting cleanly.
+                        let _ = tab_cmd_tx.send(BrowserToRenderer::Shutdown).await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            async {
+                                while let Some(event) = tab_event_rx.recv().await {
+                                    if transport.send_message(&event).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            },
+                        )
+                        .await;
+                        return 0;
+                    }
+                    Ok(Some(cmd)) => {
+                        if tab_cmd_tx.send(cmd).await.is_err() {
+                            eprintln!("[pluto-renderer] tab thread is gone");
+                            return 1;
+                        }
+                    }
+                    Ok(None) => {
+                        // The browser closed the socket: shut the
+                        // tab thread down and exit cleanly.
+                        let _ = tab_cmd_tx.send(BrowserToRenderer::Shutdown).await;
+                        return 0;
+                    }
+                    Err(e) => {
+                        // A malformed message from the browser, or
+                        // a dead socket: exit, never try to recover.
+                        eprintln!("[pluto-renderer] IPC receive failed: {e}");
+                        return 1;
+                    }
+                }
+            }
+            event = tab_event_rx.recv() => {
+                match event {
+                    Some(event) => {
+                        if transport.send_message(&event).await.is_err() {
+                            // The browser is gone: nothing left to
+                            // report to.
+                            return 0;
+                        }
+                    }
+                    None => {
+                        // The tab thread ended on its own.
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Start a navigation: cancel the previous load (its token and its
 /// task — a slow fetch no longer blocks the command loop), get a
 /// fresh realm for the new document, then spawn the load as a
@@ -1127,6 +1462,15 @@ pub async fn run_worker(mut commands: CommandReceiver, mut events: mpsc::Sender<
 /// stays visible until the new list lands; a stale outcome is
 /// discarded by epoch in `handle_nav_outcome`.
 fn start_navigation(state: &mut TabState, url: String) {
+    // Stage 9 Rec 11: visiting an origin extends its
+    // permission grants (they expire after ~90 days of
+    // non-visit). Opaque origins are skipped by `note_visit`.
+    if let Some(backends) = &state.tab_backends {
+        use pluto_js::bindings::permissions::PermissionsBackend;
+        backends
+            .permissions
+            .note_visit(&pluto_ipc::Origin::from_url(&url));
+    }
     if let Some(token) = state.nav_cancel.take() {
         token.cancel();
     }
@@ -1137,6 +1481,15 @@ fn start_navigation(state: &mut TabState, url: String) {
     let epoch = state.nav_epoch;
     let token = CancellationToken::new();
     state.nav_cancel = Some(token.clone());
+    // Stage 9 Rec 15: the navigation's referrer is the current
+    // document (link-click behaviour). The loader keeps it as the
+    // referrer context until the new document's response
+    // re-points it; with no document yet (first load) no Referer
+    // is sent. (Typed-URL navigations cannot be told apart from
+    // link navigations here — see `service::referer_for_request`.)
+    if let Some(doc) = &state.document {
+        state.loader.set_referrer_document(doc.base_url());
+    }
     // Perf (Stage 8 Rec 5): a navigation — address bar, reload,
     // or link click — starts the first-paint clock here, not just
     // in the shell's `commit` (link clicks bypass `commit`).
@@ -1227,6 +1580,10 @@ async fn handle_nav_outcome(
     }
     state.nav_cancel = None;
     state.load_handle = None;
+    // Stage 9 Rec 5: persist the HSTS store (entries may have
+    // been recorded during this navigation's fetches) and the
+    // HTTPS-only state after every completed navigation.
+    crate::security::save_from(&state.loader);
     match outcome {
         LoadOutcome::Loaded {
             document,
@@ -2261,6 +2618,105 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(100);
         let handle = tokio::spawn(run_worker(cmd_rx, event_tx));
         (handle, cmd_tx, event_rx)
+    }
+
+    /// The cross-process worker bridge over an in-process transport
+    /// (Stage 9 Rec 9): the same tab thread + layout actor as the
+    /// in-process worker, driven through `run_worker_transport` with
+    /// a channel transport standing in for the socketpair. A
+    /// navigation to `about:blank` exercises the full pipeline with
+    /// zero network (pluto-net rejects non-http(s) before any
+    /// socket), and `Shutdown` ends the bridge with exit code 0.
+    #[tokio::test]
+    async fn worker_transport_bridge_exchanges_messages() {
+        use pluto_ipc::transport::{channel_transport_pair, recv_renderer_message};
+        let (mut browser, renderer) = channel_transport_pair();
+        let handle = tokio::spawn(run_worker_transport(renderer));
+        browser
+            .send_message(&BrowserToRenderer::CommitNavigation {
+                url: "about:blank".to_string(),
+            })
+            .await
+            .expect("navigation sends");
+        // The error page arrives as a display list first, then the
+        // reason — the same order as the in-process worker.
+        let first = tokio::time::timeout(
+            Duration::from_secs(20),
+            recv_renderer_message(&mut browser),
+        )
+        .await
+        .expect("first reply arrives in time")
+        .expect("recv succeeds")
+        .expect("a message arrives");
+        match first {
+            RendererToBrowser::SubmitDisplayList { bytes, .. } => {
+                let list = DisplayList::from_bytes(&bytes).expect("list bytes decode");
+                assert!(!list.is_empty(), "error page still paints");
+            }
+            other => panic!("expected SubmitDisplayList first, got {other:?}"),
+        }
+        let second = tokio::time::timeout(
+            Duration::from_secs(20),
+            recv_renderer_message(&mut browser),
+        )
+        .await
+        .expect("second reply arrives in time")
+        .expect("recv succeeds")
+        .expect("a message arrives");
+        match second {
+            RendererToBrowser::LoadFailed { url, reason } => {
+                assert_eq!(url, "about:blank");
+                assert!(!reason.is_empty());
+            }
+            other => panic!("expected LoadFailed, got {other:?}"),
+        }
+        browser
+            .send_message(&BrowserToRenderer::Shutdown)
+            .await
+            .expect("shutdown sends");
+        assert_eq!(
+            handle.await.expect("bridge task ends"),
+            0,
+            "a clean Shutdown exits 0"
+        );
+    }
+
+    /// Stage 9 Rec 9: when the renderer process cannot be spawned
+    /// at all, the bridge falls back to the in-process worker —
+    /// the browser still runs (loudly logged), and the navigation
+    /// still produces renderer events.
+    #[tokio::test]
+    async fn renderer_bridge_falls_back_to_in_process_worker_when_spawn_fails() {
+        let (cmd_tx, cmd_rx) = pluto_ipc::command_channel();
+        let (output_tx, mut output_rx) = mpsc::channel::<crate::Message>(100);
+        let handle = tokio::spawn(run_renderer_bridge(
+            std::path::Path::new("/nonexistent/pluto-browser"),
+            cmd_rx,
+            output_tx,
+        ));
+        cmd_tx
+            .send(BrowserToRenderer::CommitNavigation {
+                url: "about:blank".to_string(),
+            })
+            .expect("bridge takes the navigation");
+        let event = tokio::time::timeout(Duration::from_secs(20), next_event(&mut output_rx))
+            .await
+            .expect("a renderer event arrives in time");
+        // about:blank loads: DidCommit or the first display list —
+        // either proves the fallback worker served the navigation.
+        assert!(
+            matches!(
+                event,
+                RendererToBrowser::DidCommit { .. }
+                    | RendererToBrowser::SubmitDisplayList { .. }
+            ),
+            "fallback worker emits a navigation event, got {event:?}"
+        );
+        drop(cmd_tx);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("bridge ends after the shell goes away")
+            .expect("bridge task joins");
     }
 
     async fn next_event(rx: &mut mpsc::Receiver<crate::Message>) -> RendererToBrowser {
@@ -3315,18 +3771,34 @@ mod tests {
                 url: page2_url,
             })
             .expect("worker takes the command");
-        match next_event(&mut event_rx).await {
-            RendererToBrowser::DidCommit { .. } => {}
-            other => panic!("expected DidCommit for page2, got {other:?}"),
-        }
-        // "page-two-here" (13).
-        match next_event(&mut event_rx).await {
-            RendererToBrowser::SubmitDisplayList { bytes, .. } => {
-                let list = DisplayList::from_bytes(&bytes).expect("list bytes decode");
-                assert_eq!(glyph_count(&list), 13);
+        // DidCommit and the first SubmitDisplayList for page2 may
+        // arrive in either order — the commit path and the layout
+        // path emit on different tasks, so their order on the
+        // channel is not a contract. Accept both orders (and skip
+        // any stale page1 resubmit on the way); the point of this
+        // test is the timer, not the event order.
+        let mut saw_commit = false;
+        let mut saw_list = false;
+        for _ in 0..4 {
+            if saw_commit && saw_list {
+                break;
             }
-            other => panic!("expected SubmitDisplayList, got {other:?}"),
+            match next_event(&mut event_rx).await {
+                RendererToBrowser::DidCommit { .. } => saw_commit = true,
+                RendererToBrowser::SubmitDisplayList { bytes, .. } => {
+                    let list = DisplayList::from_bytes(&bytes).expect("list bytes decode");
+                    if glyph_count(&list) == 13 {
+                        saw_list = true;
+                    }
+                    // Any other list is a stale page1 resubmit.
+                }
+                other => panic!("unexpected event after navigating to page2: {other:?}"),
+            }
         }
+        assert!(
+            saw_commit && saw_list,
+            "page2 commit + display list both arrive"
+        );
         // The old timer never fires: nothing resubmits for 5 s.
         // Its 6 s deadline (measured from registration during the
         // parse, ~2.6 s before this wait starts) falls inside the

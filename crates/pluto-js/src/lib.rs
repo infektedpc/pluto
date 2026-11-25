@@ -46,7 +46,7 @@ pub mod probe;
 pub mod realm;
 pub mod tab;
 
-pub use bindings::{FetchBackend, FetchCompletion, FetchError, FetchRequest, FetchResponse};
+pub use bindings::{FetchBackend, FetchCompletion, FetchError, FetchRequest, FetchResponse, ResponseType};
 pub use bytecode::{BytecodeCache, CacheHit, CacheStats, CacheKey};
 pub use engine::{EvalKind, JsEngine, JsValue};
 pub use error::JsError;

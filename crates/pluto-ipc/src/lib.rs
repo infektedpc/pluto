@@ -21,18 +21,30 @@
 //! installing. The list is *not* re-serialised per hop: the worker
 //! serialises once, the shell deserialises once.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use pluto_paint::ResourceTable;
 use serde::{Deserialize, Serialize};
+
+/// The transport layer: in-process channels and cross-process Unix
+/// socketpairs carrying the versioned frames below (Stage 9 Rec 9).
+pub mod transport;
 
 /// The protocol version every encoded message carries. Bump on any
 /// breaking change to the enums below.
 ///
-/// v3 (Stage 8 Rec 9) reworks `InputEvent` (pointer/wheel/keyboard
+/// v4 (Stage 9 Rec 9) moves the transport cross-process: the
+/// per-tab worker thread becomes a `--renderer` child process over
+/// a Unix socketpair (`transport::SocketTransport`), with a
+/// version handshake before the first frame. The message enums
+/// themselves are unchanged from v3 — the bump is the transport
+/// break, and v3 bytes are rejected by [`decode_message`]. v3
+/// (Stage 8 Rec 9) reworked `InputEvent` (pointer/wheel/keyboard
 /// with position, modifiers, timestamp, pointer id, delta mode and
 /// gesture phase), adds `SetFocused` and `ScrollViewport`. v2 bytes
 /// are rejected by [`decode_message`] — Pluto ships one binary, so
 /// a bump is a clean break, not a migration.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// What went wrong decoding a versioned message.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -165,6 +177,22 @@ pub struct ResourceRequest {
     /// is no longer current is stale and must be dropped.
     pub epoch: u64,
     pub url: String,
+    /// HTTP method for the ask (`GET` for navigations and classic
+    /// subresources; script `fetch()` may set others — the CORS
+    /// layer in `pluto-net` validates them). Stage 9 Rec 2.
+    pub method: String,
+    /// Extra request headers set by script (`fetch()` `init.headers`).
+    /// Forbidden headers are stripped before the request is sent and
+    /// CORS-unsafe names force a preflight; the list rides the wire
+    /// so the browser process (never the realm) applies the policy.
+    /// Stage 9 Rec 2.
+    pub headers: Vec<(String, String)>,
+    /// `true` when the ask came from a srcset / `<picture>` candidate
+    /// (Mixed Content L2 `imageset` initiator). Imageset images are
+    /// BLOCKED, never auto-upgraded, on a secure page. Threaded from
+    /// the preload scanner's `from: "imageset"` label through
+    /// `page.rs::subresource_request`. Stage 9 Rec 2/6.
+    pub is_imageset: bool,
     pub destination: Destination,
     pub priority: Priority,
     pub mode: RequestMode,
@@ -183,6 +211,14 @@ pub struct ResourceRequest {
     /// of going through the mixed-content gate. Set by the
     /// document's CSP at M10; false until then.
     pub upgrade_insecure_requests: bool,
+    /// The element's `integrity` attribute, verbatim (Stage 9 Rec
+    /// 14, SRI): space-separated `<algorithm>-<base64 digest>`
+    /// entries the fetch must check against the streamed bytes.
+    /// `None` means no integrity metadata — no check, not a
+    /// failure. Set by the scanner / streaming parser on
+    /// subresource discoveries; navigations and `fetch()` asks
+    /// leave it `None`.
+    pub integrity: Option<String>,
 }
 
 impl ResourceRequest {
@@ -196,6 +232,9 @@ impl ResourceRequest {
             tab_id,
             epoch,
             url: url.to_string(),
+            method: "GET".to_string(),
+            headers: Vec::new(),
+            is_imageset: false,
             destination: Destination::Document,
             priority: Priority::VeryHigh,
             mode: RequestMode::Navigate,
@@ -203,21 +242,192 @@ impl ResourceRequest {
             origin: origin.clone(),
             top_level_site: origin,
             upgrade_insecure_requests: false,
+            integrity: None,
         }
     }
 }
 
-/// The origin (`scheme://authority`) of a URL string, or the string
-/// itself when it does not parse (the fetch then fails as an invalid
-/// URL, as before).
-pub fn origin_of(url: &str) -> String {
-    let Ok(uri) = url.parse::<http::Uri>() else {
-        return url.to_string();
-    };
-    match (uri.scheme_str(), uri.authority()) {
-        (Some(scheme), Some(authority)) => format!("{scheme}://{authority}"),
-        _ => url.to_string(),
+/// The origin of a URL (WHATWG HTML §7.1.1): either a tuple origin
+/// `(scheme, host, port)` with default-port normalization, or an
+/// opaque origin — an internal value whose only meaningful operation
+/// is equality, serialized as the string `"null"`.
+///
+/// Same origin means: the same opaque origin, or two tuple origins
+/// with identical scheme, identical port, and equal hosts. Two
+/// *different* opaque origins both serialize to `"null"` but are
+/// **never** same origin, so opaque origins are unforgeable unique
+/// identities (a fresh counter value per creation), never compared
+/// by their `"null"` string.
+///
+/// `domain` is deliberately absent: Pluto never implements
+/// `document.domain` (Stage 9 report §b — the setter relaxes the
+/// same-origin check and the spec is removing it), so there is no
+/// relaxed-origin state to carry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Origin {
+    /// `(scheme, host, port)`; `port` is `None` when the URL has
+    /// no explicit port or its explicit port is the scheme's
+    /// default, so `https://example.com:443` and
+    /// `https://example.com` are the same origin.
+    Tuple {
+        scheme: String,
+        host: String,
+        port: Option<u16>,
+    },
+    /// An opaque origin: the `u64` is a process-local identity from
+    /// [`Origin::opaque`], meaningful only for equality within this
+    /// process. It must never be compared against an opaque origin
+    /// minted in another process (Rec 9's cross-process transport
+    /// mints fresh opaque origins on receipt instead of trusting
+    /// a deserialized id).
+    Opaque(u64),
+}
+
+/// The default port for a scheme (WHATWG URL §4.2), or `None` when
+/// the scheme has no default port.
+fn default_port(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        "ftp" => Some(21),
+        _ => None,
     }
+}
+
+/// Counter minting fresh opaque-origin identities (see
+/// [`Origin::Opaque`]).
+static OPAQUE_ORIGIN_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+impl Origin {
+    /// A fresh opaque origin: a unique identity no other origin —
+    /// opaque or tuple — is ever same origin with, and no
+    /// serialization can recreate.
+    pub fn opaque() -> Self {
+        Origin::Opaque(OPAQUE_ORIGIN_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Whether this is an opaque origin.
+    pub fn is_opaque(&self) -> bool {
+        matches!(self, Origin::Opaque(_))
+    }
+
+    /// The origin of a URL string, parsed structurally:
+    ///
+    /// * `http`/`https`/`ws`/`wss`/`ftp` (or any scheme with an
+    ///   authority) → the tuple origin, scheme and host lowercased,
+    ///   default ports normalized to `None`.
+    /// * `blob:<inner>` → the inner URL's origin (parse failure →
+    ///   opaque), per WHATWG URL §4.5.
+    /// * Anything without an authority (`about:`, `data:`, `file:`,
+    ///   an unparseable string, a relative URL) → a fresh opaque
+    ///   origin. Callers that need `about:blank` / `srcdoc`
+    ///   inheritance must use [`Origin::for_document`] instead,
+    ///   which takes the creator origin.
+    pub fn from_url(url: &str) -> Self {
+        // `blob:` derives its origin from the inner URL.
+        if url.len() > 5 && url[..5].eq_ignore_ascii_case("blob:") {
+            return Origin::from_url(&url[5..]);
+        }
+        let Ok(uri) = url.parse::<http::Uri>() else {
+            return Origin::opaque();
+        };
+        let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) else {
+            return Origin::opaque();
+        };
+        let scheme = scheme.to_ascii_lowercase();
+        let host = authority.host().to_ascii_lowercase();
+        // `http::Uri` keeps the brackets on an IPv6 literal
+        // (`[::1]`); strip them here — `serialize` re-adds them —
+        // so the stored host is the bare literal.
+        let host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(&host)
+            .to_string();
+        if host.is_empty() {
+            return Origin::opaque();
+        }
+        let port = match authority.port_u16() {
+            Some(p) if Some(p) == default_port(&scheme) => None,
+            p => p,
+        };
+        Origin::Tuple { scheme, host, port }
+    }
+
+    /// The origin of a document loaded from `url`, given the origin
+    /// of the document that created it (`creator`) and whether the
+    /// document is sandboxed (WHATWG HTML §7.1.1):
+    ///
+    /// * Sandboxed (without `allow-same-origin`) → a fresh opaque
+    ///   origin, whatever the URL.
+    /// * `about:blank` created by a page, and `srcdoc` without
+    ///   sandbox → the creator's origin (same-origin with its
+    ///   embedder); with no creator (a top-level `about:blank`) →
+    ///   a fresh opaque origin.
+    /// * `data:` → a fresh opaque origin per document.
+    /// * Anything else → [`Origin::from_url`].
+    pub fn for_document(url: &str, creator: Option<&Origin>, sandboxed: bool) -> Self {
+        if sandboxed {
+            return Origin::opaque();
+        }
+        // `about:blank` / `about:srcdoc`, ignoring any fragment.
+        let without_fragment = url.split('#').next().unwrap_or(url);
+        if without_fragment.eq_ignore_ascii_case("about:blank")
+            || without_fragment.eq_ignore_ascii_case("about:srcdoc")
+        {
+            return match creator {
+                Some(origin) => origin.clone(),
+                None => Origin::opaque(),
+            };
+        }
+        if url.len() >= 5 && url[..5].eq_ignore_ascii_case("data:") {
+            return Origin::opaque();
+        }
+        Origin::from_url(url)
+    }
+
+    /// Whether `other` is the same origin as this one: the same
+    /// opaque origin, or tuple origins with identical scheme, host,
+    /// and port.
+    pub fn is_same_origin(&self, other: &Origin) -> bool {
+        self == other
+    }
+
+    /// Serialize this origin: `scheme://host` (plus `:port` when
+    /// the port is non-default) for a tuple origin, `"null"` for an
+    /// opaque origin. The serialization is lossy for opaque origins
+    /// by design — never compare serialized origins for equality.
+    pub fn serialize(&self) -> String {
+        match self {
+            Origin::Tuple { scheme, host, port } => {
+                // An IPv6 literal needs brackets to round-trip.
+                let host = if host.contains(':') {
+                    format!("[{host}]")
+                } else {
+                    host.clone()
+                };
+                match port {
+                    Some(p) => format!("{scheme}://{host}:{p}"),
+                    None => format!("{scheme}://{host}"),
+                }
+            }
+            Origin::Opaque(_) => "null".to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for Origin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.serialize())
+    }
+}
+
+/// The serialized origin (`scheme://host`, `:port` when non-default,
+/// `"null"` for an opaque origin) of a URL string — the serializer
+/// for [`Origin`]. A URL with no authority (`about:`, `data:`,
+/// unparseable) serializes to `"null"`.
+pub fn origin_of(url: &str) -> String {
+    Origin::from_url(url).serialize()
 }
 
 /// What kind of resource a [`RendererToBrowser::RequestResource`]
@@ -452,8 +662,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_three() {
-        assert_eq!(PROTOCOL_VERSION, 3);
+    fn protocol_version_is_four() {
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     #[test]
@@ -595,6 +805,9 @@ mod tests {
                 tab_id: 0,
                 epoch: 3,
                 url: "https://example.com/style.css".to_string(),
+                method: "GET".to_string(),
+                headers: Vec::new(),
+                is_imageset: false,
                 destination: Destination::Stylesheet,
                 priority: Priority::VeryHigh,
                 mode: RequestMode::NoCors,
@@ -602,6 +815,7 @@ mod tests {
                 origin: "https://example.com".to_string(),
                 top_level_site: "https://example.com".to_string(),
                 upgrade_insecure_requests: false,
+                integrity: None,
             }),
             RendererToBrowser::CancelResource { request_id: 7 },
             // Stage 8 Rec 9 (v3): the worker asks the shell to
@@ -645,15 +859,16 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_version_two_bytes() {
-        // A v2 message (version prefix 2) must fail loudly, not be
-        // misread as v3: the input events changed shape in the
-        // Stage 8 Rec 9 bump.
-        let mut v2 = encode_message(&BrowserToRenderer::Shutdown);
-        v2[0] = 2;
+    fn decode_rejects_version_three_bytes() {
+        // A v3 message (version prefix 3) must fail loudly, not be
+        // misread as v4: the transport went cross-process in the
+        // Stage 9 Rec 9 bump, and a stale renderer must be rejected
+        // at the version check, never silently accepted.
+        let mut v3 = encode_message(&BrowserToRenderer::Shutdown);
+        v3[0] = 3;
         assert_eq!(
-            decode_message::<BrowserToRenderer>(&v2),
-            Err(ProtocolError::UnsupportedVersion { found: 2 })
+            decode_message::<BrowserToRenderer>(&v3),
+            Err(ProtocolError::UnsupportedVersion { found: 3 })
         );
     }
 
@@ -715,5 +930,193 @@ mod tests {
         // Dropping the receiver makes further sends fail cleanly.
         drop(rx);
         assert!(tx.send(BrowserToRenderer::Shutdown).is_err());
+    }
+
+    // ------------------------------------------------------------ Origin
+    //
+    // Stage 9 Rec 1: the origin is a parsed type, not a string.
+
+    #[test]
+    fn origin_default_port_normalization() {
+        // An explicit default port is the same origin as no port.
+        assert_eq!(
+            Origin::from_url("https://example.com:443/"),
+            Origin::from_url("https://example.com")
+        );
+        assert_eq!(
+            Origin::from_url("http://example.com:80/"),
+            Origin::from_url("http://example.com")
+        );
+        assert_eq!(
+            Origin::from_url("ws://example.com:80/"),
+            Origin::from_url("ws://example.com")
+        );
+        assert_eq!(
+            Origin::from_url("wss://example.com:443/"),
+            Origin::from_url("wss://example.com")
+        );
+        assert_eq!(
+            Origin::from_url("ftp://example.com:21/"),
+            Origin::from_url("ftp://example.com")
+        );
+        // A non-default port is a different origin.
+        assert_ne!(
+            Origin::from_url("https://example.com:8443/"),
+            Origin::from_url("https://example.com")
+        );
+        assert_ne!(
+            Origin::from_url("https://example.com:8443/"),
+            Origin::from_url("https://example.com:443/")
+        );
+        // Scheme and host differ, and case does not matter.
+        assert_ne!(
+            Origin::from_url("http://example.com/"),
+            Origin::from_url("https://example.com/")
+        );
+        assert_ne!(
+            Origin::from_url("https://example.com/"),
+            Origin::from_url("https://other.example/")
+        );
+        assert_eq!(
+            Origin::from_url("HTTPS://EXAMPLE.COM:443/"),
+            Origin::from_url("https://example.com")
+        );
+        // The normalized form keeps no default port.
+        assert_eq!(
+            Origin::from_url("https://example.com:443/").serialize(),
+            "https://example.com"
+        );
+        assert_eq!(
+            Origin::from_url("https://example.com:8443/").serialize(),
+            "https://example.com:8443"
+        );
+    }
+
+    #[test]
+    fn origin_opaque_uniqueness_and_inequality() {
+        // Every fresh opaque origin is a different identity...
+        let a = Origin::opaque();
+        let b = Origin::opaque();
+        assert_ne!(a, b);
+        assert!(!a.is_same_origin(&b));
+        // ...even though both serialize to "null".
+        assert_eq!(a.serialize(), "null");
+        assert_eq!(b.serialize(), "null");
+        // And an opaque origin is never same origin with a tuple.
+        assert_ne!(a, Origin::from_url("https://example.com"));
+        assert!(a.is_opaque());
+        assert!(!Origin::from_url("https://example.com").is_opaque());
+    }
+
+    #[test]
+    fn origin_same_origin_equality() {
+        let a = Origin::from_url("https://example.com/a");
+        let b = Origin::from_url("https://example.com:443/b");
+        assert_eq!(a, b);
+        assert!(a.is_same_origin(&b));
+        assert!(!a.is_same_origin(&Origin::from_url("https://example.com:8443/c")));
+        assert!(!a.is_same_origin(&Origin::from_url("http://example.com/d")));
+        // The same opaque origin (cloned) is same origin with itself.
+        let opaque = Origin::opaque();
+        assert!(opaque.is_same_origin(&opaque.clone()));
+    }
+
+    #[test]
+    fn origin_serialization_round_trip() {
+        for url in [
+            "https://example.com",
+            "https://example.com:8443",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ] {
+            let origin = Origin::from_url(url);
+            let serialized = origin.serialize();
+            assert_eq!(Origin::from_url(&serialized), origin, "{url}");
+            assert_eq!(origin_of(url), serialized);
+        }
+        // Opaque origins serialize to "null" and never parse back to
+        // the same identity: a fresh opaque origin is minted instead.
+        let opaque = Origin::opaque();
+        assert_eq!(opaque.serialize(), "null");
+        assert_ne!(Origin::from_url("null"), opaque);
+        assert!(Origin::from_url("null").is_opaque());
+    }
+
+    #[test]
+    fn origin_of_serializer() {
+        assert_eq!(origin_of("https://example.com:443/x"), "https://example.com");
+        assert_eq!(
+            origin_of("https://example.com:8443/x"),
+            "https://example.com:8443"
+        );
+        // No authority (or unparseable) serializes to "null".
+        assert_eq!(origin_of("data:text/html,<p>hi</p>"), "null");
+        assert_eq!(origin_of("about:blank"), "null");
+        assert_eq!(origin_of("not a url"), "null");
+    }
+
+    #[test]
+    fn origin_about_blank_and_srcdoc_inheritance() {
+        let creator = Origin::from_url("https://example.com/app");
+        // `about:blank` created by a page inherits the creator.
+        assert_eq!(
+            Origin::for_document("about:blank", Some(&creator), false),
+            creator
+        );
+        // `srcdoc` without sandbox is same-origin with its embedder.
+        assert_eq!(
+            Origin::for_document("about:srcdoc", Some(&creator), false),
+            creator
+        );
+        // A top-level `about:blank` with no creator is opaque...
+        let blank = Origin::for_document("about:blank", None, false);
+        assert!(blank.is_opaque());
+        // ...and two of them are never same origin.
+        assert_ne!(
+            blank,
+            Origin::for_document("about:blank", None, false)
+        );
+        // A sandboxed document is opaque even with a creator and a
+        // same-origin URL.
+        let sandboxed = Origin::for_document("https://example.com/", Some(&creator), true);
+        assert!(sandboxed.is_opaque());
+        assert_ne!(sandboxed, creator);
+    }
+
+    #[test]
+    fn origin_data_url_is_opaque_per_document() {
+        let creator = Origin::from_url("https://example.com/");
+        let a = Origin::for_document("data:text/html,<p>a</p>", Some(&creator), false);
+        let b = Origin::for_document("data:text/html,<p>b</p>", Some(&creator), false);
+        assert!(a.is_opaque());
+        assert!(b.is_opaque());
+        assert_ne!(a, b);
+        assert_ne!(a, creator);
+        assert_eq!(a.serialize(), "null");
+    }
+
+    #[test]
+    fn origin_blob_derives_from_inner_url() {
+        assert_eq!(
+            Origin::from_url("blob:https://example.com/550e8400-e29b-41d4-a716-446655440000"),
+            Origin::from_url("https://example.com/")
+        );
+        // An unparseable inner URL is opaque.
+        assert!(Origin::from_url("blob:not a url").is_opaque());
+    }
+
+    #[test]
+    fn origin_round_trips_through_postcard() {
+        // The type is wire-safe for Rec 9's cross-process transport
+        // (tuple origins survive exactly; an opaque origin keeps its
+        // process-local id — see the `Origin::Opaque` docs).
+        for origin in [
+            Origin::from_url("https://example.com:8443/"),
+            Origin::opaque(),
+        ] {
+            let bytes = postcard::to_allocvec(&origin).unwrap();
+            let back: Origin = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(back, origin);
+        }
     }
 }

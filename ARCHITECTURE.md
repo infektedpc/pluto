@@ -460,7 +460,79 @@ privacy controls, and extensibility.
   download manager (pluto-net streaming to disk), find-in-page (Ctrl+F),
   zoom scaling (Ctrl+ / Ctrl-).
 - **Privacy & content blocking**: native Rust request/cosmetic filter
-  engine (EasyList-compatible rules) inside pluto-net and pluto-css.
+  engine (EasyList-compatible rules) inside pluto-net and pluto-css,
+  built in stages over a few rounds, not all at once:
+  - **Round 1 — basic (in flight, Stage 9 Rec 12)**: domain-hash
+    rules first, regex last and capped; EasyList + EasyPrivacy
+    defaults; `@@` exceptions, `$document` per-site disable;
+    evaluated in the browser process before cache lookup; list
+    updates over HTTPS with ETag, keep last-good.
+  - **Round 2 — cosmetic**: element hiding driven by the lists'
+    cosmetic rules, applied through pluto-css (hide matched
+    elements, collapse the space they leave).
+  - **Round 3 — advanced**: scriptlet injection, redirect/replace
+    rules, anti-circumvention handling, per-site toggles, custom
+    lists, and block stats in the UI.
+  The porn-mode list (M12) is an extra list set on top of this
+  engine, not a second blocker.
 - **Done criteria**: Pluto safely isolates cross-origin sites, blocks
   trackers natively, manages downloads/bookmarks, and passes core security
   & Web Platform Test (WPT) suites.
+
+### Milestone 11: Built-in WireGuard VPN (Joel, 2026-11-24)
+
+Goal: a VPN inside the browser, no separate app — one toggle, all of
+Pluto's traffic through the tunnel.
+
+- **New crate `pluto-vpn`**: userspace WireGuard (boringtun is the
+  likely shape — pure Rust, no Chromium/Firefox/WebKit code; kernel
+  WireGuard via netlink is the alternative to settle at research
+  time). The tunnel is a transport under pluto-net, not a second
+  network stack: when the VPN is on, every request and every DNS
+  lookup goes through it.
+- **Keys & endpoints**: per-profile keypair, stored in the profile
+  dir (0600, OS keyring when one is available). Servers and keys are
+  Joel-supplied and never committed to the repo.
+- **Fail closed**: if the tunnel drops, traffic stops — nothing
+  leaks out direct. No kill-switch bypass, no "reconnect in the
+  clear".
+- **UI**: a toggle in the bottom-right corner of the loading status
+  navbar (the status bar at the bottom of the window), showing
+  on / off / connecting, plus a server picker.
+- **Research first**: a research stage on the VPN design (boringtun
+  vs kernel, kill-switch shape, DNS-leak tests, key storage) before
+  application, following the usual research-then-apply pattern.
+- **Done criteria**: toggle on → all traffic and DNS through the
+  tunnel and the exit IP changes; toggle off → direct; tunnel
+  drop → no traffic at all until it is back or the toggle is off.
+
+### Milestone 12: Porn Mode (Joel, 2026-11-24)
+
+Goal: the private mode — it replaces incognito/private mode
+entirely; there is no separate private mode. Security and privacy
+are the mode's core features, not add-ons.
+
+- **Activation relaunches the browser**: porn mode restarts Pluto
+  with the M11 VPN turned on and an ephemeral profile — no history
+  saved, no cookies/cache written to disk, all storage in-memory
+  and wiped on exit (depends on M5 storage work).
+- **Auto-mute**: every video is muted by default the moment it
+  loads (depends on the M8 media pipeline).
+- **Ad blocking on, special list**: the M10 blocker runs with an
+  extra porn ad-blocking list on top of the normal lists.
+- **Panic key combo** (exact keys TBD by Joel): instantly swaps the
+  viewport to a fake work screen — a fake spreadsheet, or a fake
+  Zoom call (a video of a Zoom conference call; the video variant
+  depends on M8 playback, a static mock comes first).
+- **Own homepage**: in porn mode the homepage is a grid of cards
+  featuring the top 20 adult sites to visit. The 20 sites are
+  Joel's list (TBD by Joel — not picked here).
+- **Titlebar**: while porn mode is on, the browser reports as
+  "PornBrowser" in the titlebar; switching porn mode off restores
+  "Pluto".
+- **Research first**: a research stage once M11 lands (VPN shape,
+  ephemeral-profile shape, panic-screen shape), before application.
+- **Done criteria**: relaunch → VPN on, zero history/cookies/cache
+  on disk after exit, videos muted, porn list active, panic combo
+  shows the fake work screen, homepage is the 20-site grid,
+  titlebar reads "PornBrowser" until the mode is switched off.

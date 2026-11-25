@@ -19,24 +19,23 @@
 //! ```
 //!
 //! M4 subset: `Response` has `ok` / `status` / `statusText` /
-//! `headers.get` / `text()` / `json()`; `Headers` has `get` (+ `has`
-//! / `set` / `append`, which are trivial once `get` exists).
-//! Streaming `body` is later.
+//! `type` / `headers.get` / `text()` / `json()`; `Headers` has
+//! `get` (+ `has` / `set` / `append`, which are trivial once
+//! `get` exists). Streaming `body` is later.
 //!
-//! TODO(M5): CORS. The fetch gate below (`check_fetch_allowed`) is
-//! where the CORS check goes: M4 tracks no document origin in
-//! `TabJs`, so the check cannot run yet — `fetch()` must NOT be
-//! wired to a real network backend until M5 lands the origin and the
-//! check. The test backend is a fake; the trait documents the rule.
+//! Stage 9 Rec 2: `init.mode` / `init.credentials` are threaded
+//! to the browser-side backend, which enforces them in `pluto-net`
+//! (CORS preflight, credentials rules, opaque filtering); the
+//! realm-side gate is a pass-through, and `Response.type` reports
+//! the backend-computed tainting (`basic` / `cors` / `opaque`).
 //! TODO(M10): CSP. The same gate is where the `connect-src` check
 //! goes; do not add an `unsafe-eval`-style switch in M4.
-//! TODO(M5): `init.mode` / `credentials` are parsed and ignored;
-//! opaque `no-cors` responses are a later stage, not a silent pass.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc;
 
+use pluto_ipc::{CredentialsMode, Origin, RequestMode};
 use rquickjs::function::{Opt, This};
 use rquickjs::object::{Accessor, Property};
 use rquickjs::{Coerced, Ctx, Function, Object, Symbol, Value};
@@ -64,6 +63,50 @@ pub struct FetchRequest {
     pub headers: Vec<(String, String)>,
     /// Request body bytes, if any.
     pub body: Option<Vec<u8>>,
+    /// `init.mode` (`"cors"` by default): how cross-origin access
+    /// is treated. Threaded to the browser-side backend, which
+    /// enforces it in `pluto-net` — never decided in the realm.
+    pub mode: RequestMode,
+    /// `init.credentials` (`"same-origin"` by default): whether
+    /// cookies / auth ride along. Threaded to the backend with
+    /// `mode`; `pluto-net` applies the CORS credentials rules.
+    pub credentials: CredentialsMode,
+}
+
+/// The `Response.type` of a completed fetch (Fetch §2.2.6): what
+/// script may learn about the response. Set by the backend from
+/// the CORS tainting / origin comparison — never by script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseType {
+    /// Same-origin response: status, URL, body, all headers
+    /// except the forbidden response headers.
+    Basic,
+    /// Cross-origin response that passed the CORS check: status,
+    /// URL, body, CORS-safelisted + exposed headers only.
+    Cors,
+    /// `no-cors` cross-origin response (or a CORS failure the
+    /// backend surfaces as opaque): type is the ONLY signal —
+    /// status 0, empty header list, null body.
+    Opaque,
+    /// A redirect with `redirect: manual`: same shape as opaque,
+    /// but the URL list is exposed.
+    OpaqueRedirect,
+    /// A `new Response(body, init?)` construction: not a network
+    /// response at all.
+    Default,
+}
+
+impl ResponseType {
+    /// The string script reads as `response.type`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ResponseType::Basic => "basic",
+            ResponseType::Cors => "cors",
+            ResponseType::Opaque => "opaque",
+            ResponseType::OpaqueRedirect => "opaqueredirect",
+            ResponseType::Default => "default",
+        }
+    }
 }
 
 /// One fetch response, as the backend hands it back.
@@ -77,6 +120,11 @@ pub struct FetchResponse {
     pub headers: Vec<(String, String)>,
     /// Full response body (M4: bodies are buffered, not streamed).
     pub body: Vec<u8>,
+    /// What script may learn about this response
+    /// (`response.type`). The backend sets it from the CORS
+    /// tainting; an opaque response carries status 0, no headers,
+    /// and an empty body alongside this.
+    pub response_type: ResponseType,
 }
 
 /// Why a fetch failed (surfaces as a rejected promise).
@@ -123,6 +171,19 @@ pub struct FetchCompletion {
 pub trait FetchBackend: Send + Sync {
     /// Start a fetch. Send one outcome on `done`, exactly once.
     fn start_fetch(&self, request: FetchRequest, done: mpsc::Sender<FetchCompletion>);
+
+    /// The document origin this backend fetches for, if it tracks
+    /// one (Stage 9 Rec 1). The realm-side gate
+    /// ([`check_fetch_allowed`]) reads it for its early same-origin
+    /// check; `None` (the test backend) means the realm cannot
+    /// check and the backend's own gate is the only enforcement.
+    /// The browser-side gate is always authoritative — the realm
+    /// check is defense in depth, never a substitute, and the real
+    /// check never runs inside the realm's JS: script only ever
+    /// sees the rejection, never the origin value.
+    fn document_origin(&self) -> Option<Origin> {
+        None
+    }
 }
 
 /// Install `fetch`, `Response`, and `Headers` on the global object.
@@ -150,24 +211,23 @@ pub fn install_fetch<'js>(
     Ok(())
 }
 
-/// The fetch gate. M4: validates the URL shape only.
-/// TODO(M5): CORS — check the request URL against the document
-/// origin here (same-origin, or a CORS-safelisted cross-origin
-/// request) and reject anything else. Do NOT ship a permissive
-/// fetch: until this check exists, `fetch()` must only be used
-/// with the test backend.
+/// The fetch gate (Stage 9 Rec 2): intentionally a pass-through.
+/// The browser-side backend (`PlutoFetchBackend` in pluto-browser)
+/// + the CORS engine in `pluto-net` are authoritative: the CORS
+/// preflight / safelist check, opaque filtering, and the
+/// credentials rules all run there, never in the realm — script
+/// must never receive the internal response object. Relative URLs
+/// resolve against the document base browser-side. A fetch with no
+/// backend attached is rejected by the caller, not here.
 /// TODO(M10): CSP — check `connect-src` here.
-///
-/// Wave 2b note: the integration wave's `FetchBackend`
-/// (`pluto-browser`) IS the M4 origin check — it resolves the URL
-/// against the document base and rejects absolute cross-origin
-/// URLs before any network access, so a real backend is wired
-/// only behind that same-origin gate. The full CORS preflight /
-/// `mode` handling still lands in M5 at this gate.
-fn check_fetch_allowed(_url: &str) -> Result<(), String> {
-    // No origin is tracked in M4, so there is nothing to check
-    // against yet. The gate exists so the M5/M10 checks have exactly
-    // one place to land; the README states the rule.
+fn check_fetch_allowed(_url: &str, _document_origin: Option<&Origin>) -> Result<(), String> {
+    // Stage 9 Rec 2: the realm-side gate is intentionally a
+    // pass-through. The browser-side backend (`PlutoFetchBackend`
+    // in pluto-browser) + the CORS engine in `pluto-net` are
+    // authoritative: same-origin / CORS / opaque filtering and the
+    // credentials rules all run there, never in the realm — script
+    // must never receive the internal response object. A fetch with
+    // no backend attached is rejected by the caller, not here.
     Ok(())
 }
 
@@ -225,16 +285,29 @@ fn fetch_impl<'js>(
         reject_with(ctx, "fetch: invalid URL")?;
         return Ok(promise.into_value());
     }
-    if let Err(e) = check_fetch_allowed(&url) {
+    // The realm-side same-origin gate (Stage 9 Rec 1): the document
+    // origin comes from the attached backend; the backend's own
+    // gate stays authoritative.
+    let document_origin = bindings
+        .borrow()
+        .fetch_backend
+        .as_ref()
+        .and_then(|backend| backend.document_origin());
+    if let Err(e) = check_fetch_allowed(&url, document_origin.as_ref()) {
         reject_with(ctx, &e)?;
         return Ok(promise.into_value());
     }
 
-    // `init`: method / headers / body. `mode` and `credentials`
-    // are parsed and ignored — TODO(M5) (opaque responses).
+    // `init`: method / headers / body / mode / credentials.
+    // `mode` and `credentials` are threaded to the backend, which
+    // enforces them in `pluto-net` (Stage 9 Rec 2): an unknown
+    // enum value rejects with a TypeError, as the IDL conversion
+    // would. Defaults: mode `"cors"`, credentials `"same-origin"`.
     let mut method = "GET".to_string();
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut body: Option<Vec<u8>> = None;
+    let mut mode = RequestMode::Cors;
+    let mut credentials = CredentialsMode::SameOrigin;
     if let Some(init) = init
         && let Some(obj) = init.as_object() {
             if let Ok(m) = obj.get::<_, String>("method") {
@@ -247,10 +320,35 @@ fn fetch_impl<'js>(
                 && !b.is_null() && !b.is_undefined() {
                     body = Some(to_dom_string(ctx, &b)?.into_bytes());
                 }
-            // TODO(M5): `mode` / `credentials` — read here once the
-            // CORS check exists; ignored until then.
-            let _ = obj.get::<_, String>("mode");
-            let _ = obj.get::<_, String>("credentials");
+            if let Ok(m) = obj.get::<_, String>("mode") {
+                mode = match m.as_str() {
+                    "navigate" => RequestMode::Navigate,
+                    "same-origin" => RequestMode::SameOrigin,
+                    "no-cors" => RequestMode::NoCors,
+                    "cors" => RequestMode::Cors,
+                    other => {
+                        reject_with(
+                            ctx,
+                            &format!("fetch: invalid mode {other:?}"),
+                        )?;
+                        return Ok(promise.into_value());
+                    }
+                };
+            }
+            if let Ok(c) = obj.get::<_, String>("credentials") {
+                credentials = match c.as_str() {
+                    "omit" => CredentialsMode::Omit,
+                    "same-origin" => CredentialsMode::SameOrigin,
+                    "include" => CredentialsMode::Include,
+                    other => {
+                        reject_with(
+                            ctx,
+                            &format!("fetch: invalid credentials {other:?}"),
+                        )?;
+                        return Ok(promise.into_value());
+                    }
+                };
+            }
         }
     let id = {
         let mut s = bindings.borrow_mut();
@@ -264,6 +362,8 @@ fn fetch_impl<'js>(
         method,
         headers,
         body,
+        mode,
+        credentials,
     };
     bindings.borrow_mut().pending_fetches.insert(id, request.clone());
     // Stash resolve/reject in the registry until the outcome arrives.
@@ -409,6 +509,13 @@ pub fn make_response<'js>(
     // prototype's accessors read them).
     obj.prop("status", Property::from(response.status as f64))?;
     obj.prop("statusText", Property::from(status_text))?;
+    // `type` likewise: the backend-set tainting (`basic` / `cors` /
+    // `opaque` / `opaqueredirect` / `default`), read by the
+    // prototype's `type` accessor below.
+    obj.prop(
+        "type",
+        Property::from(response.response_type.as_str()),
+    )?;
     // The `headers` object shares the body id.
     let headers_obj = make_headers_object(ctx, bindings, body_id)?;
     obj.set("headers", headers_obj)?;
@@ -483,6 +590,22 @@ fn install_response_prototype<'js>(
             ),
         )
         .map_err(|e| format!("Response.statusText: {e}"))?;
+
+    // `type` is a plain data property on the object (set by
+    // `make_response`); the prototype exposes it as an accessor
+    // that reads the own property, so a missing value reads as
+    // `undefined` instead of throwing.
+    proto
+        .prop(
+            "type",
+            Accessor::from(
+                move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+                    let _ = ctx;
+                    this.get("type")
+                },
+            ),
+        )
+        .map_err(|e| format!("Response.type: {e}"))?;
 
     // `text()`: a promise resolved with the body as a string.
     let b = Rc::clone(bindings);
@@ -584,6 +707,9 @@ fn install_response_prototype<'js>(
                 status_text,
                 headers,
                 body: bytes,
+                // A constructed response is not a network response:
+                // its type is always "default" (Fetch §2.2.6).
+                response_type: ResponseType::Default,
             };
             make_response(&ctx, &b, &response).map(Value::from)
         },

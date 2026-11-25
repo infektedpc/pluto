@@ -870,6 +870,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "cookie"
+version = "0.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
+dependencies = [
+ "percent-encoding",
+ "time",
+ "version_check",
+]
+
+[[package]]
+name = "cookie_store"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15b2c103cf610ec6cae3da84a766285b42fd16aad564758459e6ecf128c75206"
+dependencies = [
+ "cookie",
+ "document-features",
+ "idna",
+ "log",
+ "serde",
+ "serde_derive",
+ "time",
+ "url",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2971,9 +2998,9 @@ dependencies = [
 
 [[package]]
 name = "jiff-tzdb"
-version = "0.1.10"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0980fca2cc272465bd60e82397607ba9f33add9e48defd77923301bbd03808f2"
+checksum = "fa8377070c6bae868759445e5a77f66d84f0b72f3a054bfb00e6d038b8282da7"
 
 [[package]]
 name = "jiff-tzdb"
@@ -2987,7 +3014,7 @@ version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "875a5a69ac2bab1a891711cf5eccbec1ce0341ea805560dcd90b7a2e925132e8"
 dependencies = [
- "jiff-tzdb 0.1.10",
+ "jiff-tzdb 0.1.9",
 ]
 
 [[package]]
@@ -4067,22 +4094,22 @@ checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
 
 [[package]]
 name = "pin-project"
-version = "1.2.0"
+version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6c2123f4708bbd422630a6dae7c03f678b1ce1f1c99e4c4b3beac69c8174cc9"
+checksum = "2466b2336ed02bcdca6b294417127b90ec92038d1d5c4fbeac971a922e0e0924"
 dependencies = [
  "pin-project-internal",
 ]
 
 [[package]]
 name = "pin-project-internal"
-version = "1.2.0"
+version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "358938fd6df944c1e44bb328b60fb275f13c804aac47ba26a1165d45a3f87756"
+checksum = "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.10",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -4118,6 +4145,8 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 name = "pluto-browser"
 version = "0.1.0"
 dependencies = [
+ "http",
+ "libc",
  "libcosmic",
  "pluto-css",
  "pluto-html",
@@ -4126,6 +4155,7 @@ dependencies = [
  "pluto-layout",
  "pluto-net",
  "pluto-paint",
+ "ring",
  "tokio",
  "tokio-util",
  "tracing",
@@ -4170,6 +4200,7 @@ name = "pluto-js"
 version = "0.1.0"
 dependencies = [
  "pluto-html",
+ "pluto-ipc",
  "rquickjs",
  "sha2",
  "thiserror 2.0.21",
@@ -4194,7 +4225,10 @@ dependencies = [
 name = "pluto-net"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
+ "cookie",
+ "cookie_store",
  "flate2",
  "http",
  "http-body-util",
@@ -4202,11 +4236,17 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "pluto-ipc",
+ "psl",
+ "regex",
+ "ring",
  "rustls",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
  "webpki-roots",
 ]
 
@@ -4386,6 +4426,21 @@ name = "profiling"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
+
+[[package]]
+name = "psl"
+version = "2.1.260"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "829dd76b95abcb73c39c45efb2f68f201ad70a2ade8fbee6cc3cd586390cfe27"
+dependencies = [
+ "psl-types",
+]
+
+[[package]]
+name = "psl-types"
+version = "2.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
 
 [[package]]
 name = "pxfm"

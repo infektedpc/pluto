@@ -12,10 +12,31 @@ flate2.workspace = true
 webpki-roots.workspace = true
 hyper.workspace = true
 http.workspace = true
+ring = "0.17"
+base64 = "0.22"
 hyper-util.workspace = true
 hyper-rustls.workspace = true
 http-body-util.workspace = true
 rustls.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+url.workspace = true
+serde.workspace = true
+regex = "1"
+serde_json.workspace = true
 pluto-ipc.workspace = true
+# Stage 9 Rec 3 (cookie jar): cookie_store 0.22.1 is the vetted RFC 6265
+# parser/validator (see jar.rs for the full evaluation). Default features
+# are OFF on purpose: they pull `publicsuffix` 2.2.3, which is not in the
+# offline registry cache, so a default-features build cannot resolve
+# offline. The `serde` feature stays on (JSON persistence for the jar);
+# public-suffix rejection is done in jar.rs via the `psl` crate instead.
+cookie_store = { version = "0.22", default-features = false, features = ["serde"] }
+# `cookie` 0.18 is cookie_store's own parser crate, named directly so
+# jar.rs can name `SameSite` / `Partitioned` when enforcing the
+# 6265bis rules cookie_store itself does not enforce.
+cookie = "0.18"
+# `psl` 2.1.260 (cached, embeds the Public Suffix List): registrable
+# domains for same-site checks, partition keys, and public-suffix
+# rejection in jar.rs.
+psl = "2"
