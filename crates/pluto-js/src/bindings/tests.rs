@@ -1499,6 +1499,25 @@ fn image_constructor_and_document_images() {
 }
 
 #[test]
+fn image_constructor_no_args() {
+    // Stage 12 wiring follow-up: `new Image()` with no arguments
+    // used to throw ("converting from js 'undefined' into type
+    // 'f64'") — the JS wrapper always passes both slots, and
+    // rquickjs's `Opt` only covers *missing* arguments, not
+    // explicit `undefined`. The factory now takes `Value`s.
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "const img = new Image(); \
+         globalThis.__r = [img.tagName, img.width, img.height, img.complete, img instanceof Image].join('|'); \
+         const one = new Image(320); \
+         globalThis.__s = [one.width, one.height].join(',');",
+    );
+    assert_eq!(read_str(&mut tab, "__r"), "IMG|0|0|false|true");
+    assert_eq!(read_str(&mut tab, "__s"), "320,0");
+}
+
+#[test]
 fn image_load_event_fires_on_shell_report() {
     let mut host = TestHost::from_html(DOC);
     let img_key = host.dom.create_element("img");

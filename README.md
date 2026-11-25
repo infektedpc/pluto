@@ -89,9 +89,12 @@ during bootstrap, verified against the actual sources:
   decode, intrinsic sizing, `background-image`, `srcset`/`<picture>`
   selection, favicons, page titles, loading progress, preconnect +
   DNS cache, animated images, strict decode limits.
-- **M4 — next.** JavaScript leftovers: the engine (rquickjs) landed
-  early, so this is the audit-and-finish pass — dirty-subtree re-layout
-  on DOM mutation, binding coverage, ES conformance gaps.
+- **M4 — done.** JavaScript leftovers finished: the module loader,
+  `-Os` for the QuickJS C build, layout-kind measurement with
+  safe-root widening, image map into the incremental path, subtree
+  restyle, the binding batch (`location`, `URL`, `dataset`,
+  `cloneNode`, typed events, fetch surface, `onerror`, console),
+  and the production shell wiring for all of it.
 
-Full workspace suite: 762 tests, all passing. See `ARCHITECTURE.md`
+Full workspace suite: 816 tests, all passing. See `ARCHITECTURE.md`
 for the full M1–M12 roadmap.

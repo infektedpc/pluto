@@ -67,6 +67,7 @@ use pluto_ipc::{
 };
 use pluto_ipc::transport::{recv_browser_message, Transport};
 use pluto_js::TabJs;
+use pluto_js::bindings::events::TypedEventKind;
 use pluto_layout::{ElementState, ImageMap, LayoutTree, OverscrollBehavior, RelayoutKind};
 use pluto_net::{ResourceLoader, SharedLoader};
 use pluto_paint::{DisplayList, Resource, ResourceId, ResourceTable, perf};
@@ -1577,6 +1578,12 @@ async fn tab_main(
                     }
                 }
                 drive_js(&mut state);
+                // Stage 12 Rec 7: a script may have asked for a
+                // navigation (`location.assign` / `reload`) or an
+                // image load (`Image().src` / `<img>` src) — the
+                // host only recorded the request, so the tab
+                // thread acts on it here, once per tick.
+                drain_host_requests(&mut state);
                 // Stage 11 Rec 11: advance due animations (the
                 // visible set is refreshed by a `Geometry` job
                 // every ~30 ticks — see below) and re-submit the
@@ -1916,6 +1923,39 @@ fn handle_exec(state: &mut TabState, msg: crate::js_host::ExecMsg) {
     {
         recreate_realm(state);
     }
+    // Stage 12 Rec 7: a parser / defer script may have asked for
+    // a navigation or an image load — act on it now, not on the
+    // next tick (a `location.assign` in a parser-blocking script
+    // must not wait a frame to start loading).
+    drain_host_requests(state);
+}
+
+/// Drain the JS requests the host recorded (Stage 12 Rec 7
+/// wiring): a navigation (`location.assign` / `replace` /
+/// `reload`, `location.href = ...`) and image loads
+/// (`Image().src` / an `<img>` `src` set from JS). The
+/// navigation goes first: it replaces the document (fresh
+/// realm), so image requests recorded in the same turn belong
+/// to a page that is already gone and are dropped, not fetched
+/// under the new page's epoch.
+fn drain_host_requests(state: &mut TabState) {
+    let (navigation, images) = {
+        let mut host = state.host.lock().unwrap();
+        (
+            host.take_pending_navigation(),
+            host.take_pending_images(),
+        )
+    };
+    if let Some((url, _replace)) = navigation {
+        // `replace` (no new history entry) is M8 history work:
+        // `DidCommit` carries no replace flag, so a replace
+        // navigates exactly like an assign today.
+        start_navigation(state, url);
+    } else {
+        for req in images {
+            handle_js_image_request(state, req);
+        }
+    }
 }
 
 /// Run the worker: forward shell commands to the tab thread and tab
@@ -2176,6 +2216,7 @@ fn start_navigation(state: &mut TabState, url: String) {
     {
         let mut host = state.host.lock().unwrap();
         host.set_viewport(state.viewport);
+        host.set_base_url(&url);
         host.set_element_state(state.element_state.clone());
     }
     let loader = state.loader.clone();
@@ -2341,9 +2382,14 @@ fn maybe_request_favicon(state: &mut TabState, final_url: &str) {
 /// in-flight image fetches along with the document load; the
 /// epoch check in the outcome handler is the backstop.
 fn handle_image_request(state: &mut TabState, req: ImageRequest) {
-    if !state.images.request(&req) {
-        return;
+    if state.images.request(&req) {
+        spawn_image_fetch(state, req);
     }
+}
+
+/// Fetch + decode one image on detached tasks, for a request the
+/// store accepted (see `handle_image_request`).
+fn spawn_image_fetch(state: &mut TabState, req: ImageRequest) {
     let cancel = state
         .nav_cancel
         .clone()
@@ -2356,6 +2402,47 @@ fn handle_image_request(state: &mut TabState, req: ImageRequest) {
         cancel,
         state.image_outcome_tx.clone(),
     );
+}
+
+/// One image load requested by JS (`Image().src` / an `<img>`
+/// `src` set from JS — Stage 12 Rec 7 wiring, drained from the
+/// host). A fresh URL fetches like any scanner-reported image;
+/// an already-decoded URL reports `load` straight away with the
+/// cached size; an already-broken URL reports `error`; a URL
+/// still in flight reports nothing now — the outcome handler
+/// notifies when it lands.
+fn handle_js_image_request(state: &mut TabState, req: ImageRequest) {
+    if state.images.request(&req) {
+        spawn_image_fetch(state, req);
+        return;
+    }
+    if let Some((width, height)) = state.images.ready_size(&req.url) {
+        notify_image_targets(state, &req.url, Some((width, height)));
+    } else if state.images.is_broken(&req.url) {
+        notify_image_targets(state, &req.url, None);
+    }
+}
+
+/// Report one image outcome to JS (Stage 12 Rec 7): every `<img>`
+/// whose current `src` resolves to `url` gets a `load` (with the
+/// intrinsic size) or `error` event, via `TabJs`. A favicon never
+/// reaches here (it has no element). Elements whose `src` moved
+/// on since the fetch started do not match, so they hear nothing
+/// about the stale load.
+fn notify_image_targets(state: &mut TabState, url: &str, outcome: Option<(u32, u32)>) {
+    let targets = state.host.lock().unwrap().image_targets(url);
+    if targets.is_empty() {
+        return;
+    }
+    let Some(js) = state.tab_js.as_mut() else {
+        return;
+    };
+    for target in targets {
+        match outcome {
+            Some((width, height)) => js.notify_image_loaded(target, width, height),
+            None => js.notify_image_failed(target),
+        }
+    }
 }
 
 /// One image fetch + decode outcome landed on the tab thread
@@ -2386,7 +2473,19 @@ async fn handle_image_outcome(
         return;
     }
     let is_favicon = state.favicon_url.as_deref() == Some(url.as_str());
-    match state.images.apply_outcome(outcome, is_favicon) {
+    let applied = state.images.apply_outcome(outcome, is_favicon);
+    // Stage 12 Rec 7: report the outcome to JS — a decoded image
+    // fires `load` on every `<img>` whose current `src` is this
+    // URL, a failure fires `error`. Favicons have no element, so
+    // they never notify (`FaviconChanged` below is their report).
+    // The listeners run on the next tick's `drive_js`, not here.
+    if !is_favicon {
+        match &applied {
+            Some(a) => notify_image_targets(state, &url, Some((a.width, a.height))),
+            None => notify_image_targets(state, &url, None),
+        }
+    }
+    match applied {
         Some(applied) => {
             if let Some(resource) = state.images.cache.get(applied.id).cloned() {
                 let fits = match &resource {
@@ -3320,7 +3419,19 @@ async fn handle_pointer_up(
     if let Some(url) = click_target(state, x, y).await {
         start_navigation(state, url);
     } else if let Some(js) = state.tab_js.as_mut() {
-        js.dispatch_event(target, "click", true);
+        // Stage 12 Rec 7: a typed mouse event, so the click
+        // listener reads `clientX` / `clientY` / `button`
+        // instead of a bare `click`.
+        js.dispatch_typed_event(
+            target,
+            "click",
+            true,
+            TypedEventKind::Mouse {
+                client_x: x as f64,
+                client_y: y as f64,
+                button: 0,
+            },
+        );
     }
 }
 
@@ -3711,7 +3822,25 @@ async fn activate_focused(
         }
         Some("button" | "input" | "select" | "textarea") => {
             if let Some(js) = state.tab_js.as_mut() {
-                js.dispatch_event(focused, "click", true);
+                // Stage 12 Rec 7: a typed keyboard event, so
+                // the click listener reads which key activated
+                // the element (`Enter` / ` `) instead of a bare
+                // `click`. The event type stays `click` — this
+                // is a click synthesised from the keyboard.
+                let code = match key {
+                    "Enter" => "Enter",
+                    " " => "Space",
+                    other => other,
+                };
+                js.dispatch_typed_event(
+                    focused,
+                    "click",
+                    true,
+                    TypedEventKind::Keyboard {
+                        key: key.to_string(),
+                        code: code.to_string(),
+                    },
+                );
             }
         }
         _ => {
@@ -5303,6 +5432,168 @@ mod tests {
         assert!(
             wait_for_glyphs(&mut event_rx, 5, Duration::from_secs(5)).await,
             "counter did not reach 10 after the click"
+        );
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Stage 12 Rec 7: a pointer click dispatches a *typed*
+    /// mouse event — the listener reads `clientX` / `clientY` /
+    /// `button` off it, not a bare `click`. The button is a
+    /// 200x40 block at (0,0); (100,20) is inside it.
+    #[tokio::test]
+    async fn worker_typed_mouse_click_carries_client_coordinates() {
+        let page = "<!doctype html><html><head><style>body{margin:0}            button{display:block;width:200px;height:40px}</style></head><body>            <button id=\"go\">Go</button><span id=\"out\">?</span>            <script>document.getElementById('go').addEventListener('click', (e) => {            document.getElementById('out').textContent = e.clientX + ',' + e.clientY + ',' + e.button; });</script>            </body></html>";
+        let routes = std::sync::Arc::new(vec![(
+            "/".to_string(),
+            "text/html".to_string(),
+            page.to_string(),
+        )]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_routes(listener, routes));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        // "Go" (2) + "?" (1) = 3 glyphs.
+        assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 3);
+        send_click(&cmd_tx, 100.0, 20.0);
+        // "Go" (2) + "100,20,0" (8) = 10 glyphs: the click
+        // listener saw the mouse coordinates and button.
+        assert!(
+            wait_for_glyphs(&mut event_rx, 10, Duration::from_secs(5)).await,
+            "mouse click did not carry clientX/clientY/button to JS"
+        );
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Stage 12 Rec 7: keyboard activation (Enter on a focused
+    /// button) dispatches a *typed* keyboard event — the click
+    /// listener reads which key activated the element.
+    #[tokio::test]
+    async fn worker_keyboard_activation_click_carries_key() {
+        let page = "<!doctype html><html><head><style>body{margin:0}            button{display:block;width:200px;height:40px}</style></head><body>            <button id=\"go\">Go</button><span id=\"out\">?</span>            <script>document.getElementById('go').addEventListener('click', (e) => {            document.getElementById('out').textContent = e.key || 'nokey'; });</script>            </body></html>";
+        let routes = std::sync::Arc::new(vec![(
+            "/".to_string(),
+            "text/html".to_string(),
+            page.to_string(),
+        )]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_routes(listener, routes));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        // "Go" (2) + "?" (1) = 3 glyphs.
+        assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 3);
+        // Tab focuses the button; Enter activates it.
+        send_key(&cmd_tx, "Tab", "Tab", pluto_ipc::Modifiers::default());
+        send_key(&cmd_tx, "Enter", "Enter", pluto_ipc::Modifiers::default());
+        // "Go" (2) + "Enter" (5) = 7 glyphs: the click listener
+        // saw the activating key.
+        assert!(
+            wait_for_glyphs(&mut event_rx, 7, Duration::from_secs(5)).await,
+            "keyboard activation did not carry the key to JS"
+        );
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Multi-route local server with binary bodies (like
+    /// `serve_routes`, but the body is bytes — a PNG cannot
+    /// round-trip through a `String`).
+    async fn serve_bytes_routes(
+        listener: TcpListener,
+        routes: std::sync::Arc<Vec<(String, String, Vec<u8>)>>,
+    ) {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let routes = std::sync::Arc::clone(&routes);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let Ok(n) = stream.read(&mut buf).await else {
+                    return;
+                };
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+                let (content_type, body): (String, Vec<u8>) = routes
+                    .iter()
+                    .find(|(p, _, _)| *p == path)
+                    .map(|(_, ct, b)| (ct.clone(), b.clone()))
+                    .unwrap_or_else(|| {
+                        ("text/plain".to_string(), b"not found".to_vec())
+                    });
+                let status = if body == b"not found" {
+                    "404 Not Found"
+                } else {
+                    "200 OK"
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            });
+        }
+    }
+
+    /// Encode a small RGBA image to real PNG bytes (same helper
+    /// shape as the image store's decode tests — no checked-in
+    /// fixture, no hand-built CRCs).
+    fn png_2x2_red_bytes() -> Vec<u8> {
+        use image::codecs::png::PngEncoder;
+        use image::{ExtendedColorType, ImageEncoder};
+        let mut out = Vec::new();
+        let rgba: Vec<u8> = [255u8, 0, 0, 255].repeat(4);
+        PngEncoder::new(&mut out)
+            .write_image(&rgba, 2, 2, ExtendedColorType::Rgba8)
+            .expect("test PNG encodes");
+        out
+    }
+
+    /// Stage 12 Rec 7, end to end: a script creates `new
+    /// Image()`, attaches `onload` *before* setting `src`, and
+    /// the shell-reported load fires the handler. The listener
+    /// is attached before the load starts, so there is no race
+    /// with the fetch — the `src` set is what starts it.
+    #[tokio::test]
+    async fn worker_js_image_load_event_fires() {
+        let page = "<!doctype html><html><head><style>body{margin:0}</style></head><body>            <span id=\"out\">?</span>            <script>const img = new Image();            img.onload = () => { document.getElementById('out').textContent = 'loaded'; };            img.onerror = () => { document.getElementById('out').textContent = 'failed'; };            img.src = '/pic.png';</script>            </body></html>";
+        let routes = std::sync::Arc::new(vec![
+            ("/".to_string(), "text/html".to_string(), page.as_bytes().to_vec()),
+            (
+                "/pic.png".to_string(),
+                "image/png".to_string(),
+                png_2x2_red_bytes(),
+            ),
+        ]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_bytes_routes(listener, routes));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        // "?" (1) before the image loads.
+        assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 1);
+        // "loaded" (6): the `load` event fired on the JS-created
+        // image and the handler updated the DOM.
+        assert!(
+            wait_for_glyphs(&mut event_rx, 6, Duration::from_secs(5)).await,
+            "Image() load event did not fire after the shell-reported load"
         );
         cmd_tx
             .send(BrowserToRenderer::Shutdown)

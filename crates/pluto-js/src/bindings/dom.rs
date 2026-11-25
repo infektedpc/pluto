@@ -1263,16 +1263,31 @@ fn install_image_constructor<'js>(
     let b = Rc::clone(bindings);
     let factory = Function::new(
         ctx.clone(),
-        move |ctx: Ctx<'js>, width: Opt<f64>, height: Opt<f64>| -> rquickjs::Result<Value<'js>> {
+        // `Value` params, not `Opt<f64>`: rquickjs's `Opt` only
+        // covers *missing* arguments — the `Image` wrapper below
+        // always passes both slots, so `new Image()` arrives as
+        // two explicit `undefined`s and `Opt<f64>` throws
+        // "converting from js 'undefined' into type 'f64'".
+        // `undefined` / `null` here mean "absent" (no attribute
+        // set); anything else coerces the way `f64::from_js`
+        // coerces it (so `new Image("100")` still works).
+        move |ctx: Ctx<'js>, width: Value<'js>, height: Value<'js>| -> rquickjs::Result<Value<'js>> {
+            let opt_number = |v: Value<'js>| -> rquickjs::Result<Option<f64>> {
+                if v.is_undefined() || v.is_null() {
+                    Ok(None)
+                } else {
+                    f64::from_js(&ctx, v).map(Some)
+                }
+            };
             let host = host_of(&b).map_err(|e| throw_type_error(&ctx, &e))?;
             let Some(key) = host.borrow_mut().create_element("img") else {
                 return Err(throw_type_error(&ctx, "could not create image element"));
             };
-            if let Some(w) = width.0 {
+            if let Some(w) = opt_number(width)? {
                 host.borrow_mut()
                     .set_attribute(key, "width", &format!("{}", w as u64));
             }
-            if let Some(h) = height.0 {
+            if let Some(h) = opt_number(height)? {
                 host.borrow_mut()
                     .set_attribute(key, "height", &format!("{}", h as u64));
             }

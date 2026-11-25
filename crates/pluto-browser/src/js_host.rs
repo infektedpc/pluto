@@ -113,6 +113,17 @@ pub struct BrowserDomHost {
     /// clearing the document again (M4 approximation of the
     /// script-created parser stream — see `document_write`).
     implicit_open_done: bool,
+    /// Navigation requested by JS (`location.assign` / `replace` /
+    /// `reload`, `location.href = ...`): the tab thread drains it
+    /// after each JS run and performs the navigation. Last
+    /// request wins — a script that assigns twice in one turn
+    /// navigates to the last URL only.
+    pending_navigation: Option<(String, bool)>,
+    /// Image loads requested by JS (`Image().src` / an `<img>`
+    /// `src` set from JS): the tab thread drains these and routes
+    /// them through the Stage 11 store, which reports back via
+    /// `TabJs::notify_image_loaded` / `notify_image_failed`.
+    pending_images: Vec<crate::images::ImageRequest>,
 }
 
 impl BrowserDomHost {
@@ -139,6 +150,8 @@ impl BrowserDomHost {
             errors,
             render_requested,
             implicit_open_done: false,
+            pending_navigation: None,
+            pending_images: Vec::new(),
         }
     }
 
@@ -169,6 +182,86 @@ impl BrowserDomHost {
     pub fn set_document(&mut self, document: &Document) {
         self.sheet = document.sheet().clone();
         self.base_url = document.base_url().to_string();
+    }
+
+    /// Point the base URL at a navigation's requested URL (the
+    /// tab thread calls this in `start_navigation`, before the
+    /// load runs): `location` reads the requested URL while the
+    /// parse is still running, and `set_document` corrects it to
+    /// the final URL after redirects when the parse finishes.
+    pub fn set_base_url(&mut self, url: &str) {
+        self.base_url = url.to_string();
+    }
+
+    /// Take the pending JS navigation request, if any (last
+    /// request wins; see the field docs).
+    pub fn take_pending_navigation(&mut self) -> Option<(String, bool)> {
+        self.pending_navigation.take()
+    }
+
+    /// Take the pending JS image requests, if any.
+    pub fn take_pending_images(&mut self) -> Vec<crate::images::ImageRequest> {
+        std::mem::take(&mut self.pending_images)
+    }
+
+    /// The `<img>` nodes whose resolved `src` is `url`: the
+    /// notify targets for an image outcome on that URL. Attached
+    /// and detached alike — a `new Image()` element lives in the
+    /// arena with no parent until it is inserted, so this scans
+    /// the whole arena, not just the tree from the root. Two
+    /// elements sharing one URL both report (each has its own
+    /// `load` / `error`); an element whose `src` moved on since
+    /// the fetch started no longer matches, so it hears nothing
+    /// about the stale load.
+    pub fn image_targets(&self, url: &str) -> Vec<DomKey> {
+        let dom = self.dom.lock().unwrap();
+        let base = self.base_url.clone();
+        dom.all_node_ids()
+            .into_iter()
+            .filter(|&id| {
+                dom.tag(id) == Some("img")
+                    && dom
+                        .attr(id, "src")
+                        .is_some_and(|src| resolve_url(&base, src) == url)
+            })
+            .collect()
+    }
+
+    /// Deep- (`deep` = true) or shallow-clone `key` inside the
+    /// live `Dom`, returning the detached clone's key. Same
+    /// shape as the test host's `clone_within` (kind + attributes
+    /// copied, children only when `deep`); `<script>` elements
+    /// clone like any other element — they are inert, never
+    /// executed. Unlike `clone_from` (fragment `Dom` → live
+    /// `Dom`), both sides here are the one live arena.
+    fn clone_within(&self, dom: &mut Dom, key: DomKey, deep: bool) -> Option<DomKey> {
+        let (kind, attrs) = match dom.get(key) {
+            Some(n) => (n.kind.clone(), n.attrs.clone()),
+            None => return None,
+        };
+        let new_key = match &kind {
+            NodeKind::Element { tag } => dom.create_element_with_attrs(tag, attrs),
+            NodeKind::Text(data) => dom.create_text(data),
+            NodeKind::Comment(data) => dom.create_comment(data),
+            NodeKind::Doctype {
+                name,
+                public_id,
+                system_id,
+            } => dom.create_doctype(name, public_id, system_id),
+            NodeKind::ProcessingInstruction { target, data } => {
+                dom.create_pi(target, data)
+            }
+            NodeKind::Document => dom.create_document(),
+        };
+        if deep {
+            let kids: Vec<NodeId> = dom.children(key).to_vec();
+            for kid in kids {
+                if let Some(cloned) = self.clone_within(dom, kid, true) {
+                    dom.append_child(new_key, cloned);
+                }
+            }
+        }
+        Some(new_key)
     }
 
     /// Snapshot the live `Dom` (the tab thread re-syncs the
@@ -901,6 +994,58 @@ impl DomHost for BrowserDomHost {
         eprintln!("[pluto] js error: {message}");
     }
 
+    // Stage 12 Rec 7: the binding-batch host hooks. The defaults
+    // ("not present") are a missing feature here, so the
+    // production host overrides all five.
+    fn document_url(&self) -> Option<String> {
+        if self.base_url.is_empty() {
+            None
+        } else {
+            Some(self.base_url.clone())
+        }
+    }
+
+    fn request_navigation(&mut self, url: &str, replace: bool) {
+        // Recorded, not performed: the realm never navigates
+        // itself — the tab thread drains this after the JS run
+        // and drives `start_navigation` (which also resets the
+        // realm, so a navigation requested mid-script cannot
+        // re-enter the running realm).
+        self.pending_navigation = Some((url.to_string(), replace));
+    }
+
+    fn attribute_names(&self, key: DomKey) -> Vec<String> {
+        self.dom
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|n| n.attrs.iter().map(|(name, _)| name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    fn clone_node(&mut self, key: DomKey, deep: bool) -> Option<DomKey> {
+        let mut dom = self.dom.lock().unwrap();
+        if dom.get(key).is_none() {
+            return None;
+        }
+        // The clone is detached: no dirty bits, no render
+        // request — nothing lays out until it is inserted.
+        self.clone_within(&mut dom, key, deep)
+    }
+
+    fn request_image(&mut self, url: &str, base_url: &str) {
+        // Recorded, not fetched: the tab thread drains this and
+        // routes it through the Stage 11 store (same gates as
+        // the preload scanner), which reports back via
+        // `TabJs::notify_image_loaded` / `notify_image_failed`.
+        self.pending_images.push(crate::images::ImageRequest {
+            url: url.to_string(),
+            base_url: base_url.to_string(),
+            is_imageset: false,
+            integrity: None,
+        });
+    }
+
     // Stage 8 Rec 7: the mutation-observer registry lives in the
     // `Dom` (see `pluto-html::observers`); this host only locks
     // the arena and delegates.
@@ -1140,6 +1285,21 @@ impl DomHost for SharedHost {
     }
     fn report_error(&self, message: &str) {
         self.0.lock().unwrap().report_error(message)
+    }
+    fn document_url(&self) -> Option<String> {
+        self.0.lock().unwrap().document_url()
+    }
+    fn request_navigation(&mut self, url: &str, replace: bool) {
+        self.0.lock().unwrap().request_navigation(url, replace)
+    }
+    fn attribute_names(&self, key: DomKey) -> Vec<String> {
+        self.0.lock().unwrap().attribute_names(key)
+    }
+    fn clone_node(&mut self, key: DomKey, deep: bool) -> Option<DomKey> {
+        self.0.lock().unwrap().clone_node(key, deep)
+    }
+    fn request_image(&mut self, url: &str, base_url: &str) {
+        self.0.lock().unwrap().request_image(url, base_url)
     }
     fn observe_mutation(
         &mut self,
@@ -1878,7 +2038,7 @@ mod tests {
     use super::*;
     use crate::renderer::{layout_thread, LayoutJob};
     use pluto_ipc::CredentialsMode;
-    use pluto_js::{RealmConfig, TabJs};
+    use pluto_js::{JsValue, RealmConfig, TabJs};
     use std::sync::mpsc;
 
     /// A `TabJs` over a real layout actor thread, with the host's
@@ -1961,6 +2121,311 @@ mod tests {
         let host = host.lock().unwrap();
         let key = host.get_element_by_id("box").expect("box still there");
         assert_eq!(host.text_content(key).as_deref(), Some("y4"));
+    }
+
+    // ------------------------------------------- Stage 12 Rec 7 wiring
+    //
+    // The binding batch (location, dataset, cloneNode, Image(),
+    // typed events) is built and tested against the pluto-js test
+    // host — these tests prove the same behaviour through the
+    // PRODUCTION host (`BrowserDomHost` + `SharedHost`), where
+    // the defaults used to answer "not present".
+
+    /// A `TabJs` over a real layout actor thread, with the host's
+    /// `Dom` holding `html` and its base URL set to `base_url`.
+    fn wiring_setup(html: &str, base_url: &str) -> (TabJs, Rc<std::sync::Mutex<BrowserDomHost>>) {
+        let (layout_tx, layout_rx) = mpsc::channel::<LayoutJob>();
+        std::thread::spawn(move || layout_thread(layout_rx));
+        let host = BrowserDomHost::new(
+            Arc::new(Mutex::new(pluto_html::parse(html))),
+            layout_tx,
+            (1024.0, 768.0),
+            ElementState::default(),
+            base_url,
+            Rc::new(std::sync::Mutex::new(Vec::new())),
+            Rc::new(Cell::new(false)),
+        );
+        let host_rc = Rc::new(std::sync::Mutex::new(host));
+        let mut tab = TabJs::new(&RealmConfig::default()).expect("realm");
+        tab.set_dom_host(Box::new(SharedHost(Rc::clone(&host_rc))));
+        (tab, host_rc)
+    }
+
+    fn read_str(tab: &mut TabJs, source: &str) -> String {
+        match tab.eval_value(source).unwrap() {
+            JsValue::String(s) => s,
+            other => panic!("expected a string from `{source}`, got {other:?}"),
+        }
+    }
+
+    fn read_num(tab: &mut TabJs, source: &str) -> f64 {
+        match tab.eval_value(source).unwrap() {
+            JsValue::Number(n) => n,
+            other => panic!("expected a number from `{source}`, got {other:?}"),
+        }
+    }
+
+    fn read_bool(tab: &mut TabJs, source: &str) -> bool {
+        match tab.eval_value(source).unwrap() {
+            JsValue::Bool(b) => b,
+            other => panic!("expected a bool from `{source}`, got {other:?}"),
+        }
+    }
+
+    const WIRING_DOC: &str = "<!doctype html><html><head></head><body>\
+        <div id=\"app\" class=\"root\"><p id=\"para\">Hello</p><span>Click</span></div>\
+        <button id=\"btn\">Go</button><img id=\"pic\" alt=\"x\"></body></html>";
+
+    #[test]
+    fn production_host_location_reads_the_real_url() {
+        let (mut tab, host) =
+            wiring_setup(WIRING_DOC, "https://example.com/page?x=1#frag");
+        tab.eval_script(
+            "globalThis.__href = location.href; \
+             globalThis.__host = location.hostname; \
+             globalThis.__path = location.pathname; \
+             globalThis.__search = location.search; \
+             globalThis.__proto = location.protocol;",
+            "loc.js",
+        )
+        .expect("location script runs");
+        assert_eq!(read_str(&mut tab, "__href"), "https://example.com/page?x=1#frag");
+        assert_eq!(read_str(&mut tab, "__host"), "example.com");
+        assert_eq!(read_str(&mut tab, "__path"), "/page");
+        assert_eq!(read_str(&mut tab, "__search"), "?x=1");
+        assert_eq!(read_str(&mut tab, "__proto"), "https:");
+        // assign / replace / reload record a navigation with the
+        // host (they do not navigate in the realm).
+        tab.eval_script("location.assign('/other');", "loc.js")
+            .expect("assign runs");
+        assert_eq!(
+            host.lock().unwrap().take_pending_navigation(),
+            Some(("https://example.com/other".to_string(), false)),
+            "assign resolves against the document URL, no replace"
+        );
+        tab.eval_script("location.replace('https://example.com/r');", "loc.js")
+            .expect("replace runs");
+        assert_eq!(
+            host.lock().unwrap().take_pending_navigation(),
+            Some(("https://example.com/r".to_string(), true)),
+            "replace records the replace flag"
+        );
+        tab.eval_script("location.reload();", "loc.js")
+            .expect("reload runs");
+        assert_eq!(
+            host.lock().unwrap().take_pending_navigation(),
+            Some(("https://example.com/page?x=1#frag".to_string(), false)),
+            "reload re-requests the current URL"
+        );
+        // And `location.href = ...` navigates like assign.
+        tab.eval_script("location.href = '/via-href';", "loc.js")
+            .expect("href set runs");
+        assert_eq!(
+            host.lock().unwrap().take_pending_navigation(),
+            Some(("https://example.com/via-href".to_string(), false)),
+            "setting href navigates like assign"
+        );
+    }
+
+    #[test]
+    fn production_host_clone_node_round_trips() {
+        let (mut tab, _host) = wiring_setup(WIRING_DOC, "https://example.com/");
+        tab.eval_script(
+            "const app = document.getElementById('app'); \
+             const deep = app.cloneNode(true); \
+             const shallow = app.cloneNode(false); \
+             globalThis.__r = [deep.tagName, deep.childNodes.length, deep.className, deep.textContent, deep.parentNode].join('|'); \
+             globalThis.__s = [shallow.tagName, shallow.childNodes.length, shallow.className].join('|');",
+            "clone.js",
+        )
+        .expect("clone script runs");
+        assert_eq!(read_str(&mut tab, "__r"), "DIV|2|root|HelloClick|");
+        assert_eq!(read_str(&mut tab, "__s"), "DIV|0|root");
+    }
+
+    #[test]
+    fn production_host_dataset_reads_and_writes_real_attributes() {
+        let (mut tab, host) = wiring_setup(WIRING_DOC, "https://example.com/");
+        tab.eval_script(
+            "const app = document.getElementById('app'); \
+             app.dataset.fooBar = 'baz'; \
+             globalThis.__r = app.dataset.fooBar; \
+             app.dataset.userName = 'Jo'; \
+             globalThis.__keys = Object.keys(app.dataset).join(','); \
+             delete app.dataset.fooBar; \
+             globalThis.__gone = app.hasAttribute('data-foo-bar');",
+            "dataset.js",
+        )
+        .expect("dataset script runs");
+        assert_eq!(read_str(&mut tab, "__r"), "baz");
+        assert_eq!(read_str(&mut tab, "__keys"), "fooBar,userName");
+        assert!(!read_bool(&mut tab, "__gone"), "delete removes the attribute");
+        // The writes landed as real content attributes on the
+        // production host's live Dom, not a test-host copy.
+        let host = host.lock().unwrap();
+        let app = host.get_element_by_id("app").expect("app still there");
+        assert_eq!(
+            host.get_attribute(app, "data-user-name").as_deref(),
+            Some("Jo"),
+            "dataset write is a real data-* attribute"
+        );
+        assert_eq!(
+            host.get_attribute(app, "data-foo-bar"),
+            None,
+            "dataset delete removed the real attribute"
+        );
+        assert_eq!(
+            host.attribute_names(app),
+            vec!["id".to_string(), "class".to_string(), "data-user-name".to_string()],
+            "attribute_names lists the live attributes in source order"
+        );
+    }
+
+    #[test]
+    fn production_host_image_load_event_fires_on_shell_report() {
+        let (mut tab, host) = wiring_setup(WIRING_DOC, "https://example.com/page");
+        tab.eval_script(
+            "const pic = document.getElementById('pic'); \
+             let loaded = 0, onloaded = 0, errored = 0; \
+             pic.addEventListener('load', () => { loaded = 1; }); \
+             pic.addEventListener('error', () => { errored = 1; }); \
+             pic.onload = () => { onloaded = 1; }; \
+             globalThis.__loaded = () => loaded; \
+             globalThis.__onloaded = () => onloaded; \
+             globalThis.__errored = () => errored; \
+             globalThis.__pic = pic; \
+             pic.src = '/pic.png';",
+            "img.js",
+        )
+        .expect("image script runs");
+        // The `src` set asked the host for a load (resolved
+        // against the document URL), and the host knows the
+        // element to report back to.
+        let pending = host.lock().unwrap().take_pending_images();
+        assert_eq!(pending.len(), 1, "one image requested");
+        assert_eq!(pending[0].url, "https://example.com/pic.png");
+        assert_eq!(pending[0].base_url, "https://example.com/page");
+        let targets = host.lock().unwrap().image_targets(&pending[0].url);
+        assert_eq!(targets.len(), 1, "one element has this src");
+        assert_eq!(
+            targets[0],
+            host.lock().unwrap().get_element_by_id("pic").unwrap(),
+            "the target is the document img"
+        );
+        tab.notify_image_loaded(targets[0], 640, 480);
+        tab.run_until_idle().unwrap();
+        assert_eq!(read_num(&mut tab, "__loaded()"), 1.0);
+        assert_eq!(read_num(&mut tab, "__onloaded()"), 1.0);
+        assert!(read_bool(&mut tab, "__pic.complete"));
+        assert_eq!(read_num(&mut tab, "__pic.naturalWidth"), 640.0);
+        assert_eq!(read_num(&mut tab, "__pic.naturalHeight"), 480.0);
+        // A later failure reports `error` on the same element.
+        tab.eval_script("pic.src = '/gone.png';", "img.js")
+            .expect("second src set runs");
+        let pending = host.lock().unwrap().take_pending_images();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].url, "https://example.com/gone.png");
+        let targets = host.lock().unwrap().image_targets(&pending[0].url);
+        assert_eq!(targets.len(), 1);
+        tab.notify_image_failed(targets[0]);
+        tab.run_until_idle().unwrap();
+        assert_eq!(read_num(&mut tab, "__errored()"), 1.0);
+        assert!(!read_bool(&mut tab, "__pic.complete"));
+    }
+
+    #[test]
+    fn production_host_detached_image_is_found_by_url_scan() {
+        let (mut tab, host) = wiring_setup(WIRING_DOC, "https://example.com/page");
+        tab.eval_script(
+            "const img = new Image(); \
+             let loaded = 0; \
+             img.addEventListener('load', () => { loaded = 1; }); \
+             globalThis.__imgLoaded = () => loaded; \
+             globalThis.__img = img; \
+             img.src = 'https://example.com/detached.png';",
+            "img.js",
+        )
+        .expect("detached image script runs");
+        let pending = host.lock().unwrap().take_pending_images();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].url, "https://example.com/detached.png");
+        // The element is detached (never inserted), so no tree
+        // walk reaches it — only the arena scan finds it.
+        let targets = host.lock().unwrap().image_targets(&pending[0].url);
+        assert_eq!(targets.len(), 1, "detached Image() found by URL scan");
+        assert_ne!(
+            targets[0],
+            host.lock().unwrap().get_element_by_id("pic").unwrap(),
+            "the target is the detached image, not the document img"
+        );
+        tab.notify_image_loaded(targets[0], 320, 240);
+        tab.run_until_idle().unwrap();
+        assert_eq!(read_num(&mut tab, "__imgLoaded()"), 1.0);
+        assert!(read_bool(&mut tab, "__img.complete"));
+        assert_eq!(read_num(&mut tab, "__img.naturalWidth"), 320.0);
+    }
+
+    #[test]
+    fn production_host_typed_events_reach_js_with_fields() {
+        use pluto_js::bindings::events::TypedEventKind;
+        let (mut tab, host) = wiring_setup(WIRING_DOC, "https://example.com/");
+        let btn = host.lock().unwrap().get_element_by_id("btn").unwrap();
+        let para = host.lock().unwrap().get_element_by_id("para").unwrap();
+        tab.eval_script(
+            "const seenKey = []; \
+             const seenMouse = []; \
+             const seenInput = []; \
+             document.getElementById('btn').addEventListener('keydown', (e) => { seenKey.push([e.key, e.code, e instanceof KeyboardEvent, e instanceof Event]); }); \
+             document.getElementById('btn').addEventListener('click', (e) => { seenMouse.push([e.clientX, e.clientY, e.button, e instanceof MouseEvent]); }); \
+             document.getElementById('para').addEventListener('input', (e) => { seenInput.push([e.data, e instanceof InputEvent, e.target === document.getElementById('para')]); }); \
+             globalThis.__seenKey = seenKey; \
+             globalThis.__seenMouse = seenMouse; \
+             globalThis.__seenInput = seenInput;",
+            "typed.js",
+        )
+        .expect("listener script runs");
+        tab.dispatch_typed_event(
+            btn,
+            "keydown",
+            true,
+            TypedEventKind::Keyboard {
+                key: "Enter".to_string(),
+                code: "Enter".to_string(),
+            },
+        );
+        tab.run_until_idle().unwrap();
+        assert_eq!(
+            read_str(&mut tab, "__seenKey[0].join(',')"),
+            "Enter,Enter,true,true"
+        );
+        tab.dispatch_typed_event(
+            btn,
+            "click",
+            true,
+            TypedEventKind::Mouse {
+                client_x: 10.0,
+                client_y: 20.0,
+                button: 0,
+            },
+        );
+        tab.run_until_idle().unwrap();
+        assert_eq!(
+            read_str(&mut tab, "__seenMouse[0].join(',')"),
+            "10,20,0,true"
+        );
+        tab.dispatch_typed_event(
+            para,
+            "input",
+            true,
+            TypedEventKind::Input {
+                data: Some("x".to_string()),
+            },
+        );
+        tab.run_until_idle().unwrap();
+        assert_eq!(
+            read_str(&mut tab, "__seenInput[0].join(',')"),
+            "x,true,true"
+        );
     }
 
     // ------------------------------------------------------------ fetch gate

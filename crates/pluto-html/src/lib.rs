@@ -301,6 +301,14 @@ impl Dom {
         self.arena.get(id)
     }
 
+    /// Every live node id in the arena, including detached nodes
+    /// (a `new Image()` element, or a node removed from the tree
+    /// but still wrapped in JS, has no parent and no path from
+    /// the root — a tree walk never reaches it).
+    pub fn all_node_ids(&self) -> Vec<NodeId> {
+        self.arena.keys().collect()
+    }
+
     /// Children of `id` in document order.
     pub fn children(&self, id: NodeId) -> &[NodeId] {
         self.arena

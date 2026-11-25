@@ -231,6 +231,27 @@ impl ImageStore {
         }
     }
 
+    /// Intrinsic size of an already-decoded URL, if its pixels
+    /// are still cached. The tab thread uses this when JS asks
+    /// for an image that is already `Ready`: the `load` event
+    /// fires straight away with the cached size instead of
+    /// waiting for a fetch that will never come.
+    pub fn ready_size(&self, url: &str) -> Option<(u32, u32)> {
+        match self.by_url.get(url) {
+            Some(ImageState::Ready { id, width, height }) if self.cache.get(*id).is_some() => {
+                Some((*width, *height))
+            }
+            _ => None,
+        }
+    }
+
+    /// True when this URL already failed (fetch, decode, or
+    /// cache insert): a JS request for it reports `error`
+    /// straight away instead of re-fetching.
+    pub fn is_broken(&self, url: &str) -> bool {
+        matches!(self.by_url.get(url), Some(ImageState::Broken))
+    }
+
     /// Fetch + decode one image on detached tasks (call only
     /// after [`request`](Self::request) returned `true`). The
     /// fetch runs through the loader (all Stage 9 gates apply);
