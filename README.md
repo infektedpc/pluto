@@ -22,7 +22,8 @@ link. The status line reads `Loaded https://example.com` when the page
 is up. Type a URL and press Go to navigate (a bare host works:
 `example.com` becomes `https://example.com`). A failed fetch renders
 an error page instead of a blank window. The window title follows the
-active tab's page title.
+active tab's page title. Bookmarks and history persist across
+restarts (`bookmarks.json`, `history.json` in the profile dir).
 
 The window frame follows the desktop: the window manager draws it
 where it provides one (KDE, Xfce, sway...), and libcosmic draws it
@@ -35,6 +36,16 @@ manager's (note the `--` separating cargo's args from Pluto's):
 ```sh
 cargo run -p pluto-browser -- --csd
 ```
+
+## Security
+
+Each tab runs its renderer in a separate process under a seccomp
+sandbox (best-effort; `--no-sandbox` escapes it), so a renderer
+that dies doesn't take the browser with it. Requests go through a
+real Origin type with CORS, a partitioned cookie jar (SameSite Lax
+by default, `__Secure-`/`__Host-` prefixes enforced), HSTS with
+HTTPS-only upgrades, CSP v1, subresource integrity checks, and a
+basic EasyList/EasyPrivacy blocker. Details in `ARCHITECTURE.md`.
 
 Build notes:
 
@@ -95,6 +106,8 @@ during bootstrap, verified against the actual sources:
   restyle, the binding batch (`location`, `URL`, `dataset`,
   `cloneNode`, typed events, fetch surface, `onerror`, console),
   and the production shell wiring for all of it.
+- **M5 — next.** Forms, cookies + storage on disk, multi-process
+  sandboxing (research underway).
 
 Full workspace suite: 816 tests, all passing. See `ARCHITECTURE.md`
 for the full M1–M12 roadmap.
