@@ -112,7 +112,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use taffy::{
-    AvailableSpace, BoxSizing, Dimension, Display, FlexDirection, FlexWrap,
+    AvailableSpace, BoxSizing, Dimension, Display, FlexDirection, FlexWrap, GridAutoFlow,
     GridTemplateComponent, LayoutInput, LayoutOutput, LengthPercentage, LengthPercentageAuto,
     Line, MaxTrackSizingFunction, MinTrackSizingFunction, NodeId as TaffyId, Overflow,
     Position, Size, Style, TaffyError, TaffyTree, TrackSizingFunction,
@@ -363,6 +363,10 @@ pub struct ComputedStyle {
     /// (start, end) placement per axis; `Auto` = auto-placement.
     pub grid_column: (GridPlace, GridPlace),
     pub grid_row: (GridPlace, GridPlace),
+    /// `grid-auto-flow` (Stage 10 Rec 5): row/column auto-placement
+    /// axis plus the dense packing algorithm. Initial `Row`, which
+    /// is also what taffy defaults to.
+    pub grid_auto_flow: GridAutoFlow,
     /// `contain: layout` (also implied by `contain: strict` /
     /// `content`): the subtree is layout-contained, so it can be a
     /// layout root even without a definite size (Stage 8 Rec 6).
@@ -413,6 +417,7 @@ impl ComputedStyle {
             grid_gap: (Dim::Px(0.0), Dim::Px(0.0)),
             grid_column: (GridPlace::Auto, GridPlace::Auto),
             grid_row: (GridPlace::Auto, GridPlace::Auto),
+            grid_auto_flow: GridAutoFlow::Row,
             contain_layout: false,
         }
     }
@@ -480,15 +485,22 @@ pub struct NodeStyle {
 }
 
 /// Dynamic pseudo-class state for one style/layout pass: which
-/// elements are currently hovered / active / focused. The shell owns
-/// this (hit-testing feeds `:hover`); `:visited` is intentionally
-/// absent — it is always false until a history exists (see
-/// `match_pseudo_class`).
+/// elements are currently hovered / active / focused, and which
+/// links point at URLs the session has visited. The shell owns
+/// this (hit-testing feeds `:hover`; the worker's committed-URL
+/// set feeds `:visited` — see `TabState::visited_urls` in
+/// pluto-browser, which projects the set onto element ids before
+/// each layout pass).
 #[derive(Debug, Clone, Default)]
 pub struct ElementState {
     pub hover: HashSet<DomId>,
     pub active: HashSet<DomId>,
     pub focus: HashSet<DomId>,
+    /// Links whose resolved `href` is in the session's visited
+    /// set (worker-side projection — the matcher itself never
+    /// sees a URL, only element ids, so visited-ness cannot leak
+    /// through a layout-dependent query).
+    pub visited: HashSet<DomId>,
 }
 
 impl ElementState {
@@ -504,6 +516,11 @@ impl ElementState {
 
     pub fn with_focus(mut self, id: DomId) -> Self {
         self.focus.insert(id);
+        self
+    }
+
+    pub fn with_visited(mut self, id: DomId) -> Self {
+        self.visited.insert(id);
         self
     }
 }
@@ -891,6 +908,74 @@ impl LayoutTree {
             .iter()
             .map(|b| b.y + b.height)
             .fold(0.0, f32::max)
+    }
+
+    /// Total content width (right edge of the rightmost box), the
+    /// horizontal counterpart of [`content_height`].
+    pub fn content_width(&self) -> f32 {
+        self.boxes
+            .iter()
+            .map(|b| b.x + b.width)
+            .fold(0.0, f32::max)
+    }
+
+    /// Maximum scroll offset of one scroll container, per axis
+    /// (`scrollHeight - clientHeight`, `scrollWidth -
+    /// clientWidth`): how far the container's content reaches past
+    /// its own box, in the container's scroll space. `None` when
+    /// `id` has no box (not a laid-out element). Content is every
+    /// box whose nearest scroll container — counting a scroll
+    /// container's own box as content of its parent — is this
+    /// container: a nested scroll container contributes its own
+    /// border box, not its inner content (that content scrolls
+    /// inside the nested container). Boxes already carry their
+    /// container's current offset (see `recollect`), so the
+    /// container's own offset is added back — offsets of ancestors
+    /// above it shift the container's box by the same amount, so
+    /// they cancel in the difference.
+    pub fn scrollable_size(&self, id: DomId) -> Option<(f32, f32)> {
+        let container = *self.boxes_for_dom(id).first()?;
+        let (ox, oy) = self.scroll_offsets.get(&id).copied().unwrap_or((0.0, 0.0));
+        // Taffy parent of each box, from the meta children lists.
+        let mut parent: HashMap<TaffyId, TaffyId> = HashMap::new();
+        for (node, m) in &self.meta {
+            for &child in &m.children {
+                parent.insert(child, *node);
+            }
+        }
+        let by_taffy: HashMap<TaffyId, &LayoutBox> =
+            self.boxes.iter().map(|b| (b.taffy, b)).collect();
+        let is_container = |b: &LayoutBox| {
+            b.style.overflow_x.is_scroll_container() || b.style.overflow_y.is_scroll_container()
+        };
+        // The container's own extent: content shorter than the box
+        // scrolls nowhere.
+        let mut max_right = container.width;
+        let mut max_bottom = container.height;
+        for b in &self.boxes {
+            if b.dom == Some(id) {
+                continue;
+            }
+            // Nearest scroll container above this box (a scroll
+            // container's own box counts as content of its parent).
+            let ancestor = if is_container(b) {
+                parent
+                    .get(&b.taffy)
+                    .and_then(|p| by_taffy.get(p))
+                    .and_then(|p| p.scroll_ancestor)
+            } else {
+                b.scroll_ancestor
+            };
+            if ancestor != Some(id) {
+                continue;
+            }
+            max_right = max_right.max(b.x + b.width + ox - container.x);
+            max_bottom = max_bottom.max(b.y + b.height + oy - container.y);
+        }
+        Some((
+            (max_right - container.width).max(0.0),
+            (max_bottom - container.height).max(0.0),
+        ))
     }
 
     /// Hit-test: the topmost (latest in document order) box whose rect
@@ -2362,15 +2447,20 @@ fn match_pseudo_class(
                 == 1
         }
         // `:link` = an anchor with an `href`. `:any-link` is the same
-        // set here (no `:visited` distinction without history).
+        // set here (`:link` is not yet exclusive with `:visited` —
+        // a visited link still matches `:link`; the UA sheet has no
+        // separate `a:link` rule, so this is display-neutral).
         PseudoClass::Link | PseudoClass::AnyLink => {
             matches!(dom.tag(id), Some("a" | "area" | "link"))
                 && dom.attr(id, "href").is_some()
         }
-        // `:visited` is ALWAYS FALSE until a history exists (Stage 6
-        // report §c). The UA sheet's `a:visited` rule therefore never
-        // applies in M2 — by design, and documented here, not a bug.
-        PseudoClass::Visited => false,
+        // `:visited` = an anchor the worker's visited projection
+        // flagged (see `ElementState::visited`): the link's
+        // resolved href is in the session's committed-URL set.
+        // The matcher only ever sees element ids — visited-ness
+        // never leaves the style pass (no JS binding, geometry,
+        // or IPC field carries it).
+        PseudoClass::Visited => state.visited.contains(&id),
         PseudoClass::Hover => state.hover.contains(&id),
         PseudoClass::Active => state.active.contains(&id),
         PseudoClass::Focus | PseudoClass::FocusVisible => state.focus.contains(&id),
@@ -2478,6 +2568,7 @@ fn resolve_style(
     style.grid_gap = (Dim::Px(0.0), Dim::Px(0.0));
     style.grid_column = (GridPlace::Auto, GridPlace::Auto);
     style.grid_row = (GridPlace::Auto, GridPlace::Auto);
+    style.grid_auto_flow = GridAutoFlow::Row;
 
     // Collect matching declarations with their cascade keys.
     // (Owned property/value: the inline-style sheet below is a
@@ -3022,6 +3113,22 @@ fn apply_decl(
                 style.grid_row.1 = parse_grid_place(raw);
             }
         }
+        "grid-auto-flow" => {
+            // Single keywords arrive as `Keyword`, two-word forms
+            // (`row dense`) as `Raw`; both go through the same
+            // parser. An invalid value drops the declaration (the
+            // `display` arm's early `return`): the previous /
+            // initial row flow stands.
+            let raw = match value {
+                Value::Keyword(k) => k.as_str(),
+                Value::Raw(raw) => raw.as_str(),
+                _ => return,
+            };
+            match parse_grid_auto_flow(raw) {
+                Some(flow) => style.grid_auto_flow = flow,
+                None => return,
+            }
+        }
         // Deliberately unmodelled in M2 (stored nowhere, never an
         // error): float/clear (no float layout yet), border widths
         // (no border painting yet), text-decoration, list-style-type,
@@ -3210,6 +3317,41 @@ fn parse_track_list(
         .collect()
 }
 
+/// Parse `grid-auto-flow`: `[ row | column ] || dense` — `row`,
+/// `column`, `row dense`, `column dense`, and the `dense`-only form
+/// (which means `row dense`, per the grammar and taffy's `FromCss`).
+/// Keywords are case-insensitive. Anything else (`row column`,
+/// `dense dense`, `sideways`, empty, three tokens, ...) is `None`
+/// and the caller drops the declaration.
+fn parse_grid_auto_flow(raw: &str) -> Option<GridAutoFlow> {
+    let mut axis: Option<bool> = None; // false = row, true = column
+    let mut dense = false;
+    for tok in raw.split_whitespace() {
+        match tok.to_ascii_lowercase().as_str() {
+            "row" | "column" => {
+                if axis.is_some() {
+                    return None;
+                }
+                axis = Some(tok.eq_ignore_ascii_case("column"));
+            }
+            "dense" => {
+                if dense {
+                    return None;
+                }
+                dense = true;
+            }
+            _ => return None,
+        }
+    }
+    Some(match (axis, dense) {
+        (Some(false), false) => GridAutoFlow::Row,
+        (Some(true), false) => GridAutoFlow::Column,
+        (Some(false), true) | (None, true) => GridAutoFlow::RowDense,
+        (Some(true), true) => GridAutoFlow::ColumnDense,
+        (None, false) => return None,
+    })
+}
+
 fn parse_grid_place(raw: &str) -> GridPlace {
     let s = raw.trim().to_ascii_lowercase();
     if s == "auto" || s.is_empty() {
@@ -3394,6 +3536,9 @@ fn to_taffy_style(style: &ComputedStyle, viewport: (f32, f32)) -> Style {
         start: place(style.grid_row.0),
         end: place(style.grid_row.1),
     };
+    // GridAutoFlow (Stage 10 Rec 5): taffy implements
+    // auto-placement; Pluto only maps the property.
+    s.grid_auto_flow = style.grid_auto_flow;
     s
 }
 
@@ -3556,6 +3701,82 @@ mod tests {
         assert!(texts.iter().any(|t| t.contains("two")));
     }
 
+    fn id_of_class(tree: &LayoutTree, dom: &Dom, class: &str) -> DomId {
+        tree.boxes
+            .iter()
+            .find(|b| b.dom.is_some_and(|id| dom.attr(id, "class") == Some(class)))
+            .and_then(|b| b.dom)
+            .unwrap_or_else(|| panic!("no box for .{class}"))
+    }
+
+    /// `scrollable_size` (Stage 10 Rec 2): a container's maximum
+    /// scroll offset is its content past its own box, per axis —
+    /// and a scroll offset already applied to the boxes does not
+    /// change it (the offset is added back).
+    #[test]
+    fn scrollable_size_measures_content_past_the_box() {
+        let dom = parse_html(
+            r#"<div class="outer"><div class="tall"></div><div class="wide"></div></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".outer { height: 100px; overflow: auto; } \
+             .tall { height: 250px; } .wide { width: 900px; height: 10px; }",
+        );
+        let mut tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let outer = id_of_class(&tree, &dom, "outer");
+        // Tall child bottoms at 250, wide child at 260 x 900, in a
+        // 100px box (body margins cancel in the relative math; the
+        // wide child's 900 - 784 outer width = 116).
+        assert_eq!(tree.scrollable_size(outer), Some((116.0, 160.0)));
+        // Scrolling the container shifts its children's boxes, but
+        // the maximum is a property of the content, not the offset.
+        tree.set_scroll_offset(outer, 0.0, 5.0);
+        assert_eq!(tree.scrollable_size(outer), Some((116.0, 160.0)));
+        tree.set_scroll_offset(outer, 40.0, 0.0);
+        assert_eq!(tree.scrollable_size(outer), Some((116.0, 160.0)));
+    }
+
+    /// `scrollable_size` (Stage 10 Rec 2): a nested scroll
+    /// container contributes its own border box to its parent's
+    /// content — not its inner content, which scrolls inside it.
+    #[test]
+    fn scrollable_size_counts_a_nested_container_by_its_own_box() {
+        let dom = parse_html(
+            r#"<div class="outer"><div class="nested"><div class="deep"></div></div><div class="sib"></div></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".outer { height: 100px; overflow: auto; } \
+             .nested { height: 60px; overflow: auto; } .deep { height: 300px; } \
+             .sib { height: 50px; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let outer = id_of_class(&tree, &dom, "outer");
+        let nested = id_of_class(&tree, &dom, "nested");
+        // The nested container's 300px of inner content scrolls
+        // inside it (max 240); the outer sees only the nested box
+        // (60) plus the sibling (50) — 110 in a 100px box.
+        assert_eq!(tree.scrollable_size(nested), Some((0.0, 240.0)));
+        assert_eq!(tree.scrollable_size(outer), Some((0.0, 10.0)));
+    }
+
+    /// `scrollable_size` (Stage 10 Rec 2): content that fits
+    /// scrolls nowhere, and a node with no box has no maximum.
+    #[test]
+    fn scrollable_size_is_zero_when_the_content_fits() {
+        let dom = parse_html(
+            r#"<div class="hide"></div><div class="outer"><div class="small"></div></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".hide { display: none; } \
+             .outer { height: 100px; overflow: auto; } .small { height: 50px; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let outer = id_of_class(&tree, &dom, "outer");
+        assert_eq!(tree.scrollable_size(outer), Some((0.0, 0.0)));
+        let hidden = find_element(&dom, dom.root().unwrap(), "div").unwrap();
+        assert_eq!(tree.scrollable_size(hidden), None);
+    }
+
     #[test]
     fn flex_row_lays_children_side_by_side() {
         let dom = parse_html(
@@ -3637,6 +3858,21 @@ mod tests {
             }
         }
         None
+    }
+
+    /// All element descendants of `id` with this tag, in document order.
+    fn find_all_by_tag(dom: &Dom, id: DomId, tag: &str) -> Vec<DomId> {
+        let mut out = Vec::new();
+        fn walk(dom: &Dom, id: DomId, tag: &str, out: &mut Vec<DomId>) {
+            for &child in dom.children(id) {
+                if dom.tag(child) == Some(tag) {
+                    out.push(child);
+                }
+                walk(dom, child, tag, out);
+            }
+        }
+        walk(dom, id, tag, &mut out);
+        out
     }
 
     fn resolve_both(
@@ -3856,23 +4092,49 @@ mod tests {
     }
 
     #[test]
-    fn not_selector_and_visited_never_matches() {
-        let html = r#"<p class="a">A</p><p class="b">B</p><a href="https://example.com">L</a>"#;
+    fn not_selector_and_visited_matches_visited_only() {
+        let html = r#"<p class="a">A</p><p class="b">B</p><a href="https://example.com">L</a><a href="https://example.org">M</a>"#;
         let dom = parse_html(html);
-        let styles = styles_for(
-            html,
+        let sheet = Stylesheet::parse(
             "p:not(.b) { color: #ff0000; } a:visited { color: #00ff00; }",
-            (800.0, 600.0),
         );
+        let ua = Stylesheet::ua();
         let root = dom.root().unwrap();
         let a = find_by_class(&dom, root, "a").unwrap();
         let b = find_by_class(&dom, root, "b").unwrap();
-        assert_eq!(styles[&a].color, [255, 0, 0]);
-        assert_eq!(styles[&b].color, [0, 0, 0]);
-        // `:visited` is always false in M2 (no history): the link
-        // keeps the UA default blue, not the green rule.
-        let link = find_element(&dom, dom.root().unwrap(), "a").unwrap();
-        assert_eq!(styles[&link].color, [0, 0, 238]);
+        let links: Vec<DomId> = find_all_by_tag(&dom, root, "a");
+        assert_eq!(links.len(), 2);
+        let (visited_link, unvisited_link) = (links[0], links[1]);
+        // No visited state: `:visited` matches nothing — both links
+        // keep the UA default blue, not the green rule.
+        let plain =
+            resolve_document_styles(&dom, &ua, &sheet, false, (800.0, 600.0), &ElementState::default()).0;
+        assert_eq!(plain[&a].color, [255, 0, 0]);
+        assert_eq!(plain[&b].color, [0, 0, 0]);
+        assert_eq!(plain[&visited_link].color, [0, 0, 238]);
+        assert_eq!(plain[&unvisited_link].color, [0, 0, 238]);
+        // One link visited: the `a:visited` rule applies to it only.
+        let visited =
+            resolve_document_styles(&dom, &ua, &sheet, false, (800.0, 600.0), &ElementState::default().with_visited(visited_link)).0;
+        assert_eq!(visited[&visited_link].color, [0, 255, 0]);
+        assert_eq!(visited[&unvisited_link].color, [0, 0, 238]);
+    }
+
+    #[test]
+    fn ua_visited_rule_colors_visited_links_purple() {
+        let html = r#"<a href="https://example.com">L</a><a href="https://example.org">M</a>"#;
+        let dom = parse_html(html);
+        let sheet = Stylesheet::parse("");
+        let ua = Stylesheet::ua();
+        let root = dom.root().unwrap();
+        let links: Vec<DomId> = find_all_by_tag(&dom, root, "a");
+        assert_eq!(links.len(), 2);
+        let (visited_link, unvisited_link) = (links[0], links[1]);
+        let styles =
+            resolve_document_styles(&dom, &ua, &sheet, false, (800.0, 600.0), &ElementState::default().with_visited(visited_link)).0;
+        // UA sheet: `a { color: #0000EE; } a:visited { color: #551A8B; }`.
+        assert_eq!(styles[&visited_link].color, [0x55, 0x1a, 0x8b]);
+        assert_eq!(styles[&unvisited_link].color, [0, 0, 238]);
     }
 
     #[test]
@@ -4120,6 +4382,113 @@ mod tests {
         let bbox = tree.boxes.iter().find(|b| b.dom == Some(bid)).unwrap();
         assert!((abox.width - 150.0).abs() < 0.5, "a width {}", abox.width);
         assert!((bbox.x - (abox.x + 150.0)).abs() < 0.5, "b x {}", bbox.x);
+    }
+
+    // ---- Stage 10 Rec 5: `grid-auto-flow` ----
+
+    #[test]
+    fn grid_auto_flow_parses_all_forms() {
+        assert_eq!(parse_grid_auto_flow("row"), Some(GridAutoFlow::Row));
+        assert_eq!(
+            parse_grid_auto_flow("column"),
+            Some(GridAutoFlow::Column)
+        );
+        assert_eq!(
+            parse_grid_auto_flow("row dense"),
+            Some(GridAutoFlow::RowDense)
+        );
+        assert_eq!(
+            parse_grid_auto_flow("column dense"),
+            Some(GridAutoFlow::ColumnDense)
+        );
+        // The `dense`-only form means `row dense` (grammar:
+        // `[ row | column ] || dense`); order does not matter and
+        // keywords are case-insensitive.
+        assert_eq!(
+            parse_grid_auto_flow("dense"),
+            Some(GridAutoFlow::RowDense)
+        );
+        assert_eq!(
+            parse_grid_auto_flow("dense row"),
+            Some(GridAutoFlow::RowDense)
+        );
+        assert_eq!(
+            parse_grid_auto_flow("dense column"),
+            Some(GridAutoFlow::ColumnDense)
+        );
+        assert_eq!(
+            parse_grid_auto_flow("ROW DENSE"),
+            Some(GridAutoFlow::RowDense)
+        );
+        // Invalid: dropped by the caller, never a flow.
+        for bad in [
+            "",
+            "sideways",
+            "row column",
+            "row row",
+            "column column",
+            "dense dense",
+            "row dense dense",
+            "dense row column",
+            "row dense column",
+            "auto",
+        ] {
+            assert_eq!(parse_grid_auto_flow(bad), None, "input {bad:?}");
+        }
+    }
+
+    #[test]
+    fn grid_auto_flow_column_places_column_first() {
+        let dom = parse_html(
+            r#"<div class="grid"><div class="a">A</div><div class="b">B</div><div class="c">C</div><div class="d">D</div></div>"#,
+        );
+        // Two explicit rows: with zero explicit rows column flow
+        // wraps immediately (the auto-placement cursor is already
+        // past the last explicit row), putting every item in its
+        // own implicit column — so the rows must be explicit for
+        // column-first placement to be observable.
+        let sheet = Stylesheet::parse(
+            ".grid { display: grid; grid-template-columns: 100px 100px; grid-template-rows: 20px 20px; grid-auto-flow: column; width: 200px; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let root = dom.root().unwrap();
+        let at = |class: &str| {
+            let id = find_by_class(&dom, root, class).unwrap();
+            tree.boxes.iter().find(|b| b.dom == Some(id)).unwrap().clone()
+        };
+        let (a, b, c, d) = (at("a"), at("b"), at("c"), at("d"));
+        // Column flow fills column 1 first (a, b stacked), then
+        // column 2 (c, d stacked) — the opposite of the default
+        // row flow proved by `grid_two_columns`.
+        assert_eq!(b.x, a.x);
+        assert_eq!(b.y, a.y + 20.0);
+        assert_eq!(c.x, a.x + 100.0);
+        assert_eq!(c.y, a.y);
+        assert_eq!(d.x, c.x);
+        assert_eq!(d.y, b.y);
+    }
+
+    #[test]
+    fn grid_auto_flow_invalid_value_dropped() {
+        let dom = parse_html(
+            r#"<div class="grid"><div class="a">A</div><div class="b">B</div><div class="c">C</div><div class="d">D</div></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".grid { display: grid; grid-template-columns: 100px 100px; grid-auto-flow: sideways; width: 200px; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let root = dom.root().unwrap();
+        let at = |class: &str| {
+            let id = find_by_class(&dom, root, class).unwrap();
+            tree.boxes.iter().find(|b| b.dom == Some(id)).unwrap().clone()
+        };
+        let (a, b, c) = (at("a"), at("b"), at("c"));
+        // Invalid value dropped: default row flow — b sits beside
+        // a in row 1, c starts row 2 under a.
+        assert_eq!(b.x, a.x + 100.0);
+        assert_eq!(b.y, a.y);
+        assert_eq!(c.x, a.x);
+        assert!(c.y > a.y, "c below a: c.y {} a.y {}", c.y, a.y);
     }
 
     // ---- R14 overflow/scroll + R15 hit-testing ----

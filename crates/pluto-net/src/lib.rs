@@ -25,6 +25,7 @@
 //! the live proof belongs on Joel's box. The redirect/body logic *is*
 //! proven here, against a local test server (see the tests below).
 
+pub mod cache;
 pub mod client;
 pub mod blocker;
 pub mod cors;
@@ -51,6 +52,7 @@ use tokio_util::sync::CancellationToken;
 use service::Scheduler;
 
 pub use blocker::Blocker;
+pub use cache::{CacheStats, HttpCache, Lookup};
 pub use client::{HttpsClient, shared_client};
 pub use cors::PreflightCache;
 pub use hsts::HstsStore;
@@ -318,6 +320,17 @@ impl ResourceLoader {
     /// thread (see `renderer::tab_main`).
     pub fn blocker(&self) -> Arc<std::sync::Mutex<Blocker>> {
         self.scheduler.blocker()
+    }
+
+    /// The in-memory partitioned HTTP cache for this loader
+    /// (Stage 10 Rec 1).
+    pub fn http_cache(&self) -> Arc<std::sync::Mutex<HttpCache>> {
+        self.scheduler.http_cache()
+    }
+
+    /// Cache hit / miss / store / revalidation counts.
+    pub fn cache_stats(&self) -> CacheStats {
+        self.scheduler.cache_stats()
     }
 
     /// The shared HTTPS-only preference + exception store

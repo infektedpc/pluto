@@ -22,6 +22,7 @@
 //! [`Selector::compounds`] / [`Selector::combinators`] directly.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fmt;
 
 /// A parsed CSS value.
@@ -835,6 +836,7 @@ pub const KNOWN_PROPERTIES: &[&str] = &[
     "grid-column",
     "grid-row",
     "grid-area",
+    "grid-auto-flow",
     "gap",
     "grid-gap",
     "row-gap",
@@ -1056,7 +1058,9 @@ pub struct Stylesheet {
     pub rules: Vec<Rule>,
     /// The `rules_by_pseudo_class` index (Stage 8 Rec 9): which
     /// rules mention `:hover` / `:active` / `:focus`, and how far
-    /// a state change on one element can reach. Rebuilt by
+    /// a state change on one element can reach. It also carries
+    /// the Stage 10 Rec 4 `:has()` argument inventory
+    /// (`PseudoClassIndex::has`). Rebuilt by
     /// [`Stylesheet::rebuild_pseudo_class_index`], which parsing
     /// and sheet merging call; pushing rules into `rules` by hand
     /// must rebuild it too, or hover/active/focus restyles will
@@ -1158,6 +1162,14 @@ impl std::ops::BitOrAssign for PseudoReach {
 /// when a candidate rule has a combinator reaching them); the
 /// resulting computed-style changes flow through the existing
 /// RestyleHint/RestyleDamage path.
+///
+/// The `has` field (Stage 10 Rec 4) is the same idea for `:has()`:
+/// parse-time bookkeeping of which simple selectors appear in each
+/// `:has()` argument, so a later `:has()` build can ask
+/// [`HasInvalidationIndex::could_affect`] before walking ancestors.
+/// Matching is still NOT implemented — a selector containing
+/// `:has()` never matches — so `has` records bookkeeping only and
+/// changes no restyle behaviour.
 #[derive(Debug, Clone, Default)]
 pub struct PseudoClassIndex {
     pub hover: Vec<usize>,
@@ -1166,6 +1178,16 @@ pub struct PseudoClassIndex {
     pub hover_reach: PseudoReach,
     pub active_reach: PseudoReach,
     pub focus_reach: PseudoReach,
+    /// `:has()` argument inventory (Stage 10 Rec 4): one entry
+    /// per rule whose selectors contain `:has()`. Empty when no
+    /// `:has()` rule exists.
+    pub has: HasInvalidationIndex,
+    /// How far a `:has()`-relevant change can reach: ancestors
+    /// only — a `:has()` anchor is always an ancestor of the
+    /// element its argument matches. Set (ancestors) exactly when
+    /// `has` is non-empty; the anchor re-check itself is still a
+    /// stub (see [`HasInvalidationIndex::recheck_anchors`]).
+    pub has_reach: PseudoReach,
 }
 
 impl PseudoClassIndex {
@@ -1199,6 +1221,14 @@ impl PseudoClassIndex {
                     index.focus_reach |= scan.focus_reach;
                 }
             }
+        }
+        // `:has()` bookkeeping (Stage 10 Rec 4) is built from the
+        // same rules, in the same rebuild: selectors with `:has()`
+        // were skipped above (they never match), but their argument
+        // inventory is recorded here for the later matching build.
+        index.has = HasInvalidationIndex::for_rules(rules);
+        if !index.has.is_empty() {
+            index.has_reach.ancestors = true;
         }
         index
     }
@@ -1282,6 +1312,417 @@ fn reach_from(after_here: &[Combinator], outer_after: Option<&[Combinator]>) -> 
         }
     }
     reach
+}
+
+// ---- Stage 10 Rec 4: `:has()` parse-time invalidation bookkeeping ----
+//
+// `:has()` matching is NOT implemented (a selector containing it
+// never matches — see `Selector::has_unimplemented`), and a naive
+// implementation would re-run matching on every ancestor after
+// every DOM/state change, multiplying the cost of the full restyle
+// M2 already does on every build. This section records, at parse
+// time, only what a later matching build needs to avoid that scan:
+// for each `:has()` rule, which simple selectors appear in its
+// arguments. On a change the engine asks
+// `HasInvalidationIndex::could_affect` first, and only walks up the
+// ancestors re-checking anchors when the changed feature appears
+// in some argument. The walk itself is still a stub
+// (`HasInvalidationIndex::recheck_anchors` returns empty), so this
+// changes no behaviour whatsoever.
+
+/// One simple-selector feature that a DOM or state change can
+/// alter, and that a `:has()` argument may mention. The query side
+/// of the bookkeeping: a changed element contributes one feature
+/// per simple selector it (newly) satisfies, and the index answers
+/// whether any `:has()` argument mentions it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum HasArgFeature {
+    /// An element type name, lowercased (`img`, `div`).
+    Type(String),
+    /// A class name (`active`).
+    Class(String),
+    /// An id name (`main`).
+    Id(String),
+    /// An attribute name, lowercased (`href`); the value is not
+    /// part of the gate — any change to a named attribute may
+    /// affect an argument that mentions it.
+    Attribute(String),
+    /// A pseudo-class name, lowercased (`hover`, `first-child`).
+    PseudoClass(String),
+    /// An unspecified element change (insertion/removal, or a
+    /// change the caller cannot name): matches any `:has()` rule,
+    /// conservatively. Over-marking is safe; under-marking would
+    /// miss a restyle.
+    Universal,
+}
+
+impl HasArgFeature {
+    pub fn type_selector(name: &str) -> Self {
+        Self::Type(name.to_ascii_lowercase())
+    }
+    pub fn class(name: &str) -> Self {
+        Self::Class(name.to_string())
+    }
+    pub fn id(name: &str) -> Self {
+        Self::Id(name.to_string())
+    }
+    pub fn attribute(name: &str) -> Self {
+        Self::Attribute(name.to_ascii_lowercase())
+    }
+    pub fn pseudo_class(name: &str) -> Self {
+        Self::PseudoClass(name.to_ascii_lowercase())
+    }
+}
+
+/// The simple selectors appearing in one `:has()` argument
+/// selector, as sets (duplicates collapse; sets are sorted, so two
+/// parses of the same sheet build identical inventories). This is
+/// the per-argument inventory a later `:has()` build reads without
+/// re-parsing: the argument selectors themselves stay stored in
+/// the rule, this is only the gate over them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HasArgInventory {
+    pub types: BTreeSet<String>,
+    pub classes: BTreeSet<String>,
+    pub ids: BTreeSet<String>,
+    /// Attribute *names* only (see [`HasArgFeature::Attribute`]).
+    pub attributes: BTreeSet<String>,
+    /// Pseudo-class names (`hover`, `active`, `first-child`, ...),
+    /// including ones nested inside `:is()` / `:not()` / `:where()`
+    /// in the argument. Structural names are recorded, not
+    /// evaluated: a sibling/child-structure change alters them
+    /// without any feature on the changed element itself, so the
+    /// later build must treat structure changes as affecting any
+    /// argument that mentions one — the gate alone cannot see it.
+    pub pseudo_classes: BTreeSet<String>,
+    /// The argument contains a real `*` (not the parser's implied
+    /// subject — see `collect_has_simple_selectors`): any element
+    /// may be in scope, so any feature may affect it.
+    pub has_universal: bool,
+    /// The argument itself contains `:has(...)` (nested). Its
+    /// selectors are folded into this inventory; the later build
+    /// re-expands them from the stored rule selectors.
+    pub has_nested_has: bool,
+}
+
+impl HasArgInventory {
+    pub fn is_empty(&self) -> bool {
+        self.types.is_empty()
+            && self.classes.is_empty()
+            && self.ids.is_empty()
+            && self.attributes.is_empty()
+            && self.pseudo_classes.is_empty()
+            && !self.has_universal
+            && !self.has_nested_has
+    }
+
+    /// True when a change carrying `feature` could affect an
+    /// anchor guarded by this argument. A real `*` in the argument
+    /// answers true for every feature (conservative — see
+    /// `has_universal`); otherwise the feature must be listed.
+    pub fn contains(&self, feature: &HasArgFeature) -> bool {
+        if self.has_universal {
+            return true;
+        }
+        match feature {
+            HasArgFeature::Type(t) => self.types.contains(t),
+            HasArgFeature::Class(c) => self.classes.contains(c),
+            HasArgFeature::Id(i) => self.ids.contains(i),
+            HasArgFeature::Attribute(a) => self.attributes.contains(a),
+            HasArgFeature::PseudoClass(p) => self.pseudo_classes.contains(p),
+            HasArgFeature::Universal => !self.is_empty(),
+        }
+    }
+
+    /// Union `other` into this inventory.
+    pub fn merge(&mut self, other: &Self) {
+        self.types.extend(other.types.iter().cloned());
+        self.classes.extend(other.classes.iter().cloned());
+        self.ids.extend(other.ids.iter().cloned());
+        self.attributes.extend(other.attributes.iter().cloned());
+        self.pseudo_classes
+            .extend(other.pseudo_classes.iter().cloned());
+        self.has_universal |= other.has_universal;
+        self.has_nested_has |= other.has_nested_has;
+    }
+}
+
+/// One `:has()` argument selector, with its inventory and shape.
+/// `selector` is the index into the rule's selector list,
+/// `argument` the index into that `:has()`'s forgiving selector
+/// list — together they locate the argument in the stored rule
+/// without re-parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HasArgEntry {
+    pub selector: usize,
+    pub argument: usize,
+    pub inventory: HasArgInventory,
+    /// The argument selector's full combinator chain, in order.
+    pub combinators: Vec<Combinator>,
+    /// True when the argument is explicitly anchored to the anchor
+    /// element: its first combinator is `>` / `+` / `~` (the
+    /// parser rewrites a leading `>` as `* > ...`, so this is
+    /// `combinators[0]` being a non-descendant combinator).
+    /// False means the implicit-descendant (broad) form, e.g.
+    /// `body:has(div)` — the argument may match at any depth
+    /// below the anchor, so a later re-check must walk all
+    /// ancestors, not just the parent.
+    pub anchored: bool,
+}
+
+impl HasArgEntry {
+    /// The broad form: the argument is not explicitly anchored
+    /// (see [`HasArgEntry::anchored`]).
+    pub fn broad(&self) -> bool {
+        !self.anchored
+    }
+}
+
+/// The `:has()` bookkeeping for one rule: every `:has()` argument
+/// in every selector of the rule.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HasRuleEntry {
+    pub rule: usize,
+    pub args: Vec<HasArgEntry>,
+}
+
+impl HasRuleEntry {
+    /// Union of all this rule's argument inventories.
+    pub fn inventory(&self) -> HasArgInventory {
+        let mut inv = HasArgInventory::default();
+        for arg in &self.args {
+            inv.merge(&arg.inventory);
+        }
+        inv
+    }
+
+    /// True when any argument of this rule is broad (see
+    /// [`HasArgEntry::broad`]).
+    pub fn is_broad(&self) -> bool {
+        self.args.iter().any(|a| a.broad())
+    }
+}
+
+/// The `:has()` invalidation index (Stage 10 Rec 4): per-rule
+/// argument inventories for a whole stylesheet, plus their union.
+/// Built by [`PseudoClassIndex::for_rules`] (and therefore by
+/// every `Stylesheet` parse and
+/// [`Stylesheet::rebuild_pseudo_class_index`]); pushing rules by
+/// hand must rebuild it too, exactly like the `:hover` index.
+/// Bookkeeping only — no matching, no behaviour change.
+#[derive(Debug, Clone, Default)]
+pub struct HasInvalidationIndex {
+    /// One entry per rule containing `:has()`, in rule order.
+    pub rules: Vec<HasRuleEntry>,
+    /// Union of every rule's argument inventory: the gate.
+    pub all: HasArgInventory,
+}
+
+impl HasInvalidationIndex {
+    /// Build the index for `rules` (rule indices are positions in
+    /// the slice). Finds `:has()` anywhere in a selector —
+    /// including inside `:is()` / `:not()` / `:where()` — and
+    /// records each argument's simple selectors.
+    pub fn for_rules(rules: &[Rule]) -> Self {
+        let mut index = Self::default();
+        for (i, rule) in rules.iter().enumerate() {
+            let mut entry = HasRuleEntry {
+                rule: i,
+                args: Vec::new(),
+            };
+            for (si, selector) in rule.selectors.iter().enumerate() {
+                collect_has_args(selector, si, &mut entry.args);
+            }
+            if !entry.args.is_empty() {
+                index.all.merge(&entry.inventory());
+                index.rules.push(entry);
+            }
+        }
+        index
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    /// The gate: true exactly when `feature` appears in some
+    /// `:has()` argument (or some argument contains a real `*`,
+    /// which is conservative-true for every feature). False when
+    /// the sheet has no `:has()` rule at all. A later `:has()`
+    /// build calls this first on a change and only walks ancestors
+    /// when it answers true.
+    pub fn could_affect(&self, feature: &HasArgFeature) -> bool {
+        !self.is_empty() && self.all.contains(feature)
+    }
+
+    /// True when any of `features` could affect an anchor.
+    pub fn could_affect_any(&self, features: &[HasArgFeature]) -> bool {
+        features.iter().any(|f| self.could_affect(f))
+    }
+
+    /// Rule indices whose `:has()` arguments mention `feature`
+    /// (or contain a real `*`), in rule order — the candidate
+    /// rules a later build re-checks on a change carrying it.
+    /// Pure bookkeeping: no matching is performed.
+    pub fn candidate_rules(&self, feature: &HasArgFeature) -> Vec<usize> {
+        self.rules
+            .iter()
+            .filter(|entry| entry.args.iter().any(|a| a.inventory.contains(feature)))
+            .map(|entry| entry.rule)
+            .collect()
+    }
+
+    /// TODO(Stage 10 Rec 4): the anchor re-check. For a change
+    /// carrying `features`, walk each changed node's ancestors and
+    /// re-match the candidate `:has()` anchors
+    /// (`candidate_rules`), returning the rule indices whose
+    /// anchors need restyling. NOT IMPLEMENTED: `:has()` matching
+    /// is stubbed (`selector_matches` rejects `has_unimplemented`;
+    /// `PseudoClass::Has(_) => false`), so no anchor can match
+    /// today and this returns empty — behaviour identical to
+    /// before this bookkeeping existed. The later matching build
+    /// replaces this body; the gate (`could_affect`) and the
+    /// inventories above are already complete for it.
+    pub fn recheck_anchors(&self, _features: &[HasArgFeature]) -> Vec<usize> {
+        Vec::new()
+    }
+}
+
+/// Collect every `:has()` argument in `sel` (recursing into
+/// `:is()` / `:not()` / `:where()` arguments, where a `:has()`
+/// may also hide) into `out`.
+fn collect_has_args(sel: &Selector, selector_idx: usize, out: &mut Vec<HasArgEntry>) {
+    for compound in &sel.compounds {
+        for part in &compound.parts {
+            let SimpleSelector::PseudoClass(pc) = part else {
+                continue;
+            };
+            match pc {
+                PseudoClass::Has(args) => {
+                    for (ai, arg) in args.iter().enumerate() {
+                        out.push(HasArgEntry {
+                            selector: selector_idx,
+                            argument: ai,
+                            inventory: inventory_for_selector(arg),
+                            combinators: arg.combinators.clone(),
+                            anchored: matches!(
+                                arg.combinators.first(),
+                                Some(
+                                    Combinator::Child
+                                        | Combinator::NextSibling
+                                        | Combinator::SubsequentSibling
+                                )
+                            ),
+                        });
+                    }
+                }
+                PseudoClass::Is(args) | PseudoClass::Not(args) | PseudoClass::Where(args) => {
+                    for arg in args {
+                        collect_has_args(arg, selector_idx, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The inventory of one `:has()` argument selector.
+fn inventory_for_selector(sel: &Selector) -> HasArgInventory {
+    let mut inv = HasArgInventory::default();
+    collect_has_simple_selectors(sel, &mut inv);
+    inv
+}
+
+/// Record every simple selector in `sel` into `inv`, recursing
+/// into `:is()` / `:not()` / `:where()` / nested `:has()`.
+/// The parser rewrites a leading relative combinator as `* > ...`
+/// (see `parse_forgiving_selector_list`), so a bare `*` as the
+/// first compound of a multi-compound argument is the implied
+/// subject, not a selector the author wrote: it is not counted as
+/// `has_universal` (the rest of the argument discriminates). A
+/// lone `*` argument, or a `*` anywhere else, is real and counts.
+fn collect_has_simple_selectors(sel: &Selector, inv: &mut HasArgInventory) {
+    for (ci, compound) in sel.compounds.iter().enumerate() {
+        let implied_subject = ci == 0 && !sel.combinators.is_empty();
+        for part in &compound.parts {
+            match part {
+                SimpleSelector::Universal => {
+                    if !implied_subject {
+                        inv.has_universal = true;
+                    }
+                }
+                SimpleSelector::Type(t) => {
+                    inv.types.insert(t.clone());
+                }
+                SimpleSelector::Class(c) => {
+                    inv.classes.insert(c.clone());
+                }
+                SimpleSelector::Id(i) => {
+                    inv.ids.insert(i.clone());
+                }
+                SimpleSelector::Attribute { name, .. } => {
+                    inv.attributes.insert(name.to_ascii_lowercase());
+                }
+                SimpleSelector::PseudoClass(pc) => collect_has_pseudo(pc, inv),
+                SimpleSelector::PseudoElement(_) => {}
+            }
+        }
+    }
+}
+
+/// Record one pseudo-class from a `:has()` argument into `inv`.
+fn collect_has_pseudo(pc: &PseudoClass, inv: &mut HasArgInventory) {
+    match pc {
+        PseudoClass::Has(args) => {
+            inv.has_nested_has = true;
+            for arg in args {
+                collect_has_simple_selectors(arg, inv);
+            }
+        }
+        PseudoClass::Is(args) | PseudoClass::Not(args) | PseudoClass::Where(args) => {
+            for arg in args {
+                collect_has_simple_selectors(arg, inv);
+            }
+        }
+        other => {
+            inv.pseudo_classes.insert(pseudo_class_name(other));
+        }
+    }
+}
+
+/// The canonical (lowercase, hyphenated) name of a pseudo-class
+/// variant, for inventory and query purposes.
+fn pseudo_class_name(pc: &PseudoClass) -> String {
+    match pc {
+        PseudoClass::Root => "root",
+        PseudoClass::FirstChild => "first-child",
+        PseudoClass::LastChild => "last-child",
+        PseudoClass::NthChild(_) => "nth-child",
+        PseudoClass::NthLastChild(_) => "nth-last-child",
+        PseudoClass::OnlyChild => "only-child",
+        PseudoClass::Empty => "empty",
+        PseudoClass::FirstOfType => "first-of-type",
+        PseudoClass::LastOfType => "last-of-type",
+        PseudoClass::NthOfType(_) => "nth-of-type",
+        PseudoClass::NthLastOfType(_) => "nth-last-of-type",
+        PseudoClass::OnlyOfType => "only-of-type",
+        PseudoClass::Link => "link",
+        PseudoClass::Visited => "visited",
+        PseudoClass::AnyLink => "any-link",
+        PseudoClass::Hover => "hover",
+        PseudoClass::Active => "active",
+        PseudoClass::Focus => "focus",
+        PseudoClass::FocusVisible => "focus-visible",
+        PseudoClass::FocusWithin => "focus-within",
+        // Logical variants are recursed into by the caller and
+        // never reach here; name them defensively anyway.
+        PseudoClass::Not(_) => "not",
+        PseudoClass::Is(_) => "is",
+        PseudoClass::Where(_) => "where",
+        PseudoClass::Has(_) => "has",
+    }
+    .to_string()
 }
 
 /// Rule context threaded through nested group rules: the enclosing
@@ -4009,6 +4450,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn grid_auto_flow_property_known_and_value_shapes() {
+        // Stage 10 Rec 5: the property is recognised (so `@supports
+        // (grid-auto-flow: ...)` evaluates instead of failing
+        // unknown), and its value shapes are the ones layout's
+        // parser consumes: single keywords as `Keyword`, the
+        // two-word forms as `Raw`.
+        assert!(KNOWN_PROPERTIES.contains(&"grid-auto-flow"));
+        assert_eq!(parse_value("column"), Value::Keyword("column".into()));
+        assert_eq!(parse_value("dense"), Value::Keyword("dense".into()));
+        assert_eq!(
+            parse_value("row dense"),
+            Value::Raw("row dense".into())
+        );
+        assert_eq!(
+            parse_value("column dense"),
+            Value::Raw("column dense".into())
+        );
+        assert_eq!(
+            SupportsCondition::parse("(grid-auto-flow: column)").eval(),
+            Some(true)
+        );
+    }
+
     // ---- error-recovery granularity ----
 
     #[test]
@@ -4125,5 +4590,213 @@ mod tests {
         assert!(sheet.pseudo_class_index.hover.is_empty());
         sheet.rebuild_pseudo_class_index();
         assert_eq!(sheet.pseudo_class_index.hover, vec![1]);
+    }
+
+    // ---- Stage 10 Rec 4: `:has()` parse-time invalidation bookkeeping ----
+
+    #[test]
+    fn has_index_records_argument_selectors() {
+        let sheet = Stylesheet::parse(
+            "div:has(> img) { color: red; } \
+             li:has(.active) { color: blue; } \
+             body:has(div) { color: green; } \
+             p { color: black; } \
+             a:has(img, .thumb) { color: yellow; }",
+        );
+        assert!(sheet.errors.is_empty(), "errors: {:?}", sheet.errors);
+        let index = &sheet.pseudo_class_index.has;
+        // Only the four `:has()` rules are indexed; the plain `p`
+        // rule (3) is not.
+        assert_eq!(
+            index.rules.iter().map(|e| e.rule).collect::<Vec<_>>(),
+            vec![0, 1, 2, 4]
+        );
+        assert!(!index.is_empty());
+        // Anchors are ancestors of the changed element.
+        assert!(sheet.pseudo_class_index.has_reach.ancestors);
+        assert!(!sheet.pseudo_class_index.has_reach.descendants);
+        assert!(!sheet.pseudo_class_index.has_reach.siblings);
+
+        // `div:has(> img)`: one argument, anchored child, the
+        // parser's implied `*` subject is NOT counted as universal.
+        let r0 = &index.rules[0];
+        assert_eq!(r0.args.len(), 1);
+        assert_eq!(r0.args[0].selector, 0);
+        assert_eq!(r0.args[0].argument, 0);
+        assert!(r0.args[0].anchored);
+        assert!(!r0.args[0].broad());
+        assert_eq!(r0.args[0].combinators, vec![Combinator::Child]);
+        assert!(r0.args[0].inventory.types.contains("img"));
+        assert!(!r0.args[0].inventory.has_universal);
+        assert!(!r0.is_broad());
+
+        // `li:has(.active)`: implicit descendant — broad.
+        let r1 = &index.rules[1];
+        assert_eq!(r1.args.len(), 1);
+        assert!(!r1.args[0].anchored);
+        assert!(r1.args[0].broad());
+        assert!(r1.args[0].combinators.is_empty());
+        assert!(r1.args[0].inventory.classes.contains("active"));
+        assert!(r1.is_broad());
+
+        // `body:has(div)`: broad un-anchored argument.
+        let r2 = &index.rules[2];
+        assert!(r2.is_broad());
+        assert!(r2.args[0].inventory.types.contains("div"));
+
+        // `a:has(img, .thumb)`: two arguments, located by index.
+        let r4 = &index.rules[3];
+        assert_eq!(r4.args.len(), 2);
+        assert_eq!(r4.args[0].argument, 0);
+        assert!(r4.args[0].inventory.types.contains("img"));
+        assert_eq!(r4.args[1].argument, 1);
+        assert!(r4.args[1].inventory.classes.contains("thumb"));
+
+        // The union covers every argument's selectors.
+        assert!(index.all.types.contains("img"));
+        assert!(index.all.types.contains("div"));
+        assert!(index.all.classes.contains("active"));
+        assert!(index.all.classes.contains("thumb"));
+    }
+
+    #[test]
+    fn has_query_matches_only_mentioned_features() {
+        let sheet = Stylesheet::parse(
+            "div:has(> img) { color: red; } \
+             li:has(.active) { color: blue; } \
+             body:has(div) { color: green; } \
+             a:has(img, .thumb) { color: yellow; } \
+             section:has([href]) { color: pink; } \
+             nav:has(a:hover) { color: orange; }",
+        );
+        assert!(sheet.errors.is_empty(), "errors: {:?}", sheet.errors);
+        let index = &sheet.pseudo_class_index.has;
+        let img = HasArgFeature::type_selector("img");
+        let div = HasArgFeature::type_selector("div");
+        let span = HasArgFeature::type_selector("span");
+        let active = HasArgFeature::class("active");
+        let thumb = HasArgFeature::class("thumb");
+        let missing = HasArgFeature::class("missing");
+        let href = HasArgFeature::attribute("href");
+        let hover = HasArgFeature::pseudo_class("hover");
+        let focus = HasArgFeature::pseudo_class("focus");
+
+        assert!(index.could_affect(&img));
+        assert!(index.could_affect(&div));
+        assert!(index.could_affect(&active));
+        assert!(index.could_affect(&thumb));
+        assert!(index.could_affect(&href));
+        // A `:hover` inside a `:has()` argument is inventoried
+        // (it can change the anchor later), even though the
+        // `:hover` index itself skips `:has()` rules.
+        assert!(index.could_affect(&hover));
+        assert!(!sheet.pseudo_class_index.hover.contains(&5));
+
+        assert!(!index.could_affect(&span));
+        assert!(!index.could_affect(&missing));
+        assert!(!index.could_affect(&focus));
+        assert!(!index.could_affect(&HasArgFeature::id("main")));
+
+        assert!(index.could_affect_any(&[span.clone(), active.clone()]));
+        assert!(!index.could_affect_any(&[span.clone(), missing.clone()]));
+        assert!(!index.could_affect_any(&[]));
+
+        // Candidate rules are the rules whose arguments mention
+        // the feature, in rule order.
+        assert_eq!(index.candidate_rules(&img), vec![0, 3]);
+        assert_eq!(index.candidate_rules(&active), vec![1]);
+        assert_eq!(index.candidate_rules(&div), vec![2]);
+        assert_eq!(index.candidate_rules(&href), vec![4]);
+        assert_eq!(index.candidate_rules(&hover), vec![5]);
+        assert!(index.candidate_rules(&span).is_empty());
+    }
+
+    #[test]
+    fn has_index_folds_nested_has_and_logical_args() {
+        let sheet = Stylesheet::parse(
+            "div:has(:is(.a, #b)) { color: red; } \
+             div:has(span:has(img)) { color: blue; } \
+             div:has(> *) { color: green; }",
+        );
+        assert!(sheet.errors.is_empty(), "errors: {:?}", sheet.errors);
+        let index = &sheet.pseudo_class_index.has;
+        // `:is()` arguments count: the class and id are features.
+        let r0 = &index.rules[0];
+        assert!(r0.args[0].inventory.classes.contains("a"));
+        assert!(r0.args[0].inventory.ids.contains("b"));
+        assert!(index.could_affect(&HasArgFeature::id("b")));
+        // Nested `:has()` folds into the enclosing inventory and
+        // is flagged, so the gate sees the inner selectors too.
+        let r1 = &index.rules[1];
+        assert!(r1.args[0].inventory.has_nested_has);
+        assert!(r1.args[0].inventory.types.contains("span"));
+        assert!(r1.args[0].inventory.types.contains("img"));
+        assert!(index.could_affect(&HasArgFeature::type_selector("img")));
+        // A real `*` (here the child of the implied subject) is
+        // universal: any feature may affect that rule.
+        let r2 = &index.rules[2];
+        assert!(r2.args[0].inventory.has_universal);
+        assert!(index.could_affect(&HasArgFeature::type_selector("anything")));
+        assert_eq!(
+            index.candidate_rules(&HasArgFeature::type_selector("anything")),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn has_index_rebuilds_after_hand_pushed_rules() {
+        let mut sheet = Stylesheet::parse("p { color: red; }");
+        assert!(sheet.pseudo_class_index.has.is_empty());
+        let mut pushed = Stylesheet::parse("div:has(> img) { color: blue; }");
+        sheet.rules.append(&mut pushed.rules);
+        // Stale until rebuilt: the index still says no `:has()`.
+        assert!(sheet.pseudo_class_index.has.is_empty());
+        sheet.rebuild_pseudo_class_index();
+        assert_eq!(sheet.pseudo_class_index.has.rules.len(), 1);
+        assert!(sheet.pseudo_class_index.has.could_affect(
+            &HasArgFeature::type_selector("img")
+        ));
+        assert!(!sheet.pseudo_class_index.has.could_affect(
+            &HasArgFeature::type_selector("span")
+        ));
+    }
+
+    #[test]
+    fn has_selectors_still_never_match() {
+        // Regression (Stage 10 Rec 4): bookkeeping must not change
+        // behaviour — `:has()` selectors still never match, and
+        // the stubbed anchor re-check returns nothing even when
+        // the gate passes.
+        let sheet = Stylesheet::parse(
+            "div:has(> img) { color: red; } \
+             li:has(.active) { color: blue; } \
+             body:has(div) { color: green; }",
+        );
+        assert!(sheet.errors.is_empty(), "errors: {:?}", sheet.errors);
+        for rule in &sheet.rules {
+            for sel in &rule.selectors {
+                assert!(sel.has_unimplemented);
+                assert!(!sel.matches("div", None, &[]));
+                assert!(!sel.matches("li", None, &["active"]));
+            }
+        }
+        let index = &sheet.pseudo_class_index.has;
+        // The gate passes for a mentioned feature ...
+        let img = HasArgFeature::type_selector("img");
+        assert!(index.could_affect(&img));
+        assert_eq!(index.candidate_rules(&img), vec![0]);
+        // ... but the re-check is still the not-yet-implemented
+        // stub: no anchor is ever re-checked, no rule restyles.
+        assert!(index.recheck_anchors(&[img]).is_empty());
+        assert!(index
+            .recheck_anchors(&[HasArgFeature::class("active")])
+            .is_empty());
+        // And a sheet with no `:has()` at all gates everything off.
+        let plain = Stylesheet::parse("p { color: red; }");
+        assert!(plain.pseudo_class_index.has.is_empty());
+        assert!(!plain
+            .pseudo_class_index
+            .has
+            .could_affect(&HasArgFeature::type_selector("img")));
     }
 }

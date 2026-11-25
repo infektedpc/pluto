@@ -54,13 +54,53 @@ fn read_file(dir: &PathBuf, name: &str) -> Option<String> {
     std::fs::read_to_string(dir.join(name)).ok()
 }
 
+/// Write a file atomically (temp-file + rename), creating the
+/// profile dir if needed.
+///
+/// The temp name is unique per write (process id + a
+/// per-process counter, created with `O_EXCL` and retried on
+/// collision): two writers to the same profile dir — two Pluto
+/// windows sharing `$HOME/.config/pluto`, or two test threads —
+/// must never share one temp file, or their writes interleave
+/// and the renamed target ends up as one JSON value plus
+/// trailing bytes (Stage 10 Rec 6). The rename still publishes
+/// each write whole, so a reader only ever sees a complete
+/// document.
 fn write_file_atomic(dir: &PathBuf, name: &str, contents: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let target = dir.join(name);
-    let tmp = dir.join(format!(".{name}.tmp"));
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, target)?;
-    Ok(())
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut attempt = 0;
+    loop {
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                let written = file.write_all(contents.as_bytes());
+                drop(file);
+                let result = written.and_then(|()| std::fs::rename(&tmp, target));
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                return result;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A stale temp file with this pid + counter (a pid
+                // reused after a crash, or a counter wrap): take
+                // the next name instead of clobbering it.
+                attempt += 1;
+                if attempt > 100 {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Load the persisted security state into `loader`. Missing or
@@ -275,5 +315,56 @@ mod tests {
         assert!(loader.https_only().lock().unwrap().should_upgrade("intranet.local"));
         let _ = std::fs::remove_dir_all(&home);
         restore_home(old);
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_never_corrupt() {
+        // Stage 10 Rec 6, same writer as `storage`'s
+        // `concurrent_atomic_writes_never_corrupt` (this module
+        // keeps its own copy): concurrent writers to one profile
+        // dir must each land a whole document — the old fixed
+        // temp name made their writes interleave (and renames
+        // fail outright when another writer renamed the shared
+        // temp file first).
+        let dir = std::env::temp_dir().join("pluto-security-test-atomic-race");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let docs: Vec<String> = (0..4)
+            .map(|w| {
+                let pad = "x".repeat(512 + w * 997);
+                format!("{{\"writer\":{w},\"pad\":\"{pad}\"}}")
+            })
+            .collect();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+        for w in 0..4 {
+            let dir = dir.clone();
+            let doc = docs[w].clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || -> std::io::Result<()> {
+                barrier.wait();
+                for _ in 0..25 {
+                    write_file_atomic(&dir, "race.json", &doc)?;
+                }
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join().unwrap().expect("every concurrent write succeeds");
+        }
+        let text = std::fs::read_to_string(dir.join("race.json")).unwrap();
+        assert!(
+            docs.contains(&text),
+            "target holds exactly one writer's document, got {} bytes",
+            text.len()
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "race.json")
+            .collect();
+        assert!(leftovers.is_empty(), "no temp files left behind: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

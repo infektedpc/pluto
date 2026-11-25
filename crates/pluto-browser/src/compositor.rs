@@ -25,13 +25,16 @@
 //! layout: the viewport widget applies the offset as a view
 //! transform (the renderer subtracts it in the vertex shader, and
 //! the canvas fill is translated the other way so it stays glued
-//! to the viewport). The offset is clamped to >= 0 (no overscroll
-//! above or left). Clamping the bottom needs the content height,
-//! which does not ride in `SubmitDisplayList` yet — until M2's
-//! scroll work lands, the page can scroll past its end into the
-//! canvas background.
+//! to the viewport). The offset is clamped to `[0, max]` on both
+//! axes (Stage 10 Rec 2): the maximum comes from the submitted
+//! display list — item 0 is the canvas fill over the viewport, and
+//! the list's damage reaches `max(viewport, content)`, so `damage
+//! - canvas` is the page's `content - viewport`, per axis. Until
+//! a list lands the maximum is unbounded (no page yet); a list
+//! that carries no canvas or damage leaves the previous maximum
+//! in place.
 
-use pluto_paint::{perf, DisplayList, ResourceTable};
+use pluto_paint::{perf, DisplayItem, DisplayList, ResourceTable};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
@@ -71,6 +74,12 @@ pub struct Compositor {
     /// with no pending list is a deadline-missed frame.
     awaiting_new_list: Cell<bool>,
     scroll: (f32, f32),
+    /// Maximum viewport scroll, per axis (`content - viewport`,
+    /// clamped at zero — see the module docs). Unbounded until a
+    /// display list lands: with no page, there is nothing to
+    /// clamp against, and the worker's own clamp (its mirror of
+    /// this offset) is the authority until then.
+    max_scroll: Cell<(f32, f32)>,
 }
 
 impl Compositor {
@@ -84,6 +93,7 @@ impl Compositor {
             pending: RefCell::new(None),
             awaiting_new_list: Cell::new(false),
             scroll: (0.0, 0.0),
+            max_scroll: Cell::new((f32::INFINITY, f32::INFINITY)),
         }
     }
 
@@ -108,6 +118,12 @@ impl Compositor {
             && epoch <= current.epoch
         {
             return false;
+        }
+        // A newer list is a newer page: its damage is the new
+        // scroll maximum (a list that carries none leaves the
+        // previous maximum in place).
+        if let Some(max) = max_scroll_for(&display) {
+            self.max_scroll.set(max);
         }
         *pending = Some(PendingList {
             epoch,
@@ -213,16 +229,58 @@ impl Compositor {
         self.scroll
     }
 
-    /// Scroll by (dx, dy) page pixels, clamped to >= 0 on both axes.
+    /// Maximum scroll offset, in page pixels, from the newest
+    /// submitted display list — `(∞, ∞)` until a list lands.
+    /// Diagnostic API, exercised by tests.
+    #[allow(dead_code)]
+    pub fn max_scroll(&self) -> (f32, f32) {
+        self.max_scroll.get()
+    }
+
+    /// Scroll by (dx, dy) page pixels, clamped to `[0, max]` on
+    /// both axes, where `max` is the newest list's `content -
+    /// viewport` (see the module docs). The worker's mirror of
+    /// this offset applies the same clamp from the layout tree,
+    /// so a delta the worker already clamped lands exactly.
     pub fn scroll_by(&mut self, dx: f32, dy: f32) {
-        self.scroll.0 = (self.scroll.0 + dx).max(0.0);
-        self.scroll.1 = (self.scroll.1 + dy).max(0.0);
+        let (max_x, max_y) = self.max_scroll.get();
+        self.scroll.0 = (self.scroll.0 + dx).clamp(0.0, max_x);
+        self.scroll.1 = (self.scroll.1 + dy).clamp(0.0, max_y);
     }
 
     /// Reset the scroll, e.g. on a new navigation.
     pub fn reset_scroll(&mut self) {
         self.scroll = (0.0, 0.0);
     }
+}
+
+/// Maximum viewport scroll for a display list: the list's damage
+/// is the union of the canvas (the viewport) and every box, so its
+/// far edges are `max(viewport, content)` per axis — and item 0 is
+/// the canvas fill over the viewport (`DisplayList::build` always
+/// pushes it first), so `damage - canvas` is the page's `content -
+/// viewport`, clamped at zero. `None` when the list carries no
+/// damage or no canvas-shaped first item. A box-shadow sticking
+/// out below the last box stretches the damage a few px past the
+/// content, so this maximum can sit a hair above the worker's
+/// `content_height`-based one — the shell's clamp is the looser
+/// backstop, and the worker only ever sends deltas it already
+/// clamped, so the two never disagree in practice.
+fn max_scroll_for(display: &DisplayList) -> Option<(f32, f32)> {
+    let (canvas_w, canvas_h) = match display.0.first() {
+        Some(DisplayItem::FillRect {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+            ..
+        }) if *width > 0.0 && *height > 0.0 => (*width, *height),
+        _ => return None,
+    };
+    let damage = display.1?;
+    let max_x = (damage.x + damage.width - canvas_w).max(0.0);
+    let max_y = (damage.y + damage.height - canvas_h).max(0.0);
+    Some((max_x, max_y))
 }
 
 impl Default for Compositor {
@@ -334,5 +392,49 @@ mod tests {
         holder.scroll_by(5.0, 5.0);
         holder.reset_scroll();
         assert_eq!(holder.scroll(), (0.0, 0.0));
+    }
+
+    #[test]
+    fn scroll_clamps_at_the_bottom_from_the_submitted_list() {
+        let mut holder = Compositor::new();
+        // No list yet: no maximum, the old unbounded behaviour.
+        assert_eq!(holder.max_scroll(), (f32::INFINITY, f32::INFINITY));
+        // Canvas 800x600, one rect reaching y=1000: the page is
+        // 400px taller than the viewport, and no wider.
+        let mut list = DisplayList::new();
+        list.push(DisplayItem::FillRect {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 600.0,
+            color: [1.0; 4],
+        });
+        list.push(DisplayItem::FillRect {
+            x: 700.0,
+            y: 900.0,
+            width: 100.0,
+            height: 100.0,
+            color: [1.0; 4],
+        });
+        assert!(holder.submit(1, Arc::new(list), Arc::new(ResourceTable::new())));
+        assert_eq!(holder.max_scroll(), (0.0, 400.0));
+        // Scrolling past the end stops at the maximum, per axis.
+        holder.scroll_by(1000.0, 1000.0);
+        assert_eq!(holder.scroll(), (0.0, 400.0));
+        holder.scroll_by(0.0, -1000.0);
+        assert_eq!(holder.scroll(), (0.0, 0.0));
+        // A newer, shorter list lowers the maximum again.
+        let short = list_with_canvas(800.0, 600.0);
+        assert!(holder.submit(2, short, Arc::new(ResourceTable::new())));
+        assert_eq!(holder.max_scroll(), (0.0, 0.0));
+        holder.scroll_by(0.0, 50.0);
+        assert_eq!(holder.scroll(), (0.0, 0.0));
+        // A stale list never moves the maximum.
+        assert!(!holder.submit(
+            1,
+            list_with_canvas(400.0, 300.0),
+            Arc::new(ResourceTable::new())
+        ));
+        assert_eq!(holder.max_scroll(), (0.0, 0.0));
     }
 }

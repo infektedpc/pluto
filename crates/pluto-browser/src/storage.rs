@@ -368,13 +368,51 @@ pub fn parse_json(input: &str) -> Result<JsonValue, String> {
 /// profile dir if needed — the [`security`](crate::security)
 /// pattern, duplicated here because that module's helper is
 /// private.
+///
+/// The temp name is unique per write (process id + a
+/// per-process counter, created with `O_EXCL` and retried on
+/// collision): two writers to the same profile dir — two Pluto
+/// windows sharing `$HOME/.config/pluto`, or two test threads —
+/// must never share one temp file, or their writes interleave
+/// and the renamed target ends up as one JSON value plus
+/// trailing bytes (Stage 10 Rec 6). The rename still publishes
+/// each write whole, so a reader only ever sees a complete
+/// document.
 pub fn write_file_atomic(dir: &PathBuf, name: &str, contents: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let target = dir.join(name);
-    let tmp = dir.join(format!(".{name}.tmp"));
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, target)?;
-    Ok(())
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut attempt = 0;
+    loop {
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                let written = file.write_all(contents.as_bytes());
+                drop(file);
+                let result = written.and_then(|()| std::fs::rename(&tmp, target));
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                return result;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A stale temp file with this pid + counter (a pid
+                // reused after a crash, or a counter wrap): take
+                // the next name instead of clobbering it.
+                attempt += 1;
+                if attempt > 100 {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 // ------------------------------------------------------------------ bucket
@@ -1018,5 +1056,89 @@ mod tests {
         assert!(parse_json("{\"a\":}").is_err());
         assert!(parse_json("[1,2] trailing").is_err());
         assert!(parse_json("").is_err());
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_never_corrupt() {
+        // Stage 10 Rec 6: the old fixed `.{name}.tmp` temp name
+        // let concurrent writers to one profile dir interleave
+        // into a single corrupt file (one JSON value plus trailing
+        // bytes — the observed permissions flake). Every write
+        // must land whole: while the writers hammer the same file,
+        // a reader thread must only ever see whole documents, and
+        // the final file must hold exactly one writer's document,
+        // with no temp file left behind.
+        let dir = std::env::temp_dir().join("pluto-storage-test-atomic-race");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Distinct lengths per writer: a short write landing after
+        // a longer one on a shared temp file leaves the longer
+        // writer's tail behind — the exact trailing-bytes
+        // corruption the old code produced.
+        let docs: Vec<String> = (0..8)
+            .map(|w| {
+                let pad = "x".repeat(512 + w * 997);
+                format!("{{\"writer\":{w},\"pad\":\"{pad}\"}}")
+            })
+            .collect();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_dir = dir.clone();
+        let reader_done = std::sync::Arc::clone(&done);
+        let reader_barrier = std::sync::Arc::clone(&barrier);
+        let reader = std::thread::spawn(move || -> (usize, Option<String>) {
+            reader_barrier.wait();
+            let mut reads = 0;
+            loop {
+                if reader_done.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                if let Ok(text) = std::fs::read_to_string(reader_dir.join("race.json")) {
+                    reads += 1;
+                    // Any published state must be a whole document.
+                    if let Err(e) = parse_json(&text) {
+                        return (reads, Some(format!("{e} in {text:?}")));
+                    }
+                }
+            }
+            (reads, None)
+        });
+        let mut handles = Vec::new();
+        for w in 0..8 {
+            let dir = dir.clone();
+            let doc = docs[w].clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || -> std::io::Result<()> {
+                barrier.wait();
+                for _ in 0..50 {
+                    write_file_atomic(&dir, "race.json", &doc)?;
+                }
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join().unwrap().expect("every concurrent write succeeds");
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (reads, bad) = reader.join().unwrap();
+        assert!(bad.is_none(), "reader saw a corrupt publication: {bad:?}");
+        assert!(reads > 0, "reader observed at least one publication");
+        let text = std::fs::read_to_string(dir.join("race.json")).unwrap();
+        let parsed = parse_json(&text).expect("final file is a whole JSON document");
+        assert!(matches!(parsed, JsonValue::Obj(_)), "target is a JSON object");
+        assert!(
+            docs.contains(&text),
+            "target holds exactly one writer's document, got {} bytes",
+            text.len()
+        );
+        // No temp file left behind by any write.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "race.json")
+            .collect();
+        assert!(leftovers.is_empty(), "no temp files left behind: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

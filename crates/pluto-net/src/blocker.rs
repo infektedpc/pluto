@@ -773,13 +773,47 @@ fn now_secs() -> u64 {
 
 /// Atomic write inside the profile dir (temp file + rename, the
 /// same pattern `pluto-browser` uses for its profile files).
+/// The temp name is unique per write (process id + a
+/// per-process counter, created with `O_EXCL` and retried on
+/// collision): two writers to the same profile dir — two Pluto
+/// windows sharing `$HOME/.config/pluto`, or two test threads —
+/// must never share one temp file, or their writes interleave
+/// and the renamed target ends up corrupt (Stage 10 Rec 6).
 fn write_file_atomic(dir: &Path, name: &str, contents: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let target = dir.join(name);
-    let tmp = dir.join(format!(".{name}.tmp"));
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, target)?;
-    Ok(())
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut attempt = 0;
+    loop {
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                let written = file.write_all(contents.as_bytes());
+                drop(file);
+                let result = written.and_then(|()| std::fs::rename(&tmp, target));
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                return result;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A stale temp file with this pid + counter (a pid
+                // reused after a crash, or a counter wrap): take
+                // the next name instead of clobbering it.
+                attempt += 1;
+                if attempt > 100 {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1880,5 +1914,52 @@ mod tests {
         assert_eq!(registrable_domain("example.com"), "example.com");
         assert_eq!(registrable_domain("localhost"), "localhost");
         assert_eq!(registrable_domain("127.0.0.1"), "127.0.0.1");
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_never_corrupt() {
+        // Stage 10 Rec 6, same writer as `pluto-browser`'s
+        // profile files: two tracker-list refreshes (or two Pluto
+        // windows) writing one list dir must each land a whole
+        // file — the old fixed temp name made their writes
+        // interleave (and renames fail outright when another
+        // writer renamed the shared temp file first).
+        let dir = std::env::temp_dir().join("pluto-blocker-test-atomic-race");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let docs: Vec<String> = (0..4)
+            .map(|w| format!("||tracker{w}.com^\n{}", "x".repeat(512 + w * 997)))
+            .collect();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+        for w in 0..4 {
+            let dir = dir.clone();
+            let doc = docs[w].clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || -> std::io::Result<()> {
+                barrier.wait();
+                for _ in 0..25 {
+                    write_file_atomic(&dir, "race.txt", &doc)?;
+                }
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join().unwrap().expect("every concurrent write succeeds");
+        }
+        let text = std::fs::read_to_string(dir.join("race.txt")).unwrap();
+        assert!(
+            docs.contains(&text),
+            "target holds exactly one writer's document, got {} bytes",
+            text.len()
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "race.txt")
+            .collect();
+        assert!(leftovers.is_empty(), "no temp files left behind: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

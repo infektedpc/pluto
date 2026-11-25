@@ -1,5 +1,6 @@
 mod bookmarks;
 mod compositor;
+mod history;
 mod js_host;
 mod page;
 mod renderer;
@@ -12,16 +13,21 @@ mod viewport;
 
 /// Test-only lock serialising the tests that mutate the
 /// process-global `HOME` env var (the permissions / storage /
-/// security persistence round-trip tests). `HOME` is
-/// process-global, so two such tests running in parallel clobber
-/// each other — each `with_home` helper holds this lock from its
-/// `set_var` until its `restore_home` restores the old value.
+/// security persistence round-trip tests) — and the tests that
+/// build a worker tab (`renderer.rs`, `WorkerHomeGuard`): a tab
+/// reads the profile at `TabState::new` and writes it back on
+/// shutdown, so it is a HOME-mutating test even though it never
+/// touches `HOME` itself. `HOME` is process-global, so two such
+/// tests running in parallel clobber each other — each `with_home`
+/// helper holds this lock from its `set_var` until its
+/// `restore_home` restores the old value.
 /// Poisoning is tolerated: a test that panics mid-span must not
 /// take the rest of the suite down with it.
 #[cfg(test)]
 pub(crate) static TEST_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use bookmarks::{BookmarkStore, load_bookmarks, save_bookmarks};
+use history::{load_history, save_history};
 use compositor::Compositor;
 use cosmic::app::{Core, Task};
 use cosmic::iced::{Alignment, Length};
@@ -61,9 +67,14 @@ pub struct PlutoBrowser {
     /// and link clicks push entries (in `DidCommit`); Back/Forward
     /// move the index and navigate with `history_nav` set, so the
     /// commit they cause does not push a duplicate. `:visited` reads
-    /// this in a later stage — the matcher still answers false until
-    /// the visited set is threaded into `ElementState` (see
-    /// renderer.rs).
+    /// the same committed URLs worker-side (`TabState::visited_urls`
+    /// in renderer.rs, projected into `ElementState::visited` before
+    /// each layout pass) — the worker's set and this history hold
+    /// the same URLs, with no IPC change. Stage 10 Rec 8: the
+    /// history is persisted to `history.json` in the profile
+    /// (newest 50, see `history.rs`) — loaded at startup, saved on
+    /// every push — so it (and `:visited`, seeded from it
+    /// worker-side) survives a restart.
     history: Vec<String>,
     history_index: usize,
     history_nav: bool,
@@ -498,6 +509,13 @@ impl Application for PlutoBrowser {
         // No load task here: the worker subscription (Stage 4 #2)
         // starts the pipeline, and the first navigation is flushed
         // to it as `pending_url` when it reports ready.
+        // Stage 10 Rec 8: the persisted history (newest 50) is
+        // the starting session history — the History panel simply
+        // sees it pre-populated. The index starts on the newest
+        // entry, so Back from a fresh launch goes to the previous
+        // visit.
+        let history = load_history();
+        let history_index = history.len().saturating_sub(1);
         let app = Self {
             core,
             url_input: url.clone(),
@@ -508,8 +526,8 @@ impl Application for PlutoBrowser {
             visible: true,
             renderer_tx: None,
             pending_url: Some(url),
-            history: Vec::new(),
-            history_index: 0,
+            history,
+            history_index,
             history_nav: false,
             bookmarks: load_bookmarks(),
             menu_open: false,
@@ -619,6 +637,10 @@ impl Application for PlutoBrowser {
                         self.history.truncate(self.history_index + 1);
                         self.history.push(url);
                         self.history_index = self.history.len() - 1;
+                        // Stage 10 Rec 8: persist on every push
+                        // (the profile pattern: save on every
+                        // mutation, like bookmarks).
+                        save_history(&self.history);
                     }
                 }
                 RendererToBrowser::SubmitDisplayList {

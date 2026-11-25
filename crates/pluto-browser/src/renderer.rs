@@ -375,6 +375,19 @@ pub(crate) enum LayoutJob {
     ScrollContainers {
         reply: oneshot::Sender<Vec<NodeId>>,
     },
+    /// Maximum scroll offset of one scroll container (Stage 10 Rec
+    /// 2 — see [`LayoutTree::scrollable_size`]); `None` when the
+    /// actor holds no tree / the node has no box.
+    ScrollMax {
+        id: NodeId,
+        reply: oneshot::Sender<Option<(f32, f32)>>,
+    },
+    /// Maximum viewport (page) scroll offset, per axis: the tree's
+    /// `content - viewport`, clamped at zero (Stage 10 Rec 2).
+    /// `(0, 0)` when the actor holds no tree.
+    PageMaxScroll {
+        reply: oneshot::Sender<(f32, f32)>,
+    },
     /// Geometry of one node from the actor's retained tree, with NO
     /// flush (the caller already knows the layout is clean).
     /// `None` when the actor holds no tree / node.
@@ -411,12 +424,15 @@ pub(crate) enum LayoutJob {
 /// One entry of a wheel scroll chain (Stage 8 Rec 9): the scroll
 /// container and its `overscroll-behavior` per axis — whether a
 /// scroll reaching this container's limit chains onward or stops
-/// here.
+/// here — plus the container's maximum scroll offset per axis
+/// (Stage 10 Rec 2), so the wheel clamps at the container's end
+/// instead of scrolling past it into blank space.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ScrollChainEntry {
     pub id: NodeId,
     pub overscroll_x: OverscrollBehavior,
     pub overscroll_y: OverscrollBehavior,
+    pub max_scroll: (f32, f32),
 }
 
 /// The innermost-first chain of scroll containers containing the
@@ -472,6 +488,9 @@ fn scroll_chain_for(
                     id,
                     overscroll_x,
                     overscroll_y,
+                    // A container the tree cannot measure (no box)
+                    // scrolls nowhere: the whole delta chains on.
+                    max_scroll: tree.scrollable_size(id).unwrap_or((0.0, 0.0)),
                 },
             )
         })
@@ -698,6 +717,22 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                     .collect();
                 let _ = reply.send(containers);
             }
+            LayoutJob::ScrollMax { id, reply } => {
+                let max = tree.as_ref().and_then(|tree| tree.scrollable_size(id));
+                let _ = reply.send(max);
+            }
+            LayoutJob::PageMaxScroll { reply } => {
+                let max = tree
+                    .as_ref()
+                    .map(|tree| {
+                        (
+                            (tree.content_width() - tree.viewport.0).max(0.0),
+                            (tree.content_height() - tree.viewport.1).max(0.0),
+                        )
+                    })
+                    .unwrap_or((0.0, 0.0));
+                let _ = reply.send(max);
+            }
             LayoutJob::Geometry { id, reply } => {
                 let geometry = tree.as_ref().and_then(|tree| geometry_of(tree, id));
                 let _ = reply.send(geometry);
@@ -753,6 +788,218 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
 // tick gate skips relayout while hidden (dirty flags stay set, so
 // the first visible tick re-lays out), and JS timers keep running.
 
+/// Frame-time histogram (Stage 10 Rec 7): the M2 done criteria
+/// demand "scroll smoothly at 60+ FPS", but there is no vsync
+/// signal in the shell — the tab thread ticks on a ~16 ms timer
+/// and re-lays out only when dirty — and no frame-time
+/// measurement existed anywhere, so the 60 FPS claim was
+/// unprovable in either direction. This measures first: every
+/// submitted frame records its tick-to-submit time (JS drive +
+/// restyle/layout + observer steps + display-list collect +
+/// submit), broken into phases, so a miss can be attributed to
+/// the likely hot spots (a full restyle on every build, or a
+/// display-list rebuild on every wheel tick) instead of guessed
+/// at. Nothing here changes the tick cadence or any scheduling
+/// behaviour — it only observes.
+///
+/// Overhead is deliberately negligible: one fixed-size ring of
+/// pre-allocated samples (no `Vec`, no heap allocation per tick
+/// — `record` is a timestamp diff plus one array write), and
+/// percentiles sort a stack copy only when read, never per tick.
+/// Real 60 FPS numbers can only be measured on Joel's box
+/// against a long real page; the sandbox numbers prove the
+/// instrumentation works, not the frame rate.
+pub(crate) const FRAME_TIME_SAMPLES: usize = 240;
+
+/// One frame's phase breakdown, in milliseconds. `layout` is the
+/// layout-actor round trip (restyle + layout tree build);
+/// `collect` is the ResizeObserver / IntersectionObserver steps
+/// plus the display-list collect; `submit` is the postcard encode
+/// + send. Wheel scrolls re-collect without re-laying out, so
+/// their samples carry `layout_ms: 0.0` — a scroll frame's cost
+/// is its collect, which is exactly the hot spot to watch.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct FrameSample {
+    pub total_ms: f32,
+    pub layout_ms: f32,
+    pub collect_ms: f32,
+    pub submit_ms: f32,
+}
+
+/// Which phase of a [`FrameSample`] a percentile reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FramePhase {
+    Total,
+    Layout,
+    Collect,
+    Submit,
+}
+
+impl FramePhase {
+    fn value(self, sample: &FrameSample) -> f32 {
+        match self {
+            FramePhase::Total => sample.total_ms,
+            FramePhase::Layout => sample.layout_ms,
+            FramePhase::Collect => sample.collect_ms,
+            FramePhase::Submit => sample.submit_ms,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            FramePhase::Total => "total",
+            FramePhase::Layout => "layout",
+            FramePhase::Collect => "collect",
+            FramePhase::Submit => "submit",
+        }
+    }
+}
+
+/// A fixed-size rolling histogram of frame times: the newest
+/// [`FRAME_TIME_SAMPLES`] samples (four seconds at 60 Hz), kept
+/// in a pre-allocated ring — `record` never allocates, and the
+/// storage never grows past `capacity()`. Percentiles use the
+/// nearest-rank rule (the same convention as `pluto_paint::perf`,
+/// never averages), computed over a stack-sorted copy, so reading
+/// them costs no heap allocation either.
+#[derive(Debug, Clone)]
+pub(crate) struct FrameTimeHistogram {
+    samples: [FrameSample; FRAME_TIME_SAMPLES],
+    next: usize,
+    len: usize,
+    total_recorded: u64,
+    over_budget: u64,
+}
+
+impl Default for FrameTimeHistogram {
+    fn default() -> Self {
+        Self {
+            samples: [FrameSample::default(); FRAME_TIME_SAMPLES],
+            next: 0,
+            len: 0,
+            total_recorded: 0,
+            over_budget: 0,
+        }
+    }
+}
+
+impl FrameTimeHistogram {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one frame. O(1), no allocation: one ring write.
+    /// Non-finite or negative totals are ignored, never counted.
+    pub(crate) fn record(&mut self, sample: FrameSample) {
+        if !sample.total_ms.is_finite() || sample.total_ms < 0.0 {
+            return;
+        }
+        self.samples[self.next] = sample;
+        self.next = (self.next + 1) % FRAME_TIME_SAMPLES;
+        self.len = (self.len + 1).min(FRAME_TIME_SAMPLES);
+        self.total_recorded += 1;
+        if sample.total_ms > perf::FRAME_BUDGET_MS {
+            self.over_budget += 1;
+        }
+    }
+
+    /// Samples currently held (at most `capacity()`).
+    pub(crate) fn count(&self) -> usize {
+        self.len
+    }
+
+    /// The fixed ring capacity — the storage never grows past this.
+    pub(crate) fn capacity(&self) -> usize {
+        FRAME_TIME_SAMPLES
+    }
+
+    /// Frames recorded since the tab started (including ones that
+    /// have rolled off the ring).
+    pub(crate) fn total_recorded(&self) -> u64 {
+        self.total_recorded
+    }
+
+    /// Frames in the ring that missed the 16.67 ms budget.
+    pub(crate) fn over_budget(&self) -> u64 {
+        self.over_budget
+    }
+
+    /// Share of ring samples over budget, or `None` when empty.
+    pub(crate) fn over_budget_ratio(&self) -> Option<f32> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(self.over_budget as f32 / self.len as f32)
+        }
+    }
+
+    /// Nearest-rank percentile (`p` in 0..=100) of one phase, or
+    /// `None` when no samples have been recorded yet.
+    pub(crate) fn percentile(&self, phase: FramePhase, p: f32) -> Option<f32> {
+        if self.len == 0 {
+            return None;
+        }
+        let mut values = [0.0f32; FRAME_TIME_SAMPLES];
+        for (i, sample) in self.samples.iter().take(self.len).enumerate() {
+            values[i] = phase.value(sample);
+        }
+        values[..self.len].sort_by(f32::total_cmp);
+        let rank = (p / 100.0 * self.len as f32).ceil() as usize;
+        values
+            .get(rank.saturating_sub(1).min(self.len - 1))
+            .copied()
+    }
+
+    pub(crate) fn p50(&self, phase: FramePhase) -> Option<f32> {
+        self.percentile(phase, 50.0)
+    }
+
+    pub(crate) fn p95(&self, phase: FramePhase) -> Option<f32> {
+        self.percentile(phase, 95.0)
+    }
+
+    pub(crate) fn max(&self, phase: FramePhase) -> Option<f32> {
+        self.samples
+            .iter()
+            .take(self.len)
+            .map(|s| phase.value(s))
+            .fold(None, |max: Option<f32>, v| {
+                Some(match max {
+                    Some(m) if m >= v => m,
+                    _ => v,
+                })
+            })
+    }
+
+    /// One stderr line with the total + per-phase percentiles and
+    /// the over-budget share. `Option` reads print as `-` (no
+    /// samples yet). Logged periodically by the tab tick, never
+    /// per tick.
+    pub(crate) fn summary(&self) -> String {
+        let fmt = |v: Option<f32>| v.map_or("-".to_string(), |v| format!("{v:.2}"));
+        let pct = |phase: FramePhase| {
+            format!(
+                "{} p50={} p95={} max={}",
+                phase.name(),
+                fmt(self.p50(phase)),
+                fmt(self.p95(phase)),
+                fmt(self.max(phase))
+            )
+        };
+        format!(
+            "frames n={} total_recorded={} over_budget={} ({:.1}%) | {} | {} | {} | {}",
+            self.len,
+            self.total_recorded,
+            self.over_budget,
+            self.over_budget_ratio().unwrap_or(0.0) * 100.0,
+            pct(FramePhase::Total),
+            pct(FramePhase::Layout),
+            pct(FramePhase::Collect),
+            pct(FramePhase::Submit),
+        )
+    }
+}
+
 /// How often the tab thread ticks (the M4 rendering cadence:
 /// ~60 Hz; see the module docs — no shell vsync exists to drive it).
 const TAB_TICK: Duration = Duration::from_millis(16);
@@ -804,6 +1051,18 @@ struct TabState {
     document: Option<Document>,
     has_document: bool,
     element_state: ElementState,
+    /// Committed URLs this session (Stage 10 Rec 3): every URL
+    /// the worker commits — the same `final_url` it reports in
+    /// `DidCommit`, which is exactly what the shell pushes into
+    /// its session `history` — so this set and the shell's history
+    /// hold the same URLs with no IPC change. Stage 10 Rec 8:
+    /// seeded from the persisted `history.json` in `TabState::new`,
+    /// so `:visited` survives a restart. Keys are
+    /// fragment-stripped (`visited_key`): browsers ignore the
+    /// fragment for `:visited`. `refresh_visited` projects this
+    /// set onto the current document's link ids before each
+    /// layout pass, into `element_state.visited`.
+    visited_urls: HashSet<String>,
     scroll_offsets: HashMap<NodeId, (f32, f32)>,
     /// The currently hovered element chain — the hit element plus
     /// its ancestors (browsers hover ancestors too: hovering text
@@ -835,12 +1094,13 @@ struct TabState {
     /// The viewport scroll offset, mirrored from the shell (Stage 8
     /// Rec 10): every viewport scroll flows through
     /// `emit_scroll_viewport`, which updates this with the same
-    /// ≥0 clamp the shell's `compositor.scroll_by` applies, and
-    /// `start_navigation` resets it — so the IntersectionObserver
-    /// step can compute viewport-root intersections from the
-    /// retained tree without a protocol change. The worker works
-    /// entirely in page coordinates; the viewport root is
-    /// `[viewport_scroll, viewport]` in page coordinates.
+    /// `[0, page max]` clamp the shell's `compositor.scroll_by`
+    /// applies, and `start_navigation` resets it — so the
+    /// IntersectionObserver step can compute viewport-root
+    /// intersections from the retained tree without a protocol
+    /// change. The worker works entirely in page coordinates; the
+    /// viewport root is `[viewport_scroll, viewport]` in page
+    /// coordinates.
     viewport_scroll: (f32, f32),
     /// When this tab started (the `IntersectionObserver` entry
     /// `time` clock: ms since the tab started).
@@ -870,6 +1130,18 @@ struct TabState {
     /// Set by JS mutations (via the host); the tick reads and
     /// clears it, then asks the loop for a rendering opportunity.
     render_requested: Rc<Cell<bool>>,
+    /// Frame-time histogram (Stage 10 Rec 7): every submitted
+    /// frame records its tick-to-submit time here (see
+    /// [`FrameTimeHistogram`]). Read by the tab tick's periodic
+    /// log line and by tests through [`TabState::frame_times`].
+    /// The shell has no direct handle to the tab thread — and the
+    /// renderer runs out-of-process — so the periodic stderr
+    /// line is the shell-visible surface, not a struct field.
+    frame_times: FrameTimeHistogram,
+    /// `total_recorded` at the last periodic frame-time log, so
+    /// the tick logs only when new frames landed (no spam on
+    /// idle ticks).
+    last_frame_log_total: u64,
 }
 
 impl TabState {
@@ -895,6 +1167,15 @@ impl TabState {
         // from the browser profile (defaults when none exists).
         let loader = ResourceLoader::new();
         crate::security::load_into(&loader);
+        // Stage 10 Rec 8: seed `:visited` from the persisted
+        // history, so links to pages visited in a previous
+        // session already match on the first layout pass — the
+        // worker's set and the shell's history hold the same
+        // URLs (fragment-stripped keys, as on commit).
+        let visited_urls: HashSet<String> = crate::history::load_history()
+            .iter()
+            .map(|url| visited_key(url).to_string())
+            .collect();
         Self {
             layout_tx,
             loader,
@@ -906,6 +1187,7 @@ impl TabState {
             document: None,
             has_document: false,
             element_state: ElementState::default(),
+            visited_urls,
             scroll_offsets: HashMap::new(),
             hovered: Vec::new(),
             active_element: None,
@@ -927,7 +1209,16 @@ impl TabState {
             load_outcome_tx,
             load_outcome_rx: Some(load_outcome_rx),
             render_requested,
+            frame_times: FrameTimeHistogram::new(),
+            last_frame_log_total: 0,
         }
+    }
+
+    /// The frame-time histogram for this tab (Stage 10 Rec 7):
+    /// p50/p95 per phase plus the sample count, for tests and
+    /// the tick's periodic log line.
+    pub(crate) fn frame_times(&self) -> &FrameTimeHistogram {
+        &self.frame_times
     }
 
     /// The live `TabJs`, creating it on the first navigation.
@@ -1036,6 +1327,12 @@ async fn tab_main(
     loop {
         tokio::select! {
             _ = tick.tick() => {
+                // Stage 10 Rec 7: the frame clock starts here —
+                // the tick-to-submit time is tick start (before
+                // the JS drive) to the submit that the dirty
+                // relayout performs, so the histogram measures
+                // the whole frame, not just the layout half.
+                let tick_started = std::time::Instant::now();
                 state.tick_count += 1;
                 // Wheel gesture expiry (Stage 8 Rec 9): no wheel
                 // for ~200 ms (~12 ticks) ends the gesture — the
@@ -1069,13 +1366,25 @@ async fn tab_main(
                     || state.host.lock().unwrap().dom_is_dirty();
                 if visible && dirty {
                     state.render_requested.set(false);
-                    relayout_and_submit(&mut state, &events).await;
+                    relayout_and_submit(&mut state, &events, tick_started).await;
                 } else if !visible && dirty {
                     // Perf (Stage 8 Rec 5): a hidden tab that
                     // would have re-laid out counts the skip.
                     if let Ok(mut counters) = perf::global().lock() {
                         counters.frames_hidden_skipped += 1;
                     }
+                }
+                // Stage 10 Rec 7: one frame-time summary line
+                // every ~10 s (600 ticks at 16 ms), and only
+                // when new frames landed since the last line —
+                // never per tick, never on idle ticks. The
+                // line is the shell-visible surface for the
+                // histogram (stderr, like the perf summary).
+                if state.tick_count % 600 == 0
+                    && state.frame_times.total_recorded() > state.last_frame_log_total
+                {
+                    state.last_frame_log_total = state.frame_times.total_recorded();
+                    eprintln!("[pluto frame-time] {}", state.frame_times.summary());
                 }
             }
             cmd = commands.recv() => {
@@ -1591,6 +1900,12 @@ async fn handle_nav_outcome(
             ..
         } => {
             eprintln!("[pluto] worker fetched {final_url}");
+            // Stage 10 Rec 3: a committed URL is visited from now
+            // on — record it before laying out, so the new page's
+            // own links to it already match `:visited`.
+            state
+                .visited_urls
+                .insert(visited_key(&final_url).to_string());
             state.document = Some((*document).clone());
             if !emit_tab(events, RendererToBrowser::DidCommit {
                 url: final_url.clone(),
@@ -1600,14 +1915,14 @@ async fn handle_nav_outcome(
             {
                 return;
             }
-            layout_and_submit(state, events, Some(*document), false).await;
+            layout_and_submit(state, events, Some(*document), false, std::time::Instant::now()).await;
         }
         LoadOutcome::Failed { url, reason, .. } => {
             eprintln!("[pluto] worker fetch failed: {reason}");
             let document = page::parse_document(&page::error_document(&url, &reason));
             state.document = Some(document.clone());
             state.scroll_offsets.clear();
-            layout_and_submit(state, events, Some(document), false).await;
+            layout_and_submit(state, events, Some(document), false, std::time::Instant::now()).await;
             let _ = emit_tab(
                 events,
                 RendererToBrowser::LoadFailed { url, reason },
@@ -1685,13 +2000,20 @@ async fn layout_and_submit(
     events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
     document: Option<Document>,
     incremental: bool,
+    started: std::time::Instant,
 ) -> bool {
+    // Stage 10 Rec 3: project the committed-URL set onto the
+    // document's links before the state is cloned into the
+    // layout job, so `:visited` is fresh for every pass.
+    refresh_visited(state);
     // Perf (Stage 8 Rec 5): the whole build — layout tree,
     // ResizeObserver step, IntersectionObserver step, display-list
     // collect — is the worker build span. The submit's postcard
-    // encode is measured separately, in `submit`.
-    let build_started = std::time::Instant::now();
+    // encode is measured separately, in `submit`. `started` is
+    // the caller's frame clock (the tick start on the tick path),
+    // so the recorded total is tick-to-submit, not just the build.
     // (1) Layout tree on the actor (no display list yet).
+    let layout_started = std::time::Instant::now();
     let (tree_tx, tree_rx) = oneshot::channel();
     let job = LayoutJob::LayoutTree {
         document: Box::new(document),
@@ -1720,6 +2042,10 @@ async fn layout_and_submit(
         .await;
     }
     state.has_document = true;
+    // Stage 10 Rec 7: the layout phase ends when the tree reply
+    // lands; the collect phase runs from here to the list.
+    let layout_ms = layout_started.elapsed().as_secs_f32() * 1000.0;
+    let collect_started = std::time::Instant::now();
     // (2) ResizeObserver step, after layout, before the list.
     run_resize_observer_step(state).await;
     // (2b) IntersectionObserver step, after layout, before the
@@ -1743,12 +2069,27 @@ async fn layout_and_submit(
     }
     match list_rx.await {
         Ok(display) => {
+            // Stage 10 Rec 7: the collect phase ends when the
+            // list lands (it covers the observer steps above
+            // plus the collect round trip).
+            let collect_ms = collect_started.elapsed().as_secs_f32() * 1000.0;
             perf::record_span(
                 perf::SpanKind::WorkerBuild,
-                build_started.elapsed().as_secs_f32() * 1000.0,
+                started.elapsed().as_secs_f32() * 1000.0,
             );
             state.host.lock().unwrap().clear_dirty();
-            submit(state, events, display).await
+            let submit_started = std::time::Instant::now();
+            let submitted = submit(state, events, display).await;
+            // Stage 10 Rec 7: one ring write per submitted
+            // frame — total is tick-to-submit (the caller's
+            // clock), phases are layout / collect / submit.
+            state.frame_times.record(FrameSample {
+                total_ms: started.elapsed().as_secs_f32() * 1000.0,
+                layout_ms,
+                collect_ms,
+                submit_ms: submit_started.elapsed().as_secs_f32() * 1000.0,
+            });
+            submitted
         }
         Err(_) => emit_tab(
             events,
@@ -1867,6 +2208,7 @@ async fn run_intersection_observer_step(state: &mut TabState) {
 async fn relayout_and_submit(
     state: &mut TabState,
     events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    started: std::time::Instant,
 ) {
     if !state.has_document {
         return;
@@ -1875,7 +2217,7 @@ async fn relayout_and_submit(
     state.document = Some(document.clone());
     // Same-lineage snapshot of the live Dom: the actor may lay
     // out incrementally on its retained tree (Stage 8 Rec 6).
-    layout_and_submit(state, events, Some(document), true).await;
+    layout_and_submit(state, events, Some(document), true, started).await;
 }
 
 /// Hit-test a click (page coordinates: the shell already added the
@@ -1956,6 +2298,53 @@ async fn handle_input(
     }
 }
 
+/// The `:visited` key for a URL (Stage 10 Rec 3): the URL with
+/// its `#fragment` stripped. Browsers ignore the fragment for
+/// `:visited` — visiting `page#top` marks `page#bottom` visited
+/// too — so both the recorded commits and the link lookups go
+/// through this key.
+fn visited_key(url: &str) -> &str {
+    url.split('#').next().unwrap_or(url)
+}
+
+/// The link ids in `doc` whose resolved `href` is in
+/// `visited_urls` (Stage 10 Rec 3): the worker-side projection
+/// of the committed-URL set onto the document, resolved against
+/// the document base URL with the same `find_link_href` the
+/// click path uses. This is the `:visited` half of
+/// `ElementState` — the matcher only ever sees ids, never URLs.
+fn visited_link_ids(doc: &Document, visited_urls: &HashSet<String>) -> HashSet<pluto_html::NodeId> {
+    let mut out = HashSet::new();
+    if visited_urls.is_empty() {
+        return out;
+    }
+    let dom = doc.dom();
+    let mut stack = dom.root().map(|r| vec![r]).unwrap_or_default();
+    while let Some(id) = stack.pop() {
+        if dom.tag(id) == Some("a")
+            && let Some(href) = page::find_link_href(doc, id)
+            && visited_urls.contains(visited_key(&href))
+        {
+            out.insert(id);
+        }
+        stack.extend(dom.children(id).iter().rev());
+    }
+    out
+}
+
+/// Recompute `state.element_state.visited` from the current
+/// document and the session's committed-URL set (Stage 10 Rec 3).
+/// Called at the top of `layout_and_submit` — the choke point
+/// for every layout pass (navigation, resize, dirty tick,
+/// relayout) — so a Back/Forward revisit, which re-lays out the
+/// old page after later URLs were committed, picks up the new
+/// visited links too.
+fn refresh_visited(state: &mut TabState) {
+    if let Some(doc) = state.document.as_ref() {
+        state.element_state.visited = visited_link_ids(doc, &state.visited_urls);
+    }
+}
+
 /// The hover chain for a hit target (Stage 8 Rec 9): the element
 /// plus its ancestors, from the tab's synced document. Browsers
 /// hover ancestors too — hovering text inside a button highlights
@@ -2010,7 +2399,99 @@ fn restyle_dirty_set(
             }
         }
     }
+    // Stage 10 Rec 4: `:has()` anchors are ancestors of the changed
+    // element, so they belong in this same expansion. The re-check
+    // is still stubbed (returns no nodes — `:has()` matching is not
+    // implemented), so this changes nothing today; the gate and the
+    // TODO live in `has_anchor_recheck` below.
+    for id in has_anchor_recheck(state, changed) {
+        dirty.insert(id);
+    }
     dirty.into_iter().collect()
+}
+
+/// The `:has()` anchor re-check for a restyle (Stage 10 Rec 4,
+/// bookkeeping only). Gate first, walk second: the sheet's
+/// `:has()` inventory is asked whether any feature of the changed
+/// nodes appears in a `:has()` argument, and only then would the
+/// ancestors be walked re-checking anchors.
+///
+/// TODO(Stage 10 Rec 4): the walk itself is NOT IMPLEMENTED.
+/// `HasInvalidationIndex::recheck_anchors` (in `pluto-css`) is the
+/// stub that will return the candidate rules' anchors to mark
+/// dirty; until `:has()` matching lands it returns empty, so this
+/// function returns no nodes and `:has()` still never matches —
+/// behaviour identical to before this bookkeeping existed. Do not
+/// "just wire up matching" here: a naive re-run of
+/// `selector_matches` on every ancestor after every change is the
+/// quadratic trap the Rec 4 design names.
+fn has_anchor_recheck(state: &TabState, changed: &[NodeId]) -> Vec<NodeId> {
+    let Some(doc) = state.document.as_ref() else {
+        return Vec::new();
+    };
+    let index = &doc.sheet().pseudo_class_index.has;
+    if index.is_empty() {
+        return Vec::new();
+    }
+    let features: Vec<pluto_css::HasArgFeature> = changed
+        .iter()
+        .flat_map(|&id| has_features_for(state, id))
+        .collect();
+    if !index.could_affect_any(&features) {
+        return Vec::new();
+    }
+    // Gate passed — a `:has()` argument mentions a changed feature.
+    // The ancestor walk goes here once matching exists; today the
+    // stub returns no candidate rules, so no anchor is marked.
+    let _ = index.recheck_anchors(&features);
+    Vec::new()
+}
+
+/// The `:has()`-relevant features of one element (Stage 10 Rec 4):
+/// its tag, classes, id, and attribute names from the DOM, plus
+/// the dynamic pseudo-class state the shell tracks for it
+/// (`:hover` / `:active` / `:focus` / `:visited`). The later
+/// `:has()` build reads these through
+/// `HasInvalidationIndex::could_affect`; structural features
+/// (`:first-child`, `:empty`, ...) are not named here — a
+/// sibling/child-structure change alters them without any feature
+/// on the changed element itself, so the later build must treat
+/// structure changes as affecting any argument that mentions one
+/// (the inventory records those names; see `pluto-css`).
+fn has_features_for(state: &TabState, id: NodeId) -> Vec<pluto_css::HasArgFeature> {
+    let mut out = Vec::new();
+    if let Some(doc) = state.document.as_ref() {
+        let dom = doc.dom();
+        if let Some(node) = dom.get(id) {
+            if let Some(tag) = node.tag() {
+                out.push(pluto_css::HasArgFeature::type_selector(tag));
+            }
+            if let Some(class) = node.attr("class") {
+                for c in class.split_whitespace() {
+                    out.push(pluto_css::HasArgFeature::class(c));
+                }
+            }
+            if let Some(i) = node.attr("id") {
+                out.push(pluto_css::HasArgFeature::id(i));
+            }
+            for (name, _) in &node.attrs {
+                out.push(pluto_css::HasArgFeature::attribute(name));
+            }
+        }
+    }
+    if state.element_state.hover.contains(&id) {
+        out.push(pluto_css::HasArgFeature::pseudo_class("hover"));
+    }
+    if state.element_state.active.contains(&id) {
+        out.push(pluto_css::HasArgFeature::pseudo_class("active"));
+    }
+    if state.element_state.focus.contains(&id) {
+        out.push(pluto_css::HasArgFeature::pseudo_class("focus"));
+    }
+    if state.element_state.visited.contains(&id) {
+        out.push(pluto_css::HasArgFeature::pseudo_class("visited"));
+    }
+    out
 }
 
 /// All descendants of `id` (exclusive), into `out`.
@@ -2040,7 +2521,7 @@ async fn restyle(
         host.set_element_state(state.element_state.clone());
         host.mark_dirty(dirty);
     }
-    relayout_and_submit(state, events).await;
+    relayout_and_submit(state, events, std::time::Instant::now()).await;
 }
 
 /// The sheet's pseudo-class reach for `which` (`hover`, `active`,
@@ -2178,6 +2659,41 @@ async fn scroll_chain(state: &TabState, x: f32, y: f32) -> Vec<ScrollChainEntry>
     reply_rx.await.unwrap_or_default()
 }
 
+/// Maximum viewport (page) scroll offset from the layout actor
+/// (Stage 10 Rec 2): `content - viewport` per axis, clamped at
+/// zero. `(0, 0)` when the actor is gone or holds no tree — the
+/// page scrolls nowhere rather than past its end.
+async fn page_max_scroll(state: &TabState) -> (f32, f32) {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if state
+        .layout_tx
+        .send(LayoutJob::PageMaxScroll { reply: reply_tx })
+        .is_err()
+    {
+        return (0.0, 0.0);
+    }
+    reply_rx.await.unwrap_or((0.0, 0.0))
+}
+
+/// Maximum scroll offset of one scroll container from the layout
+/// actor (Stage 10 Rec 2). `(0, 0)` when the actor is gone or the
+/// node has no box — the container scrolls nowhere, and the whole
+/// delta chains on.
+async fn container_max_scroll(state: &TabState, id: NodeId) -> (f32, f32) {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if state
+        .layout_tx
+        .send(LayoutJob::ScrollMax {
+            id,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return (0.0, 0.0);
+    }
+    reply_rx.await.ok().flatten().unwrap_or((0.0, 0.0))
+}
+
 /// Apply several container scrolls at once and submit the single
 /// re-collected display list (Stage 8 Rec 9). False when the actor
 /// is gone or holds no tree.
@@ -2186,6 +2702,10 @@ async fn apply_scrolls(
     events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
     scrolls: Vec<(NodeId, f32, f32)>,
 ) -> bool {
+    // Stage 10 Rec 7: a scroll frame re-collects without
+    // re-laying out, so its cost is the ScrollMany round trip
+    // (collect) plus the submit — no layout phase.
+    let started = std::time::Instant::now();
     let (reply_tx, reply_rx) = oneshot::channel();
     if state
         .layout_tx
@@ -2199,25 +2719,34 @@ async fn apply_scrolls(
     }
     match reply_rx.await {
         Ok(Some(display)) => {
+            let collect_ms = started.elapsed().as_secs_f32() * 1000.0;
             for (id, x, y) in scrolls {
                 state.scroll_offsets.insert(id, (x, y));
             }
-            submit(state, events, display).await
+            let submit_started = std::time::Instant::now();
+            let submitted = submit(state, events, display).await;
+            state.frame_times.record(FrameSample {
+                total_ms: started.elapsed().as_secs_f32() * 1000.0,
+                layout_ms: 0.0,
+                collect_ms,
+                submit_ms: submit_started.elapsed().as_secs_f32() * 1000.0,
+            });
+            submitted
         }
         _ => false,
     }
 }
 
 /// Apply one axis of a wheel delta to a container offset (Stage 8
-/// Rec 9). Returns (new offset, remaining delta). A negative delta
-/// consumes the offset down to zero; the remainder chains onward —
-/// unless the container's `overscroll-behavior` stops the chain,
-/// in which case the remainder is dropped. A positive delta is
-/// always fully consumed: the tree exposes no per-container
-/// content height yet, so there is no bottom limit to hit (the
-/// same documented gap as the shell scroll).
-fn consume_axis(offset: f32, delta: f32, stops: bool) -> (f32, f32) {
-    let next = (offset + delta).max(0.0);
+/// Rec 9, clamped Stage 10 Rec 2). Returns (new offset, remaining
+/// delta). The offset clamps to `[0, max]`: a delta that would
+/// carry it past either end is only partly consumed, and the
+/// remainder chains onward — unless the container's
+/// `overscroll-behavior` stops the chain, in which case the
+/// remainder is dropped. A container already at its limit consumes
+/// nothing, so the whole delta chains on.
+fn consume_axis(offset: f32, delta: f32, max: f32, stops: bool) -> (f32, f32) {
+    let next = (offset + delta).clamp(0.0, max);
     let consumed = next - offset;
     let mut remaining = delta - consumed;
     if stops {
@@ -2227,37 +2756,52 @@ fn consume_axis(offset: f32, delta: f32, stops: bool) -> (f32, f32) {
 }
 
 /// Emit a `ScrollViewport` delta and mirror it in
-/// `state.viewport_scroll` (Stage 8 Rec 10): every viewport scroll
-/// flows through here, with the same ≥0 clamp the shell's
+/// `state.viewport_scroll` (Stage 8 Rec 10, clamped Stage 10 Rec
+/// 2): every viewport scroll flows through here, clamped to `[0,
+/// page max]` per axis — the same `[0, max]` clamp the shell's
 /// `compositor.scroll_by` applies — so the worker's mirror of the
 /// shell scroll stays exact, and the IntersectionObserver step can
-/// use it without a protocol change. Callers re-run the
-/// IntersectionObserver step after a scroll (the geometry changed
-/// even though nothing re-laid out).
+/// use it without a protocol change. Only the consumed part of the
+/// delta is emitted: the shell clamps too, but sending the
+/// unclamped remainder would desync the mirror from the shell.
+/// Callers re-run the IntersectionObserver step after a scroll
+/// (the geometry changed even though nothing re-laid out).
 async fn emit_scroll_viewport(
     state: &mut TabState,
     events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
     dx: f32,
     dy: f32,
 ) {
-    state.viewport_scroll = (
-        (state.viewport_scroll.0 + dx).max(0.0),
-        (state.viewport_scroll.1 + dy).max(0.0),
+    let (max_x, max_y) = page_max_scroll(state).await;
+    let next = (
+        (state.viewport_scroll.0 + dx).clamp(0.0, max_x),
+        (state.viewport_scroll.1 + dy).clamp(0.0, max_y),
     );
-    emit_tab(
-        events,
-        RendererToBrowser::ScrollViewport { dx, dy },
-    )
-    .await;
+    let consumed = (
+        next.0 - state.viewport_scroll.0,
+        next.1 - state.viewport_scroll.1,
+    );
+    state.viewport_scroll = next;
+    if consumed.0 != 0.0 || consumed.1 != 0.0 {
+        emit_tab(
+            events,
+            RendererToBrowser::ScrollViewport {
+                dx: consumed.0,
+                dy: consumed.1,
+            },
+        )
+        .await;
+    }
 }
 
 /// A wheel event (Stage 8 Rec 9): the worker owns the whole wheel.
 /// The delta is scaled by mode (lines × 16 px, pages × the
 /// viewport size, pixels as-is); a new gesture picks the
 /// innermost-first container chain under the cursor, and the delta
-/// walks it — each container consumes what it can, the leftover
-/// chains onward, and the viewport takes the rest (via
-/// `ScrollViewport`, which the shell clamps at zero).
+/// walks it — each container consumes what it can up to its
+/// maximum, the leftover chains onward, and the viewport takes the
+/// rest (via `ScrollViewport`, which the shell clamps to `[0, page
+/// max]` — the same clamp the worker's mirror applies).
 async fn handle_wheel(
     state: &mut TabState,
     events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
@@ -2287,8 +2831,18 @@ async fn handle_wheel(
             .get(&entry.id)
             .copied()
             .unwrap_or((0.0, 0.0));
-        let (nx, rem_x) = consume_axis(ox, rx, entry.overscroll_x.stops_chaining());
-        let (ny, rem_y) = consume_axis(oy, ry, entry.overscroll_y.stops_chaining());
+        let (nx, rem_x) = consume_axis(
+            ox,
+            rx,
+            entry.max_scroll.0,
+            entry.overscroll_x.stops_chaining(),
+        );
+        let (ny, rem_y) = consume_axis(
+            oy,
+            ry,
+            entry.max_scroll.1,
+            entry.overscroll_y.stops_chaining(),
+        );
         if (nx, ny) != (ox, oy) {
             scrolls.push((entry.id, nx, ny));
         }
@@ -2353,13 +2907,16 @@ async fn handle_key(
         "PageUp" => {
             scroll_focused_or_viewport(state, events, 0.0, -state.viewport.1).await
         }
-        // The shell clamps the viewport scroll at zero, so a huge
-        // negative delta is "scroll to the top". `End` needs the
-        // page's content height, which the tree does not expose
-        // yet — skipped (the same documented gap as the bottom
-        // clamp).
+        // `Home` and `End` jump to the ends of the page: a huge
+        // delta is "scroll to the top / bottom" — `emit_scroll_viewport`
+        // clamps it at the page maximum (zero at the top), so the
+        // emitted delta is exactly the remaining distance.
         "Home" => {
             emit_scroll_viewport(state, events, 0.0, -1e9).await;
+            run_intersection_observer_step(state).await;
+        }
+        "End" => {
+            emit_scroll_viewport(state, events, 0.0, 1e9).await;
             run_intersection_observer_step(state).await;
         }
         _ => {}
@@ -2498,7 +3055,15 @@ async fn scroll_focused_or_viewport(
                 .get(&focused)
                 .copied()
                 .unwrap_or((0.0, 0.0));
-            let (nx, ny) = ((ox + dx).max(0.0), (oy + dy).max(0.0));
+            // Clamped to the container's maximum (Stage 10 Rec 2):
+            // a key that would carry it past the end consumes
+            // nothing, so it falls through to the viewport below —
+            // keyboard scroll has no `overscroll-behavior` stop.
+            let (max_x, max_y) = container_max_scroll(state, focused).await;
+            let (nx, ny) = (
+                (ox + dx).clamp(0.0, max_x),
+                (oy + dy).clamp(0.0, max_y),
+            );
             if (nx, ny) != (ox, oy) {
                 apply_scrolls(state, events, vec![(focused, nx, ny)]).await;
                 run_intersection_observer_step(state).await;
@@ -2529,7 +3094,7 @@ async fn resize(
     state.host.lock().unwrap().set_viewport((width, height));
     if state.has_document {
         eprintln!("[pluto] worker viewport resized to {width}x{height}, re-layout");
-        layout_and_submit(state, events, None, true).await;
+        layout_and_submit(state, events, None, true, std::time::Instant::now()).await;
     }
 }
 
@@ -2606,18 +3171,74 @@ mod tests {
         }
     }
 
+    /// Guard holding `TEST_HOME_LOCK` with `HOME` pointed at a
+    /// fresh temp dir for the whole span a worker tab is alive
+    /// (see `TEST_HOME_LOCK` in `lib.rs`). A worker tab reads the
+    /// profile at `TabState::new` and writes it back on shutdown,
+    /// so it is a HOME-mutating test even though it never touches
+    /// `HOME` itself — without this, a parallel
+    /// permissions/storage/bookmarks/security round-trip test could
+    /// swap `HOME` under it and corrupt the profile (Stage 10
+    /// Rec 6). Restores `HOME` on drop; the guard must be held
+    /// until the worker task has been awaited.
+    struct WorkerHomeGuard {
+        old: Option<std::ffi::OsString>,
+        dir: std::path::PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for WorkerHomeGuard {
+        fn drop(&mut self) {
+            // Restore HOME first; the lock field drops after this,
+            // so no other HOME-mutating test can interleave.
+            unsafe {
+                match self.old.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn worker_home() -> WorkerHomeGuard {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let lock = crate::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "pluto-renderer-test-home-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("HOME");
+        // SAFETY: HOME is only read by the persistence helpers,
+        // which run on the tab thread while the lock is held.
+        unsafe {
+            std::env::set_var("HOME", &dir);
+        }
+        WorkerHomeGuard { old, dir, _lock: lock }
+    }
+
     /// Drive the worker directly (no iced): send commands in, read
     /// `RendererEvent` messages out. Returns the worker task handle
-    /// and the channels, so each test drives its own worker.
+    /// and the channels, so each test drives its own worker — plus
+    /// the `WorkerHomeGuard`, which the caller must hold until the
+    /// worker task has ended (the tab reads the profile at startup
+    /// and writes it back on shutdown).
     fn spawn_worker() -> (
+        WorkerHomeGuard,
         tokio::task::JoinHandle<()>,
         pluto_ipc::CommandSender,
         mpsc::Receiver<crate::Message>,
     ) {
+        let home = worker_home();
         let (cmd_tx, cmd_rx) = pluto_ipc::command_channel();
         let (event_tx, event_rx) = mpsc::channel(100);
         let handle = tokio::spawn(run_worker(cmd_rx, event_tx));
-        (handle, cmd_tx, event_rx)
+        (home, handle, cmd_tx, event_rx)
     }
 
     /// The cross-process worker bridge over an in-process transport
@@ -2630,6 +3251,7 @@ mod tests {
     #[tokio::test]
     async fn worker_transport_bridge_exchanges_messages() {
         use pluto_ipc::transport::{channel_transport_pair, recv_renderer_message};
+        let _home = worker_home();
         let (mut browser, renderer) = channel_transport_pair();
         let handle = tokio::spawn(run_worker_transport(renderer));
         browser
@@ -2687,6 +3309,7 @@ mod tests {
     /// still produces renderer events.
     #[tokio::test]
     async fn renderer_bridge_falls_back_to_in_process_worker_when_spawn_fails() {
+        let _home = worker_home();
         let (cmd_tx, cmd_rx) = pluto_ipc::command_channel();
         let (output_tx, mut output_rx) = mpsc::channel::<crate::Message>(100);
         let handle = tokio::spawn(run_renderer_bridge(
@@ -2857,7 +3480,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve(listener));
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         cmd_tx
             .send(BrowserToRenderer::CommitNavigation { url: url.clone() })
@@ -2903,7 +3526,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve(listener));
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         cmd_tx
             .send(BrowserToRenderer::CommitNavigation { url })
@@ -2953,7 +3576,7 @@ mod tests {
 
     #[tokio::test]
     async fn worker_failed_load_renders_an_error_page() {
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         cmd_tx
             .send(BrowserToRenderer::CommitNavigation {
                 url: "ftp://example.com/".to_string(),
@@ -2986,7 +3609,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve(listener));
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let slow = format!("http://127.0.0.1:{}/slow", addr.port());
         let fast = format!("http://127.0.0.1:{}/", addr.port());
         cmd_tx
@@ -3063,7 +3686,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_two_pages(listener));
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let page1 = format!("http://127.0.0.1:{}/", addr.port());
         let page2 = format!("http://127.0.0.1:{}/page2", addr.port());
         cmd_tx
@@ -3149,7 +3772,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_scroll_page(listener));
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         cmd_tx
             .send(BrowserToRenderer::CommitNavigation { url })
@@ -3181,7 +3804,9 @@ mod tests {
 
     /// One-page server with a single nested scroll container whose
     /// `overscroll-behavior` is `behavior` (Stage 8 Rec 9): a
-    /// 100px-tall `overflow:auto` div with ten lines inside it.
+    /// 100px-tall `overflow:auto` div with ten lines inside it,
+    /// over a 1000px spacer — the page is 1100px tall in a 768px
+    /// viewport, so the viewport itself can scroll 332px.
     async fn serve_overscroll_page(listener: TcpListener, behavior: &'static str) {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
@@ -3194,14 +3819,14 @@ mod tests {
                 };
                 let _ = n;
                 let mut body = String::from(
-                    "<!doctype html><html><head><style>body{margin:0}\n                     div{height:100px;overflow:auto;overscroll-behavior:",
+                    "<!doctype html><html><head><style>body{margin:0}\n                     div.c{height:100px;overflow:auto;overscroll-behavior:",
                 );
                 body.push_str(behavior);
-                body.push_str("}</style></head><body><div>");
+                body.push_str("}</style></head><body><div class=\"c\">");
                 for i in 0..10 {
                     body.push_str(&format!("<p>line {i}</p>"));
                 }
-                body.push_str("</div></body></html>");
+                body.push_str("</div><div style=\"height:1000px\"></div></body></html>");
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -3226,7 +3851,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_routes(listener, routes));
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 4);
         // Hover the link: the glyphs turn red.
@@ -3284,7 +3909,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_overscroll_page(listener, behavior));
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         cmd_tx
             .send(BrowserToRenderer::CommitNavigation { url })
@@ -3305,6 +3930,21 @@ mod tests {
             other => panic!("expected SubmitDisplayList after wheel down, got {other:?}"),
         };
         assert!(epoch > first_epoch, "wheel down resubmits");
+        // Wheel down 200px below the container (y=500, in the tall
+        // spacer): no container under the cursor, so the whole
+        // delta scrolls the viewport — the page is 1100px tall in
+        // a 768px viewport, so 200px is inside its maximum. The
+        // viewport must be scrolled down first: a leftover that
+        // chains to a viewport already at its limit (or at zero,
+        // for a negative delta) has nowhere to go.
+        send_wheel(&cmd_tx, 50.0, 500.0, 0.0, 200.0);
+        match next_event(&mut event_rx).await {
+            RendererToBrowser::ScrollViewport { dx, dy } => {
+                assert_eq!(dx, 0.0);
+                assert!((dy - 200.0).abs() < 0.01, "viewport scrolled 200, got {dy}");
+            }
+            other => panic!("expected ScrollViewport below the container, got {other:?}"),
+        }
         // Wheel up 100px: the container consumes 48 (back to 0)
         // and 52px are left over.
         send_wheel(&cmd_tx, 50.0, 50.0, 0.0, -100.0);
@@ -3342,6 +3982,245 @@ mod tests {
         wheel_overscroll_case("auto", true).await;
     }
 
+    /// `consume_axis` (Stage 10 Rec 2): the offset clamps to
+    /// `[0, max]` and only the unconsumed part of the delta chains
+    /// on — unless `overscroll-behavior` stops the chain.
+    #[test]
+    fn consume_axis_clamps_to_both_limits() {
+        // At the top, a negative delta is unconsumed (chains on).
+        assert_eq!(consume_axis(0.0, -50.0, 100.0, false), (0.0, -50.0));
+        // A delta inside the range is fully consumed.
+        assert_eq!(consume_axis(0.0, 50.0, 100.0, false), (50.0, 0.0));
+        // Past the bottom, only the room up to the maximum is
+        // consumed; the rest chains on.
+        assert_eq!(consume_axis(80.0, 50.0, 100.0, false), (100.0, 30.0));
+        // Already at the maximum, nothing is consumed.
+        assert_eq!(consume_axis(100.0, 50.0, 100.0, false), (100.0, 50.0));
+        // A negative delta from the maximum is fully consumed.
+        assert_eq!(consume_axis(100.0, -30.0, 100.0, false), (70.0, 0.0));
+        // `overscroll-behavior` drops the remainder either way.
+        assert_eq!(consume_axis(100.0, 50.0, 100.0, true), (100.0, 0.0));
+        assert_eq!(consume_axis(0.0, -50.0, 100.0, true), (0.0, 0.0));
+    }
+
+    /// A 100px-tall `overflow:auto` div with ten lines, over a
+    /// 1000px spacer: page content 1100px, viewport maximum 332px.
+    fn tall_container_page() -> String {
+        let mut page = String::from(
+            "<!doctype html><html><head><style>body{margin:0}div.c{height:100px;overflow:auto}</style></head><body><div class=\"c\">",
+        );
+        for i in 0..10 {
+            page.push_str(&format!("<p>line {i}</p>"));
+        }
+        page.push_str("</div><div style=\"height:1000px\"></div></body></html>");
+        page
+    }
+
+    /// Stage 10 Rec 2: a wheel past the end of a short page stops
+    /// at the page maximum — the viewport never scrolls into blank
+    /// space — and a further wheel in the same direction emits
+    /// nothing; the zero clamp still holds on the way back up.
+    #[tokio::test]
+    async fn worker_wheel_stops_at_the_bottom_of_a_short_page() {
+        let page = "<!doctype html><html><head><style>body{margin:0}#tall{height:1000px}</style></head><body><div id=\"tall\"></div></body></html>";
+        let routes = std::sync::Arc::new(vec![(
+            "/".to_string(),
+            "text/html".to_string(),
+            page.to_string(),
+        )]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_routes(listener, routes));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 0);
+        // The page is 1000px tall in a 768px viewport: maximum 232.
+        send_wheel(&cmd_tx, 50.0, 500.0, 0.0, 100000.0);
+        match next_event(&mut event_rx).await {
+            RendererToBrowser::ScrollViewport { dx, dy } => {
+                assert_eq!(dx, 0.0);
+                assert!(
+                    (dy - 232.0).abs() < 0.01,
+                    "viewport stopped at its 232 maximum, got {dy}"
+                );
+            }
+            other => panic!("expected ScrollViewport after the wheel, got {other:?}"),
+        }
+        // Already at the maximum: another wheel down consumes
+        // nothing and emits nothing.
+        send_wheel(&cmd_tx, 50.0, 500.0, 0.0, 100000.0);
+        assert!(
+            no_event_within(&mut event_rx, Duration::from_millis(200)).await,
+            "wheel past the page maximum must emit nothing"
+        );
+        // Back up: the whole maximum, then nothing past zero.
+        send_wheel(&cmd_tx, 50.0, 500.0, 0.0, -100000.0);
+        match next_event(&mut event_rx).await {
+            RendererToBrowser::ScrollViewport { dx, dy } => {
+                assert_eq!(dx, 0.0);
+                assert!(
+                    (dy - (-232.0)).abs() < 0.01,
+                    "viewport returned to zero, got {dy}"
+                );
+            }
+            other => panic!("expected ScrollViewport after the wheel up, got {other:?}"),
+        }
+        send_wheel(&cmd_tx, 50.0, 500.0, 0.0, -100000.0);
+        assert!(
+            no_event_within(&mut event_rx, Duration::from_millis(200)).await,
+            "wheel past the top must emit nothing"
+        );
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Stage 10 Rec 2: a wheel past the end of a short nested
+    /// container stops at the container's maximum and chains the
+    /// leftover to the viewport — which stops at its own maximum;
+    /// a further wheel in the same direction emits nothing.
+    #[tokio::test]
+    async fn worker_wheel_stops_at_the_bottom_of_a_nested_container() {
+        let routes = std::sync::Arc::new(vec![(
+            "/".to_string(),
+            "text/html".to_string(),
+            tall_container_page(),
+        )]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_routes(listener, routes));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        cmd_tx
+            .send(BrowserToRenderer::CommitNavigation { url })
+            .expect("worker takes the command");
+        assert!(matches!(
+            next_event(&mut event_rx).await,
+            RendererToBrowser::DidCommit { .. }
+        ));
+        let mut last_epoch = match next_event(&mut event_rx).await {
+            RendererToBrowser::SubmitDisplayList { epoch, .. } => epoch,
+            other => panic!("expected SubmitDisplayList, got {other:?}"),
+        };
+        // A wheel down of 100000px inside the container: the
+        // container consumes up to its own maximum, the leftover
+        // chains to the viewport, which stops at its 332 maximum.
+        send_wheel(&cmd_tx, 50.0, 50.0, 0.0, 100000.0);
+        match next_event(&mut event_rx).await {
+            RendererToBrowser::SubmitDisplayList { epoch, .. } => {
+                assert!(epoch > last_epoch, "wheel down resubmits");
+                last_epoch = epoch;
+            }
+            other => panic!("expected SubmitDisplayList after wheel down, got {other:?}"),
+        }
+        match next_event(&mut event_rx).await {
+            RendererToBrowser::ScrollViewport { dx, dy } => {
+                assert_eq!(dx, 0.0);
+                assert!(
+                    (dy - 332.0).abs() < 0.01,
+                    "leftover chained to the viewport maximum, got {dy}"
+                );
+            }
+            other => panic!("expected ScrollViewport with the chained leftover, got {other:?}"),
+        }
+        // Both scrollers are at their maximum: another wheel down
+        // consumes nothing anywhere and emits nothing.
+        send_wheel(&cmd_tx, 50.0, 50.0, 0.0, 100000.0);
+        assert!(
+            no_event_within(&mut event_rx, Duration::from_millis(200)).await,
+            "wheel past both maxima must emit nothing"
+        );
+        // Wheel up: the container gives back its whole maximum
+        // (resubmit) and the viewport its 332.
+        send_wheel(&cmd_tx, 50.0, 50.0, 0.0, -100000.0);
+        match next_event(&mut event_rx).await {
+            RendererToBrowser::SubmitDisplayList { epoch, .. } => {
+                assert!(epoch > last_epoch, "wheel up resubmits");
+            }
+            other => panic!("expected SubmitDisplayList after wheel up, got {other:?}"),
+        }
+        match next_event(&mut event_rx).await {
+            RendererToBrowser::ScrollViewport { dx, dy } => {
+                assert_eq!(dx, 0.0);
+                assert!(
+                    (dy - (-332.0)).abs() < 0.01,
+                    "viewport returned to zero, got {dy}"
+                );
+            }
+            other => panic!("expected ScrollViewport after the wheel up, got {other:?}"),
+        }
+        // Back at both minima, another wheel up emits nothing.
+        send_wheel(&cmd_tx, 50.0, 50.0, 0.0, -100000.0);
+        assert!(
+            no_event_within(&mut event_rx, Duration::from_millis(200)).await,
+            "wheel past both minima must emit nothing"
+        );
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Stage 10 Rec 2: `End` jumps to the bottom of the page (the
+    /// viewport maximum) and `Home` back to the top; pressing
+    /// either again at its end emits nothing.
+    #[tokio::test]
+    async fn worker_end_and_home_jump_to_the_bottom_and_top() {
+        let page = "<!doctype html><html><head><style>body{margin:0}#tall{height:1000px}</style></head><body><div id=\"tall\"></div></body></html>";
+        let routes = std::sync::Arc::new(vec![(
+            "/".to_string(),
+            "text/html".to_string(),
+            page.to_string(),
+        )]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_routes(listener, routes));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 0);
+        let no_modifiers = pluto_ipc::Modifiers::default();
+        // The page is 1000px tall in a 768px viewport: maximum 232.
+        send_key(&cmd_tx, "End", "End", no_modifiers);
+        match next_event(&mut event_rx).await {
+            RendererToBrowser::ScrollViewport { dx, dy } => {
+                assert_eq!(dx, 0.0);
+                assert!(
+                    (dy - 232.0).abs() < 0.01,
+                    "End jumped to the 232 maximum, got {dy}"
+                );
+            }
+            other => panic!("expected ScrollViewport after End, got {other:?}"),
+        }
+        // Already at the bottom: End again emits nothing.
+        send_key(&cmd_tx, "End", "End", no_modifiers);
+        assert!(
+            no_event_within(&mut event_rx, Duration::from_millis(200)).await,
+            "End at the bottom must emit nothing"
+        );
+        send_key(&cmd_tx, "Home", "Home", no_modifiers);
+        match next_event(&mut event_rx).await {
+            RendererToBrowser::ScrollViewport { dx, dy } => {
+                assert_eq!(dx, 0.0);
+                assert!(
+                    (dy - (-232.0)).abs() < 0.01,
+                    "Home returned to zero, got {dy}"
+                );
+            }
+            other => panic!("expected ScrollViewport after Home, got {other:?}"),
+        }
+        // Already at the top: Home again emits nothing.
+        send_key(&cmd_tx, "Home", "Home", no_modifiers);
+        assert!(
+            no_event_within(&mut event_rx, Duration::from_millis(200)).await,
+            "Home at the top must emit nothing"
+        );
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
     /// Stage 8 Rec 9: Tab moves keyboard focus between buttons
     /// (`:focus` recolors the focused one, lower on the page each
     /// Tab), and Enter activates the focused button (its click
@@ -3357,7 +4236,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_routes(listener, routes));
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         // "One" (3) + "Two" (3) + "0" (1) = 7 glyphs.
         assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 7);
@@ -3425,7 +4304,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_routes(listener, routes));
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         // "Target" is 6 glyphs; the callback writes "IN" (2 more).
         assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 6);
@@ -3459,7 +4338,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_routes(listener, routes));
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         // "Target" is 6 glyphs; out of view the callback writes
         // "OUT" (3 more).
@@ -3468,14 +4347,16 @@ mod tests {
             wait_for_glyphs(&mut event_rx, 9, Duration::from_secs(5)).await,
             "IntersectionObserver initial entry did not write OUT"
         );
-        // Wheel down 500px over the spacer: no container, so the
+        // Wheel down 332px over the spacer: no container, so the
         // whole delta chains to the viewport (target 1000..1100
-        // enters the 500..1268 visible region).
-        send_wheel(&cmd_tx, 50.0, 50.0, 0.0, 500.0);
+        // enters the 332..1100 visible region). 332, not 500: the
+        // page is 1100px tall in a 768px viewport, so the viewport
+        // maximum is 332 (Stage 10 Rec 2 clamps anything larger).
+        send_wheel(&cmd_tx, 50.0, 50.0, 0.0, 332.0);
         match next_event(&mut event_rx).await {
             RendererToBrowser::ScrollViewport { dx, dy } => {
                 assert_eq!(dx, 0.0);
-                assert!((dy - 500.0).abs() < 0.01, "viewport scrolled 500, got {dy}");
+                assert!((dy - 332.0).abs() < 0.01, "viewport scrolled 332, got {dy}");
             }
             other => panic!("expected ScrollViewport after the wheel, got {other:?}"),
         }
@@ -3625,7 +4506,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_routes(listener, routes));
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         // "Inc" (3) + "9" (1) = 4 glyphs.
         assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 4);
@@ -3656,7 +4537,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_routes(listener, routes));
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         // "Toggle" (6), details empty.
         assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 6);
@@ -3696,7 +4577,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_routes(listener, routes));
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 7);
         // "hello-json" (10): the promise resolved as a networking
@@ -3725,7 +4606,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_routes(listener, routes));
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         // The second script ran despite the throw: "alive" (5).
         assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 5);
@@ -3757,7 +4638,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_routes(listener, routes));
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let page1_url = format!("http://127.0.0.1:{}/", addr.port());
         let page2_url = format!("http://127.0.0.1:{}/page2", addr.port());
         // "page-one" (8).
@@ -3832,7 +4713,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_routes(listener, routes));
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 7);
         assert!(
@@ -3858,7 +4739,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_routes(listener, routes));
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         // "written" (7) is in the first display list.
         assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 7);
@@ -3881,7 +4762,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_routes(listener, routes));
-        let (handle, cmd_tx, mut event_rx) = spawn_worker();
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         // "safe" (4). If the injected script had run, the text
         // would be "pwned" (5) instead.
@@ -3890,6 +4771,352 @@ mod tests {
             .send(BrowserToRenderer::Shutdown)
             .expect("worker takes Shutdown");
         handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Stage 10 Rec 6: the permissions round-trip under a
+    /// concurrently-built tab. The old fixed temp name let a
+    /// tab's shutdown save interleave with a permission-grant
+    /// save into one corrupt `permissions.json` (the observed
+    /// flake: "trailing characters after JSON value", a grant
+    /// read back as Prompt). With a unique temp name per write,
+    /// every published profile file parses — even when the tab
+    /// and the grant loop save at the same time. The final
+    /// content is last-writer-wins, so only parse-validity (never
+    /// corruption) is asserted, over several rounds.
+    #[tokio::test]
+    async fn permissions_round_trip_survives_concurrent_tab_save() {
+        let _home = worker_home();
+        // A real tab: `TabState::new` reads the security profile,
+        // `tab_js()` builds the tab backends, loading permissions.
+        let (layout_tx, _layout_rx) = std::sync::mpsc::channel::<LayoutJob>();
+        let mut state = TabState::new(layout_tx, tokio::runtime::Handle::current());
+        state.tab_js();
+        let backends = std::sync::Arc::new(
+            state.tab_backends.take().expect("tab backends built"),
+        );
+        let dir = crate::security::profile_dir().expect("profile dir resolves");
+        for round in 0..10 {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+            let mut handles = Vec::new();
+            for w in 0..4 {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let dir = dir.clone();
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..10 {
+                        let origin = pluto_ipc::Origin::from_url(&format!(
+                            "https://race{round}-{w}-{i}.example/"
+                        ));
+                        let mut store = crate::js_host::permissions::load_permissions();
+                        store.grant_persistent_storage_at(
+                            &origin,
+                            std::time::SystemTime::now(),
+                        );
+                        crate::js_host::permissions::save_permissions(&store);
+                        // Every published state must parse: a
+                        // corrupt publication is the race.
+                        let text = std::fs::read_to_string(
+                            dir.join(crate::js_host::permissions::PERMISSIONS_FILE),
+                        )
+                        .expect("permissions file exists");
+                        crate::js_host::storage::parse_json(&text)
+                            .expect("published permissions file parses");
+                    }
+                }));
+            }
+            // The tab's shutdown save, racing the grants.
+            let tab_barrier = std::sync::Arc::clone(&barrier);
+            let tab_backends = std::sync::Arc::clone(&backends);
+            handles.push(std::thread::spawn(move || {
+                tab_barrier.wait();
+                for _ in 0..10 {
+                    crate::js_host::save_tab_backends(&tab_backends);
+                }
+            }));
+            for h in handles {
+                h.join().unwrap();
+            }
+            let text = std::fs::read_to_string(
+                dir.join(crate::js_host::permissions::PERMISSIONS_FILE),
+            )
+            .expect("permissions file exists");
+            crate::js_host::storage::parse_json(&text)
+                .expect("permissions file parses after the round");
+        }
+    }
+
+    #[test]
+    fn visited_key_strips_fragment() {
+        assert_eq!(visited_key("https://example.com/a#b"), "https://example.com/a");
+        assert_eq!(visited_key("https://example.com/a"), "https://example.com/a");
+        assert_eq!(visited_key("https://example.com/a#"), "https://example.com/a");
+        assert_eq!(visited_key("about:blank"), "about:blank");
+    }
+
+    /// Stage 10 Rec 8: a fresh tab seeds its `:visited` set from
+    /// the persisted history — a restart (a new `TabState`) sees
+    /// the previous session's URLs, fragment-stripped, with no
+    /// navigation in between. The `WorkerHomeGuard` holds
+    /// `TEST_HOME_LOCK` while the tab reads the profile.
+    #[tokio::test]
+    async fn visited_urls_seeded_from_persisted_history() {
+        let _home = worker_home();
+        crate::history::save_history(&[
+            "https://example.com/a".to_string(),
+            "https://example.com/b#frag".to_string(),
+        ]);
+        let (layout_tx, _layout_rx) = std::sync::mpsc::channel::<LayoutJob>();
+        let state = TabState::new(layout_tx, tokio::runtime::Handle::current());
+        assert!(state.visited_urls.contains("https://example.com/a"));
+        // The fragment is stripped on seed, as on commit.
+        assert!(state.visited_urls.contains("https://example.com/b"));
+        assert!(!state.visited_urls.contains("https://example.com/b#frag"));
+        assert_eq!(state.visited_urls.len(), 2);
+        // And a tab with no persisted history starts unvisited.
+        let _ = std::fs::remove_file(
+            crate::security::profile_dir()
+                .unwrap()
+                .join(crate::history::HISTORY_FILE),
+        );
+        let (layout_tx, _layout_rx) = std::sync::mpsc::channel::<LayoutJob>();
+        let fresh = TabState::new(layout_tx, tokio::runtime::Handle::current());
+        assert!(fresh.visited_urls.is_empty());
+    }
+
+    #[test]
+    fn visited_link_ids_match_resolved_hrefs_only() {
+        // Stage 10 Rec 3: the worker-side projection of the
+        // committed-URL set onto a document's links — absolute
+        // hrefs, root-relative hrefs resolved against the base
+        // URL, fragment-stripped keys, and href-less anchors
+        // excluded.
+        let doc = page::parse_document_with_base(
+            "<a href=\"https://example.com/a\">A</a><a href=\"/b\">B</a>\
+             <a href=\"https://example.com/c#frag\">C</a><a href=\"https://other.example/d\">D</a>\
+             <a>No href</a>",
+            "https://example.com/index",
+        );
+        let mut visited = HashSet::new();
+        visited.insert("https://example.com/a".to_string());
+        visited.insert("https://example.com/b".to_string());
+        // The `#frag` link resolves with its fragment; the key
+        // strips it, so it counts as visited.
+        visited.insert("https://example.com/c".to_string());
+        let ids = visited_link_ids(&doc, &visited);
+        assert_eq!(ids.len(), 3, "exactly the three visited links match");
+        // Every `<a>` in the document is matched iff its resolved
+        // href (fragment-stripped) is in the visited set.
+        let dom = doc.dom();
+        let mut stack = dom.root().map(|r| vec![r]).unwrap_or_default();
+        let mut links = 0;
+        while let Some(id) = stack.pop() {
+            if dom.tag(id) == Some("a") {
+                links += 1;
+                let href = page::find_link_href(&doc, id);
+                let expect = href
+                    .as_ref()
+                    .is_some_and(|h| visited.contains(visited_key(h)));
+                assert_eq!(
+                    ids.contains(&id),
+                    expect,
+                    "link {href:?} visited-ness must follow the set"
+                );
+            }
+            stack.extend(dom.children(id).iter().rev());
+        }
+        assert_eq!(links, 5, "all five anchors walked");
+        // Empty set: nothing matches.
+        assert!(visited_link_ids(&doc, &HashSet::new()).is_empty());
+    }
+
+    /// Stage 10 Rec 7: the histogram reports correct nearest-rank
+    /// p50/p95 on synthetic durations, per phase, plus the
+    /// over-budget count — the numbers the 60 FPS verdict reads.
+    #[test]
+    fn frame_time_histogram_percentiles_on_synthetic_durations() {
+        let mut hist = FrameTimeHistogram::new();
+        // Empty: every read is None, never a zero masquerading
+        // as a measurement.
+        assert_eq!(hist.count(), 0);
+        assert_eq!(hist.p50(FramePhase::Total), None);
+        assert_eq!(hist.p95(FramePhase::Total), None);
+        assert_eq!(hist.max(FramePhase::Total), None);
+        assert_eq!(hist.over_budget_ratio(), None);
+        // Totals 1..=10 ms; layout is half the total, collect a
+        // quarter, submit a flat 0.1 ms — distinct per phase, so
+        // a crossed wire between phases fails the test.
+        for v in 1..=10 {
+            hist.record(FrameSample {
+                total_ms: v as f32,
+                layout_ms: v as f32 * 0.5,
+                collect_ms: v as f32 * 0.25,
+                submit_ms: 0.1,
+            });
+        }
+        assert_eq!(hist.count(), 10);
+        assert_eq!(hist.total_recorded(), 10);
+        // Nearest-rank, never averages: p50 of 1..=10 is 5.0
+        // (an average would say 5.5).
+        assert_eq!(hist.p50(FramePhase::Total), Some(5.0));
+        assert_eq!(hist.p95(FramePhase::Total), Some(10.0));
+        assert_eq!(hist.max(FramePhase::Total), Some(10.0));
+        assert_eq!(hist.p50(FramePhase::Layout), Some(2.5));
+        assert_eq!(hist.p95(FramePhase::Layout), Some(5.0));
+        assert_eq!(hist.p50(FramePhase::Collect), Some(1.25));
+        assert_eq!(hist.p95(FramePhase::Collect), Some(2.5));
+        assert_eq!(hist.p50(FramePhase::Submit), Some(0.1));
+        assert_eq!(hist.p95(FramePhase::Submit), Some(0.1));
+        assert_eq!(hist.over_budget(), 0);
+        // One 20 ms frame misses the 16.67 ms budget; the rest do
+        // not. Non-finite / negative samples are ignored, not
+        // counted.
+        hist.record(FrameSample {
+            total_ms: 20.0,
+            layout_ms: 20.0,
+            collect_ms: 0.0,
+            submit_ms: 0.0,
+        });
+        hist.record(FrameSample {
+            total_ms: f32::NAN,
+            layout_ms: 0.0,
+            collect_ms: 0.0,
+            submit_ms: 0.0,
+        });
+        hist.record(FrameSample {
+            total_ms: -1.0,
+            layout_ms: 0.0,
+            collect_ms: 0.0,
+            submit_ms: 0.0,
+        });
+        assert_eq!(hist.count(), 11);
+        assert_eq!(hist.total_recorded(), 11);
+        assert_eq!(hist.over_budget(), 1);
+        assert!((hist.over_budget_ratio().unwrap() - 1.0 / 11.0).abs() < 0.001);
+        assert_eq!(hist.max(FramePhase::Total), Some(20.0));
+    }
+
+    /// Stage 10 Rec 7: the measurement must not itself become
+    /// the bottleneck — the storage is one fixed-size,
+    /// pre-allocated ring (no `Vec`, no heap field), `record` is
+    /// a single array write, and recording far past capacity
+    /// rolls the oldest samples off instead of growing.
+    #[test]
+    fn frame_time_histogram_is_fixed_size_and_never_grows() {
+        assert_eq!(FRAME_TIME_SAMPLES, 240, "four seconds at 60 Hz");
+        let mut hist = FrameTimeHistogram::new();
+        assert_eq!(hist.capacity(), 240);
+        // The whole histogram is the ring plus four counters:
+        // 240 samples × 16 bytes, no heap allocation to grow.
+        assert_eq!(
+            std::mem::size_of::<FrameTimeHistogram>(),
+            FRAME_TIME_SAMPLES * std::mem::size_of::<FrameSample>() + 32
+        );
+        for v in 0..1000 {
+            hist.record(FrameSample {
+                total_ms: v as f32,
+                layout_ms: 0.0,
+                collect_ms: 0.0,
+                submit_ms: 0.0,
+            });
+        }
+        assert_eq!(hist.count(), 240, "the ring caps at capacity");
+        assert_eq!(hist.capacity(), 240, "recording never grows it");
+        assert_eq!(hist.total_recorded(), 1000, "the count keeps the truth");
+        // Samples 760..=999 remain; nearest-rank p50 is index 119.
+        assert_eq!(hist.p50(FramePhase::Total), Some(879.0));
+        assert_eq!(hist.max(FramePhase::Total), Some(999.0));
+    }
+
+    /// Stage 10 Rec 7: the periodic summary line carries the
+    /// verdict numbers (total + per-phase percentiles, the
+    /// over-budget share) in one line, and renders with no
+    /// samples instead of panicking.
+    #[test]
+    fn frame_time_histogram_summary_names_phases_and_budget() {
+        let empty = FrameTimeHistogram::new();
+        let line = empty.summary();
+        assert!(line.contains("frames n=0"), "empty summary: {line}");
+        assert!(line.contains("total p50=-"), "empty summary: {line}");
+        let mut hist = FrameTimeHistogram::new();
+        hist.record(FrameSample {
+            total_ms: 20.0,
+            layout_ms: 12.0,
+            collect_ms: 7.0,
+            submit_ms: 1.0,
+        });
+        let line = hist.summary();
+        assert!(line.contains("frames n=1"), "summary: {line}");
+        assert!(line.contains("over_budget=1"), "summary: {line}");
+        assert!(line.contains("total p50=20.00"), "summary: {line}");
+        assert!(line.contains("layout p50=12.00"), "summary: {line}");
+        assert!(line.contains("collect p50=7.00"), "summary: {line}");
+        assert!(line.contains("submit p50=1.00"), "summary: {line}");
+    }
+
+    /// Stage 10 Rec 7: the instrumented paths still function —
+    /// a real `layout_and_submit` through a live layout actor
+    /// submits its display list AND records exactly one frame,
+    /// and a scroll re-collect (`apply_scrolls`, the wheel path)
+    /// records a second frame with a zero layout phase (scrolls
+    /// re-collect without re-laying out). This is the tick path
+    /// with measurement enabled, minus the timer itself.
+    #[tokio::test]
+    async fn frame_time_histogram_records_a_real_submitted_frame() {
+        let _home = worker_home();
+        let (layout_tx, layout_rx) = std::sync::mpsc::channel::<LayoutJob>();
+        std::thread::Builder::new()
+            .name("pluto-layout".to_string())
+            .spawn(move || layout_thread(layout_rx))
+            .expect("layout actor thread spawns");
+        let mut state = TabState::new(layout_tx, tokio::runtime::Handle::current());
+        let (events_tx, mut events_rx) =
+            tokio::sync::mpsc::channel::<RendererToBrowser>(100);
+        let doc = page::parse_document(EXAMPLE_COM);
+        let submitted = layout_and_submit(
+            &mut state,
+            &events_tx,
+            Some(doc),
+            false,
+            std::time::Instant::now(),
+        )
+        .await;
+        assert!(submitted, "the instrumented build still submits");
+        let event = tokio::time::timeout(Duration::from_secs(20), events_rx.recv())
+            .await
+            .expect("a display list arrives in time")
+            .expect("events channel stays open");
+        assert!(
+            matches!(event, RendererToBrowser::SubmitDisplayList { .. }),
+            "the frame reaches the shell, got {event:?}"
+        );
+        assert_eq!(state.frame_times().count(), 1);
+        assert_eq!(state.frame_times().total_recorded(), 1);
+        let p50 = state
+            .frame_times()
+            .p50(FramePhase::Total)
+            .expect("one recorded frame has a p50");
+        assert!(p50.is_finite() && p50 > 0.0, "p50 total is a real time: {p50}");
+        assert!(
+            state.frame_times().p50(FramePhase::Layout).is_some(),
+            "the layout phase was attributed"
+        );
+        assert!(
+            state.frame_times().summary().contains("frames n=1"),
+            "the summary reads the recorded frame"
+        );
+        // The wheel path: re-collect with no layout phase.
+        let scrolled = apply_scrolls(&mut state, &events_tx, vec![]).await;
+        assert!(scrolled, "the instrumented scroll still submits");
+        assert_eq!(state.frame_times().count(), 2);
+        assert_eq!(
+            state.frame_times().p50(FramePhase::Layout),
+            Some(0.0),
+            "half the samples are scrolls with zero layout time"
+        );
+        assert!(
+            state.frame_times().p50(FramePhase::Collect).is_some(),
+            "the scroll's collect phase was attributed"
+        );
     }
 
 }

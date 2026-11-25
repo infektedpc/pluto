@@ -2143,4 +2143,48 @@ mod tests {
         backend.set_base_url_with_creator("about:blank", Some(&creator), true);
         assert!(backend.document_origin().is_opaque());
     }
+
+    #[test]
+    fn js_query_selector_cannot_observe_visited() {
+        // Stage 10 Rec 3 (privacy): even when the host holds a
+        // visited element state — the state the layout pass
+        // styles with — JS selector matching must never see
+        // `:visited`. The query path always matches against
+        // `ElementState::default()`, so no binding, `matches()`,
+        // or `querySelector` call can probe history.
+        let (layout_tx, _layout_rx) = mpsc::channel::<LayoutJob>();
+        let html = "<a href=\"https://example.com\">L</a><a href=\"https://example.org\">M</a>";
+        let mut host = BrowserDomHost::new(
+            Arc::new(Mutex::new(pluto_html::parse(html))),
+            layout_tx,
+            (1024.0, 768.0),
+            ElementState::default(),
+            "https://example.com/",
+            Rc::new(std::sync::Mutex::new(Vec::new())),
+            Rc::new(Cell::new(false)),
+        );
+        // Mark the first link visited in the host's element state.
+        let snapshot = host.dom_snapshot();
+        let root = snapshot.root().unwrap();
+        let mut links = Vec::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if snapshot.tag(id) == Some("a") {
+                links.push(id);
+            }
+            stack.extend(snapshot.children(id).iter().rev());
+        }
+        assert_eq!(links.len(), 2);
+        host.set_element_state(ElementState::default().with_visited(links[0]));
+        // Sanity: plain queries still work with a visited state held.
+        assert_eq!(host.query_selector_all(root, "a").len(), 2);
+        assert_eq!(host.query_selector(root, "a"), Some(links[0]));
+        // `:visited` is invisible to JS — no match, even for the
+        // link the host knows is visited.
+        assert!(host.query_selector_all(root, "a:visited").is_empty());
+        assert!(host.query_selector_all(root, ":visited").is_empty());
+        assert_eq!(host.query_selector(root, "a:visited"), None);
+        // `:not(:visited)` therefore matches every link here.
+        assert_eq!(host.query_selector_all(root, "a:not(:visited)").len(), 2);
+    }
 }

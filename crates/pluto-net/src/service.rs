@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::NetError;
+use crate::cache::{CachedEntry, HttpCache, Lookup, is_storable};
 use crate::client::{HttpsClient, shared_client};
 use crate::blocker::{Blocker, profile_list_dir};
 use crate::cors::{
@@ -185,6 +186,12 @@ pub struct Scheduler {
     // loaded from the profile list dir at construction and
     // refreshed in the background by the tab thread.
     blocker: Arc<std::sync::Mutex<Blocker>>,
+    // Stage 10 Rec 1: the in-memory partitioned HTTP cache
+    // (`cache.rs`). Per-tab until M3 promotes the loader to a
+    // shared handle — same placement as the cookie jar above;
+    // the key already carries the partition, so the move needs
+    // no key-scheme change.
+    cache: Arc<std::sync::Mutex<HttpCache>>,
 }
 
 impl Scheduler {
@@ -204,6 +211,7 @@ impl Scheduler {
                     .map(|dir| Blocker::load_from_dir(&dir))
                     .unwrap_or_default(),
             )),
+            cache: Arc::new(std::sync::Mutex::new(HttpCache::new())),
         }
     }
 
@@ -242,6 +250,18 @@ impl Scheduler {
     /// Round 1 basic).
     pub fn blocker(&self) -> Arc<std::sync::Mutex<Blocker>> {
         Arc::clone(&self.blocker)
+    }
+
+    /// The in-memory partitioned HTTP cache for this loader
+    /// (Stage 10 Rec 1). Tests use it to set a small byte cap
+    /// (LRU eviction) and to read hit/miss statistics.
+    pub fn http_cache(&self) -> Arc<std::sync::Mutex<HttpCache>> {
+        Arc::clone(&self.cache)
+    }
+
+    /// Cache hit / miss / store / revalidation counts.
+    pub fn cache_stats(&self) -> crate::cache::CacheStats {
+        self.cache.lock().unwrap().stats()
     }
 
     /// Front-of-pipeline secure upgrade (Stage 9 Rec 5): HSTS
@@ -796,8 +816,8 @@ async fn execute_fetch(
         }
     }
     // Frozen gate order (Stage 5): HSTS/mixed → blocker → CSP fetch
-    // → CORS → cache → network. The blocker gate ran above; there
-    // is no cache yet (M2), so the next gate is CSP, then CORS.
+    // → CORS → cache → network. The blocker gate ran above; the
+    // cache gate runs after CORS, below.
     //
     // CSP pre-request check (Stage 9 Rec 8): the current
     // document's policy container gates the fetch by destination
@@ -815,6 +835,45 @@ async fn execute_fetch(
     // headers arrive (below). `SameOrigin` mode to another origin
     // fails here — the M4 refusal, kept as the fallback.
     cors_pre_request(scheduler, request, &current).await?;
+    // Cache (Stage 10 Rec 1): the last gate before the network,
+    // per the frozen order (HSTS/mixed → blocker → CSP → CORS →
+    // cache → network). The blocker already ran above, so a
+    // blocked resource is neither served from cache nor cached.
+    // Only `GET` asks consult the cache (the wire method is
+    // always GET today; `request.method` is the script-declared
+    // method, so a non-GET script fetch must not be served a
+    // cached GET response). A fresh hit is served here and
+    // returns — no network traffic, no re-layout, no style
+    // re-resolution: the consumer sees the same event shape as
+    // a network fetch. A stale entry with a validator becomes
+    // the conditional request below; anything else fetches
+    // unconditionally.
+    let effective_headers = cache_request_headers(request);
+    let mut revalidate: Option<CachedEntry> = None;
+    if request.method.eq_ignore_ascii_case("GET") {
+        // The lock is scoped to this block: the guard must be
+        // dropped before the `await` in `serve_cached` below —
+        // a `std::sync::MutexGuard` held across an await makes
+        // the fetch future non-`Send` (and would block every
+        // other fetch on this scheduler for the whole serve).
+        let outcome = {
+            let cache_arc = scheduler.http_cache();
+            let mut cache = cache_arc.lock().unwrap();
+            cache.lookup(
+                &request.top_level_site,
+                &request.method,
+                &current.to_string(),
+                &effective_headers,
+            )
+        };
+        match outcome {
+            Lookup::Fresh(entry) => {
+                return serve_cached(scheduler, request, &current, &entry).await;
+            }
+            Lookup::Stale(entry) => revalidate = Some(entry),
+            Lookup::Miss => {}
+        }
+    }
     let mut method = Method::GET;
     // Whether the request body has been dropped by a redirect
     // method conversion (301/302 + POST → GET, 303 + non-GET/HEAD →
@@ -843,6 +902,7 @@ async fn execute_fetch(
                     scheduler,
                     crossed_origin,
                     body_dropped,
+                    revalidate.as_ref(),
                 )?),
             ) => match result {
                 Ok(Ok(response)) => response,
@@ -935,6 +995,40 @@ async fn execute_fetch(
         );
         if request.destination == Destination::Document && !is_redirect {
             scheduler.note_document_response(&current, response.headers());
+        }
+        // Cache revalidation (Stage 10 Rec 1, RFC 9111 §4.3.4):
+        // a `304 Not Modified` to a conditional request keeps
+        // the stored body and refreshes the stored headers (and
+        // the stored time, so freshness is recomputed from the
+        // new headers). HSTS / CSP / cookie intake above already
+        // ran on the 304's headers, so the update below only
+        // touches the cache. An unsolicited 304 (no conditional
+        // was sent — `revalidate` is `None`) falls through to
+        // the normal path and is delivered as an empty 304, as
+        // before; it is never stored (it has no body).
+        if status == StatusCode::NOT_MODIFIED
+            && let Some(entry) = revalidate.take()
+        {
+            let updated = scheduler.http_cache().lock().unwrap().update_after_304(
+                &entry,
+                response.headers(),
+                SystemTime::now(),
+            );
+            match updated {
+                Some(updated) => {
+                    return serve_cached(scheduler, request, &current, &updated).await;
+                }
+                None => {
+                    // The 304 itself made the entry unusable
+                    // (e.g. a new `Vary: *`): refetch
+                    // unconditionally rather than serve a body
+                    // whose headers just changed under it.
+                    return Err(NetError::Request(
+                        "revalidation returned 304 but the cached entry is no longer usable"
+                            .to_string(),
+                    ));
+                }
+            }
         }
         if matches!(
             status,
@@ -1039,6 +1133,11 @@ async fn execute_fetch(
                 }
                 MixedContentDecision::Upgrade(upgraded) => upgraded,
             };
+            // The conditional headers belonged to the original
+            // URL, not the hop target: a redirect ends the
+            // revalidation (the hop is fetched unconditionally,
+            // and a 304 from it is unsolicited).
+            revalidate = None;
             method = hop_method;
             redirects += 1;
             continue;
@@ -1141,6 +1240,28 @@ async fn execute_fetch(
             .get(header::CONTENT_ENCODING)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
+        // Cache store decision (Stage 10 Rec 1): only a final,
+        // non-opaque, CORS-passing GET response is a candidate
+        // — an opaque response returned above, a redirect never
+        // reaches here as a final response, and CORS / SRI
+        // failures return before the store below. The raw
+        // headers are cloned here because `response` is consumed
+        // by `into_body()` below. `store` re-checks storability
+        // with the real body length, so this is only the
+        // buffering decision (a body that turns out larger than
+        // the cache cap is buffered, then not stored — bounded
+        // by the per-destination byte cap that already applies).
+        let raw_headers = response.headers().clone();
+        let maybe_store = request.method.eq_ignore_ascii_case("GET")
+            && is_storable(
+                &request.method,
+                status.as_u16(),
+                &effective_headers,
+                &raw_headers,
+                0,
+                scheduler.http_cache().lock().unwrap().max_bytes(),
+            );
+        let mut cached_body: Vec<u8> = Vec::new();
         if !scheduler
             .emit(
                 request.request_id,
@@ -1191,6 +1312,9 @@ async fn execute_fetch(
                         cap,
                     });
                 }
+                if maybe_store {
+                    cached_body.extend_from_slice(&decoded);
+                }
                 if !decoded.is_empty()
                     && !scheduler
                         .emit(
@@ -1217,6 +1341,9 @@ async fn execute_fetch(
                 cap,
             });
         }
+        if maybe_store {
+            cached_body.extend_from_slice(&tail);
+        }
         if !tail.is_empty()
             && !scheduler
                 .emit(
@@ -1241,6 +1368,23 @@ async fn execute_fetch(
                 "integrity check failed for {current}"
             )));
         }
+        // Cache store (Stage 10 Rec 1): only after the stream
+        // is complete AND SRI verified, so a failed or tampered
+        // fetch never lands in the cache. The stored URL is the
+        // FINAL url (after redirects); the stored body is the
+        // decoded body. A redirect chain's intermediate responses
+        // are never stored (they never reach this point).
+        if maybe_store {
+            scheduler.http_cache().lock().unwrap().store(
+                &request.top_level_site,
+                &request.method,
+                &current.to_string(),
+                status.as_u16(),
+                &raw_headers,
+                &effective_headers,
+                Bytes::from(cached_body),
+            );
+        }
         scheduler
             .emit(
                 request.request_id,
@@ -1251,6 +1395,195 @@ async fn execute_fetch(
             .await;
         return Ok(());
     }
+}
+
+/// The EFFECTIVE request headers for cache purposes (Stage 10
+/// Rec 1): the `Accept` default for the destination plus
+/// `Accept-Encoding`, plus the script's headers with forbidden
+/// names stripped — the same set `build_request` sends, minus
+/// the headers the browser adds itself afterwards (`User-Agent`,
+/// `Referer`, `Origin`, `Cookie`). A server `Vary` can only
+/// select on these, so only these go into the cache key; a
+/// stored `Vary` naming one of the UA-added headers never
+/// matches (see `cache.rs`).
+fn cache_request_headers(request: &ResourceRequest) -> header::HeaderMap {
+    let accept = match request.destination {
+        Destination::Document => "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        Destination::Stylesheet => "text/css,*/*;q=0.1",
+        Destination::Script => "*/*",
+        Destination::Image => "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        Destination::Font => "font/*,*/*;q=0.1",
+        Destination::Fetch | Destination::Other => "*/*",
+    };
+    let mut headers = header::HeaderMap::new();
+    if let Ok(value) = accept.parse() {
+        headers.insert(header::ACCEPT, value);
+    }
+    headers.insert(
+        header::ACCEPT_ENCODING,
+        header::HeaderValue::from_static("gzip, deflate"),
+    );
+    for (name, value) in &request.headers {
+        if is_forbidden_request_header(&name.to_ascii_lowercase(), value) {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            header::HeaderName::from_bytes(name.as_bytes()),
+            header::HeaderValue::from_str(value),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+    headers
+}
+
+/// Serve a cached entry (Stage 10 Rec 1): the same event shape
+/// as a network fetch — `ResponseHeaders`, `BodyChunk`s, `Done`
+/// — so the consumer cannot tell a hit from a fetch, and no
+/// re-layout or style re-resolution is triggered by one. The
+/// post-headers decisions of the network path are re-run here
+/// against the STORED headers, so a hit is gated exactly like
+/// a fetch: a cached document stores its CSP and becomes the
+/// referrer context; a mixed download is still blocked; the
+/// CORS check still runs (a cached `Access-Control-Allow-Origin:
+/// *` must still fail an `include` request); an opaque
+/// tainting still delivers status 0 with a null body; and SRI
+/// still verifies the stored bytes before anything is emitted.
+async fn serve_cached(
+    scheduler: &Arc<Scheduler>,
+    request: &ResourceRequest,
+    url: &Uri,
+    entry: &CachedEntry,
+) -> Result<(), NetError> {
+    if request.destination == Destination::Document {
+        let enforce: Vec<&str> = entry
+            .headers
+            .get_all("content-security-policy")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        let report_only: Vec<&str> = entry
+            .headers
+            .get_all("content-security-policy-report-only")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        if !enforce.is_empty() || !report_only.is_empty() {
+            *scheduler.csp_policies().lock().unwrap() =
+                PolicySet::from_headers(&enforce, &report_only);
+        }
+        scheduler.note_document_response(url, &entry.headers);
+    }
+    if is_mixed_download(&request.origin, url, &entry.headers) {
+        return Err(NetError::MixedContentBlocked(format!(
+            "mixed download blocked: {url}"
+        )));
+    }
+    let request_origin = Origin::from_url(&request.origin);
+    let tainting = tainting_for(request.mode, &request_origin, url, request.destination);
+    if tainting == ResponseTainting::Opaque {
+        if request
+            .integrity
+            .as_deref()
+            .is_some_and(|i| !i.trim().is_empty())
+        {
+            return Err(NetError::SriFailed(
+                "integrity metadata present but the response is opaque (cross-origin, no CORS)"
+                    .to_string(),
+            ));
+        }
+        if !scheduler
+            .emit(
+                request.request_id,
+                ResourceEvent::ResponseHeaders {
+                    request_id: request.request_id,
+                    status: 0,
+                    url: String::new(),
+                    headers: Vec::new(),
+                    content_length: None,
+                },
+            )
+            .await
+        {
+            return Err(NetError::Cancelled);
+        }
+        scheduler
+            .emit(
+                request.request_id,
+                ResourceEvent::Done {
+                    request_id: request.request_id,
+                },
+            )
+            .await;
+        return Ok(());
+    }
+    let status = StatusCode::from_u16(entry.status).unwrap_or(StatusCode::OK);
+    let headers: Vec<(String, String)> = match tainting {
+        ResponseTainting::Cors => {
+            if !cors_check_is_skipped(status)
+                && !cors_check(&request_origin, request.credentials, &entry.headers)
+            {
+                return Err(NetError::CorsBlocked(format!(
+                    "CORS check failed for {url}"
+                )));
+            }
+            filter_cors_response_headers(&entry.headers, request.credentials)
+        }
+        ResponseTainting::Basic => filter_basic_response_headers(&entry.headers),
+        ResponseTainting::Opaque => unreachable!("opaque handled above"),
+    };
+    // SRI on the stored bytes, before anything is emitted.
+    if let Some(mut sri) = request
+        .integrity
+        .as_deref()
+        .map(SriVerifier::from_attribute)
+        .filter(|v| !v.is_empty())
+    {
+        sri.update(&entry.body);
+        if !sri.verify() {
+            return Err(NetError::SriFailed(format!(
+                "integrity check failed for {url}"
+            )));
+        }
+    }
+    if !scheduler
+        .emit(
+            request.request_id,
+            ResourceEvent::ResponseHeaders {
+                request_id: request.request_id,
+                status: entry.status,
+                url: url.to_string(),
+                headers,
+                content_length: Some(entry.body.len() as u64),
+            },
+        )
+        .await
+    {
+        return Err(NetError::Cancelled);
+    }
+    for chunk in entry.body.chunks(64 * 1024) {
+        if !scheduler
+            .emit(
+                request.request_id,
+                ResourceEvent::BodyChunk {
+                    request_id: request.request_id,
+                    bytes: chunk.to_vec(),
+                },
+            )
+            .await
+        {
+            return Err(NetError::Cancelled);
+        }
+    }
+    scheduler
+        .emit(
+            request.request_id,
+            ResourceEvent::Done {
+                request_id: request.request_id,
+            },
+        )
+        .await;
+    Ok(())
 }
 
 /// Build one request. The header set is rebuilt fresh on every hop
@@ -1274,6 +1607,11 @@ fn build_request(
     scheduler: &Scheduler,
     crossed_origin: bool,
     body_dropped: bool,
+    // Stage 10 Rec 1: the entry being revalidated, if any —
+    // `Some` only on the FIRST hop (the caller clears it when a
+    // redirect is followed). Its validators become the
+    // conditional-request headers.
+    revalidate: Option<&CachedEntry>,
 ) -> Result<Request<Full<Bytes>>, NetError> {
     let accept = match request.destination {
         Destination::Document => "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -1329,6 +1667,23 @@ fn build_request(
             header::HeaderValue::from_str(value),
         ) {
             headers.insert(name, value);
+        }
+    }
+    // Stage 10 Rec 1: revalidation — the stored entry's
+    // validators become conditional headers, so the server can
+    // answer 304 instead of resending the body. Both when both
+    // exist: the server may honour either.
+    if let Some(entry) = revalidate {
+        let (etag, last_modified) = entry.revalidation_headers();
+        if let Some(etag) = etag
+            && let Ok(value) = header::HeaderValue::from_str(&etag)
+        {
+            headers.insert(header::IF_NONE_MATCH, value);
+        }
+        if let Some(last_modified) = last_modified
+            && let Ok(value) = header::HeaderValue::from_str(&last_modified)
+        {
+            headers.insert(header::IF_MODIFIED_SINCE, value);
         }
     }
     // Stage 9 Rec 3: the `Cookie` header comes from the jar —
@@ -1620,6 +1975,194 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve(listener));
         format!("http://127.0.0.1:{}/", addr.port())
+    }
+
+    // --- Stage 10 Rec 1 (HTTP cache): a counting test server ---
+    //
+    // Every request it serves is recorded (path, conditional
+    // headers, the `Vary`-selected header), so a test can prove
+    // a second fetch issued NO network traffic at all — the
+    // server simply never saw it.
+
+    #[derive(Debug, Clone, Default)]
+    struct CacheRequestRecord {
+        path: String,
+        if_none_match: Option<String>,
+        if_modified_since: Option<String>,
+        x_flavor: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct CacheServerState {
+        requests: std::sync::Mutex<Vec<CacheRequestRecord>>,
+    }
+
+    impl CacheServerState {
+        fn count(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+
+        fn records(&self) -> Vec<CacheRequestRecord> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn header_value(request: &str, name: &str) -> Option<String> {
+        request.lines().find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case(name) {
+                Some(v.trim().to_string())
+            } else {
+                None
+            }
+        })
+    }
+
+    async fn cache_serve(listener: TcpListener, state: Arc<CacheServerState>) {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                let Ok(n) = stream.read(&mut buf).await else {
+                    return;
+                };
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = request
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+                let record = CacheRequestRecord {
+                    path: path.clone(),
+                    if_none_match: header_value(&request, "if-none-match"),
+                    if_modified_since: header_value(&request, "if-modified-since"),
+                    x_flavor: header_value(&request, "x-flavor"),
+                };
+                state.requests.lock().unwrap().push(record);
+                let (status, headers, body): (&str, String, Vec<u8>) = match path.as_str() {
+                    "/cacheable" => (
+                        "200 OK",
+                        "Content-Type: text/plain\r\nCache-Control: max-age=60".into(),
+                        b"cached-v1".to_vec(),
+                    ),
+                    "/revalidate" => {
+                        if header_value(&request, "if-none-match").as_deref() == Some("\"v1\"") {
+                            (
+                                "304 Not Modified",
+                                "Cache-Control: max-age=60\r\nETag: \"v1\"\r\nX-Version: 2".into(),
+                                Vec::new(),
+                            )
+                        } else {
+                            (
+                                "200 OK",
+                                "Content-Type: text/plain\r\nCache-Control: max-age=0\r\nETag: \"v1\"\r\nX-Version: 1"
+                                    .into(),
+                                b"v1-body".to_vec(),
+                            )
+                        }
+                    }
+                    "/nostore" => (
+                        "200 OK",
+                        "Content-Type: text/plain\r\nCache-Control: no-store".into(),
+                        b"ns".to_vec(),
+                    ),
+                    "/nocache" => {
+                        if header_value(&request, "if-none-match").as_deref() == Some("\"nc1\"") {
+                            (
+                                "304 Not Modified",
+                                "Cache-Control: no-cache\r\nETag: \"nc1\"".into(),
+                                Vec::new(),
+                            )
+                        } else {
+                            (
+                                "200 OK",
+                                "Content-Type: text/plain\r\nCache-Control: no-cache\r\nETag: \"nc1\""
+                                    .into(),
+                                b"nc-body".to_vec(),
+                            )
+                        }
+                    }
+                    "/private" => (
+                        "200 OK",
+                        "Content-Type: text/plain\r\nCache-Control: private, max-age=60".into(),
+                        b"priv".to_vec(),
+                    ),
+                    "/vary" => {
+                        let flavor = header_value(&request, "x-flavor")
+                            .unwrap_or_else(|| "default".to_string());
+                        (
+                            "200 OK",
+                            "Content-Type: text/plain\r\nCache-Control: max-age=60\r\nVary: X-Flavor"
+                                .into(),
+                            format!("flavor-{flavor}").into_bytes(),
+                        )
+                    }
+                    p if p.starts_with("/fill?") => {
+                        let size = p
+                            .split("size=")
+                            .nth(1)
+                            .and_then(|s| s.split('&').next())
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(0)
+                            .min(10_000);
+                        (
+                            "200 OK",
+                            "Content-Type: text/plain\r\nCache-Control: max-age=60".into(),
+                            vec![b'x'; size],
+                        )
+                    }
+                    _ => ("404 Not Found", String::new(), Vec::new()),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n{headers}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            });
+        }
+    }
+
+    async fn cache_test_server() -> (String, Arc<CacheServerState>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(CacheServerState::default());
+        tokio::spawn(cache_serve(listener, Arc::clone(&state)));
+        (format!("http://127.0.0.1:{}/", addr.port()), state)
+    }
+
+    /// A subresource ask from an explicit top-level site, for
+    /// partition tests (the `request()` helper always uses the
+    /// URL's own origin as the site).
+    fn partitioned_request(
+        id: u64,
+        url: &str,
+        site: &str,
+        headers: Vec<(String, String)>,
+    ) -> ResourceRequest {
+        ResourceRequest {
+            request_id: id,
+            tab_id: 0,
+            epoch: 1,
+            url: url.to_string(),
+            method: "GET".to_string(),
+            headers,
+            is_imageset: false,
+            destination: Destination::Image,
+            priority: Priority::Medium,
+            mode: pluto_ipc::RequestMode::NoCors,
+            credentials: CredentialsMode::SameOrigin,
+            origin: site.to_string(),
+            top_level_site: site.to_string(),
+            upgrade_insecure_requests: false,
+            integrity: None,
+        }
     }
 
     fn scheduler() -> Arc<Scheduler> {
@@ -2672,7 +3215,7 @@ mod tests {
             "http://127.0.0.1:9",
             &["session=abc123; Path=/".to_string()],
         );
-        let built = build_request(&Method::GET, &url, &req, &sched, false, false).unwrap();
+        let built = build_request(&Method::GET, &url, &req, &sched, false, false, None).unwrap();
         let headers = built.headers();
         assert_eq!(
             headers.get("x-custom").and_then(|v| v.to_str().ok()),
@@ -2692,10 +3235,265 @@ mod tests {
         // jar entry for the URL.
         let mut omit = req.clone();
         omit.credentials = CredentialsMode::Omit;
-        let built = build_request(&Method::GET, &url, &omit, &sched, false, false).unwrap();
+        let built = build_request(&Method::GET, &url, &omit, &sched, false, false, None).unwrap();
         assert!(
             built.headers().get("cookie").is_none(),
             "credentials omit sends no Cookie header"
+        );
+    }
+
+    // --- Stage 10 Rec 1 (HTTP cache) through the live pipeline ---
+
+    #[tokio::test]
+    async fn cache_second_navigation_issues_no_network_fetch() {
+        let (base, state) = cache_test_server().await;
+        let sched = scheduler();
+        let url = format!("{base}cacheable");
+        for id in 1..=2u64 {
+            let rx = sched
+                .submit(
+                    request(id, &url, Destination::Document, Priority::VeryHigh),
+                    CancellationToken::new(),
+                )
+                .await;
+            let (status, _, body, terminal) = collect(rx).await;
+            assert_eq!(status, 200);
+            assert_eq!(body, b"cached-v1");
+            assert!(terminal.is_none());
+        }
+        assert_eq!(
+            state.count(),
+            1,
+            "the second navigation must not reach the server at all"
+        );
+        let stats = sched.cache_stats();
+        assert_eq!(stats.stores, 1);
+        assert_eq!(stats.hits, 1, "one store, one hit: {stats:?}");
+    }
+
+    #[tokio::test]
+    async fn cache_stale_entry_revalidates_with_304() {
+        let (base, state) = cache_test_server().await;
+        let sched = scheduler();
+        let url = format!("{base}revalidate");
+        let rx = sched
+            .submit(
+                request(1, &url, Destination::Document, Priority::VeryHigh),
+                CancellationToken::new(),
+            )
+            .await;
+        let (_, _, body, terminal) = collect(rx).await;
+        assert_eq!(body, b"v1-body");
+        assert!(terminal.is_none());
+        // `max-age=0` makes the entry stale at once, so the
+        // second fetch must revalidate — and the 304 keeps the
+        // body while refreshing the headers.
+        let rx = sched
+            .submit(
+                request(2, &url, Destination::Document, Priority::VeryHigh),
+                CancellationToken::new(),
+            )
+            .await;
+        let (status, headers, body, terminal) = collect(rx).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"v1-body", "the 304 keeps the stored body");
+        assert!(terminal.is_none());
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "x-version" && v == "2"),
+            "the 304's headers refresh the stored entry: {headers:?}"
+        );
+        assert_eq!(state.count(), 2, "stale means one revalidation fetch");
+        let records = state.records();
+        assert_eq!(records[1].path, "/revalidate");
+        assert_eq!(
+            records[1].if_none_match.as_deref(),
+            Some("\"v1\""),
+            "revalidation sends If-None-Match from the stored ETag"
+        );
+        assert!(
+            records[1].if_modified_since.is_none(),
+            "no Last-Modified was stored, so no If-Modified-Since is sent"
+        );
+        assert_eq!(sched.cache_stats().revalidations, 1);
+    }
+
+    #[tokio::test]
+    async fn cache_partition_isolation() {
+        let (base, state) = cache_test_server().await;
+        let sched = scheduler();
+        let url = format!("{base}cacheable");
+        let site_a = "http://site-a.example";
+        let site_b = "http://site-b.example";
+        for (id, site) in [(1u64, site_a), (2, site_b), (3, site_a)] {
+            let rx = sched
+                .submit(
+                    partitioned_request(id, &url, site, Vec::new()),
+                    CancellationToken::new(),
+                )
+                .await;
+            let (status, _, body, terminal) = collect(rx).await;
+            assert_eq!(status, 200);
+            assert_eq!(body, b"cached-v1");
+            assert!(terminal.is_none());
+        }
+        assert_eq!(
+            state.count(),
+            2,
+            "same URL, two top-level sites: one fetch per partition, then a hit"
+        );
+        assert_eq!(sched.cache_stats().hits, 1);
+    }
+
+    #[tokio::test]
+    async fn cache_no_store_never_cached_and_no_cache_revalidates() {
+        let (base, state) = cache_test_server().await;
+        let sched = scheduler();
+        // `no-store`: two fetches, two network requests, nothing
+        // stored.
+        for id in 1..=2u64 {
+            let rx = sched
+                .submit(
+                    request(id, &format!("{base}nostore"), Destination::Image, Priority::Medium),
+                    CancellationToken::new(),
+                )
+                .await;
+            let (_, _, body, terminal) = collect(rx).await;
+            assert_eq!(body, b"ns");
+            assert!(terminal.is_none());
+        }
+        assert_eq!(state.count(), 2);
+        assert_eq!(sched.http_cache().lock().unwrap().len(), 0);
+        // `no-cache`: stored, but revalidated before every reuse.
+        for id in 3..=4u64 {
+            let rx = sched
+                .submit(
+                    request(id, &format!("{base}nocache"), Destination::Image, Priority::Medium),
+                    CancellationToken::new(),
+                )
+                .await;
+            let (_, _, body, terminal) = collect(rx).await;
+            assert_eq!(body, b"nc-body");
+            assert!(terminal.is_none());
+        }
+        assert_eq!(state.count(), 4, "no-cache must revalidate, not serve fresh");
+        assert_eq!(
+            state.records()[3].if_none_match.as_deref(),
+            Some("\"nc1\""),
+            "no-cache revalidation sends If-None-Match"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_private_cached_within_partition_not_across() {
+        let (base, state) = cache_test_server().await;
+        let sched = scheduler();
+        let url = format!("{base}private");
+        let site_a = "http://site-a.example";
+        let site_b = "http://site-b.example";
+        for (id, site) in [(1u64, site_a), (2, site_a), (3, site_b), (4, site_a)] {
+            let rx = sched
+                .submit(
+                    partitioned_request(id, &url, site, Vec::new()),
+                    CancellationToken::new(),
+                )
+                .await;
+            let (_, _, body, terminal) = collect(rx).await;
+            assert_eq!(body, b"priv");
+            assert!(terminal.is_none());
+        }
+        assert_eq!(
+            state.count(),
+            2,
+            "private is cached inside its partition (hits) but never served across partitions"
+        );
+        assert_eq!(sched.cache_stats().hits, 2);
+    }
+
+    #[tokio::test]
+    async fn cache_vary_selects_variants() {
+        let (base, state) = cache_test_server().await;
+        let sched = scheduler();
+        let url = format!("{base}vary");
+        let fetch = |sched: &Arc<Scheduler>, id: u64, flavor: &str| {
+            let sched = Arc::clone(sched);
+            let url = url.clone();
+            let flavor = flavor.to_string();
+            async move {
+                let rx = sched
+                    .submit(
+                        partitioned_request(
+                            id,
+                            &url,
+                            "http://site-a.example",
+                            vec![("X-Flavor".to_string(), flavor)],
+                        ),
+                        CancellationToken::new(),
+                    )
+                    .await;
+                collect(rx).await
+            }
+        };
+        let (_, _, body, _) = fetch(&sched, 1, "a").await;
+        assert_eq!(body, b"flavor-a");
+        let (_, _, body, _) = fetch(&sched, 2, "b").await;
+        assert_eq!(body, b"flavor-b");
+        let (_, _, body, _) = fetch(&sched, 3, "a").await;
+        assert_eq!(body, b"flavor-a", "the first variant is served again from cache");
+        assert_eq!(
+            state.count(),
+            2,
+            "two variants stored, the third fetch is a hit on the first"
+        );
+        assert_eq!(
+            state
+                .records()
+                .iter()
+                .map(|r| r.x_flavor.clone())
+                .collect::<Vec<_>>(),
+            vec![Some("a".to_string()), Some("b".to_string())],
+            "only the two distinct variants ever reached the server"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_lru_evicts_under_a_small_cap() {
+        let (base, state) = cache_test_server().await;
+        let sched = scheduler();
+        sched.http_cache().lock().unwrap().set_max_bytes(100);
+        // Three 60-byte bodies under a 100-byte cap: storing the
+        // second evicts the first.
+        for (id, n) in [(1u64, 1), (2, 2)] {
+            let rx = sched
+                .submit(
+                    request(
+                        id,
+                        &format!("{base}fill?size=60&n={n}"),
+                        Destination::Image,
+                        Priority::Medium,
+                    ),
+                    CancellationToken::new(),
+                )
+                .await;
+            let (_, _, body, terminal) = collect(rx).await;
+            assert_eq!(body.len(), 60);
+            assert!(terminal.is_none());
+        }
+        assert_eq!(sched.http_cache().lock().unwrap().total_bytes(), 60);
+        let rx = sched
+            .submit(
+                request(3, &format!("{base}fill?size=60&n=1"), Destination::Image, Priority::Medium),
+                CancellationToken::new(),
+            )
+            .await;
+        let (_, _, body, terminal) = collect(rx).await;
+        assert_eq!(body.len(), 60);
+        assert!(terminal.is_none());
+        assert_eq!(
+            state.count(),
+            3,
+            "the evicted entry must be fetched from the network again"
         );
     }
 }
