@@ -2,6 +2,7 @@
 
 Pluto is a web browser written from scratch in Rust. No Mozilla code, no Google code, no Apple code — no Servo, no Chromium, no WebKit. Every line of the engine is written originally for Pluto: its own HTML tokenizer and WHATWG tree builder, its own CSS parser and cascade, its own layout, paint, networking, JavaScript bindings, and IPC.
 Goals
+built in mind for the cosmic desktop.
  - **Fast.** Pages render through a wgpu display list with glyph and image atlases, style and layout run in parallel where the design allows, and the network layer pools connections per origin. The bar for "done" on real sites is 60+ FPS scrolling and clicking.
 -   **Robust.** The parser recovers from malformed HTML the way the WHATWG spec says to (it passes 99.6% of the html5lib corpus); a failed fetch renders an error page, never a blank window; a renderer that dies must not take the browser with it.
 -   **Rust, end to end.** Memory safety from the language, not from a sandbox bolted on afterwards — and then a sandbox anyway (see Security below).
