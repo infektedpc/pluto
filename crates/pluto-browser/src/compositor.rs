@@ -73,7 +73,10 @@ pub struct Compositor {
     /// `&mut`), cleared by activation. While set, a frame built
     /// with no pending list is a deadline-missed frame.
     awaiting_new_list: Cell<bool>,
-    scroll: (f32, f32),
+    /// Current viewport scroll offset, in page pixels. A `Cell`
+    /// because `submit` (a `&self` path) re-clamps it when a new
+    /// list lowers the maximum.
+    scroll: Cell<(f32, f32)>,
     /// Maximum viewport scroll, per axis (`content - viewport`,
     /// clamped at zero — see the module docs). Unbounded until a
     /// display list lands: with no page, there is nothing to
@@ -92,7 +95,7 @@ impl Compositor {
             }),
             pending: RefCell::new(None),
             awaiting_new_list: Cell::new(false),
-            scroll: (0.0, 0.0),
+            scroll: Cell::new((0.0, 0.0)),
             max_scroll: Cell::new((f32::INFINITY, f32::INFINITY)),
         }
     }
@@ -121,9 +124,16 @@ impl Compositor {
         }
         // A newer list is a newer page: its damage is the new
         // scroll maximum (a list that carries none leaves the
-        // previous maximum in place).
+        // previous maximum in place). The stored scroll may now
+        // exceed that maximum (a resize that shrank the page), so
+        // re-clamp it here, at submit — leaving it stale until
+        // the next scroll event self-heals it shows a blank gap
+        // past the end of the content.
         if let Some(max) = max_scroll_for(&display) {
             self.max_scroll.set(max);
+            let (sx, sy) = self.scroll.get();
+            self.scroll
+                .set((sx.clamp(0.0, max.0), sy.clamp(0.0, max.1)));
         }
         *pending = Some(PendingList {
             epoch,
@@ -226,7 +236,7 @@ impl Compositor {
 
     /// Current scroll offset, in page pixels.
     pub fn scroll(&self) -> (f32, f32) {
-        self.scroll
+        self.scroll.get()
     }
 
     /// Maximum scroll offset, in page pixels, from the newest
@@ -244,13 +254,16 @@ impl Compositor {
     /// so a delta the worker already clamped lands exactly.
     pub fn scroll_by(&mut self, dx: f32, dy: f32) {
         let (max_x, max_y) = self.max_scroll.get();
-        self.scroll.0 = (self.scroll.0 + dx).clamp(0.0, max_x);
-        self.scroll.1 = (self.scroll.1 + dy).clamp(0.0, max_y);
+        let (sx, sy) = self.scroll.get();
+        self.scroll.set((
+            (sx + dx).clamp(0.0, max_x),
+            (sy + dy).clamp(0.0, max_y),
+        ));
     }
 
     /// Reset the scroll, e.g. on a new navigation.
     pub fn reset_scroll(&mut self) {
-        self.scroll = (0.0, 0.0);
+        self.scroll.set((0.0, 0.0));
     }
 }
 
@@ -436,5 +449,55 @@ mod tests {
             Arc::new(ResourceTable::new())
         ));
         assert_eq!(holder.max_scroll(), (0.0, 0.0));
+    }
+
+    #[test]
+    fn submit_reclamps_scroll_when_the_page_shrinks() {
+        let mut holder = Compositor::new();
+        // Tall list: canvas 800x600, one rect reaching y=1000, so
+        // the page maximum is (0, 400). Scroll to the bottom.
+        let mut list = DisplayList::new();
+        list.push(DisplayItem::FillRect {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 600.0,
+            color: [1.0; 4],
+        });
+        list.push(DisplayItem::FillRect {
+            x: 700.0,
+            y: 900.0,
+            width: 100.0,
+            height: 100.0,
+            color: [1.0; 4],
+        });
+        assert!(holder.submit(1, Arc::new(list), Arc::new(ResourceTable::new())));
+        holder.scroll_by(0.0, 1000.0);
+        assert_eq!(holder.scroll(), (0.0, 400.0));
+        // A newer, medium list (rect to y=700, maximum (0, 100))
+        // re-clamps the stored scroll at submit — not at the next
+        // scroll event.
+        let mut medium = DisplayList::new();
+        medium.push(DisplayItem::FillRect {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 600.0,
+            color: [1.0; 4],
+        });
+        medium.push(DisplayItem::FillRect {
+            x: 700.0,
+            y: 650.0,
+            width: 100.0,
+            height: 50.0,
+            color: [1.0; 4],
+        });
+        assert!(holder.submit(2, Arc::new(medium), Arc::new(ResourceTable::new())));
+        assert_eq!(holder.max_scroll(), (0.0, 100.0));
+        assert_eq!(holder.scroll(), (0.0, 100.0));
+        // And a list no taller than the canvas clamps it to zero.
+        let short = list_with_canvas(800.0, 600.0);
+        assert!(holder.submit(3, short, Arc::new(ResourceTable::new())));
+        assert_eq!(holder.scroll(), (0.0, 0.0));
     }
 }

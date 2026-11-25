@@ -2042,6 +2042,32 @@ async fn layout_and_submit(
         .await;
     }
     state.has_document = true;
+    // Follow-up 2 (Stage 10): the viewport scroll mirror goes
+    // stale when a resize shrinks the page — re-clamp it to the
+    // new page maximum now that the tree has landed, and send the
+    // correction to the shell so the two stay in sync (the shell's
+    // compositor re-clamps on submit too; this keeps the mirror
+    // exact for the IntersectionObserver step below).
+    let (max_x, max_y) = page_max_scroll(state).await;
+    let clamped = (
+        state.viewport_scroll.0.clamp(0.0, max_x),
+        state.viewport_scroll.1.clamp(0.0, max_y),
+    );
+    if clamped != state.viewport_scroll {
+        let (dx, dy) = (
+            clamped.0 - state.viewport_scroll.0,
+            clamped.1 - state.viewport_scroll.1,
+        );
+        state.viewport_scroll = clamped;
+        if !emit_tab(
+            events,
+            RendererToBrowser::ScrollViewport { dx, dy },
+        )
+        .await
+        {
+            return false;
+        }
+    }
     // Stage 10 Rec 7: the layout phase ends when the tree reply
     // lands; the collect phase runs from here to the list.
     let layout_ms = layout_started.elapsed().as_secs_f32() * 1000.0;
@@ -3568,6 +3594,78 @@ mod tests {
                 height: 300.0,
             })
             .expect("worker takes Resize");
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Follow-up 2 (Stage 10): shrinking the viewport re-clamps
+    /// the worker's viewport scroll mirror — a `ScrollViewport`
+    /// correction (negative, to the new maximum) arrives before
+    /// the resized display list.
+    #[tokio::test]
+    async fn worker_resize_reclamps_the_viewport_scroll() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_overscroll_page(listener, "auto"));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        cmd_tx
+            .send(BrowserToRenderer::CommitNavigation { url })
+            .expect("worker takes the command");
+        assert!(matches!(
+            next_event(&mut event_rx).await,
+            RendererToBrowser::DidCommit { .. }
+        ));
+        let first_epoch = match next_event(&mut event_rx).await {
+            RendererToBrowser::SubmitDisplayList { epoch, .. } => epoch,
+            other => panic!("expected SubmitDisplayList, got {other:?}"),
+        };
+        // The page is 1100px tall in a 768px viewport (max 332):
+        // wheel down 200px in the tall spacer, where no container
+        // sits, so the whole delta scrolls the viewport.
+        send_wheel(&cmd_tx, 50.0, 500.0, 0.0, 200.0);
+        match next_event(&mut event_rx).await {
+            RendererToBrowser::ScrollViewport { dx, dy } => {
+                assert_eq!(dx, 0.0);
+                assert!((dy - 200.0).abs() < 0.01, "viewport scrolled 200, got {dy}");
+            }
+            other => panic!("expected ScrollViewport after wheel down, got {other:?}"),
+        }
+        // Shrink the viewport to 1000px tall: the new maximum is
+        // 100, below the current 200 — the resize must emit the
+        // -100 correction before the new list lands.
+        cmd_tx
+            .send(BrowserToRenderer::Resize {
+                width: 1024.0,
+                height: 1000.0,
+            })
+            .expect("worker takes Resize");
+        match next_event(&mut event_rx).await {
+            RendererToBrowser::ScrollViewport { dx, dy } => {
+                assert_eq!(dx, 0.0);
+                assert!(
+                    (dy - (-100.0)).abs() < 0.01,
+                    "correction is -100, got {dy}"
+                );
+            }
+            other => panic!("expected ScrollViewport correction after resize, got {other:?}"),
+        }
+        let (epoch, bytes) = match next_event(&mut event_rx).await {
+            RendererToBrowser::SubmitDisplayList { epoch, bytes, .. } => (epoch, bytes),
+            other => panic!("expected SubmitDisplayList after resize, got {other:?}"),
+        };
+        assert!(epoch > first_epoch, "resize advances the epoch");
+        let list = DisplayList::from_bytes(&bytes).expect("list bytes decode");
+        assert!(matches!(
+            list.0[0],
+            DisplayItem::FillRect {
+                width: 1024.0,
+                height: 1000.0,
+                ..
+            }
+        ));
         cmd_tx
             .send(BrowserToRenderer::Shutdown)
             .expect("worker takes Shutdown");

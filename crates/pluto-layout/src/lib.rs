@@ -1007,8 +1007,17 @@ impl LayoutTree {
 
     /// Set a scroll container's offset (input-driven) and re-collect
     /// boxes with the new offsets applied. Layout is NOT recomputed:
-    /// offsets only shift already-laid-out descendants.
+    /// offsets only shift already-laid-out descendants. The offset
+    /// clamps to the container's current maximum — offsets
+    /// re-applied after a resize (a fresh rebuild or an incremental
+    /// re-layout) must not survive past the new maximum. An id with
+    /// no box has no measurable maximum, so its offset is stored
+    /// as given.
     pub fn set_scroll_offset(&mut self, id: DomId, x: f32, y: f32) {
+        let (x, y) = match self.scrollable_size(id) {
+            Some((max_x, max_y)) => (x.clamp(0.0, max_x), y.clamp(0.0, max_y)),
+            None => (x, y),
+        };
         self.scroll_offsets.insert(id, (x, y));
         self.recollect();
     }
@@ -2446,11 +2455,16 @@ fn match_pseudo_class(
                 .count()
                 == 1
         }
-        // `:link` = an anchor with an `href`. `:any-link` is the same
-        // set here (`:link` is not yet exclusive with `:visited` —
-        // a visited link still matches `:link`; the UA sheet has no
-        // separate `a:link` rule, so this is display-neutral).
-        PseudoClass::Link | PseudoClass::AnyLink => {
+        // `:link` = an anchor with an `href` that has NOT been
+        // visited — `:link` and `:visited` are exclusive per spec.
+        // `:any-link` is the union: any anchor with an `href`,
+        // visited or not.
+        PseudoClass::Link => {
+            matches!(dom.tag(id), Some("a" | "area" | "link"))
+                && dom.attr(id, "href").is_some()
+                && !state.visited.contains(&id)
+        }
+        PseudoClass::AnyLink => {
             matches!(dom.tag(id), Some("a" | "area" | "link"))
                 && dom.attr(id, "href").is_some()
         }
@@ -3759,6 +3773,31 @@ mod tests {
         assert_eq!(tree.scrollable_size(outer), Some((0.0, 10.0)));
     }
 
+    /// `set_scroll_offset` (Stage 10 follow-up): an offset past
+    /// the container's maximum clamps to it — offsets re-applied
+    /// after a resize must not survive past the new maximum — and
+    /// a negative offset clamps to zero.
+    #[test]
+    fn set_scroll_offset_clamps_to_the_containers_maximum() {
+        let dom = parse_html(
+            r#"<div class="outer"><div class="tall"></div><div class="wide"></div></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".outer { height: 100px; overflow: auto; } \
+             .tall { height: 250px; } .wide { width: 900px; height: 10px; }",
+        );
+        let mut tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let outer = id_of_class(&tree, &dom, "outer");
+        assert_eq!(tree.scrollable_size(outer), Some((116.0, 160.0)));
+        tree.set_scroll_offset(outer, 500.0, 9999.0);
+        assert_eq!(tree.scroll_offset(outer), Some((116.0, 160.0)));
+        tree.set_scroll_offset(outer, -5.0, -5.0);
+        assert_eq!(tree.scroll_offset(outer), Some((0.0, 0.0)));
+        // Within the maximum, the offset stores as given.
+        tree.set_scroll_offset(outer, 40.0, 30.0);
+        assert_eq!(tree.scroll_offset(outer), Some((40.0, 30.0)));
+    }
+
     /// `scrollable_size` (Stage 10 Rec 2): content that fits
     /// scrolls nowhere, and a node with no box has no maximum.
     #[test]
@@ -4135,6 +4174,48 @@ mod tests {
         // UA sheet: `a { color: #0000EE; } a:visited { color: #551A8B; }`.
         assert_eq!(styles[&visited_link].color, [0x55, 0x1a, 0x8b]);
         assert_eq!(styles[&unvisited_link].color, [0, 0, 238]);
+    }
+
+    #[test]
+    fn link_and_visited_are_exclusive_any_link_is_the_union() {
+        let html = r#"<a href="https://example.com">L</a><a href="https://example.org">M</a>"#;
+        let dom = parse_html(html);
+        let ua = Stylesheet::ua();
+        let root = dom.root().unwrap();
+        let links: Vec<DomId> = find_all_by_tag(&dom, root, "a");
+        assert_eq!(links.len(), 2);
+        let (visited_link, unvisited_link) = (links[0], links[1]);
+        // `:link` red vs `:visited` green, same specificity: a
+        // visited link matches only `:visited`, an unvisited link
+        // only `:link` — the two are exclusive per spec.
+        let sheet = Stylesheet::parse(
+            "a:link { color: #ff0000; } a:visited { color: #00ff00; }",
+        );
+        let styles = resolve_document_styles(
+            &dom,
+            &ua,
+            &sheet,
+            false,
+            (800.0, 600.0),
+            &ElementState::default().with_visited(visited_link),
+        )
+        .0;
+        assert_eq!(styles[&visited_link].color, [0, 255, 0]);
+        assert_eq!(styles[&unvisited_link].color, [255, 0, 0]);
+        // `:any-link` is the union: both links match it, visited
+        // or not.
+        let sheet = Stylesheet::parse("a:any-link { color: #0000ff; }");
+        let styles = resolve_document_styles(
+            &dom,
+            &ua,
+            &sheet,
+            false,
+            (800.0, 600.0),
+            &ElementState::default().with_visited(visited_link),
+        )
+        .0;
+        assert_eq!(styles[&visited_link].color, [0, 0, 255]);
+        assert_eq!(styles[&unvisited_link].color, [0, 0, 255]);
     }
 
     #[test]
