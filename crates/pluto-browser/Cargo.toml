@@ -17,7 +17,14 @@ pluto-css.workspace = true
 pluto-layout.workspace = true
 pluto-ipc.workspace = true
 pluto-js.workspace = true
-# Stage 9 Rec 9: fcntl (CLOEXEC) on the renderer spawn path.
+pluto-media.workspace = true
+slotmap.workspace = true
+# Stage 16 Phase 3 (Rec 11): the WebSocket pump — tokio-tungstenite
+# for the socket, futures-util for `SinkExt` / `StreamExt`.
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+# Stage 9 Rec 9: `libc` for the renderer spawn path — clearing
+# stray fds, chroot, capabilities, seccomp (renderer_process.rs).
 libc.workspace = true
 # Stage 9 Rec 13: ring::digest for the download SHA-256 (computed
 # as the temp file is written). ring 0.17 is already in the lock

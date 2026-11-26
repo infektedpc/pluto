@@ -431,10 +431,41 @@ pub fn install_permissions<'js>(
     install_geolocation_stub(ctx, bindings, &navigator)?;
     install_media_devices_stub(ctx, bindings, &navigator)?;
     install_clipboard_stub(ctx, bindings, &navigator)?;
+    install_user_activation_object(ctx, bindings, &navigator)?;
 
     globals
         .set("navigator", navigator)
         .map_err(|e| format!("install navigator: {e}"))?;
+    Ok(())
+}
+
+/// Install `navigator.userActivation` (Stage 16 Phase 1, Rec 7):
+/// the spec's read-only view of the tab's activation state —
+/// `isActive` (transient activation alive right now) and
+/// `hasBeenActive` (any gesture ever in this tab). The getters
+/// read the shared state through `BindingState`, so they track
+/// gestures the renderer records without any JS round-trip.
+fn install_user_activation_object<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    navigator: &Object<'js>,
+) -> Result<(), String> {
+    let ua = Object::new(ctx.clone()).map_err(|e| format!("userActivation: {e}"))?;
+    let b = Rc::clone(bindings);
+    let get_active = move |_ctx: Ctx<'js>| -> rquickjs::Result<bool> {
+        Ok(b.borrow().user_activation.borrow().is_active())
+    };
+    ua.prop("isActive", Accessor::from(get_active))
+        .map_err(|e| format!("userActivation.isActive: {e}"))?;
+    let b = Rc::clone(bindings);
+    let get_been = move |_ctx: Ctx<'js>| -> rquickjs::Result<bool> {
+        Ok(b.borrow().user_activation.borrow().has_been_active())
+    };
+    ua.prop("hasBeenActive", Accessor::from(get_been))
+        .map_err(|e| format!("userActivation.hasBeenActive: {e}"))?;
+    navigator
+        .set("userActivation", ua)
+        .map_err(|e| format!("install userActivation: {e}"))?;
     Ok(())
 }
 

@@ -47,8 +47,11 @@ use rquickjs::function::{Opt, This};
 use rquickjs::{Ctx, Function, Object};
 
 use crate::bindings::{
-    BindingState, FetchBackend, FetchCompletion, call_onerror, install_bindings, registry_map,
+    BindingState, FetchBackend, FetchCompletion, call_onerror, install_bindings,
+    registry_map,
 };
+use crate::bindings::fetch::FetchStreamEvent;
+use crate::bindings::websocket::{WebSocketBackend, WsEvent};
 use crate::bindings::dom::fire_image_event;
 use crate::bindings::events::TypedEventKind;
 use crate::bindings::permissions::PermissionsBackend;
@@ -105,6 +108,16 @@ pub struct TabJs {
     /// values — shared with the binding host functions. Fresh per
     /// navigation; the host/backend below are re-attached to it.
     bindings: Rc<RefCell<BindingState>>,
+    /// The tab's user-activation state (Stage 16 Phase 1, Rec 7):
+    /// the ONE handle, shared with every fresh `BindingState`
+    /// (sticky activation survives navigation; transient is
+    /// cleared in `navigate`). The renderer records trusted
+    /// gestures into it; `navigator.userActivation` reads it.
+    activation: Rc<RefCell<crate::activation::UserActivation>>,
+    /// The tab's autoplay policy (Stage 16 Phase 1, Rec 7):
+    /// default policy, no autoplay with sound. Phase 2's media
+    /// elements consult it via [`Self::autoplay_decision`].
+    autoplay_policy: crate::activation::AutoplayPolicy,
     /// The host document, re-attached to each fresh [`BindingState`]
     /// on navigation (set by the per-tab worker).
     host: Option<Rc<RefCell<Box<dyn DomHost>>>>,
@@ -122,6 +135,20 @@ pub struct TabJs {
     fetch_tx: std::sync::mpsc::Sender<FetchCompletion>,
     /// Receiving end of the fetch-completion channel.
     fetch_rx: std::sync::mpsc::Receiver<FetchCompletion>,
+    /// Chunk events for streaming fetches + `EventSource`s (any
+    /// thread). Drained each turn into Networking-source tasks,
+    /// like completions.
+    stream_tx: std::sync::mpsc::Sender<FetchStreamEvent>,
+    /// Receiving end of the stream-event channel.
+    stream_rx: std::sync::mpsc::Receiver<FetchStreamEvent>,
+    /// WebSocket events from the browser-side pump (any thread).
+    /// Drained each turn into Networking-source tasks.
+    ws_tx: std::sync::mpsc::Sender<WsEvent>,
+    /// Receiving end of the WebSocket-event channel.
+    ws_rx: std::sync::mpsc::Receiver<WsEvent>,
+    /// The WebSocket backend, re-attached the same way as the
+    /// fetch backend.
+    ws_backend: Option<std::sync::Arc<dyn WebSocketBackend>>,
     /// Loop-driven modules (wave 2b): ids started by
     /// [`TabJs::start_module_async`] whose promises are still
     /// pending; polled each turn by [`TabJs::poll_modules`].
@@ -144,10 +171,23 @@ impl TabJs {
         config.rejection_sink = Some(tx);
         let state = Rc::new(RefCell::new(LoopState::new()));
         let bindings = Rc::new(RefCell::new(BindingState::new()));
+        let activation = Rc::new(RefCell::new(crate::activation::UserActivation::new()));
+        // The bindings' handle is the tab's handle: one shared
+        // state, not two that drift.
+        bindings.borrow_mut().user_activation = Rc::clone(&activation);
         let (fetch_tx, fetch_rx) = std::sync::mpsc::channel();
+        let (stream_tx, stream_rx) = std::sync::mpsc::channel();
+        let (ws_tx, ws_rx) = std::sync::mpsc::channel();
         let mut realm = TabRealm::new(&config)?;
         Self::install_globals(&mut realm, &state)?;
-        install_bindings(&mut realm, &state, &bindings, fetch_tx.clone())?;
+        install_bindings(
+            &mut realm,
+            &state,
+            &bindings,
+            fetch_tx.clone(),
+            stream_tx.clone(),
+            ws_tx.clone(),
+        )?;
         let mut tab = Self {
             state,
             realm,
@@ -155,12 +195,19 @@ impl TabJs {
             config,
             bytecode: BytecodeCache::new(DEFAULT_BYTECODE_CAPACITY_BYTES),
             bindings,
+            activation,
+            autoplay_policy: crate::activation::AutoplayPolicy::new(),
             host: None,
             fetch_backend: None,
             storage_backend: None,
             permissions_backend: None,
             fetch_tx,
             fetch_rx,
+            stream_tx,
+            stream_rx,
+            ws_tx,
+            ws_rx,
+            ws_backend: None,
             pending_modules: Vec::new(),
             next_module_id: 1,
             module_sources: ModuleSources::new(),
@@ -199,6 +246,119 @@ impl TabJs {
     pub fn set_fetch_backend(&mut self, backend: std::sync::Arc<dyn FetchBackend>) {
         self.fetch_backend = Some(std::sync::Arc::clone(&backend));
         self.bindings.borrow_mut().fetch_backend = Some(backend);
+    }
+
+    /// Attach the `WebSocket` backend (Stage 16 Phase 3, Rec 11).
+    /// Until it is attached, `new WebSocket()` throws a
+    /// `TypeError` (same shape as a missing fetch backend).
+    pub fn set_websocket_backend(&mut self, backend: std::sync::Arc<dyn WebSocketBackend>) {
+        self.ws_backend = Some(std::sync::Arc::clone(&backend));
+        self.bindings.borrow_mut().ws_backend = Some(backend);
+    }
+
+    /// Dispatch a `popstate` event on the window (Stage 16 Phase
+    /// 3, Rec 9): called by the renderer after a Back/Forward
+    /// commit, with the entry's stored state JSON (`None` when the
+    /// entry has no state). Enqueued as a Networking-source task,
+    /// so the listeners run on the loop.
+    pub fn dispatch_popstate(&mut self, state_json: Option<String>) {
+        self.enqueue_host_task(
+            TaskSource::Networking,
+            Box::new(move |tab| {
+                let bindings = Rc::clone(&tab.bindings);
+                let result = tab.realm.with_ctx(|ctx| {
+                    crate::bindings::events::dispatch_popstate_event(
+                        &ctx,
+                        &bindings,
+                        state_json.as_deref(),
+                    )
+                    .map_err(|e| e.to_string())
+                });
+                if let Err(e) = result {
+                    tab.bindings
+                        .borrow_mut()
+                        .errors
+                        .push(format!("popstate dispatch failed: {e}"));
+                }
+            }),
+        );
+    }
+
+    /// Dispatch a `hashchange` event on the window (Stage 16
+    /// Phase 3, Rec 9): called by the renderer after a
+    /// same-document fragment navigation. Enqueued as a
+    /// Networking-source task, like `popstate`.
+    pub fn dispatch_hashchange(&mut self, old_url: String, new_url: String) {
+        self.enqueue_host_task(
+            TaskSource::Networking,
+            Box::new(move |tab| {
+                let bindings = Rc::clone(&tab.bindings);
+                let result = tab.realm.with_ctx(|ctx| {
+                    crate::bindings::events::dispatch_hashchange_event(
+                        &ctx, &bindings, &old_url, &new_url,
+                    )
+                    .map_err(|e| e.to_string())
+                });
+                if let Err(e) = result {
+                    tab.bindings
+                        .borrow_mut()
+                        .errors
+                        .push(format!("hashchange dispatch failed: {e}"));
+                }
+            }),
+        );
+    }
+
+    /// Deliver one WebSocket event into the realm (Stage 16 Phase
+    /// 3, Rec 11): called by the renderer when a
+    /// `BrowserToRenderer::WebSocketEvent` arrives from the
+    /// browser-side pump. Enqueued as a Networking-source task, so
+    /// the socket's listeners run on the loop — the same bridge as
+    /// `dispatch_popstate`, not the raw channel (the renderer does
+    /// not hold the tab's `ws_tx`).
+    pub fn deliver_ws_event(&mut self, event: WsEvent) {
+        self.enqueue_host_task(
+            TaskSource::Networking,
+            Box::new(move |tab| {
+                let bindings = Rc::clone(&tab.bindings);
+                let result = tab.realm.with_ctx(|ctx| {
+                    crate::bindings::websocket::resolve_ws_event(&ctx, &bindings, event)
+                        .map_err(|e| e.to_string())
+                });
+                if let Err(e) = result {
+                    tab.bindings
+                        .borrow_mut()
+                        .errors
+                        .push(format!("websocket event failed: {e}"));
+                }
+            }),
+        );
+    }
+
+    /// Set the realm's history state (Stage 16 Phase 3, Rec 8):
+    /// called by the renderer when a `CommitNavigation` carries a
+    /// `state_json` (a Back/Forward traversal), so
+    /// `history.state` reads the entry's state.
+    pub fn set_history_state(&mut self, state_json: Option<String>) {
+        self.bindings.borrow_mut().history_state_json = state_json;
+    }
+
+    /// Read the realm's history state (Stage 16 Phase 3, Rec 9 —
+    /// finisher): a same-document navigation reports the new URL
+    /// to the shell as a `HistoryReplace`, and the current state
+    /// rides along so the shell does not wipe it.
+    pub fn history_state(&self) -> Option<String> {
+        self.bindings.borrow().history_state_json.clone()
+    }
+
+    /// Mirror the shell's session-history length / index (Stage 16
+    /// Phase 3, Rec 8): called by the renderer on `HistorySync`.
+    /// The shell is authoritative; the realm's local `pushState`
+    /// bookkeeping is corrected here.
+    pub fn set_history_length(&mut self, length: usize, index: usize) {
+        let mut s = self.bindings.borrow_mut();
+        s.history_length = length;
+        s.history_index = index;
     }
 
     /// Attach the storage backend (Stage 9 Rec 4: the shell's
@@ -476,6 +636,137 @@ impl TabJs {
         );
     }
 
+    // --- Stage 16 (M8 Phase 2, Rec 4): media ---
+
+    /// Register every `<video>` / `<audio>` in the current
+    /// document (called by the renderer after parse): creates
+    /// the per-element state, collects candidates + tracks, and
+    /// starts the first candidate's fetch. Runs on the loop as a
+    /// host task so the `request_media` hooks fire in order.
+    pub fn register_media_elements(&mut self) {
+        self.enqueue_host_task(
+            TaskSource::UserInteraction,
+            Box::new(move |tab| {
+                let bindings = Rc::clone(&tab.bindings);
+                let _ = tab.realm.with_ctx(|ctx| {
+                    crate::bindings::media::register_media_elements(&ctx, &bindings)
+                        .map_err(|e| e.to_string())
+                });
+            }),
+        );
+    }
+
+    /// Deliver one media candidate's fetched bytes to the
+    /// element's session (called by the renderer on a fetch
+    /// outcome). `mime` is the response Content-Type (may be
+    /// empty — the container is sniffed from the bytes);
+    /// `origin_clean` is the renderer's tainting decision for
+    /// this fetch; `cors_approved` records whether the fetch
+    /// was CORS-approved (for the readback rules).
+    pub fn deliver_media(
+        &mut self,
+        target: DomKey,
+        bytes: Vec<u8>,
+        mime: String,
+        origin_clean: bool,
+        cors_approved: bool,
+    ) {
+        self.enqueue_host_task(
+            TaskSource::UserInteraction,
+            Box::new(move |tab| {
+                let bindings = Rc::clone(&tab.bindings);
+                let _ = tab.realm.with_ctx(|ctx| {
+                    crate::bindings::media::deliver_media_bytes(
+                        &ctx,
+                        &bindings,
+                        target,
+                        bytes,
+                        mime,
+                        origin_clean,
+                        cors_approved,
+                    )
+                    .map_err(|e| e.to_string())
+                });
+            }),
+        );
+    }
+
+    /// Report a media candidate fetch failure: the binding tries
+    /// the next candidate, or goes `NETWORK_NO_SOURCE`.
+    pub fn notify_media_failed(&mut self, target: DomKey, reason: String) {
+        self.enqueue_host_task(
+            TaskSource::UserInteraction,
+            Box::new(move |tab| {
+                let bindings = Rc::clone(&tab.bindings);
+                let _ = tab.realm.with_ctx(|ctx| {
+                    crate::bindings::media::notify_media_failed(&ctx, &bindings, target, &reason)
+                        .map_err(|e| e.to_string())
+                });
+            }),
+        );
+    }
+
+    /// Deliver a `<track>` file's bytes for parsing into the
+    /// element's session (`track_idx` is the document-order
+    /// index from registration).
+    pub fn deliver_track(&mut self, target: DomKey, track_idx: usize, bytes: Vec<u8>) {
+        self.enqueue_host_task(
+            TaskSource::UserInteraction,
+            Box::new(move |tab| {
+                let bindings = Rc::clone(&tab.bindings);
+                let _ = tab.realm.with_ctx(|ctx| {
+                    crate::bindings::media::deliver_track_bytes(
+                        &ctx, &bindings, target, track_idx, bytes,
+                    )
+                    .map_err(|e| e.to_string())
+                });
+            }),
+        );
+    }
+
+    /// Report a `<track>` fetch failure: the track stays
+    /// cue-less, the media plays on.
+    pub fn notify_track_failed(&mut self, target: DomKey, track_idx: usize) {
+        self.enqueue_host_task(
+            TaskSource::UserInteraction,
+            Box::new(move |tab| {
+                let bindings = Rc::clone(&tab.bindings);
+                let _ = tab.realm.with_ctx(|ctx| {
+                    crate::bindings::media::notify_track_failed(
+                        &ctx, &bindings, target, track_idx,
+                    )
+                    .map_err(|e| e.to_string())
+                });
+            }),
+        );
+    }
+
+    /// Advance every media session one tick (called by the
+    /// renderer once per tab tick, after `drive_js`): returns
+    /// the frames presented this tick, keyed by element, for
+    /// the renderer to send over IPC. The session's audio
+    /// clock decides what presents — never the tick count.
+    pub fn media_tick(&mut self) -> Vec<(DomKey, pluto_ipc::VideoFrame)> {
+        let bindings = Rc::clone(&self.bindings);
+        let mut out = Vec::new();
+        let _ = self.realm.with_ctx(|ctx| {
+            match crate::bindings::media::media_tick(&ctx, &bindings) {
+                Ok(frames) => out = frames,
+                Err(e) => {
+                    eprintln!("[pluto] media tick error: {e}");
+                }
+            }
+            Ok::<(), String>(())
+        });
+        out
+    }
+
+    /// Intrinsic sizes for layout: (width, height, has_frame)
+    /// per video element with decoded metadata.
+    pub fn media_intrinsic_sizes(&self) -> HashMap<DomKey, (u32, u32, bool)> {
+        crate::bindings::media::media_intrinsic_sizes(&self.bindings)
+    }
+
     /// Current navigation epoch.
     pub fn epoch(&self) -> u64 {
         self.state.borrow().epoch
@@ -580,11 +871,20 @@ impl TabJs {
         new_state.epoch = old_epoch + 1;
         let new_state = Rc::new(RefCell::new(new_state));
         let new_bindings = Rc::new(RefCell::new(BindingState::new()));
+        // The activation handle carries over: sticky activation
+        // survives navigation, and the new realm's
+        // `navigator.userActivation` must read the same state.
+        new_bindings.borrow_mut().user_activation = Rc::clone(&self.activation);
+        // A new document starts with no transient activation.
+        self.activation.borrow_mut().clear_transient();
         if let Some(host) = &self.host {
             new_bindings.borrow_mut().host = Some(Rc::clone(host));
         }
         if let Some(backend) = &self.fetch_backend {
             new_bindings.borrow_mut().fetch_backend = Some(std::sync::Arc::clone(backend));
+        }
+        if let Some(backend) = &self.ws_backend {
+            new_bindings.borrow_mut().ws_backend = Some(std::sync::Arc::clone(backend));
         }
         if let Some(backend) = &self.storage_backend {
             new_bindings.borrow_mut().storage_backend = std::sync::Arc::clone(backend);
@@ -593,9 +893,18 @@ impl TabJs {
             new_bindings.borrow_mut().permissions_backend = std::sync::Arc::clone(backend);
         }
         let (fetch_tx, fetch_rx) = std::sync::mpsc::channel();
+        let (stream_tx, stream_rx) = std::sync::mpsc::channel();
+        let (ws_tx, ws_rx) = std::sync::mpsc::channel();
         let mut new_realm = TabRealm::new(&self.config)?;
         Self::install_globals(&mut new_realm, &new_state)?;
-        install_bindings(&mut new_realm, &new_state, &new_bindings, fetch_tx.clone())?;
+        install_bindings(
+            &mut new_realm,
+            &new_state,
+            &new_bindings,
+            fetch_tx.clone(),
+            stream_tx.clone(),
+            ws_tx.clone(),
+        )?;
         // Drop the old realm after the new one is installed: its
         // host-function closures hold `Rc` clones of the old state
         // and old bindings, and dropping the realm frees them. The
@@ -607,6 +916,10 @@ impl TabJs {
         self.bindings = new_bindings;
         self.fetch_tx = fetch_tx;
         self.fetch_rx = fetch_rx;
+        self.stream_tx = stream_tx;
+        self.stream_rx = stream_rx;
+        self.ws_tx = ws_tx;
+        self.ws_rx = ws_rx;
         self.bytecode = BytecodeCache::new(DEFAULT_BYTECODE_CAPACITY_BYTES);
         self.pending_modules.clear();
         self.module_sources = ModuleSources::new();
@@ -619,6 +932,33 @@ impl TabJs {
     /// the poisoned realm's pending callbacks are gone with it.
     pub fn recreate_realm(&mut self) -> Result<(), JsError> {
         self.navigate()
+    }
+
+    /// Record a trusted user gesture (Stage 16 Phase 1, Rec 7):
+    /// called by the renderer from the `InputEvent` path
+    /// (`pointerdown` / `keydown`), never from JS — a synthetic
+    /// `dispatchEvent` must not unlock autoplay.
+    pub fn note_user_activation(&mut self) {
+        self.activation.borrow_mut().note_gesture();
+    }
+
+    /// Is transient activation alive right now?
+    pub fn user_activation_is_active(&self) -> bool {
+        self.activation.borrow().is_active()
+    }
+
+    /// Has any gesture ever happened in this tab?
+    pub fn user_activation_has_been_active(&self) -> bool {
+        self.activation.borrow().has_been_active()
+    }
+
+    /// The autoplay decision for a media element with this
+    /// `muted` state, under the tab's policy (Stage 16 Phase 1,
+    /// Rec 7). Phase 2's `<audio>` / `<video>` consult this
+    /// before starting playback.
+    pub fn autoplay_decision(&self, muted: bool) -> crate::activation::AutoplayDecision {
+        self.autoplay_policy
+            .decide(muted, &self.activation.borrow())
     }
 
     /// Set the tab's visibility (Stage 8 Rec 1): a hidden tab runs
@@ -751,16 +1091,30 @@ impl TabJs {
     /// `IntersectionObserver` callback that writes to the DOM must
     /// not affect the same frame). `time_ms` is the computation
     /// timestamp the entries carry (ms since the tab started).
+    /// `geometry` is in PAGE coordinates (as the layout actor
+    /// measures it); `viewport_scroll` is the viewport's scroll
+    /// offset, and the rects are converted to viewport-relative
+    /// coordinates here (Stage 16 Phase 1, Rec 10) before the
+    /// registry queues entries — the spec's `boundingClientRect` /
+    /// `rootBounds` / `intersectionRect` are viewport-relative,
+    /// and the conversion belongs at this seam because only the
+    /// tab (not the registry) knows the scroll.
     pub fn run_intersection_observers_with_geometry(
         &mut self,
         geometry: &HashMap<(u64, DomKey), ComputedIntersection>,
         time_ms: f64,
+        viewport_scroll: (f32, f32),
     ) {
         let enqueue = {
             let mut bindings = self.bindings.borrow_mut();
-            bindings
-                .intersection_registry
-                .gather(&|id, key| geometry.get(&(id, key)).copied(), time_ms)
+            bindings.intersection_registry.gather(
+                &|id, key| {
+                    geometry
+                        .get(&(id, key))
+                        .map(|g| g.to_viewport_relative(viewport_scroll))
+                },
+                time_ms,
+            )
         };
         if enqueue {
             self.enqueue_host_task(
@@ -801,7 +1155,7 @@ impl TabJs {
     /// recorded, not returned; only a watchdog kill / poisoned realm
     /// propagates as `Err`.
     pub fn run_turn(&mut self) -> Result<TurnOutcome, JsError> {
-        self.drain_fetch_completions();
+        self.drain_backend_events();
         let task = self.state.borrow_mut().next_task();
         let outcome = match task {
             Some(task) => {
@@ -818,7 +1172,25 @@ impl TabJs {
         self.poll_modules()?;
         self.drain_rejections();
         self.maybe_render()?;
+        // Drain again: a task (or a microtask it queues) can deliver
+        // new backend events mid-turn — a `WebSocket` `open` handler
+        // calling `send()`, whose echo lands in the channel while
+        // this turn is still running. Without this second drain the
+        // loop can go idle with the event undrained and
+        // `has_pending_work` cannot see it (Stage 16 Phase 3,
+        // Rec 11).
+        self.drain_backend_events();
         Ok(outcome)
+    }
+
+    /// Move every pending backend-channel event (fetch completions,
+    /// stream chunks, WebSocket events) into Networking-source
+    /// resolution tasks. The backends never resolve a promise
+    /// themselves; resolution happens here, on the loop.
+    fn drain_backend_events(&mut self) {
+        self.drain_fetch_completions();
+        self.drain_stream_events();
+        self.drain_ws_events();
     }
 
     /// Run turns until no work remains (no tasks, microtasks, pending
@@ -829,16 +1201,23 @@ impl TabJs {
     pub fn run_until_idle(&mut self) -> Result<(), JsError> {
         let started = Instant::now();
         loop {
-            if !self.has_pending_work() {
-                return Ok(());
-            }
             if started.elapsed() > RUN_UNTIL_IDLE_TIMEOUT {
                 return Err(JsError::Internal(
                     "run_until_idle timed out (work keeps arriving)".to_string(),
                 ));
             }
+            // Run a turn FIRST, then check for idleness: the
+            // turn's drain step moves backend channel events
+            // (fetch completions, stream chunks, WebSocket
+            // events) into tasks, and `has_pending_work` cannot
+            // see a channel's contents — checking first would
+            // return while a `WebSocket` open event still sat
+            // undrained (Stage 16 Phase 3, Rec 11).
             let outcome = self.run_turn()?;
-            if outcome == TurnOutcome::Idle && self.has_pending_work() {
+            if !self.has_pending_work() {
+                return Ok(());
+            }
+            if outcome == TurnOutcome::Idle {
                 // Everything left is in the future: sleep until the
                 // next timer deadline or the next frame time.
                 if let Some(wake) = self.next_wake() {
@@ -866,14 +1245,18 @@ impl TabJs {
     pub fn drive_until_idle_or_timeout(&mut self, budget: Duration) -> Result<(), JsError> {
         let started = Instant::now();
         loop {
-            if !self.has_pending_work() {
-                return Ok(());
-            }
             if started.elapsed() >= budget {
                 return Ok(());
             }
+            // Run a turn FIRST, then check for idleness — same
+            // channel-visibility reason as `run_until_idle` above:
+            // a `WebSocket` event arriving while the loop is
+            // otherwise idle must still be drained this drive.
             let outcome = self.run_turn()?;
-            if outcome == TurnOutcome::Idle && self.has_pending_work() {
+            if !self.has_pending_work() {
+                return Ok(());
+            }
+            if outcome == TurnOutcome::Idle {
                 let remaining = budget.saturating_sub(started.elapsed());
                 if remaining.is_zero() {
                     return Ok(());
@@ -919,6 +1302,61 @@ impl TabJs {
                             .borrow_mut()
                             .errors
                             .push(format!("fetch completion failed: {e}"));
+                    }
+                }),
+            );
+        }
+    }
+
+    /// Move stream events delivered by backends into
+    /// Networking-source resolution tasks (Stage 16 Phase 3, Rec
+    /// 12). Same bridge as `drain_fetch_completions`; the
+    /// `stream_tx` clone rides along so `EventSource` routing can
+    /// start (or restart) a stream from inside the task.
+    fn drain_stream_events(&mut self) {
+        let events: Vec<FetchStreamEvent> = self.stream_rx.try_iter().collect();
+        for event in events {
+            let stream_tx = self.stream_tx.clone();
+            self.enqueue_host_task(
+                TaskSource::Networking,
+                Box::new(move |tab| {
+                    let bindings = Rc::clone(&tab.bindings);
+                    let result = tab.realm.with_ctx(|ctx| {
+                        crate::bindings::fetch::resolve_stream_event(
+                            &ctx, &bindings, &stream_tx, event,
+                        )
+                        .map_err(|e| e.to_string())
+                    });
+                    if let Err(e) = result {
+                        tab.bindings
+                            .borrow_mut()
+                            .errors
+                            .push(format!("fetch stream event failed: {e}"));
+                    }
+                }),
+            );
+        }
+    }
+
+    /// Move WebSocket events delivered by the browser-side pump
+    /// into Networking-source resolution tasks (Stage 16 Phase 3,
+    /// Rec 11). Same bridge as `drain_fetch_completions`.
+    fn drain_ws_events(&mut self) {
+        let events: Vec<WsEvent> = self.ws_rx.try_iter().collect();
+        for event in events {
+            self.enqueue_host_task(
+                TaskSource::Networking,
+                Box::new(move |tab| {
+                    let bindings = Rc::clone(&tab.bindings);
+                    let result = tab.realm.with_ctx(|ctx| {
+                        crate::bindings::websocket::resolve_ws_event(&ctx, &bindings, event)
+                            .map_err(|e| e.to_string())
+                    });
+                    if let Err(e) = result {
+                        tab.bindings
+                            .borrow_mut()
+                            .errors
+                            .push(format!("websocket event failed: {e}"));
                     }
                 }),
             );

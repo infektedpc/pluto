@@ -57,13 +57,15 @@
 //! shell for nothing and draws nothing; it only builds lists.
 
 use crate::images::{ImageOutcome, ImageRequest, ImageStore, document_title};
+use crate::js_host::{MediaRequest, TrackRequest};
 use crate::page::{self, Document};
 use cosmic::iced::futures::SinkExt;
 use cosmic::iced::futures::channel::mpsc;
 use pluto_html::NodeId;
 use pluto_ipc::{
-    BrowserToRenderer, CommandReceiver, DeltaMode, InputEvent, Origin, PointerKind,
-    RendererToBrowser, WheelPhase, origin_of,
+    BrowserToRenderer, CommandReceiver, CredentialsMode, DeltaMode, Destination, InputEvent,
+    Origin, PointerKind, Priority, RendererToBrowser, RequestMode, ResourceRequest, WheelPhase,
+    origin_of,
 };
 use pluto_ipc::transport::{recv_browser_message, Transport};
 use pluto_js::DomHost;
@@ -76,7 +78,7 @@ use pluto_layout::animation::{
 };
 use pluto_layout::{
     ElementState, ImageMap, LayoutTree, OverscrollBehavior, RelayoutKind, RelayoutOutcome,
-    Theme,
+    Theme, VideoInfo,
 };
 use pluto_net::{ResourceLoader, SharedLoader};
 use pluto_paint::{
@@ -84,6 +86,7 @@ use pluto_paint::{
     svg::SvgRasterCache,
 };
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -586,6 +589,15 @@ pub(crate) enum LayoutJob {
     Geometry {
         id: NodeId,
         reply: std::sync::mpsc::Sender<Option<pluto_js::Geometry>>,
+    },
+    /// Geometry of one node from the actor's retained tree, with NO
+    /// flush — same answer as `Geometry`, but a oneshot reply so
+    /// the async tab thread can await it directly (scroll-to-anchor,
+    /// Stage 16 Phase 3 Rec 9). `None` when the actor holds no tree
+    /// / node.
+    NodeRect {
+        id: NodeId,
+        reply: oneshot::Sender<Option<pluto_js::Geometry>>,
     },
     /// Forced synchronous layout flush: replace the actor's
     /// document with the live (JS-mutated) one, rebuild the tree
@@ -1148,6 +1160,10 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                 let geometry = tree.as_ref().and_then(|tree| geometry_of(tree, id));
                 let _ = reply.send(geometry);
             }
+            LayoutJob::NodeRect { id, reply } => {
+                let geometry = tree.as_ref().and_then(|tree| geometry_of(tree, id));
+                let _ = reply.send(geometry);
+            }
             LayoutJob::FlushGeometry {
                 document: new_document,
                 viewport,
@@ -1609,6 +1625,20 @@ struct TabState {
     image_outcome_tx: tokio::sync::mpsc::UnboundedSender<ImageOutcome>,
     /// Image outcomes, received by the main loop (see `exec_rx`).
     image_outcome_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ImageOutcome>>,
+    /// Media fetch outcomes, sent back by fetch tasks.
+    media_outcome_tx: tokio::sync::mpsc::UnboundedSender<MediaOutcome>,
+    /// Media outcomes, received by the main loop (see `exec_rx`).
+    media_outcome_rx: Option<tokio::sync::mpsc::UnboundedReceiver<MediaOutcome>>,
+    /// True when a media intrinsic size / liveness changed since
+    /// the last layout pass (Stage 16 Phase 2, Rec 5): the next
+    /// tick rebuilds the image map with fresh `videos` entries.
+    /// Set only on change (metadata arrival, first frame) — NOT
+    /// on every presented frame, so a playing video does not
+    /// re-layout at 30 fps.
+    media_dirty: bool,
+    /// Last announced media intrinsic sizes, for the change
+    /// check above: (width, height, has_frame) per element.
+    last_media_sizes: HashMap<NodeId, (u32, u32, bool)>,
     /// Document-load progress reports from the load task.
     progress_tx: tokio::sync::mpsc::UnboundedSender<(u64, Option<u64>)>,
     /// Load progress, received by the main loop (see `exec_rx`).
@@ -1728,6 +1758,33 @@ struct TabState {
     /// scripts + timers + promises).
     nav_epoch: u64,
     nav_cancel: Option<CancellationToken>,
+    /// Whether the in-flight navigation replaces the current
+    /// history entry (`location.replace()` — Stage 16 Phase 3,
+    /// Rec 8): `DidCommit` carries it to the shell, which replaces
+    /// instead of pushing. Set by `start_navigation`.
+    nav_replace: bool,
+    /// Pending `popstate` for a Back/Forward traversal (Stage 16
+    /// Phase 3, Rec 8/9): `Some(state_json)` while a traversal
+    /// navigation is in flight — the state is restored into the
+    /// fresh realm at navigation start, and `popstate` fires after
+    /// the commit. `None` for ordinary navigations.
+    pending_popstate: Option<Option<String>>,
+    /// History API requests staged by the sync host drain (Stage 16
+    /// Phase 3, Rec 8): the async drain forwards them to the shell
+    /// as `HistoryPush` / `HistoryReplace` / `HistoryGo`. Staged,
+    /// not sent, because the sync drain has no event sender.
+    staged_history_push: Vec<(String, Option<String>)>,
+    staged_history_replace: Vec<(String, Option<String>)>,
+    staged_history_traversal: Vec<i32>,
+    /// A same-document fragment navigation staged by the sync host
+    /// drain (Stage 16 Phase 3, Rec 9): `(old_url, new_url)`. The
+    /// async drain updates the URL in place, scrolls to the anchor,
+    /// and dispatches `hashchange` — no fetch, no new entry.
+    pending_same_document: Option<(String, String)>,
+    /// The tab's event sender (to the shell): the `WebSocket`
+    /// backend forwards `WebSocketOpen` / `Send` / `Close` through
+    /// it (Stage 16 Phase 3, Rec 11).
+    events: tokio::sync::mpsc::Sender<RendererToBrowser>,
     /// The running load task, if any (aborted when a newer
     /// navigation commits).
     load_handle: Option<tokio::task::JoinHandle<()>>,
@@ -1805,6 +1862,7 @@ impl TabState {
         tab_id: u64,
         shared: &SharedLoader,
         broker: Option<Arc<crate::broker::BrokerHandle>>,
+        events: tokio::sync::mpsc::Sender<RendererToBrowser>,
     ) -> Self {
         let errors = Rc::new(std::sync::Mutex::new(Vec::new()));
         let render_requested = Rc::new(Cell::new(false));
@@ -1821,6 +1879,7 @@ impl TabState {
         let (load_outcome_tx, load_outcome_rx) = tokio::sync::mpsc::unbounded_channel();
         let (image_request_tx, image_request_rx) = tokio::sync::mpsc::unbounded_channel();
         let (image_outcome_tx, image_outcome_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (media_outcome_tx, media_outcome_rx) = tokio::sync::mpsc::unbounded_channel();
         let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel();
         let (font_outcome_tx, font_outcome_rx) = tokio::sync::mpsc::unbounded_channel();
         // Stage 9 Rec 5: the tab's loader starts with the
@@ -1881,6 +1940,10 @@ impl TabState {
             image_request_rx: Some(image_request_rx),
             image_outcome_tx,
             image_outcome_rx: Some(image_outcome_rx),
+            media_outcome_tx,
+            media_outcome_rx: Some(media_outcome_rx),
+            media_dirty: false,
+            last_media_sizes: HashMap::new(),
             progress_tx,
             progress_rx: Some(progress_rx),
             last_image_map: ImageMap::new(),
@@ -1914,6 +1977,13 @@ impl TabState {
             epoch: 0,
             nav_epoch: 0,
             nav_cancel: None,
+            nav_replace: false,
+            pending_popstate: None,
+            staged_history_push: Vec::new(),
+            staged_history_replace: Vec::new(),
+            staged_history_traversal: Vec::new(),
+            pending_same_document: None,
+            events,
             load_handle: None,
             exec_tx,
             exec_rx: Some(exec_rx),
@@ -1953,6 +2023,16 @@ impl TabState {
             ));
             js.set_fetch_backend(
                 std::sync::Arc::clone(&backend) as std::sync::Arc<dyn pluto_js::FetchBackend>,
+            );
+            // Stage 16 Phase 3 (Rec 11): the `WebSocket` backend —
+            // the realm's sockets open through the shell, never
+            // from this process.
+            js.set_websocket_backend(
+                std::sync::Arc::new(crate::js_host::PlutoWebSocketBackend::new(
+                    self.events.clone(),
+                    self.fetch_handle.clone(),
+                ))
+                    as std::sync::Arc<dyn pluto_js::bindings::websocket::WebSocketBackend>,
             );
             // Stage 9 Rec 4/11: attach the profile-backed
             // storage + permissions backends (created once per
@@ -2033,6 +2113,7 @@ async fn tab_main(
         tab_id,
         &shared,
         broker_handle,
+        events.clone(),
     );
     // Stage 9 Rec 12: refresh the tracker lists in the
     // background (EasyList + EasyPrivacy, fetched by default).
@@ -2071,6 +2152,10 @@ async fn tab_main(
         .image_outcome_rx
         .take()
         .expect("image outcome receiver present");
+    let mut media_outcome_rx = state
+        .media_outcome_rx
+        .take()
+        .expect("media outcome receiver present");
     let mut progress_rx = state
         .progress_rx
         .take()
@@ -2197,6 +2282,14 @@ async fn tab_main(
                         }
                     }
                 }
+                // Stage 16 (M8 Phase 2, Rec 4/6): advance the
+                // media sessions — decode ahead, present due
+                // frames on the audio clock, fire drained events
+                // — and send presented frames to the shell. A
+                // size/liveness change marks the media map dirty
+                // (layout re-runs below); a plain frame never does
+                // (the shell re-uploads the texture, no layout).
+                drive_media(&mut state, &events).await;
                 // Dirty-bit flow (Rec 7): a JS mutation sets the
                 // host's render flag / dirty bits and returns
                 // immediately (no layout); the frame tick re-lays
@@ -2219,7 +2312,12 @@ async fn tab_main(
                     // too — the next layout pass gives it its
                     // intrinsic size (full rebuild, coalesced to
                     // one per tick by `layout_and_submit`).
-                    || state.images.images_dirty;
+                    || state.images.images_dirty
+                    // Stage 16 (M8 Phase 2, Rec 5): a media
+                    // size/liveness change re-lays out the same
+                    // way (a playing video's frames do not set
+                    // this — see `drive_media`).
+                    || state.media_dirty;
                 if visible && dirty {
                     state.render_requested.set(false);
                     relayout_and_submit(&mut state, &events, tick_started).await;
@@ -2264,6 +2362,10 @@ async fn tab_main(
             outcome = image_outcome_rx.recv() => {
                 let Some(outcome) = outcome else { break };
                 handle_image_outcome(&mut state, &events, outcome).await;
+            }
+            outcome = media_outcome_rx.recv() => {
+                let Some(outcome) = outcome else { break };
+                handle_media_outcome(&mut state, outcome);
             }
             outcome = font_outcome_rx.recv() => {
                 let Some(outcome) = outcome else { break };
@@ -2345,8 +2447,17 @@ async fn handle_single_command(
 ) -> bool {
     match cmd {
         BrowserToRenderer::Shutdown => return false,
-        BrowserToRenderer::CommitNavigation { url } => {
-            start_navigation(state, url);
+        BrowserToRenderer::CommitNavigation {
+            url,
+            state_json,
+            traversal,
+            scroll,
+        } => {
+            // Stage 16 Phase 3, Rec 8 (finisher): a traversal
+            // restores the entry's `history.state` and scroll and
+            // fires `popstate` after the commit; a plain navigation
+            // carries `None` / `false` / `(0.0, 0.0)`.
+            start_navigation_with_body(state, url, None, false, state_json, traversal, scroll);
         }
         BrowserToRenderer::Resize { width, height } => {
             resize(state, events, width, height).await;
@@ -2393,6 +2504,52 @@ async fn handle_single_command(
                 handle.deliver(event).await;
             } else {
                 eprintln!("[pluto] ignoring ResourceEvent from shell: {event:?}");
+            }
+        }
+        BrowserToRenderer::HistorySync { length, index } => {
+            // Stage 16 Phase 3, Rec 8 (finisher): the shell is
+            // authoritative for session-history length / index —
+            // mirror it into the realm, correcting the optimistic
+            // `pushState` / `replaceState` bookkeeping.
+            if let Some(js) = state.tab_js.as_mut() {
+                js.set_history_length(length, index);
+            }
+        }
+        BrowserToRenderer::WebSocketEvent { socket_id, event } => {
+            // Stage 16 Phase 3, Rec 11 (finisher): a broker-pump
+            // event for one socket — convert to the tab's
+            // `WsEvent` (the `socket_id` rides in both, so the
+            // tab routes it to the right `WebSocket` object) and
+            // deliver it on the JS loop.
+            use pluto_js::bindings::websocket::WsEvent;
+            let ws_event = match event {
+                pluto_ipc::WebSocketEvent::Opened { protocol, .. } => WsEvent::Opened {
+                    id: socket_id,
+                    protocol,
+                },
+                pluto_ipc::WebSocketEvent::Message { data, is_binary, .. } => WsEvent::Message {
+                    id: socket_id,
+                    data,
+                    is_binary,
+                },
+                pluto_ipc::WebSocketEvent::Closed {
+                    code,
+                    reason,
+                    clean,
+                    ..
+                } => WsEvent::Closed {
+                    id: socket_id,
+                    code,
+                    reason,
+                    clean,
+                },
+                pluto_ipc::WebSocketEvent::Error { message, .. } => WsEvent::Error {
+                    id: socket_id,
+                    message,
+                },
+            };
+            if let Some(js) = state.tab_js.as_mut() {
+                js.deliver_ws_event(ws_event);
             }
         }
         BrowserToRenderer::InputEvent(event) => {
@@ -2509,6 +2666,11 @@ fn handle_exec(state: &mut TabState, msg: crate::js_host::ExecMsg) {
             document, reply, ..
         } => {
             let document = exec.finish_page(js, *document);
+            // Stage 16 (M8 Phase 2, Rec 4): the document is
+            // parsed — register its media elements so their
+            // sessions, candidates and tracks exist before any
+            // script or tick touches them.
+            js.register_media_elements();
             let _ = reply.send(document);
         }
     }
@@ -2693,23 +2855,80 @@ fn drain_animate_requests(state: &mut TabState) {
 
 fn drain_host_requests(state: &mut TabState) {
     drain_animate_requests(state);
-    let (navigation, images) = {
+    let (navigation, images, media, tracks, history) = {
         let mut host = state.host.lock().unwrap();
         (
             host.take_pending_navigation(),
             host.take_pending_images(),
+            host.take_pending_media(),
+            host.take_pending_tracks(),
+            host.take_pending_history(),
         )
     };
-    if let Some((url, _replace)) = navigation {
-        // `replace` (no new history entry) is M8 history work:
-        // `DidCommit` carries no replace flag, so a replace
-        // navigates exactly like an assign today.
-        start_navigation(state, url);
+    // Stage 16 Phase 3, Rec 8 (finisher): the sync drain has no
+    // event sender, so history requests stage here and the async
+    // drain forwards them to the shell.
+    let (pushes, replaces, traversals) = history;
+    state.staged_history_push.extend(pushes);
+    state.staged_history_replace.extend(replaces);
+    state.staged_history_traversal.extend(traversals);
+    if let Some((url, replace)) = navigation {
+        // Stage 16 Phase 3, Rec 9 (finisher): a navigation whose
+        // URL differs only in the fragment is same-document — no
+        // fetch, no new entry. It stages here; the async drain
+        // scrolls to the anchor and dispatches `hashchange`.
+        if is_fragment_only_change(state, &url) {
+            let old_url = state
+                .host
+                .lock()
+                .unwrap()
+                .document_url()
+                .unwrap_or_default();
+            state.pending_same_document = Some((old_url, url));
+        } else {
+            // `replace` (no new history entry) rides in
+            // `nav_replace` to `DidCommit` (Stage 16 Phase 3,
+            // Rec 8): a `location.replace()` commit replaces the
+            // current entry in place instead of pushing.
+            start_navigation_with_body(state, url, None, replace, None, false, (0.0, 0.0));
+        }
     } else {
         for req in images {
             handle_js_image_request(state, req);
         }
+        for req in media {
+            handle_js_media_request(state, req);
+        }
+        for req in tracks {
+            handle_js_track_request(state, req);
+        }
     }
+}
+
+/// True when `url` differs from the current document's URL only
+/// in the fragment (Stage 16 Phase 3, Rec 9): such a navigation
+/// is same-document — no fetch, no new entry, just a scroll to
+/// the anchor and a `hashchange` event. The "current URL" is the
+/// host's URL (set at navigation start, moved in place by
+/// `pushState` / same-document changes) — NOT `state.document`,
+/// which is `None` until the first load commits and would turn a
+/// hash change during the first parse into a full navigation
+/// that swallows the `hashchange`.
+fn is_fragment_only_change(state: &TabState, url: &str) -> bool {
+    let Some(current) = state.host.lock().unwrap().document_url() else {
+        return false;
+    };
+    same_document_url(&current, url) && current != url
+}
+
+/// True when two URLs are the same document (Stage 16 Phase 3,
+/// Rec 9): equal up to the fragment — the fragment itself may
+/// differ or be absent on either side.
+fn same_document_url(a: &str, b: &str) -> bool {
+    fn strip(u: &str) -> &str {
+        u.split('#').next().unwrap_or(u)
+    }
+    strip(a) == strip(b)
 }
 
 /// Drain the JS requests that need an async tab thread (Stage 13
@@ -2736,10 +2955,137 @@ async fn drain_host_requests_async(
     for (form, submitter) in submits {
         submit_form(state, events, form, submitter).await;
     }
+    // Stage 16 Phase 3, Rec 8 (finisher): forward the staged
+    // history requests to the shell — pushes, then replaces, then
+    // traversals. Each list keeps the page's order; cross-kind
+    // order is not observable, since each request is a separate
+    // JS call. A failed send means the tab is dead; stop.
+    for (url, state_json) in std::mem::take(&mut state.staged_history_push) {
+        if !emit_tab(
+            events,
+            RendererToBrowser::HistoryPush { url, state_json },
+        )
+        .await
+        {
+            return;
+        }
+    }
+    for (url, state_json) in std::mem::take(&mut state.staged_history_replace) {
+        if !emit_tab(
+            events,
+            RendererToBrowser::HistoryReplace { url, state_json },
+        )
+        .await
+        {
+            return;
+        }
+    }
+    for delta in std::mem::take(&mut state.staged_history_traversal) {
+        if !emit_tab(events, RendererToBrowser::HistoryGo { delta }).await {
+            return;
+        }
+    }
+    // Stage 16 Phase 3, Rec 9 (finisher): a staged
+    // same-document navigation — update the URL in place, scroll
+    // to the anchor, and dispatch `hashchange`. No fetch, no new
+    // entry.
+    if let Some((old_url, new_url)) = state.pending_same_document.take() {
+        navigate_same_document(state, events, old_url, new_url).await;
+    }
     // Storage events fan out here too (Stage 13 Rec 10d): other
     // tabs' mutations arrive as `storage` events on this tab's
     // window, never the mutating tab's.
     drain_storage_events(state);
+}
+
+/// A same-document fragment navigation (Stage 16 Phase 3, Rec 9):
+/// no fetch, no new entry, no realm reset — update the URL in
+/// place, scroll to the anchor (or the top when there is none),
+/// and dispatch `hashchange`. The shell learns the new URL via a
+/// `HistoryReplace` (carrying the current state, so the entry's
+/// `history.state` survives), so the address bar and the session
+/// entry agree.
+///
+/// No bfcache: Pluto keeps no back/forward cache — a traversal
+/// re-fetches and rebuilds the document in a fresh realm (see
+/// ARCHITECTURE.md, M8). A same-document navigation never leaves
+/// the document, so there is nothing to cache or restore.
+async fn navigate_same_document(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    old_url: String,
+    new_url: String,
+) {
+    // The realm's `location` and the fetch base move to the new
+    // URL; the document's `base_url` is left alone — a fragment
+    // never changes relative-URL resolution.
+    {
+        let mut host = state.host.lock().unwrap();
+        host.set_document_url(&new_url);
+        host.set_base_url(&new_url);
+    }
+    if let Some(backend) = &state.fetch_backend {
+        backend.set_base_url(&new_url);
+    }
+    // Scroll to the anchor: the element whose `id` is the
+    // fragment, at the top of the viewport (clamped to the page's
+    // max scroll). No anchor — or an empty fragment — scrolls to
+    // the top.
+    let fragment = new_url.split('#').nth(1).unwrap_or("");
+    let mut target = (0.0, 0.0);
+    if !fragment.is_empty() {
+        if let Some(id) = state.host.lock().unwrap().get_element_by_id(fragment) {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if state
+                .layout_tx
+                .send(LayoutJob::NodeRect { id, reply: reply_tx })
+                .is_ok()
+                && let Ok(Some(geometry)) = reply_rx.await
+            {
+                target = (geometry.x as f32, geometry.y as f32);
+            }
+        }
+    }
+    let (max_x, max_y) = page_max_scroll(state).await;
+    let clamped = (target.0.clamp(0.0, max_x), target.1.clamp(0.0, max_y));
+    if clamped != state.viewport_scroll {
+        let (dx, dy) = (
+            clamped.0 - state.viewport_scroll.0,
+            clamped.1 - state.viewport_scroll.1,
+        );
+        state.viewport_scroll = clamped;
+        if emit_tab(events, RendererToBrowser::ScrollViewport { dx, dy }).await {
+            // Sync the actor's tree (sticky offsets are
+            // scroll-derived); the frame tick re-collects the list
+            // from the synced tree.
+            let _ = apply_viewport_scroll(state, events).await;
+        }
+    }
+    // The entry's URL changed in place: tell the shell (a
+    // `HistoryReplace` — no new entry), then dispatch `hashchange`
+    // on the window. When a load is in flight, skip the replace:
+    // the upcoming `DidCommit` carries the fragment (see
+    // `handle_nav_outcome`), and a replace now would push the
+    // fragment URL into the history ahead of the page being
+    // loaded.
+    let state_json = state
+        .tab_js
+        .as_ref()
+        .map(|js| js.history_state())
+        .unwrap_or(None);
+    if state.load_handle.is_none() {
+        let _ = emit_tab(
+            events,
+            RendererToBrowser::HistoryReplace {
+                url: new_url.clone(),
+                state_json,
+            },
+        )
+        .await;
+    }
+    if let Some(js) = state.tab_js.as_mut() {
+        js.dispatch_hashchange(old_url, new_url);
+    }
 }
 
 /// Drain cross-tab `storage` events for this tab's origin and
@@ -3445,6 +3791,10 @@ async fn submit_form(
                 bytes: body,
                 content_type,
             }),
+            false,
+            None,
+            false,
+            (0.0, 0.0),
         );
     }
 }
@@ -3618,17 +3968,29 @@ fn with_caret(state: &mut TabState, base: Arc<DisplayList>) -> Arc<DisplayList> 
 }
 
 fn start_navigation(state: &mut TabState, url: String) {
-    start_navigation_with_body(state, url, None);
+    start_navigation_with_body(state, url, None, false, None, false, (0.0, 0.0));
 }
 
-/// Start a navigation, optionally as a form POST (Stage 13 Rec
-/// 6): the body rides the same loader and the same Stage 9 gates
-/// as a GET navigation; only the method / body / `Content-Type`
-/// differ (see `page::load_page_cancellable_with_hooks`).
+/// Start a navigation with the history semantics attached (Stage
+/// 16 Phase 3, Rec 8): `replace` (no new history entry —
+/// `location.replace()`), `state_json` (the session-history state
+/// to restore into the fresh realm — `Some` for a Back/Forward
+/// traversal or a reload of a stateful entry, `None` for a fresh
+/// navigation, whose `history.state` is `null`), `traversal`
+/// (a Back/Forward traversal fires `popstate` after the commit;
+/// a reload restores the state but fires none), and `scroll` (the
+/// viewport scroll to restore — the entry's saved scroll for a
+/// traversal / reload, `(0.0, 0.0)` for a fresh navigation; the
+/// worker's layout mirror must match the shell's compositor, or
+/// fixed / sticky elements lay out at the wrong offset).
 fn start_navigation_with_body(
     state: &mut TabState,
     url: String,
     post_body: Option<page::PostBody>,
+    replace: bool,
+    state_json: Option<String>,
+    traversal: bool,
+    scroll: (f32, f32),
 ) {
     // Stage 9 Rec 11: visiting an origin extends its
     // permission grants (they expire after ~90 days of
@@ -3647,6 +4009,12 @@ fn start_navigation_with_body(
     }
     state.nav_epoch += 1;
     let epoch = state.nav_epoch;
+    state.nav_replace = replace;
+    state.pending_popstate = if traversal {
+        Some(state_json.clone())
+    } else {
+        None
+    };
     let token = CancellationToken::new();
     state.nav_cancel = Some(token.clone());
     // Stage 9 Rec 15: the navigation's referrer is the current
@@ -3688,8 +4056,11 @@ fn start_navigation_with_body(
     state.animation_geometry_pending.clear();
     // The shell resets its scroll on commit; mirror it here (the
     // viewport scroll is mirrored, not messaged — see
-    // `viewport_scroll`).
-    state.viewport_scroll = (0.0, 0.0);
+    // `viewport_scroll`). A traversal / reload restores the
+    // entry's saved scroll instead (Stage 16 Phase 3, Rec 8 —
+    // finisher); the shell restores the same scroll into its
+    // compositor when the new list lands, so the two agree.
+    state.viewport_scroll = scroll;
     // M6 Phase 3 (Rec 11/12): navigation clears running
     // animations/transitions, sampled values, the computed-style
     // cache, and pending fonts — the new document starts clean
@@ -3711,6 +4082,12 @@ fn start_navigation_with_body(
     let js = state.tab_js();
     if js.navigate().is_err() {
         eprintln!("[pluto] realm recreation failed for navigation to {url}");
+    }
+    // A traversal / stateful reload restores the entry's state
+    // into the fresh realm before any script runs, so the new
+    // document's scripts read the right `history.state`.
+    if let Some(state_json) = state_json {
+        state.tab_js().set_history_state(Some(state_json));
     }
     if let Some(backend) = &state.fetch_backend {
         backend.set_base_url(&url);
@@ -3840,14 +4217,42 @@ async fn handle_nav_outcome(
             // `@font-face` sources fetch through the loader now.
             maybe_request_font_faces(state);
             if !emit_tab(events, RendererToBrowser::DidCommit {
-                url: final_url.clone(),
+                // Stage 16 Phase 3, Rec 9 (finisher): the
+                // committed URL is the realm's effective URL — a
+                // same-document fragment change during the load
+                // (a script setting `location.hash` during the
+                // first parse) moves the realm's URL before the
+                // commit lands, and the entry must carry the
+                // fragment; the fetch-side URL has none.
+                url: {
+                    let host_url = state.host.lock().unwrap().document_url();
+                    match host_url {
+                        Some(u) if same_document_url(&u, &final_url) => u,
+                        _ => final_url.clone(),
+                    }
+                },
                 status: format!("Loaded {final_url}"),
+                // Stage 16 Phase 3, Rec 8 (finisher): the shell
+                // replaces the current entry in place on a
+                // `location.replace()` commit instead of pushing.
+                replace: state.nav_replace,
             })
             .await
             {
                 return;
             }
             layout_and_submit(state, events, Some(*document), false, std::time::Instant::now()).await;
+            // Stage 16 Phase 3, Rec 8 (finisher): a traversal's
+            // `popstate` fires after the commit — the state was
+            // restored into the fresh realm at navigation start.
+            // A failed traversal load fires none (the error page
+            // has no realm state to report); a stale outcome never
+            // reaches here (the epoch guard above returns first).
+            if let Some(state_json) = state.pending_popstate.take() {
+                if let Some(js) = state.tab_js.as_mut() {
+                    js.dispatch_popstate(state_json);
+                }
+            }
         }
         LoadOutcome::Failed { url, reason, .. } => {
             eprintln!("[pluto] worker fetch failed: {reason}");
@@ -4064,6 +4469,346 @@ fn handle_js_image_request(state: &mut TabState, req: ImageRequest) {
     } else if state.images.is_broken(&req.url) {
         notify_image_targets(state, &req.url, None);
     }
+}
+
+// --- Stage 16 (M8 Phase 2, Rec 4/5): media fetches ---
+
+/// Request-id counter for media fetches (separate from the
+/// image counter — the broker keys responses by id, and the
+/// two pipelines must never collide).
+static NEXT_MEDIA_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// One media fetch outcome, from a spawned task to the tab
+/// thread: the whole fetched file (buffered-whole media until
+/// Rec 12 streaming), or the failure reason.
+pub enum MediaOutcome {
+    /// A media candidate's bytes (or failure) for `key`.
+    Media {
+        key: NodeId,
+        epoch: u64,
+        result: Result<MediaDelivery, String>,
+    },
+    /// A `<track>` file's bytes (or failure) for `key`.
+    Track {
+        key: NodeId,
+        track_idx: usize,
+        epoch: u64,
+        result: Result<Vec<u8>, String>,
+    },
+}
+
+/// A delivered media candidate: the bytes, the response
+/// Content-Type, and the tainting decision for this fetch.
+pub struct MediaDelivery {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+    /// True when the origin is clean for this element:
+    /// same-origin, `data:`, or a CORS-approved cross-origin
+    /// fetch. The renderer computes it (see
+    /// `media_origin_clean`); `pluto-net` enforces CORS, the
+    /// renderer records the outcome.
+    pub origin_clean: bool,
+    /// True when the fetch was CORS-approved (mode `Cors` +
+    /// success). M8 always fetches media `NoCors` (no
+    /// `crossorigin` attribute support yet), so this is false
+    /// today — the field exists so the record is explicit and
+    /// the `crossorigin` work can flip it without changing the
+    /// delivery shape.
+    pub cors_approved: bool,
+}
+
+/// Whether a media URL is origin-clean (Stage 16 Phase 2,
+/// Rec 4): `data:` URLs never taint; a URL is clean when its
+/// origin equals the document base URL's origin. Cross-origin
+/// media taints unless the fetch was CORS-approved — the
+/// caller passes that in separately (see `MediaDelivery`).
+fn media_origin_clean(base_url: &str, url: &str, cors_approved: bool) -> bool {
+    if cors_approved {
+        return true;
+    }
+    if url.starts_with("data:") {
+        return true;
+    }
+    Origin::from_url(url) == Origin::from_url(base_url)
+}
+
+/// Build a media subresource request (mirrors
+/// `image_resource_request` / `subresource_request`): the
+/// destination is `Video` / `Audio` by element, mode is
+/// `NoCors` (the element has no `crossorigin` attribute in
+/// M8), priority Medium.
+fn media_resource_request(
+    url: &str,
+    destination: Destination,
+    base_url: &str,
+    tab_id: u64,
+    epoch: u64,
+) -> ResourceRequest {
+    let origin = origin_of(base_url);
+    ResourceRequest {
+        request_id: NEXT_MEDIA_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+        tab_id,
+        epoch,
+        url: url.to_string(),
+        method: "GET".to_string(),
+        headers: Vec::new(),
+        is_imageset: false,
+        destination,
+        priority: Priority::Medium,
+        mode: RequestMode::NoCors,
+        credentials: CredentialsMode::SameOrigin,
+        origin: origin.clone(),
+        top_level_site: origin,
+        upgrade_insecure_requests: false,
+        integrity: None,
+        body: None,
+    }
+}
+
+/// Handle one JS media-candidate request: a `data:` URL is
+/// decoded inline (the broker never sees it — same belt as
+/// the preload scanner's `data:` skip); anything else spawns
+/// a broker fetch whose outcome lands on `media_outcome_rx`.
+fn handle_js_media_request(state: &mut TabState, req: MediaRequest) {
+    let Some(js) = state.tab_js.as_mut() else {
+        return;
+    };
+    if let Some(bytes) = decode_data_url(&req.url) {
+        js.deliver_media(req.key, bytes, req.mime_hint, true, true);
+        return;
+    }
+    let is_video = state
+        .host
+        .lock()
+        .unwrap()
+        .tag_name(req.key)
+        .as_deref()
+        == Some("video");
+    let destination = if is_video {
+        Destination::Video
+    } else {
+        Destination::Audio
+    };
+    let fetch = state.fetch_source.clone();
+    let request = media_resource_request(
+        &req.url,
+        destination,
+        &req.base_url,
+        state.tab_id,
+        state.nav_epoch,
+    );
+    let cancel = state
+        .nav_cancel
+        .clone()
+        .unwrap_or_else(CancellationToken::new);
+    let outcome_tx = state.media_outcome_tx.clone();
+    let key = req.key;
+    let epoch = state.nav_epoch;
+    let base_url = req.base_url.clone();
+    tokio::task::spawn(async move {
+        let result = match fetch.fetch_with(request, cancel).await {
+            Ok(response) => {
+                let mime = response
+                    .content_type()
+                    .unwrap_or("")
+                    .to_string();
+                // Mode is always NoCors in M8 (see
+                // `media_resource_request`), so a cross-origin
+                // success is NOT CORS-approved — the clean bit
+                // comes from same-origin / data: only.
+                let cors_approved = false;
+                let origin_clean = media_origin_clean(&base_url, &response.final_url.to_string(), cors_approved);
+                Ok(MediaDelivery {
+                    bytes: response.body,
+                    mime,
+                    origin_clean,
+                    cors_approved,
+                })
+            }
+            Err(e) => Err(format!("{e}")),
+        };
+        let _ = outcome_tx.send(MediaOutcome::Media {
+            key,
+            epoch,
+            result,
+        });
+    });
+}
+
+/// Handle one JS `<track>` request: same shape as media
+/// (inline `data:` decode, else a broker fetch with
+/// `Destination::Video` — tracks ride the media pipeline;
+/// the destination only gates CSP media-src, which is the
+/// right gate for a track file).
+fn handle_js_track_request(state: &mut TabState, req: TrackRequest) {
+    let Some(js) = state.tab_js.as_mut() else {
+        return;
+    };
+    if let Some(bytes) = decode_data_url(&req.url) {
+        js.deliver_track(req.key, req.track_idx, bytes);
+        return;
+    }
+    let fetch = state.fetch_source.clone();
+    let request = media_resource_request(
+        &req.url,
+        Destination::Video,
+        &req.base_url,
+        state.tab_id,
+        state.nav_epoch,
+    );
+    let cancel = state
+        .nav_cancel
+        .clone()
+        .unwrap_or_else(CancellationToken::new);
+    let outcome_tx = state.media_outcome_tx.clone();
+    let key = req.key;
+    let track_idx = req.track_idx;
+    let epoch = state.nav_epoch;
+    tokio::task::spawn(async move {
+        let result = match fetch.fetch_with(request, cancel).await {
+            Ok(response) => Ok(response.body),
+            Err(e) => Err(format!("{e}")),
+        };
+        let _ = outcome_tx.send(MediaOutcome::Track {
+            key,
+            track_idx,
+            epoch,
+            result,
+        });
+    });
+}
+
+/// Apply one media fetch outcome: stale epochs are dropped
+/// (a navigation since the fetch started), the rest go to
+/// the element's session via `TabJs`.
+fn handle_media_outcome(state: &mut TabState, outcome: MediaOutcome) {
+    let epoch = match &outcome {
+        MediaOutcome::Media { epoch, .. } => *epoch,
+        MediaOutcome::Track { epoch, .. } => *epoch,
+    };
+    if epoch != state.nav_epoch {
+        return;
+    }
+    let Some(js) = state.tab_js.as_mut() else {
+        return;
+    };
+    match outcome {
+        MediaOutcome::Media { key, result, .. } => match result {
+            Ok(delivery) => js.deliver_media(
+                key,
+                delivery.bytes,
+                delivery.mime,
+                delivery.origin_clean,
+                delivery.cors_approved,
+            ),
+            Err(reason) => js.notify_media_failed(key, reason),
+        },
+        MediaOutcome::Track {
+            key,
+            track_idx,
+            result,
+            ..
+        } => match result {
+            Ok(bytes) => js.deliver_track(key, track_idx, bytes),
+            Err(_) => js.notify_track_failed(key, track_idx),
+        },
+    }
+}
+
+/// Advance every media session one tick and send presented
+/// frames to the shell (Stage 16, M8 Phase 2, Rec 4/6). The
+/// session's audio clock decides what presents; this only
+/// moves the frames. A size/liveness change marks the media
+/// map dirty (layout re-runs on the next dirty check); a
+/// plain frame never does.
+async fn drive_media(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+) {
+    let Some(js) = state.tab_js.as_mut() else {
+        return;
+    };
+    let presented = js.media_tick();
+    let sizes = js.media_intrinsic_sizes();
+    if sizes != state.last_media_sizes {
+        state.last_media_sizes = sizes;
+        state.media_dirty = true;
+    }
+    for (_key, frame) in presented {
+        if !emit_tab(
+            events,
+            RendererToBrowser::VideoFrame {
+                epoch: state.nav_epoch,
+                frame,
+            },
+        )
+        .await
+        {
+            break;
+        }
+    }
+}
+
+/// Decode a `data:` URL to bytes (`data:[mime][;base64],...`),
+/// or `None` when the URL is not a `data:` URL or is
+/// malformed. Media and track `data:` sources decode inline
+/// here — the broker never sees them.
+fn decode_data_url(url: &str) -> Option<Vec<u8>> {
+    let rest = url.trim_start().strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    if meta.contains(";base64") {
+        base64_decode(data)
+    } else {
+        percent_decode(data)
+    }
+}
+
+/// Minimal base64 decode (no padding-sensitive general
+/// decoder; invalid input → None).
+fn base64_decode(data: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut acc: u32 = 0;
+    let mut nbits = 0;
+    for c in data.chars() {
+        let v = match c {
+            'A'..='Z' => c as u32 - 'A' as u32,
+            'a'..='z' => c as u32 - 'a' as u32 + 26,
+            '0'..='9' => c as u32 - '0' as u32 + 52,
+            '+' => 62,
+            '/' => 63,
+            '=' => break,
+            _ => return None,
+        };
+        acc = (acc << 6) | v;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Percent-decode a data-URL body (`%XX` → byte).
+fn percent_decode(data: &str) -> Option<Vec<u8>> {
+    let bytes = data.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+            let v = u8::from_str_radix(hex, 16).ok()?;
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Some(out)
 }
 
 /// Whether an image URL is origin-clean for canvas tainting
@@ -4534,10 +5279,12 @@ async fn layout_and_submit(
     // empty). The dirty flag is consumed here: an image that lands
     // mid-layout sets it again, and the next tick rebuilds.
     let images_dirty = state.images.images_dirty;
-    let images = if images_dirty || !incremental {
+    let media_dirty = state.media_dirty;
+    let images = if images_dirty || media_dirty || !incremental {
         state.images.images_dirty = false;
+        state.media_dirty = false;
         let doc = document.as_ref().or(state.document.as_ref());
-        match doc {
+        let mut images = match doc {
             Some(doc) => state.images.build_image_map(
                 doc.dom(),
                 doc.sheet(),
@@ -4546,11 +5293,27 @@ async fn layout_and_submit(
                 1.0,
             ),
             None => ImageMap::new(),
+        };
+        // Stage 16 (M8 Phase 2, Rec 5): the decoded media sizes
+        // ride the same map layout reads — the intrinsic size
+        // once HAVE_METADATA, and whether a frame is presentable.
+        if let Some(js) = state.tab_js.as_ref() {
+            for (key, (w, h, live)) in js.media_intrinsic_sizes() {
+                images.videos.insert(
+                    key,
+                    VideoInfo {
+                        width: w,
+                        height: h,
+                        has_frame: live,
+                    },
+                );
+            }
         }
+        images
     } else {
         ImageMap::new()
     };
-    if images_dirty || !incremental {
+    if images_dirty || media_dirty || !incremental {
         state.last_image_map = images.clone();
     }
     // Stage 11 Rec 8: read the title BEFORE the document moves
@@ -4944,7 +5707,7 @@ async fn run_intersection_observer_step(state: &mut TabState) {
     let Some(js) = state.tab_js.as_mut() else {
         return;
     };
-    js.run_intersection_observers_with_geometry(&geometry, time_ms);
+    js.run_intersection_observers_with_geometry(&geometry, time_ms, state.viewport_scroll);
 }
 
 /// Re-layout the live (possibly JS-mutated) document and submit.
@@ -5414,6 +6177,14 @@ async fn handle_pointer_down(
     y: f32,
     button: Option<u8>,
 ) {
+    // Stage 16 Phase 1, Rec 7: a trusted pointer press is a user
+    // gesture — record it BEFORE hit-testing, so a press on empty
+    // page still counts (the shell never forwards chrome clicks
+    // here). `pointerdown` itself is not dispatched to JS yet;
+    // activation is recorded from the `InputEvent` regardless.
+    if let Some(js) = state.tab_js.as_mut() {
+        js.note_user_activation();
+    }
     let Some(target) = hit_test(state, x, y).await else {
         return;
     };
@@ -5828,6 +6599,15 @@ async fn handle_key(
 ) {
     if !state.window_focused {
         return;
+    }
+    if pressed {
+        // Stage 16 Phase 1, Rec 7: a trusted key press is a user
+        // gesture. Recorded before dispatch: a `preventDefault()`d
+        // keydown still counts (the gesture happened), and a
+        // keyup never counts.
+        if let Some(js) = state.tab_js.as_mut() {
+            js.note_user_activation();
+        }
     }
     if !pressed {
         // A real `keyup` on the focused element (Stage 13 Rec 2).
@@ -6281,6 +7061,9 @@ mod tests {
         browser
             .send_message(&BrowserToRenderer::CommitNavigation {
                 url: "about:blank".to_string(),
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
             })
             .await
             .expect("navigation sends");
@@ -6398,6 +7181,9 @@ mod tests {
         cmd_tx
             .send(BrowserToRenderer::CommitNavigation {
                 url: "about:blank".to_string(),
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
             })
             .expect("bridge takes the navigation");
         let event = tokio::time::timeout(Duration::from_secs(20), next_event(&mut output_rx))
@@ -6438,6 +7224,9 @@ mod tests {
         cmd_tx
             .send(BrowserToRenderer::CommitNavigation {
                 url: "about:blank".to_string(),
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
             })
             .expect("bridge takes the navigation");
         let event = tokio::time::timeout(Duration::from_secs(20), next_event(&mut output_rx))
@@ -6695,7 +7484,12 @@ mod tests {
         let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         cmd_tx
-            .send(BrowserToRenderer::CommitNavigation { url: url.clone() })
+            .send(BrowserToRenderer::CommitNavigation {
+                url: url.clone(),
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
             .expect("worker takes the command");
         // The fetch commits first, then the display list lands.
         match next_event(&mut event_rx).await {
@@ -6750,7 +7544,12 @@ mod tests {
         let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/svg", addr.port());
         cmd_tx
-            .send(BrowserToRenderer::CommitNavigation { url: url.clone() })
+            .send(BrowserToRenderer::CommitNavigation {
+                url: url.clone(),
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
             .expect("worker takes the command");
         assert!(matches!(
             next_event(&mut event_rx).await,
@@ -6833,7 +7632,12 @@ mod tests {
         let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         cmd_tx
-            .send(BrowserToRenderer::CommitNavigation { url })
+            .send(BrowserToRenderer::CommitNavigation {
+                url,
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
             .expect("worker takes the command");
         assert!(matches!(
             next_event(&mut event_rx).await,
@@ -6890,7 +7694,12 @@ mod tests {
         let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         cmd_tx
-            .send(BrowserToRenderer::CommitNavigation { url })
+            .send(BrowserToRenderer::CommitNavigation {
+                url,
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
             .expect("worker takes the command");
         assert!(matches!(
             next_event(&mut event_rx).await,
@@ -6956,6 +7765,9 @@ mod tests {
         cmd_tx
             .send(BrowserToRenderer::CommitNavigation {
                 url: "ftp://example.com/".to_string(),
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
             })
             .expect("worker takes the command");
         // The error page arrives as a display list first, then the
@@ -6989,12 +7801,22 @@ mod tests {
         let slow = format!("http://127.0.0.1:{}/slow", addr.port());
         let fast = format!("http://127.0.0.1:{}/", addr.port());
         cmd_tx
-            .send(BrowserToRenderer::CommitNavigation { url: slow })
+            .send(BrowserToRenderer::CommitNavigation {
+                url: slow,
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
             .expect("worker takes the command");
         // Before the slow fetch lands (500 ms), commit the fast one.
         tokio::time::sleep(Duration::from_millis(50)).await;
         cmd_tx
-            .send(BrowserToRenderer::CommitNavigation { url: fast.clone() })
+            .send(BrowserToRenderer::CommitNavigation {
+                url: fast.clone(),
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
             .expect("worker takes the command");
         // The only DidCommit is the fast URL: the slow navigation
         // was cancelled by token, and any stale outcome it reports
@@ -7066,7 +7888,12 @@ mod tests {
         let page1 = format!("http://127.0.0.1:{}/", addr.port());
         let page2 = format!("http://127.0.0.1:{}/page2", addr.port());
         cmd_tx
-            .send(BrowserToRenderer::CommitNavigation { url: page1 })
+            .send(BrowserToRenderer::CommitNavigation {
+                url: page1,
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
             .expect("worker takes the command");
         assert!(matches!(
             next_event(&mut event_rx).await,
@@ -7102,6 +7929,325 @@ mod tests {
                 .is_err(),
             "click on blank area must not navigate"
         );
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Wait for a `TitleChanged` carrying `want` (Stage 16 Phase
+    /// 3): pages under test report JS-observed state by setting
+    /// `document.title`, since the worker tests have no JS-eval
+    /// channel. Other events are skipped; a timeout fails the test.
+    async fn wait_for_title(rx: &mut mpsc::Receiver<crate::Message>, want: &str) {
+        let found = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match rx.next().await.expect("worker emits an event") {
+                    crate::Message::RendererEvent(
+                        _,
+                        RendererToBrowser::TitleChanged { title },
+                    ) if title == want => return,
+                    crate::Message::RendererEvent(_, _) => continue,
+                    other => panic!("expected a RendererEvent, got {other:?}"),
+                }
+            }
+        })
+        .await;
+        assert!(found.is_ok(), "timed out waiting for title {want:?}");
+    }
+
+    /// Serve one fixed page body for the history tests below.
+    async fn serve_fixed_page(listener: TcpListener, body: &'static str) {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let Ok(_) = stream.read(&mut buf).await else {
+                    return;
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    }
+
+    /// Stage 16 Phase 3, Rec 8 (finisher): a page's `pushState`
+    /// reaches the shell as a `HistoryPush` — the drain forwards
+    /// the staged request instead of dropping it.
+    #[tokio::test]
+    async fn worker_history_push_state_reaches_shell() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_fixed_page(
+            listener,
+            "<!doctype html><html><head><style>body{margin:0}</style></head>\
+             <body><script>history.pushState({view:\"home\"}, \"\", \"app#view\");</script>\
+             <p>push page</p></body></html>",
+        ));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let page = format!("http://127.0.0.1:{}/", addr.port());
+        cmd_tx
+            .send(BrowserToRenderer::CommitNavigation {
+                url: page.clone(),
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
+            .expect("worker takes the command");
+        // The push runs during the parse, so its `HistoryPush`
+        // may arrive before or after the commit — collect both,
+        // in either order.
+        let mut committed = false;
+        let mut pushed: Option<(String, Option<String>)> = None;
+        while !committed || pushed.is_none() {
+            match next_event(&mut event_rx).await {
+                RendererToBrowser::DidCommit { .. } => committed = true,
+                RendererToBrowser::HistoryPush { url, state_json } => {
+                    pushed = Some((url, state_json));
+                }
+                RendererToBrowser::SubmitDisplayList { .. } => continue,
+                other => panic!("expected DidCommit/HistoryPush, got {other:?}"),
+            }
+        }
+        let (url, state_json) = pushed.expect("HistoryPush arrived");
+        assert_eq!(url, format!("{page}app#view"));
+        assert_eq!(state_json.as_deref(), Some(r#"{"view":"home"}"#));
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Stage 16 Phase 3, Rec 8 (finisher): a traversal commit
+    /// restores the entry's state into the fresh realm and fires
+    /// `popstate` after the commit — the page's listener reads
+    /// the restored `history.state`.
+    #[tokio::test]
+    async fn worker_traversal_restores_state_and_fires_popstate() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_fixed_page(
+            listener,
+            "<!doctype html><html><head><style>body{margin:0}</style></head>\
+             <body><script>window.addEventListener('popstate', (e) => { \
+             document.title = 'popped:' + JSON.stringify(e.state); });</script>\
+             <p>popstate page</p></body></html>",
+        ));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let page = format!("http://127.0.0.1:{}/", addr.port());
+        cmd_tx
+            .send(BrowserToRenderer::CommitNavigation {
+                url: page.clone(),
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
+            .expect("worker takes the command");
+        assert!(matches!(
+            next_event(&mut event_rx).await,
+            RendererToBrowser::DidCommit { .. }
+        ));
+        // Drain the first page's submit before the traversal:
+        // it is already queued ahead of the traversal's commit.
+        assert!(matches!(
+            next_event(&mut event_rx).await,
+            RendererToBrowser::SubmitDisplayList { .. }
+        ));
+        // A Back/Forward commit to the same page, carrying the
+        // entry's state: the worker restores it and fires
+        // `popstate` after the commit.
+        cmd_tx
+            .send(BrowserToRenderer::CommitNavigation {
+                url: page.clone(),
+                state_json: Some(r#"{"view":"home"}"#.to_string()),
+                traversal: true,
+                scroll: (0.0, 0.0),
+            })
+            .expect("worker takes the command");
+        assert!(matches!(
+            next_event(&mut event_rx).await,
+            RendererToBrowser::DidCommit { .. }
+        ));
+        wait_for_title(&mut event_rx, r#"popped:{"view":"home"}"#).await;
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Stage 16 Phase 3, Rec 9 (finisher): setting
+    /// `location.hash` is a same-document navigation — no fetch,
+    /// no new entry: `hashchange` fires and no second `DidCommit`
+    /// arrives.
+    #[tokio::test]
+    async fn worker_hash_change_is_same_document() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_fixed_page(
+            listener,
+            "<!doctype html><html><head><style>body{margin:0}</style></head>\
+             <body><div id=\"sec2\" style=\"height:2000px\">section two</div>\
+             <script>window.addEventListener('hashchange', () => { \
+             document.title = 'hashed:' + location.hash; }); \
+             location.hash = 'sec2';</script></body></html>",
+        ));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let page = format!("http://127.0.0.1:{}/", addr.port());
+        cmd_tx
+            .send(BrowserToRenderer::CommitNavigation {
+                url: page.clone(),
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
+            .expect("worker takes the command");
+        // The `hashchange` (and its title) may arrive before or
+        // after the commit — collect both, in either order.
+        let mut committed = false;
+        let mut titled = false;
+        let found = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match event_rx.next().await.expect("worker emits an event") {
+                    crate::Message::RendererEvent(_, RendererToBrowser::DidCommit { .. }) => {
+                        committed = true;
+                    }
+                    crate::Message::RendererEvent(
+                        _,
+                        RendererToBrowser::TitleChanged { title },
+                    ) if title == "hashed:#sec2" => titled = true,
+                    crate::Message::RendererEvent(_, _) => continue,
+                    other => panic!("expected a RendererEvent, got {other:?}"),
+                }
+                if committed && titled {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            found.is_ok(),
+            "timed out waiting for DidCommit + hashed title"
+        );
+        // A full reload would commit again — nothing arrives
+        // within 200 ms (the established quiet-window idiom).
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), next_event(&mut event_rx))
+                .await
+                .is_err(),
+            "a hash change must not commit a second load"
+        );
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Stage 16 Phase 3, Rec 8 (finisher): the shell's
+    /// `HistorySync` mirrors the session-history length / index
+    /// into the realm — `history.length` reads the shell's value,
+    /// not the realm's optimistic bookkeeping.
+    #[tokio::test]
+    async fn worker_history_sync_mirrors_shell_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_fixed_page(
+            listener,
+            "<!doctype html><html><head><style>body{margin:0}</style></head>\
+             <body><script>setInterval(() => { \
+             if (history.length !== 1) document.title = 'len:' + history.length; }, 100);</script>\
+             <p>sync page</p></body></html>",
+        ));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let page = format!("http://127.0.0.1:{}/", addr.port());
+        cmd_tx
+            .send(BrowserToRenderer::CommitNavigation {
+                url: page.clone(),
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
+            .expect("worker takes the command");
+        assert!(matches!(
+            next_event(&mut event_rx).await,
+            RendererToBrowser::DidCommit { .. }
+        ));
+        cmd_tx
+            .send(BrowserToRenderer::HistorySync {
+                length: 7,
+                index: 3,
+            })
+            .expect("worker takes HistorySync");
+        wait_for_title(&mut event_rx, "len:7").await;
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Stage 16 Phase 3, Rec 11 (finisher): `new WebSocket`
+    /// asks the shell to open the socket (a `WebSocketOpen`
+    /// leaves the worker), and a `WebSocketEvent` from the shell
+    /// reaches the socket's `onopen` handler.
+    #[tokio::test]
+    async fn worker_websocket_open_round_trips() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ws_url = format!("ws://127.0.0.1:{}/chat", addr.port());
+        let body = format!(
+            "<!doctype html><html><head><style>body{{margin:0}}</style></head>\
+             <body><script>const ws = new WebSocket('{ws_url}'); \
+             ws.onopen = () => {{ document.title = 'ws-open'; }};</script>\
+             <p>socket page</p></body></html>"
+        );
+        let body: &'static str = Box::leak(body.into_boxed_str());
+        tokio::spawn(serve_fixed_page(listener, body));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let page = format!("http://127.0.0.1:{}/", addr.port());
+        cmd_tx
+            .send(BrowserToRenderer::CommitNavigation {
+                url: page.clone(),
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
+            .expect("worker takes the command");
+        // `new WebSocket` runs during the parse, so its
+        // `WebSocketOpen` may arrive before or after the commit —
+        // collect both, in either order.
+        let mut socket_id = None;
+        let mut committed = false;
+        while socket_id.is_none() || !committed {
+            match next_event(&mut event_rx).await {
+                RendererToBrowser::WebSocketOpen {
+                    socket_id: id, url, ..
+                } => {
+                    assert_eq!(url, ws_url);
+                    socket_id = Some(id);
+                }
+                RendererToBrowser::DidCommit { .. } => committed = true,
+                RendererToBrowser::SubmitDisplayList { .. } => continue,
+                other => panic!("expected WebSocketOpen/DidCommit, got {other:?}"),
+            }
+        }
+        let socket_id = socket_id.expect("WebSocketOpen arrived");
+        // The shell's answer (the broker's handshake, simulated
+        // here): the socket opens, and the page's handler runs.
+        cmd_tx
+            .send(BrowserToRenderer::WebSocketEvent {
+                socket_id,
+                event: pluto_ipc::WebSocketEvent::Opened {
+                    socket_id,
+                    protocol: String::new(),
+                },
+            })
+            .expect("worker takes WebSocketEvent");
+        wait_for_title(&mut event_rx, "ws-open").await;
         cmd_tx
             .send(BrowserToRenderer::Shutdown)
             .expect("worker takes Shutdown");
@@ -7151,7 +8297,12 @@ mod tests {
         let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         cmd_tx
-            .send(BrowserToRenderer::CommitNavigation { url })
+            .send(BrowserToRenderer::CommitNavigation {
+                url,
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
             .expect("worker takes the command");
         assert!(matches!(
             next_event(&mut event_rx).await,
@@ -7288,7 +8439,12 @@ mod tests {
         let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         cmd_tx
-            .send(BrowserToRenderer::CommitNavigation { url })
+            .send(BrowserToRenderer::CommitNavigation {
+                url,
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
             .expect("worker takes the command");
         assert!(matches!(
             next_event(&mut event_rx).await,
@@ -7469,7 +8625,12 @@ mod tests {
         let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
         let url = format!("http://127.0.0.1:{}/", addr.port());
         cmd_tx
-            .send(BrowserToRenderer::CommitNavigation { url })
+            .send(BrowserToRenderer::CommitNavigation {
+                url,
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
             .expect("worker takes the command");
         assert!(matches!(
             next_event(&mut event_rx).await,
@@ -7809,7 +8970,12 @@ mod tests {
         url: String,
     ) -> usize {
         cmd_tx
-            .send(BrowserToRenderer::CommitNavigation { url })
+            .send(BrowserToRenderer::CommitNavigation {
+                url,
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
             .expect("worker takes the command");
         assert!(matches!(
             next_event(rx).await,
@@ -7925,6 +9091,47 @@ mod tests {
         assert!(
             wait_for_glyphs(&mut event_rx, 10, Duration::from_secs(5)).await,
             "mouse click did not carry clientX/clientY/button to JS"
+        );
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Stage 16 Phase 1, Rec 7: a pointer press records user
+    /// activation — the click listener (which runs on pointer-up,
+    /// after the pointer-down recorded the gesture) reads
+    /// `navigator.userActivation.isActive` as true. A key press
+    /// does the same: a `keydown` handler reads it live.
+    #[tokio::test]
+    async fn worker_pointer_and_key_record_user_activation() {
+        let page = "<!doctype html><html><head><style>body{margin:0}            button{display:block;width:200px;height:40px}</style></head><body>            <button id=\"go\">Go</button><span id=\"out\">?</span>            <script>document.getElementById('go').addEventListener('click', () => {            document.getElementById('out').textContent = navigator.userActivation.isActive ? 'ACTIVE' : 'IDLE'; });            document.addEventListener('keydown', () => {            document.getElementById('out').textContent = navigator.userActivation.isActive ? 'KEY-ACTIVE' : 'KEY-IDLE'; });</script>            </body></html>";
+        let routes = std::sync::Arc::new(vec![(
+            "/".to_string(),
+            "text/html".to_string(),
+            page.to_string(),
+        )]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_routes(listener, routes));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        // "Go" (2) + "?" (1) = 3 glyphs.
+        assert_eq!(load_and_count(&cmd_tx, &mut event_rx, url).await, 3);
+        send_click(&cmd_tx, 100.0, 20.0);
+        // "Go" (2) + "ACTIVE" (6) = 8 glyphs: the pointer press
+        // recorded activation before the click dispatched.
+        assert!(
+            wait_for_glyphs(&mut event_rx, 8, Duration::from_secs(5)).await,
+            "pointer press did not record user activation"
+        );
+        // The click focused the button, so the keydown bubbles
+        // from it to the document listener.
+        send_key(&cmd_tx, "a", "KeyA", pluto_ipc::Modifiers::default());
+        // "Go" (2) + "KEY-ACTIVE" (10) = 12 glyphs.
+        assert!(
+            wait_for_glyphs(&mut event_rx, 12, Duration::from_secs(5)).await,
+            "key press did not record user activation"
         );
         cmd_tx
             .send(BrowserToRenderer::Shutdown)
@@ -8188,6 +9395,9 @@ mod tests {
         cmd_tx
             .send(BrowserToRenderer::CommitNavigation {
                 url: page2_url,
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
             })
             .expect("worker takes the command");
         // DidCommit and the first SubmitDisplayList for page2 may
@@ -8327,7 +9537,7 @@ mod tests {
         // A real tab: `TabState::new` reads the security profile,
         // `tab_js()` builds the tab backends, loading permissions.
         let (layout_tx, _layout_rx) = std::sync::mpsc::channel::<LayoutJob>();
-        let mut state = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new(), None);
+        let mut state = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new(), None, tokio::sync::mpsc::channel(100).0);
         state.tab_js();
         let backends = std::sync::Arc::new(
             state.tab_backends.take().expect("tab backends built"),
@@ -8404,7 +9614,7 @@ mod tests {
             "https://example.com/b#frag".to_string(),
         ]);
         let (layout_tx, _layout_rx) = std::sync::mpsc::channel::<LayoutJob>();
-        let state = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new(), None);
+        let state = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new(), None, tokio::sync::mpsc::channel(100).0);
         assert!(state.visited_urls.contains("https://example.com/a"));
         // The fragment is stripped on seed, as on commit.
         assert!(state.visited_urls.contains("https://example.com/b"));
@@ -8417,7 +9627,7 @@ mod tests {
                 .join(crate::history::HISTORY_FILE),
         );
         let (layout_tx, _layout_rx) = std::sync::mpsc::channel::<LayoutJob>();
-        let fresh = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new(), None);
+        let fresh = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new(), None, tokio::sync::mpsc::channel(100).0);
         assert!(fresh.visited_urls.is_empty());
     }
 
@@ -8679,7 +9889,7 @@ mod tests {
             .name("pluto-layout".to_string())
             .spawn(move || layout_thread(layout_rx))
             .expect("layout actor thread spawns");
-        let mut state = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new(), None);
+        let mut state = TabState::new(layout_tx, tokio::runtime::Handle::current(), 0, &SharedLoader::new(), None, tokio::sync::mpsc::channel(100).0);
         let (events_tx, mut events_rx) =
             tokio::sync::mpsc::channel::<RendererToBrowser>(100);
         let doc = page::parse_document(EXAMPLE_COM);

@@ -78,6 +78,13 @@ pub enum Destination {
     Image,
     Font,
     Fetch,
+    /// Stage 16 Phase 1, Rec 2: mirrors
+    /// `pluto_ipc::Destination::Audio` / `Video` / `WebSocket`
+    /// (see that enum's docs). `WebSocket` has no HTML producer
+    /// — it exists so the mirror stays variant-for-variant.
+    Audio,
+    Video,
+    WebSocket,
     Other,
 }
 
@@ -586,10 +593,14 @@ pub fn scan_hints(bytes: &[u8], document_url: &str) -> Vec<ConnectionHint> {
 /// Classify one element's fetchable attributes. Shared by the preload
 /// scanner and the streaming parser (which classifies `ElementCreated`
 /// events the same way), so the two can never disagree about what an
-/// element fetches. `in_picture` / `in_media` disambiguate `<source>`:
+/// element fetches. `in_picture` / `media_tag` disambiguate `<source>`:
 /// inside `<picture>` it is an image candidate, inside
-/// `<video>`/`<audio>` it is media (`Destination::Other` — there is no
-/// audio/video destination in the v1 protocol).
+/// `<video>`/`<audio>` it is media — `Destination::Video` or
+/// `Destination::Audio` by the enclosing media tag (Stage 16 Phase
+/// 1, Rec 2; before this it was `Destination::Other`, which capped
+/// media at 10 MiB and gated it as blockable mixed content).
+/// `media_tag` is `Some("video")` / `Some("audio")` for the
+/// innermost enclosing media element, `None` outside media.
 ///
 /// `viewport_width` / `dpr` drive `srcset` selection (Stage 11 Rec
 /// 10): an `<img>` with a `srcset` emits exactly ONE discovery —
@@ -611,7 +622,7 @@ pub fn classify_element(
     namespace: &str,
     attrs: &[(String, String)],
     in_picture: bool,
-    in_media: bool,
+    media_tag: Option<&str>,
     viewport_width: f32,
     dpr: f32,
 ) -> Vec<RawDiscovery> {
@@ -737,12 +748,15 @@ pub fn classify_element(
             }
         }
         "source" => {
-            if in_media && !in_picture {
+            if media_tag.is_some() && !in_picture {
                 if let Some(src) = attr(attrs, "src") {
                     if !src.trim().is_empty() {
                         out.push(RawDiscovery {
                             url: src.to_string(),
-                            destination: Destination::Other,
+                            destination: match media_tag {
+                                Some("audio") => Destination::Audio,
+                                _ => Destination::Video,
+                            },
                             priority: Priority::Low,
                             from: "source[src]",
                             integrity: integrity.clone(),
@@ -872,6 +886,26 @@ pub fn classify_element(
             }
         }
         "video" => {
+            // Stage 16 (M8 Phase 2, Rec 4): the element's own
+            // `src` is a media discovery (preload warming — the
+            // bytes land in the shared HTTP cache, and the
+            // binding's authoritative fetch serves from it when
+            // storable; the binding still owns selection + load,
+            // so a non-storable response downloads twice — the
+            // same trade-off images already make).
+            if let Some(src) = attr(attrs, "src")
+                && !src.trim().is_empty()
+                && !src.trim_start().starts_with("data:")
+            {
+                out.push(RawDiscovery {
+                    url: src.to_string(),
+                    destination: Destination::Video,
+                    priority: Priority::Low,
+                    from: "video[src]",
+                    integrity: integrity.clone(),
+                    is_module: false,
+                });
+            }
             if let Some(poster) = attr(attrs, "poster") {
                 if !poster.trim().is_empty() && !poster.trim_start().starts_with("data:") {
                     out.push(RawDiscovery {
@@ -883,6 +917,23 @@ pub fn classify_element(
                     is_module: false,
                     });
                 }
+            }
+        }
+        "audio" => {
+            // Stage 16 (M8 Phase 2, Rec 4): as `video[src]`
+            // above, for `<audio>`.
+            if let Some(src) = attr(attrs, "src")
+                && !src.trim().is_empty()
+                && !src.trim_start().starts_with("data:")
+            {
+                out.push(RawDiscovery {
+                    url: src.to_string(),
+                    destination: Destination::Audio,
+                    priority: Priority::Low,
+                    from: "audio[src]",
+                    integrity: integrity.clone(),
+                    is_module: false,
+                });
             }
         }
         // No `iframe[src]` discovery (Stage 9 Rec 7, T12): iframes
@@ -1020,7 +1071,7 @@ pub fn scan_with_viewport(
     let mut base: Option<String> = None;
     let mut template_depth: usize = 0;
     let mut picture_depth: usize = 0;
-    let mut media_depth: usize = 0;
+    let mut media_stack: Vec<String> = Vec::new();
     // Foreign-content tracking (Stage 15, M7 Phase 1, Rec 11): the
     // raw tokenizer has no tree, so the scanner tracks `<svg>`
     // depth itself to know when a `<script>` is foreign (inert —
@@ -1049,7 +1100,7 @@ pub fn scan_with_viewport(
                         picture_depth += 1;
                         picture_sources.clear();
                     }
-                    "video" | "audio" => media_depth += 1,
+                    "video" | "audio" => media_stack.push(name.clone()),
                     "svg" if !tag.self_closing => svg_depth += 1,
                     // Tag names arrive lowercased from the tokenizer
                     // (`foreignObject` -> `foreignobject`).
@@ -1070,7 +1121,7 @@ pub fn scan_with_viewport(
                 }
                 if template_depth == 0 {
                     let in_picture = picture_depth > 0;
-                    let in_media = media_depth > 0;
+                    let media_tag = media_stack.last().map(String::as_str);
                     let b = effective_base(&base);
                     if name == "source" && in_picture {
                         // Tracked for the <img>'s selection, not
@@ -1121,7 +1172,7 @@ pub fn scan_with_viewport(
                         },
                         &tag.attrs,
                         in_picture,
-                        in_media,
+                        media_tag,
                         viewport_width,
                         dpr,
                     ) {
@@ -1144,7 +1195,9 @@ pub fn scan_with_viewport(
                         picture_sources.clear();
                     }
                 }
-                "video" | "audio" => media_depth = media_depth.saturating_sub(1),
+                "video" | "audio" => {
+                    media_stack.pop();
+                }
                 "svg" => svg_depth = svg_depth.saturating_sub(1),
                 "foreignobject" => {
                     foreign_object_depth = foreign_object_depth.saturating_sub(1)
@@ -1235,12 +1288,12 @@ mod tests {
         // Direct unit check of the classifier: same tag + attrs,
         // different namespace.
         let attrs = vec![("src".to_string(), "/s.js".to_string())];
-        let svg = classify_element("script", NS_SVG, &attrs, false, false, 1024.0, 1.0);
+        let svg = classify_element("script", NS_SVG, &attrs, false, None, 1024.0, 1.0);
         assert!(svg.is_empty(), "SVG script must classify to nothing");
-        let html = classify_element("script", "", &attrs, false, false, 1024.0, 1.0);
+        let html = classify_element("script", "", &attrs, false, None, 1024.0, 1.0);
         assert_eq!(html.len(), 1);
         assert_eq!(html[0].destination, Destination::Script);
-        let mathml = classify_element("script", NS_MATHML, &attrs, false, false, 1024.0, 1.0);
+        let mathml = classify_element("script", NS_MATHML, &attrs, false, None, 1024.0, 1.0);
         assert!(mathml.is_empty(), "MathML script must classify to nothing");
     }
 
@@ -1334,19 +1387,45 @@ mod tests {
     fn source_in_picture_is_selected_by_the_img_in_video_is_other() {
         // Stage 11 Rec 10: a <picture> <source> emits nothing on
         // its own — the <img> selects from it. A <source> in a
-        // <video> is still media (Other).
+        // <video> is Video (Stage 16 Phase 1, Rec 2: before this
+        // it was `Other`, which capped media at 10 MiB).
         let found = scan(
-            br#"<picture><source srcset="p.webp"><img src="fallback.png"></picture><video><source src="v.mp4"></video>"#,
+            br#"<picture><source srcset="p.webp"><img src="fallback.png"></picture><video><source src="v.mp4"></video><audio><source src="a.mp3"></audio>"#,
             DOC,
         );
-        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found.len(), 3, "{found:?}");
         assert_eq!(found[0].destination, Destination::Image);
         assert_eq!(found[0].url, "https://example.com/dir/p.webp");
         assert_eq!(found[0].from, "imageset");
-        assert_eq!(found[1].destination, Destination::Other);
+        assert_eq!(found[1].destination, Destination::Video);
+        assert_eq!(found[1].url, "https://example.com/dir/v.mp4");
+        assert_eq!(found[2].destination, Destination::Audio);
+        assert_eq!(found[2].url, "https://example.com/dir/a.mp3");
         // And a <picture> with no <img> selects nothing.
         let found = scan(br#"<picture><source srcset="p.webp"></picture>"#, DOC);
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn media_element_own_src_is_discovered() {
+        // Stage 16 (M8 Phase 2, Rec 4): a `<video>` / `<audio>`
+        // element's own `src` is a media discovery (before this
+        // only the poster was discovered and the `src` fetched
+        // nothing at all); a `data:` src is not a fetch.
+        let found = scan(
+            br#"<video src="v.mp4" poster="p.png"></video><audio src="a.mp3"></audio><video src="data:video/mp4;base64,AAA"></video>"#,
+            DOC,
+        );
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert_eq!(found[0].destination, Destination::Video);
+        assert_eq!(found[0].url, "https://example.com/dir/v.mp4");
+        assert_eq!(found[0].from, "video[src]");
+        assert_eq!(found[1].destination, Destination::Image);
+        assert_eq!(found[1].url, "https://example.com/dir/p.png");
+        assert_eq!(found[1].from, "video[poster]");
+        assert_eq!(found[2].destination, Destination::Audio);
+        assert_eq!(found[2].url, "https://example.com/dir/a.mp3");
+        assert_eq!(found[2].from, "audio[src]");
     }
 
     #[test]

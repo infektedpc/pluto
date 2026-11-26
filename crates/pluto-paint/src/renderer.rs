@@ -55,6 +55,7 @@
 //! (If that ever proves untrue on a machine, the fix is to hand the
 //! renderer's `FontSystem` to layout instead of building a second one.)
 
+use crate::canvas::is_video_blob_id;
 use crate::glyph_key::font_id_map;
 use crate::path::VectorVertex;
 use crate::image::{IMAGE_CACHE_BYTE_CAP, build_mip_chain, mip_chain_bytes, mip_level_for_scale};
@@ -1600,6 +1601,15 @@ struct ImageEntryMeta {
 /// Rec 12): the cap is [`IMAGE_CACHE_BYTE_CAP`] (64 MiB), eviction
 /// is least-recently-used and never evicts a texture drawn this
 /// frame, and a frame advance dirties only its own entry.
+///
+/// Stage 16 (M8 Phase 2, Rec 5) eviction policy: video-frame
+/// textures are the preferred victims — a 4K frame is ~33 MiB,
+/// half the 64 MiB cap, and a frame is re-uploadable on the next
+/// presented frame anyway, while a page image evicted wholesale
+/// has to be re-decoded and re-uploaded. So each eviction round
+/// takes the least-recently-used video Blob first; only when no
+/// video texture is evictable does it fall back to the oldest
+/// texture of any kind. The `in_use` guard still applies to both.
 #[derive(Debug, Default)]
 struct ImageTextureCache {
     entries: HashMap<ResourceId, ImageEntryMeta>,
@@ -1703,9 +1713,14 @@ impl ImageTextureCache {
     fn evict_for(&mut self, needed: usize, cap: usize) -> Vec<ResourceId> {
         let mut evicted = Vec::new();
         while self.bytes_used + needed > cap {
+            // Video-frame textures first (Stage 16, M8 Phase 2,
+            // Rec 5): they are re-uploadable next frame, page
+            // images are not. Oldest video victim wins; only
+            // when none is evictable does the oldest texture of
+            // any kind go.
             let mut victim: Option<(ResourceId, u64)> = None;
             for (id, entry) in &self.entries {
-                if self.in_use.contains(id) {
+                if self.in_use.contains(id) || !is_video_blob_id(*id) {
                     continue;
                 }
                 let better = match victim {
@@ -1714,6 +1729,20 @@ impl ImageTextureCache {
                 };
                 if better {
                     victim = Some((*id, entry.last_used));
+                }
+            }
+            if victim.is_none() {
+                for (id, entry) in &self.entries {
+                    if self.in_use.contains(id) {
+                        continue;
+                    }
+                    let better = match victim {
+                        None => true,
+                        Some((_, lu)) => entry.last_used < lu,
+                    };
+                    if better {
+                        victim = Some((*id, entry.last_used));
+                    }
                 }
             }
             let Some((id, _)) = victim else {
@@ -4161,6 +4190,33 @@ mod tests {
         assert!(cache.contains(ResourceId(2)));
         assert!(cache.contains(ResourceId(3)));
         assert_eq!(cache.bytes_used(), 200);
+    }
+
+    #[test]
+    fn image_texture_cache_evicts_video_frames_before_page_images() {
+        // Stage 16 (M8 Phase 2, Rec 5): a video-frame texture is
+        // the preferred victim even when a page image is older —
+        // the frame is re-uploadable next frame, the page image
+        // is not.
+        use crate::canvas::VIDEO_BLOB_ID_BASE;
+        let mut cache = ImageTextureCache::new();
+        cache.begin_frame();
+        cache.register(ResourceId(1), 100, 1); // old page image
+        cache.begin_frame();
+        let video_id = ResourceId(VIDEO_BLOB_ID_BASE | 3);
+        cache.register(video_id, 100, 1); // newer video frame
+        cache.begin_frame();
+        cache.register(ResourceId(2), 100, 1); // newest page image
+        let evicted = cache.evict_for(100, 300);
+        assert_eq!(evicted, vec![video_id], "video frame goes first");
+        assert!(cache.contains(ResourceId(1)));
+        assert!(cache.contains(ResourceId(2)));
+        assert_eq!(cache.bytes_used(), 200);
+        // With no video texture left, eviction falls back to
+        // plain LRU: the oldest page image goes.
+        let evicted = cache.evict_for(50, 150);
+        assert_eq!(evicted, vec![ResourceId(1)]);
+        assert!(VIDEO_BLOB_ID_BASE == 0x7000_0000);
     }
 
     #[test]

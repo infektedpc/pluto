@@ -22,8 +22,9 @@ use rquickjs::function::{Opt, This};
 use rquickjs::{Array, Coerced, Ctx, FromJs, Function, Object, Value};
 
 use crate::bindings::{
-    BindingState, WINDOW_TARGET_ID, dom_key_of_this, js, map_delete_str, map_get_str,
-    map_set_str, registry_map, throw_dom, throw_type_error, to_dom_string, wrapper_id_of,
+    BindingState, TARGET_ID_SYMBOL, WINDOW_TARGET_ID, dom_key_of_this, js, js_null,
+    map_delete_str, map_get_str, map_set_str, registry_map, throw_dom, throw_type_error,
+    to_dom_string, wrapper_id_of,
 };
 use crate::host::DomKey;
 
@@ -97,7 +98,20 @@ pub fn install_events<'js>(
            this.inputType = (eventInit && 'inputType' in eventInit) ? String(eventInit.inputType) : ''; \
          }; \
          InputEvent.prototype = Object.create(Event.prototype); \
-         InputEvent.prototype.constructor = InputEvent;",
+         InputEvent.prototype.constructor = InputEvent; \
+         globalThis.PopStateEvent = function PopStateEvent(type, eventInit) { \
+           Event.call(this, type, eventInit); \
+           this.state = (eventInit && 'state' in eventInit) ? eventInit.state : null; \
+         }; \
+         PopStateEvent.prototype = Object.create(Event.prototype); \
+         PopStateEvent.prototype.constructor = PopStateEvent; \
+         globalThis.HashChangeEvent = function HashChangeEvent(type, eventInit) { \
+           Event.call(this, type, eventInit); \
+           this.oldURL = (eventInit && 'oldURL' in eventInit) ? String(eventInit.oldURL) : ''; \
+           this.newURL = (eventInit && 'newURL' in eventInit) ? String(eventInit.newURL) : ''; \
+         }; \
+         HashChangeEvent.prototype = Object.create(Event.prototype); \
+         HashChangeEvent.prototype.constructor = HashChangeEvent;",
     )
     .map_err(|e| format!("install Event: {e}"))?;
 
@@ -198,6 +212,14 @@ fn target_id_of_this<'js>(
             if state.borrow().wrapper_keys.contains_key(&id) {
                 return Ok(id);
             }
+        }
+        // Stage 16 Phase 3 (Rec 11/12): a standalone `EventTarget`
+        // (`WebSocket` / `EventSource`) carries its registry id
+        // under the target-id symbol instead of a `DomKey`.
+        if let Some(id) = standalone_target_id_of(ctx, obj)
+            && standalone_target(ctx, id)?.is_some()
+        {
+            return Ok(id);
         }
         return Err(throw_type_error(
             ctx,
@@ -461,7 +483,9 @@ pub fn dispatch_to_target<'js>(
 }
 
 /// The JS object that is `currentTarget` for a registry target id:
-/// the window (`globalThis`) or the node's wrapper.
+/// the window (`globalThis`), a standalone `EventTarget`
+/// (`WebSocket` / `EventSource`, held in the registry's
+/// `standaloneTargets` map), or the node's wrapper.
 fn target_object<'js>(
     ctx: &Ctx<'js>,
     state: &Rc<RefCell<BindingState>>,
@@ -469,6 +493,9 @@ fn target_object<'js>(
 ) -> rquickjs::Result<Value<'js>> {
     if target == WINDOW_TARGET_ID {
         return Ok(Value::from(ctx.globals()));
+    }
+    if let Some(obj) = standalone_target(ctx, target)? {
+        return Ok(Value::from(obj));
     }
     let Some(key) = state.borrow().wrapper_keys.get(&target).copied() else {
         return Ok(Value::from(ctx.globals()));
@@ -479,14 +506,65 @@ fn target_object<'js>(
     }
 }
 
+/// The standalone `EventTarget` object for `id`, if one is
+/// registered (Stage 16 Phase 3, Rec 11/12).
+fn standalone_target<'js>(
+    ctx: &Ctx<'js>,
+    id: u64,
+) -> rquickjs::Result<Option<Object<'js>>> {
+    let map = registry_map(ctx, "standaloneTargets")?;
+    let value = crate::bindings::map_get(ctx, &map, id)?;
+    Ok(value.as_object().cloned())
+}
+
+/// Mint a registry target id for a standalone `EventTarget` object
+/// (`WebSocket` / `EventSource` — no `DomKey`), stamp it on the
+/// object under the target-id symbol, and register the object so
+/// dispatch can find it. Ids come from the same counter as wrapper
+/// ids, so the two id spaces can never collide.
+pub fn mint_standalone_target<'js>(
+    ctx: &Ctx<'js>,
+    state: &Rc<RefCell<BindingState>>,
+    obj: &Object<'js>,
+) -> rquickjs::Result<u64> {
+    let id = mint_wrapper_id(state);
+    let sym = rquickjs::Symbol::new_global(ctx.clone(), TARGET_ID_SYMBOL)
+        .map_err(|e| crate::bindings::throw_type_error(ctx, &format!("target id: {e}")))?;
+    obj.set(sym.as_atom(), id as f64)?;
+    let map = registry_map(ctx, "standaloneTargets")?;
+    crate::bindings::map_set(ctx, &map, id, Value::from(obj.clone()))?;
+    Ok(id)
+}
+
+/// The standalone target id stamped on `obj`, if any.
+pub fn standalone_target_id_of<'js>(ctx: &Ctx<'js>, obj: &Object<'js>) -> Option<u64> {
+    let sym = rquickjs::Symbol::new_global(ctx.clone(), TARGET_ID_SYMBOL).ok()?;
+    let value: Value = obj.get(sym.as_atom()).ok()?;
+    value.as_number().map(|n| n as u64)
+}
+
 /// The propagation path for `target`: window first, then ancestors
 /// from the document root down to the target. The window is always
 /// path[0]; the target is always path[last].
+///
+/// Stage 16 Phase 3 (Rec 9): a window target is just `[window]` —
+/// the old code built `[window, window]`, so a capture listener on
+/// the window ran twice (capture phase + target phase) and a bubble
+/// listener on a bubbling window event ran twice (target phase +
+/// bubble phase). A standalone target (`WebSocket` / `EventSource`)
+/// is just `[target]` — its events never propagate to the window
+/// (a window `message` listener must not see WebSocket messages).
 fn propagation_path(
     ctx: &Ctx<'_>,
     state: &Rc<RefCell<BindingState>>,
     target: u64,
 ) -> Vec<u64> {
+    if target == WINDOW_TARGET_ID {
+        return vec![WINDOW_TARGET_ID];
+    }
+    if let Ok(Some(_)) = standalone_target(ctx, target) {
+        return vec![target];
+    }
     let mut chain: Vec<u64> = vec![target];
     if target != WINDOW_TARGET_ID {
         let key = state.borrow().wrapper_keys.get(&target).copied();
@@ -781,6 +859,183 @@ pub fn dispatch_storage_event<'js>(
     event.set("newValue", new_value)?;
     event.set("url", url)?;
     dispatch_to_target(ctx, state, WINDOW_TARGET_ID, &event, "storage")?;
+    Ok(())
+}
+
+/// Install an `on<name>` event-handler property on `obj` (Stage 16
+/// Phase 3, Rec 9/11/12): the WebIDL event-handler attribute shape.
+/// Getting reads the registered handler (or `null`); setting to a
+/// function replaces the previous handler in the listener registry
+/// — the same `"<target-id>:<type>"` key `addEventListener` uses,
+/// so the handler runs through the normal dispatch walk, in
+/// registration order, with `once` never set; setting to `null` /
+/// `undefined` removes it; any other value is ignored (WebIDL:
+/// a non-callable handler is treated as `null`).
+pub fn install_event_handler_property<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    obj: &Object<'js>,
+    target_id: u64,
+    name: &str,
+) -> Result<(), String> {
+    use rquickjs::object::Accessor;
+    let prop = format!("on{name}");
+    let key = format!("{target_id}:{name}");
+    let b = Rc::clone(bindings);
+    let key_get = key.clone();
+    let get = move |ctx: Ctx<'js>, This(_this): This<Value<'js>>| -> rquickjs::Result<Value<'js>> {
+        let _ = &b;
+        let map = registry_map(&ctx, "onhandlers")?;
+        let value = map_get_str(&ctx, &map, &key_get)?;
+        if value.is_undefined() {
+            Ok(js_null(&ctx))
+        } else {
+            Ok(value)
+        }
+    };
+    let b = Rc::clone(bindings);
+    let key_set = key.clone();
+    let name_set = name.to_string();
+    let set = move |ctx: Ctx<'js>, This(_this): This<Value<'js>>, value: Value<'js>| -> rquickjs::Result<()> {
+        let _ = &b;
+        let handlers = registry_map(&ctx, "onhandlers")?;
+        let old = map_get_str(&ctx, &handlers, &key_set)?;
+        if old.is_function() {
+            remove_listener_record(&ctx, target_id, &name_set, &old)?;
+        }
+        if value.is_function() {
+            add_listener_record(&ctx, target_id, &name_set, value.clone())?;
+            map_set_str(&ctx, &handlers, &key_set, value)?;
+        } else {
+            map_delete_str(&ctx, &handlers, &key_set);
+        }
+        Ok(())
+    };
+    obj.prop(
+        prop.as_str(),
+        Accessor::new(get, set).enumerable().configurable(),
+    )
+    .map_err(|e| format!("on{name} property: {e}"))?;
+    Ok(())
+}
+
+/// Append one listener record to the registry array for
+/// `"<target-id>:<type>"` (the `on*` setter path — no `this`
+/// resolution, no dedup: the caller removed the previous handler
+/// first).
+fn add_listener_record<'js>(
+    ctx: &Ctx<'js>,
+    target: u64,
+    ty: &str,
+    func: Value<'js>,
+) -> rquickjs::Result<()> {
+    let key = listeners_key(target, ty);
+    let map = registry_map(ctx, "listeners")?;
+    let mut records: Vec<Value> = Vec::new();
+    if let Some(arr) = listener_array(ctx, &key)? {
+        let len: usize = arr.len();
+        for i in 0..len {
+            if let Ok(v) = arr.get::<Value>(i) {
+                records.push(v);
+            }
+        }
+    }
+    let record = Object::new(ctx.clone())?;
+    record.set("func", func)?;
+    record.set("capture", false)?;
+    record.set("once", false)?;
+    record.set("passive", false)?;
+    record.set("type", ty)?;
+    records.push(Value::from(record));
+    let arr = Array::new(ctx.clone())?;
+    for (i, value) in records.into_iter().enumerate() {
+        arr.set(i, value)?;
+    }
+    map_set_str(ctx, &map, &key, Value::from(arr))?;
+    Ok(())
+}
+
+/// Drop every record for `func` from the registry array for
+/// `"<target-id>:<type>"` (the `on*` setter path).
+fn remove_listener_record<'js>(
+    ctx: &Ctx<'js>,
+    target: u64,
+    ty: &str,
+    func: &Value<'js>,
+) -> rquickjs::Result<()> {
+    let key = listeners_key(target, ty);
+    let Some(arr) = listener_array(ctx, &key)? else {
+        return Ok(());
+    };
+    let map = registry_map(ctx, "listeners")?;
+    let mut kept: Vec<Value> = Vec::new();
+    let len: usize = arr.len();
+    for i in 0..len {
+        let Ok(record) = arr.get::<Value>(i) else {
+            continue;
+        };
+        let mut drop_it = false;
+        if let Some(obj) = record.as_object() {
+            let f: Value = obj.get("func").unwrap_or_else(|_| js(ctx, ()));
+            if &f == func {
+                drop_it = true;
+            }
+        }
+        if !drop_it {
+            kept.push(record);
+        }
+    }
+    if kept.is_empty() {
+        map_delete_str(ctx, &map, &key);
+    } else {
+        let out = Array::new(ctx.clone())?;
+        for (i, value) in kept.into_iter().enumerate() {
+            out.set(i, value)?;
+        }
+        map_set_str(ctx, &map, &key, Value::from(out))?;
+    }
+    Ok(())
+}
+
+/// Dispatch a `popstate` event to the window (Stage 16 Phase 3,
+/// Rec 8/9): a `PopStateEvent` carrying the restored session
+/// state (`state_json` parsed back — `null` when there is no
+/// state, or when the stored JSON cannot parse). Never bubbles,
+/// never cancelable, per spec.
+pub fn dispatch_popstate_event<'js>(
+    ctx: &Ctx<'js>,
+    state: &Rc<RefCell<BindingState>>,
+    state_json: Option<&str>,
+) -> rquickjs::Result<()> {
+    let event: Object = ctx.eval("new PopStateEvent('popstate', {})")?;
+    let state_value: Value = match state_json {
+        Some(json) => {
+            let json_obj: Object = ctx.globals().get("JSON")?;
+            let parse: Function = json_obj.get("parse")?;
+            parse
+                .call::<_, Value>((json,))
+                .unwrap_or_else(|_| js_null(&ctx))
+        }
+        None => js_null(&ctx),
+    };
+    event.set("state", state_value)?;
+    dispatch_to_target(ctx, state, WINDOW_TARGET_ID, &event, "popstate")?;
+    Ok(())
+}
+
+/// Dispatch a `hashchange` event to the window (Stage 16 Phase 3,
+/// Rec 9): a `HashChangeEvent` carrying the old and new URLs.
+/// Never bubbles, never cancelable, per spec.
+pub fn dispatch_hashchange_event<'js>(
+    ctx: &Ctx<'js>,
+    state: &Rc<RefCell<BindingState>>,
+    old_url: &str,
+    new_url: &str,
+) -> rquickjs::Result<()> {
+    let event: Object = ctx.eval("new HashChangeEvent('hashchange', {})")?;
+    event.set("oldURL", old_url)?;
+    event.set("newURL", new_url)?;
+    dispatch_to_target(ctx, state, WINDOW_TARGET_ID, &event, "hashchange")?;
     Ok(())
 }
 

@@ -9,6 +9,7 @@ members = [
     "crates/pluto-paint",
     "crates/pluto-ipc",
     "crates/pluto-js",
+    "crates/pluto-media",
 ]
 
 [workspace.package]
@@ -24,6 +25,45 @@ license = "MIT OR Apache-2.0"
 # wgpu::Device/Queue handed out by libcosmic would be a different type
 # from the one pluto-paint sees. One version everywhere, or nothing works.
 [workspace.dependencies]
+
+# Stage 16 Phase 1, Rec 3: the M8 decode stack.
+#
+# Audio — symphonia 0.5.5, `default-features = false` plus exactly
+# the formats Pluto plays. Codec scope, stated honestly:
+# MP3 (bundle-mp3, cached in the offline registry), FLAC
+# (bundle-flac 0.5.5), Vorbis in Ogg, WAV/PCM, AAC in MP4
+# (isomp4). NOT covered: Opus (symphonia 0.5 has no Opus
+# decoder), ALAC, ADPCM. `get_probe()` reports an unsupported
+# codec as an error, never silence.
+symphonia = { version = "0.5.5", default-features = false, features = ["mp3", "flac", "vorbis", "ogg", "wav", "aac", "isomp4", "pcm"] }
+# Video (primary) — openh264 0.9.10 (H.264). Justification: H.264
+# is the codec of the overwhelming majority of real-world web
+# video, and the `source` feature builds Cisco's library from
+# the vendored C++ in `openh264-sys2` (no download at build
+# time). First build compiles the C++ (slow; no nasm in this
+# sandbox, so the build falls back to C-only, no SIMD — decode
+# still works). AV1 (rav1d 1.1.0) is deliberately NOT in this
+# phase: it is a large pure-Rust decoder with a C-style API
+# (`Dav1dContext` / `send_data` / `get_picture`) that needs a
+# dedicated integration, and the transport + demux layers are
+# codec-agnostic, so adding it later is a decoder swap, not a
+# redesign. See `pluto-media`'s crate docs.
+openh264 = "0.9.10"
+# Demuxers — MP4: `mp4` 0.14.0. WebM: `matroska-demuxer` 0.8.1
+# (pure Rust, no deps; the `webm` crate needs a C library via
+# `webm-sys` and was rejected for that). WebM demux is proven;
+# VP9 (the codec in the WebM fixture) has no decoder — see the
+# Phase 2 VP9 decision in `pluto-media`'s crate docs: no
+# VP9-capable decoder (rav1d / dav1d / libvpx) exists in the
+# offline registry, so WebM/VP9 reports unsupported, never faked.
+mp4 = "0.14.0"
+matroska-demuxer = "0.8.1"
+# Audio sink — cpal 0.15.3 (Stage 16 Phase 2, Rec 6). Linux
+# builds against the system ALSA lib (present in the sandbox);
+# no device is needed to build, and a missing device at runtime
+# degrades to the null sink — never a hard failure.
+cpal = "0.15.3"
+
 bytes = "1"
 bytemuck = "1"
 tokio = { version = "1", features = ["full"] }
@@ -56,6 +96,22 @@ hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", 
 # dropped on purpose: it pulls the OS native cert store, and Pluto
 # trusts webpki-roots instead.
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12", "webpki-roots"] }
+# Stage 16 Phase 3 (Rec 11): tokio-tungstenite 0.26.2 for the
+# WebSocket transport (pairs with tungstenite 0.26.2 — NOT the
+# cached tungstenite 0.30.0 / async-tungstenite 0.35.0, which pair
+# with each other; tokio-tungstenite itself was NOT in the offline
+# cache, but crates.io is reachable from this sandbox and the
+# crate + its deps (tungstenite 0.26.2, tokio-rustls 0.26,
+# webpki-roots 0.26) fetch cleanly — verified 2026-11-26 before
+# depending on it). The `rustls-tls-webpki-roots` feature only
+# gates the `Connector::Rustls` variant; Pluto passes its own
+# `ClientConfig` (pluto-net's `tls_config()`, ring + webpki-roots
+# 1.x) for `wss:`, so the feature's bundled roots are never
+# consulted — they just unlock the variant.
+tokio-tungstenite = { version = "0.26.2", features = ["rustls-tls-webpki-roots"] }
+# `futures-util` for `SinkExt` / `StreamExt` on the WebSocket
+# stream (browser-side pump, Stage 16 Phase 3, Rec 11).
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 http-body-util = "0.1"
 slotmap = "1"
 thiserror = "2"
@@ -86,6 +142,16 @@ libc = "0.2"
 # parallel style (#5) and image decode (#6).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Stage 16 Phase 1, Rec 1: `serde_bytes` for the video-frame
+# planes (`pluto-ipc::VideoFrame`). Serde has NO fast path for
+# `Vec<u8>` — it serialises byte-by-byte through the generic
+# sequence impl, which measured 227 ms encode + 329 ms decode
+# per 1080p frame in debug (the socket itself does 2.9 ms).
+# `#[serde(with = "serde_bytes")]` routes through
+# `serialize_bytes` (one memcpy) instead. The same trap applies
+# to `pluto-paint::Resource::Image.rgba` (M7 path) — flagged as
+# a follow-up, not changed here.
+serde_bytes = "0.11"
 postcard = { version = "1", features = ["alloc"] }
 rayon = "1"
 # Image decoding (Stage 4 #6; the <img> pipeline itself is M3).
@@ -147,4 +213,8 @@ version = "0.1.0"
 
 [workspace.dependencies.pluto-ipc]
 path = "crates/pluto-ipc"
+version = "0.1.0"
+
+[workspace.dependencies.pluto-media]
+path = "crates/pluto-media"
 version = "0.1.0"

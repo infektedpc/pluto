@@ -31,7 +31,11 @@ use pluto_html::{
     Dom, NodeId, NodeKind, Parser, QueuedScript, ScriptPaused, parse_fragment,
     resolve_url,
 };
-use pluto_ipc::{Destination, Origin, Priority, RequestMode, ResourceRequest};
+use pluto_ipc::{
+    Destination, Origin, Priority, RequestMode, ResourceEvent, ResourceRequest,
+};
+use pluto_js::bindings::fetch::FetchStreamEvent;
+use pluto_js::bindings::websocket::{WebSocketBackend, WsConnectRequest, WsEvent};
 use pluto_js::host::{
     AnimateSpec, AnimationInfo, CanvasCall, CanvasGradientKindSpec, CanvasImageData,
     CanvasOutcome, CanvasPaintSpec, WaapiOp,
@@ -66,6 +70,29 @@ use crate::renderer::LayoutJob;
 /// How long a forced geometry flush waits for the layout actor
 /// before giving up (a dead actor must not hang the JS thread).
 const GEOMETRY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One media candidate fetch requested by JS (Stage 16, M8
+/// Phase 2, Rec 4): the element `key` whose session is waiting,
+/// the resolved candidate `url` against `base_url`, and the
+/// `<source type>` hint ("" for the element's own `src`).
+#[derive(Debug, Clone)]
+pub struct MediaRequest {
+    pub key: DomKey,
+    pub url: String,
+    pub base_url: String,
+    pub mime_hint: String,
+}
+
+/// One `<track>` file fetch requested by JS (Stage 16, M8
+/// Phase 2, Rec 4): the element `key` and the document-order
+/// `track_idx` the bytes parse into.
+#[derive(Debug, Clone)]
+pub struct TrackRequest {
+    pub key: DomKey,
+    pub track_idx: usize,
+    pub url: String,
+    pub base_url: String,
+}
 
 /// The production [`DomHost`]: a [`Dom`] shared with the parser
 /// (during a parse) or owned by the tab thread (after it), plus the
@@ -123,11 +150,29 @@ pub struct BrowserDomHost {
     /// request wins — a script that assigns twice in one turn
     /// navigates to the last URL only.
     pending_navigation: Option<(String, bool)>,
+    /// History API requests queued by JS (`history.pushState` /
+    /// `replaceState` / `back` / `forward` / `go` — Stage 16 Phase
+    /// 3, Rec 8): the tab thread drains these and forwards them to
+    /// the shell as `HistoryPush` / `HistoryReplace` / `HistoryGo`
+    /// (the shell owns the session history). Push / replace carry
+    /// `(url, state_json)`; traversals carry the delta.
+    pending_history_push: Vec<(String, Option<String>)>,
+    pending_history_replace: Vec<(String, Option<String>)>,
+    pending_history_traversal: Vec<i32>,
     /// Image loads requested by JS (`Image().src` / an `<img>`
     /// `src` set from JS): the tab thread drains these and routes
     /// them through the Stage 11 store, which reports back via
     /// `TabJs::notify_image_loaded` / `notify_image_failed`.
     pending_images: Vec<crate::images::ImageRequest>,
+    /// Media candidate fetches requested by JS (Stage 16, M8
+    /// Phase 2, Rec 4): the tab thread drains these and routes
+    /// them through the broker, which reports back via
+    /// `TabJs::deliver_media` / `notify_media_failed`.
+    pending_media: Vec<MediaRequest>,
+    /// `<track>` file fetches requested by JS (Stage 16, M8
+    /// Phase 2, Rec 4): drained the same way, reported back via
+    /// `TabJs::deliver_track` / `notify_track_failed`.
+    pending_tracks: Vec<TrackRequest>,
     /// `setCustomValidity` messages by node (Stage 13 Rec 8).
     custom_validity: std::collections::HashMap<DomKey, String>,
     /// Form submissions queued by JS (`form.submit()` /
@@ -232,7 +277,12 @@ impl BrowserDomHost {
             render_requested,
             implicit_open_done: false,
             pending_navigation: None,
+            pending_history_push: Vec::new(),
+            pending_history_replace: Vec::new(),
+            pending_history_traversal: Vec::new(),
             pending_images: Vec::new(),
+            pending_media: Vec::new(),
+            pending_tracks: Vec::new(),
             custom_validity: std::collections::HashMap::new(),
             pending_form_submits: Vec::new(),
             pending_focus: None,
@@ -460,9 +510,63 @@ impl BrowserDomHost {
         self.pending_navigation.take()
     }
 
+    /// Take the pending JS history requests, if any (Stage 16
+    /// Phase 3, Rec 8): `(pushes, replaces, traversals)`.
+    pub fn take_pending_history(
+        &mut self,
+    ) -> (
+        Vec<(String, Option<String>)>,
+        Vec<(String, Option<String>)>,
+        Vec<i32>,
+    ) {
+        (
+            std::mem::take(&mut self.pending_history_push),
+            std::mem::take(&mut self.pending_history_replace),
+            std::mem::take(&mut self.pending_history_traversal),
+        )
+    }
+
+    /// The element a same-document navigation should scroll to
+    /// (Stage 16 Phase 3, Rec 9): the element whose `id` is
+    /// `fragment`, else the first `<a name="fragment">` (spec
+    /// fallback). `None` when neither exists — the navigation
+    /// still updates the URL and fires `hashchange`, it just does
+    /// not scroll.
+    pub fn anchor_element(&self, fragment: &str) -> Option<DomKey> {
+        let dom = self.dom.lock().unwrap();
+        let root = dom.root()?;
+        let mut stack = vec![root];
+        let mut named: Option<DomKey> = None;
+        while let Some(node) = stack.pop() {
+            if dom.attr(node, "id") == Some(fragment) {
+                return Some(node);
+            }
+            if named.is_none()
+                && dom.tag(node) == Some("a")
+                && dom.attr(node, "name") == Some(fragment)
+            {
+                named = Some(node);
+            }
+            stack.extend(dom.children(node).iter().rev());
+        }
+        named
+    }
+
     /// Take the pending JS image requests, if any.
     pub fn take_pending_images(&mut self) -> Vec<crate::images::ImageRequest> {
         std::mem::take(&mut self.pending_images)
+    }
+
+    /// Take the pending JS media candidate requests, if any
+    /// (Stage 16, M8 Phase 2, Rec 4).
+    pub fn take_pending_media(&mut self) -> Vec<MediaRequest> {
+        std::mem::take(&mut self.pending_media)
+    }
+
+    /// Take the pending JS `<track>` file requests, if any
+    /// (Stage 16, M8 Phase 2, Rec 4).
+    pub fn take_pending_tracks(&mut self) -> Vec<TrackRequest> {
+        std::mem::take(&mut self.pending_tracks)
     }
 
     /// Take the pending WAAPI animation starts, if any (M6 Phase
@@ -1379,6 +1483,28 @@ impl DomHost for BrowserDomHost {
         self.pending_navigation = Some((url.to_string(), replace));
     }
 
+    fn set_document_url(&mut self, url: &str) {
+        // `pushState` / `replaceState` (Stage 16 Phase 3, Rec 8):
+        // the realm updates its document URL in place — no fetch,
+        // no navigation — and the shell-side half goes out as
+        // `HistoryPush` / `HistoryReplace` on the next tick drain.
+        self.base_url = url.to_string();
+    }
+
+    fn request_history_push(&mut self, url: &str, state_json: Option<&str>) {
+        self.pending_history_push
+            .push((url.to_string(), state_json.map(|s| s.to_string())));
+    }
+
+    fn request_history_replace(&mut self, url: &str, state_json: Option<&str>) {
+        self.pending_history_replace
+            .push((url.to_string(), state_json.map(|s| s.to_string())));
+    }
+
+    fn request_history_traversal(&mut self, delta: i32) {
+        self.pending_history_traversal.push(delta);
+    }
+
     fn attribute_names(&self, key: DomKey) -> Vec<String> {
         self.dom
             .lock()
@@ -1408,6 +1534,31 @@ impl DomHost for BrowserDomHost {
             base_url: base_url.to_string(),
             is_imageset: false,
             integrity: None,
+        });
+    }
+
+    fn request_media(&mut self, key: DomKey, url: &str, base_url: &str, mime_hint: &str) {
+        // Recorded, not fetched: the tab thread drains this and
+        // routes it through the broker (same gates as the
+        // preload scanner), which reports back via
+        // `TabJs::deliver_media` / `notify_media_failed`.
+        self.pending_media.push(MediaRequest {
+            key,
+            url: url.to_string(),
+            base_url: base_url.to_string(),
+            mime_hint: mime_hint.to_string(),
+        });
+    }
+
+    fn request_track(&mut self, key: DomKey, track_idx: usize, url: &str, base_url: &str) {
+        // Recorded, not fetched: the tab thread drains this and
+        // routes it through the broker, which reports back via
+        // `TabJs::deliver_track` / `notify_track_failed`.
+        self.pending_tracks.push(TrackRequest {
+            key,
+            track_idx,
+            url: url.to_string(),
+            base_url: base_url.to_string(),
         });
     }
 
@@ -2373,6 +2524,28 @@ impl DomHost for SharedHost {
     fn request_navigation(&mut self, url: &str, replace: bool) {
         self.0.lock().unwrap().request_navigation(url, replace)
     }
+    fn set_document_url(&mut self, url: &str) {
+        // Stage 16 Phase 3, Rec 8/9 (finisher): without this
+        // forward, `pushState` / `replaceState` / same-document
+        // hash changes hit the trait's no-op default and the URL
+        // never moves — the realm and the shell silently disagree.
+        self.0.lock().unwrap().set_document_url(url)
+    }
+    fn request_history_push(&mut self, url: &str, state_json: Option<&str>) {
+        // Stage 16 Phase 3, Rec 8 (finisher): the same missing
+        // forward dropped every `pushState` — the shell never
+        // heard about it, so no entry was ever pushed.
+        self.0.lock().unwrap().request_history_push(url, state_json)
+    }
+    fn request_history_replace(&mut self, url: &str, state_json: Option<&str>) {
+        self.0
+            .lock()
+            .unwrap()
+            .request_history_replace(url, state_json)
+    }
+    fn request_history_traversal(&mut self, delta: i32) {
+        self.0.lock().unwrap().request_history_traversal(delta)
+    }
     fn attribute_names(&self, key: DomKey) -> Vec<String> {
         self.0.lock().unwrap().attribute_names(key)
     }
@@ -2381,6 +2554,18 @@ impl DomHost for SharedHost {
     }
     fn request_image(&mut self, url: &str, base_url: &str) {
         self.0.lock().unwrap().request_image(url, base_url)
+    }
+    fn request_media(&mut self, key: DomKey, url: &str, base_url: &str, mime_hint: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .request_media(key, url, base_url, mime_hint)
+    }
+    fn request_track(&mut self, key: DomKey, track_idx: usize, url: &str, base_url: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .request_track(key, track_idx, url, base_url)
     }
     fn observe_mutation(
         &mut self,
@@ -2663,6 +2848,14 @@ pub struct PlutoFetchBackend {
     /// as `Cancelled` (the loop drops it anyway — belt and braces).
     epoch: Arc<AtomicU64>,
     next_request_id: AtomicU64,
+    /// In-flight fetch cancellation tokens, by JS fetch id (Stage
+    /// 16 Phase 3, Rec 11): `cancel_fetch` cancels the token, so
+    /// `controller.abort()` really stops the socket work instead
+    /// of only rejecting the JS promise (before this, `start_fetch`
+    /// spawned with a fresh, never-stored token and the trait
+    /// default `cancel_fetch` was a no-op). Removed when the fetch
+    /// task ends (completion, error, or cancellation).
+    tokens: Arc<std::sync::Mutex<std::collections::HashMap<u64, CancellationToken>>>,
     /// The shell-assigned tab id (Stage 11 Rec 4).
     tab_id: u64,
 }
@@ -2681,6 +2874,7 @@ impl PlutoFetchBackend {
             origin: Arc::new(Mutex::new(Origin::from_url(base_url))),
             epoch: Arc::new(AtomicU64::new(0)),
             next_request_id: AtomicU64::new(1),
+            tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             // Stage 11 Rec 4: the shell-assigned tab id, echoed
             // in every `fetch()` request instead of the old
             // hardcoded 0.
@@ -2739,85 +2933,15 @@ impl FetchBackend for PlutoFetchBackend {
         let send = |result: Result<FetchResponse, FetchError>| {
             let _ = done.send(FetchCompletion { id, result });
         };
-        let base = self.base_url.lock().unwrap().clone();
-        let absolute = resolve_url(&base, &request.url);
-        if !absolute.starts_with("http://") && !absolute.starts_with("https://") {
-            send(Err(FetchError::InvalidUrl(format!(
-                "fetch: unsupported URL scheme in {absolute}"
-            ))));
-            return;
-        }
-        // Mixed-content gate (Stage 5 also gates in the scheduler;
-        // this is the fetch-API gate): an https page may not fetch
-        // http.
-        if base.starts_with("https://") && absolute.starts_with("http://") {
-            send(Err(FetchError::Network(format!(
-                "mixed content blocked: {absolute} on an https page"
-            ))));
-            return;
-        }
-        // Same-origin gate (M4) → CORS gate (Stage 9 Rec 2): an
-        // absolute cross-origin URL is NOT rejected here anymore.
-        // It goes to `pluto-net` as a CORS fetch, where the
-        // preflight / CORS check / opaque filtering run. The
-        // comparison below still uses parsed `Origin`s
-        // (default-port normalized), never serialized strings —
-        // and an opaque document origin can never pass a CORS
-        // check, so an opaque document fetching cross-origin
-        // fails fast here, before any network access (fail
-        // closed: the CORS code cannot classify an opaque
-        // origin's cross-origin fetch as anything but an error).
-        // TODO(M10): CSP `connect-src` check goes here, before the
-        // network, once CSP lands — it slots in BEFORE the CORS
-        // decision (see the struct docs).
-        let doc_origin = self.origin.lock().unwrap().clone();
-        if doc_origin.is_opaque()
-            && !Origin::from_url(&absolute).is_same_origin(&doc_origin)
-        {
-            send(Err(FetchError::InvalidUrl(format!(
-                "cross-origin fetch from an opaque origin is blocked: {absolute}"
-            ))));
-            return;
-        }
-        // `mode: "same-origin"` is enforced here, before any
-        // network access: a cross-origin URL with that mode is a
-        // TypeError, not a CORS request (Fetch §4.2). `mode:
-        // "no-cors"` and `"cors"` go to `pluto-net`, which runs the
-        // preflight / CORS check / opaque filtering.
-        if request.mode == RequestMode::SameOrigin
-            && !Origin::from_url(&absolute).is_same_origin(&doc_origin)
-        {
-            send(Err(FetchError::InvalidUrl(format!(
-                "same-origin fetch to a cross-origin URL is blocked: {absolute}"
-            ))));
-            return;
-        }
-        let resource = ResourceRequest {
-            request_id: self.next_request_id.fetch_add(1, Ordering::Relaxed),
-            tab_id: self.tab_id,
-            epoch: self.epoch.load(Ordering::SeqCst),
-            url: absolute,
-            destination: Destination::Fetch,
-            priority: Priority::Medium,
-            // Stage 9 Rec 2: `init.method` / `init.headers` /
-            // `init.mode` / `init.credentials` ride the wire —
-            // `pluto-net` validates the method/headers (CORS
-            // safelists, forbidden headers, preflight) and applies
-            // the mode/credentials rules. Nothing here decides
-            // CORS; this backend only enforces the same-origin
-            // mode above and the opaque-origin fail-closed rule.
-            method: request.method.clone(),
-            headers: request.headers.clone(),
-            // `fetch()` is never an imageset fetch.
-            is_imageset: false,
-            mode: request.mode,
-            credentials: request.credentials,
-            origin: doc_origin.serialize(),
-            top_level_site: doc_origin.serialize(),
-            upgrade_insecure_requests: false,
-            integrity: None,
-            body: None,
+        let resource = match self.build_request(&request, Destination::Fetch) {
+            Ok(resource) => resource,
+            Err(e) => {
+                send(Err(e));
+                return;
+            }
         };
+        let token = CancellationToken::new();
+        self.tokens.lock().unwrap().insert(id, token.clone());
         let fetch = self.fetch.clone();
         let epoch = Arc::clone(&self.epoch);
         let start_epoch = epoch.load(Ordering::SeqCst);
@@ -2826,17 +2950,15 @@ impl FetchBackend for PlutoFetchBackend {
         // `pluto-net` zeroed the response (status 0, no headers, no
         // body) for opaque tainting, so status 0 is the opaque
         // signal; anything else is basic (same-origin) or cors.
-        let doc_origin_for_type = doc_origin.clone();
+        let doc_origin = self.origin.lock().unwrap().clone();
+        let tokens = Arc::clone(&self.tokens);
         self.handle.spawn(async move {
-            let outcome = match fetch
-                .fetch_with(resource, CancellationToken::new())
-                .await
-            {
+            let outcome = match fetch.fetch_with(resource, token).await {
                 Ok(response) => {
                     let response_type = if response.status.as_u16() == 0 {
                         ResponseType::Opaque
                     } else if Origin::from_url(&response.final_url.to_string())
-                        .is_same_origin(&doc_origin_for_type)
+                        .is_same_origin(&doc_origin)
                     {
                         ResponseType::Basic
                     } else {
@@ -2868,7 +2990,304 @@ impl FetchBackend for PlutoFetchBackend {
             } else {
                 outcome
             };
+            tokens.lock().unwrap().remove(&id);
             let _ = done.send(FetchCompletion { id, result: outcome });
+        });
+    }
+
+    /// Cancel an in-flight fetch (Stage 16 Phase 3, Rec 11): the
+    /// stored token stops the socket work — `controller.abort()`
+    /// used to only reject the JS promise while the fetch ran to
+    /// completion underneath. No-op when the fetch already ended
+    /// (its token was removed on completion).
+    fn cancel_fetch(&self, id: u64) {
+        if let Some(token) = self.tokens.lock().unwrap().remove(&id) {
+            token.cancel();
+        }
+    }
+
+    /// Stream a fetch (Stage 16 Phase 3, Rec 12): headers resolve
+    /// the promise, then chunks flow as `FetchStreamEvent`s on the
+    /// realm's channel — the same mpsc → Networking Host-task
+    /// bridge as the completion path. `Destination::Stream` carries
+    /// its own caps (1 GiB / 600 s), so a long-lived stream is not
+    /// killed by the whole-response 20 s / 10 MiB limits.
+    fn start_stream_fetch(
+        &self,
+        request: FetchRequest,
+        stream_tx: mpsc::Sender<FetchStreamEvent>,
+    ) {
+        let id = request.id;
+        let resource = match self.build_request(&request, Destination::Stream) {
+            Ok(resource) => resource,
+            Err(e) => {
+                let _ = stream_tx.send(FetchStreamEvent::Error { id, error: e });
+                return;
+            }
+        };
+        let token = CancellationToken::new();
+        self.tokens.lock().unwrap().insert(id, token.clone());
+        let fetch = self.fetch.clone();
+        let doc_origin = self.origin.lock().unwrap().clone();
+        let tokens = Arc::clone(&self.tokens);
+        self.handle.spawn(async move {
+            match &fetch {
+                crate::broker::FetchSource::Direct(loader) => {
+                    let mut rx = loader.fetch_stream(resource, token.clone()).await;
+                    forward_stream_events(id, &mut rx, &token, &stream_tx, &doc_origin).await;
+                }
+                crate::broker::FetchSource::Broker(handle) => {
+                    let (mut rx, broker_id) =
+                        handle.fetch_stream(resource, token.clone()).await;
+                    tokio::select! {
+                        _ = token.cancelled() => {
+                            handle.cancel_stream(broker_id).await;
+                            let _ = stream_tx.send(FetchStreamEvent::Error {
+                                id,
+                                error: FetchError::Cancelled,
+                            });
+                        }
+                        _ = forward_stream_events(id, &mut rx, &token, &stream_tx, &doc_origin) => {}
+                    }
+                    handle.finish_stream(broker_id).await;
+                }
+            }
+            tokens.lock().unwrap().remove(&id);
+        });
+    }
+}
+
+impl PlutoFetchBackend {
+    /// Resolve + gate a `fetch()` request into a `ResourceRequest`
+    /// (Stage 16 Phase 3, Rec 12: shared by `start_fetch` and
+    /// `start_stream_fetch` — the gates are identical, only the
+    /// destination differs). The gates, in order: http(s) scheme,
+    /// mixed content, opaque-origin fail-closed, `mode:
+    /// "same-origin"`. CORS / CSP / the blocker run in `pluto-net`.
+    fn build_request(
+        &self,
+        request: &FetchRequest,
+        destination: Destination,
+    ) -> Result<ResourceRequest, FetchError> {
+        let base = self.base_url.lock().unwrap().clone();
+        let absolute = resolve_url(&base, &request.url);
+        if !absolute.starts_with("http://") && !absolute.starts_with("https://") {
+            return Err(FetchError::InvalidUrl(format!(
+                "fetch: unsupported URL scheme in {absolute}"
+            )));
+        }
+        // Mixed-content gate (Stage 5 also gates in the scheduler;
+        // this is the fetch-API gate): an https page may not fetch
+        // http.
+        if base.starts_with("https://") && absolute.starts_with("http://") {
+            return Err(FetchError::Network(format!(
+                "mixed content blocked: {absolute} on an https page"
+            )));
+        }
+        let doc_origin = self.origin.lock().unwrap().clone();
+        if doc_origin.is_opaque()
+            && !Origin::from_url(&absolute).is_same_origin(&doc_origin)
+        {
+            return Err(FetchError::InvalidUrl(format!(
+                "cross-origin fetch from an opaque origin is blocked: {absolute}"
+            )));
+        }
+        // `mode: "same-origin"` is enforced here, before any
+        // network access: a cross-origin URL with that mode is a
+        // TypeError, not a CORS request (Fetch §4.2). `mode:
+        // "no-cors"` and `"cors"` go to `pluto-net`, which runs the
+        // preflight / CORS check / opaque filtering.
+        if request.mode == RequestMode::SameOrigin
+            && !Origin::from_url(&absolute).is_same_origin(&doc_origin)
+        {
+            return Err(FetchError::InvalidUrl(format!(
+                "same-origin fetch to a cross-origin URL is blocked: {absolute}"
+            )));
+        }
+        Ok(ResourceRequest {
+            request_id: self.next_request_id.fetch_add(1, Ordering::Relaxed),
+            tab_id: self.tab_id,
+            epoch: self.epoch.load(Ordering::SeqCst),
+            url: absolute,
+            destination,
+            priority: Priority::Medium,
+            // Stage 9 Rec 2: `init.method` / `init.headers` /
+            // `init.mode` / `init.credentials` ride the wire —
+            // `pluto-net` validates the method/headers (CORS
+            // safelists, forbidden headers, preflight) and applies
+            // the mode/credentials rules. Nothing here decides
+            // CORS; this backend only enforces the same-origin
+            // mode above and the opaque-origin fail-closed rule.
+            method: request.method.clone(),
+            headers: request.headers.clone(),
+            // `fetch()` is never an imageset fetch.
+            is_imageset: false,
+            mode: request.mode,
+            credentials: request.credentials,
+            origin: doc_origin.serialize(),
+            top_level_site: doc_origin.serialize(),
+            upgrade_insecure_requests: false,
+            integrity: None,
+            body: None,
+        })
+    }
+}
+
+/// Forward `ResourceEvent`s from a streaming fetch into
+/// `FetchStreamEvent`s on the realm's channel, until the terminal
+/// event, the token fires, or the realm goes away (send fails).
+/// Returns when the stream ends for any of those reasons.
+async fn forward_stream_events(
+    id: u64,
+    rx: &mut tokio::sync::mpsc::Receiver<ResourceEvent>,
+    token: &CancellationToken,
+    stream_tx: &mpsc::Sender<FetchStreamEvent>,
+    doc_origin: &Origin,
+) {
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => {
+                let _ = stream_tx.send(FetchStreamEvent::Error {
+                    id,
+                    error: FetchError::Cancelled,
+                });
+                return;
+            }
+            event = rx.recv() => {
+                let Some(event) = event else {
+                    let _ = stream_tx.send(FetchStreamEvent::Error {
+                        id,
+                        error: FetchError::Network("stream ended".to_string()),
+                    });
+                    return;
+                };
+                let terminal = matches!(
+                    event,
+                    ResourceEvent::Done { .. }
+                        | ResourceEvent::Error { .. }
+                        | ResourceEvent::Cancelled { .. }
+                );
+                let mapped = map_stream_event(id, event, doc_origin);
+                if stream_tx.send(mapped).is_err() {
+                    return;
+                }
+                if terminal {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// One `ResourceEvent` → one `FetchStreamEvent`. The response type
+/// is computed from the final URL's origin against the document
+/// origin (same rule as the whole-response path: status 0 is the
+/// opaque signal).
+fn map_stream_event(id: u64, event: ResourceEvent, doc_origin: &Origin) -> FetchStreamEvent {
+    match event {
+        ResourceEvent::ResponseHeaders {
+            status,
+            url,
+            headers,
+            ..
+        } => {
+            let response_type = if status == 0 {
+                ResponseType::Opaque
+            } else if Origin::from_url(&url).is_same_origin(doc_origin) {
+                ResponseType::Basic
+            } else {
+                ResponseType::Cors
+            };
+            FetchStreamEvent::Headers {
+                id,
+                status,
+                status_text: String::new(),
+                headers,
+                response_type,
+            }
+        }
+        ResourceEvent::BodyChunk { bytes, .. } => FetchStreamEvent::Chunk { id, bytes },
+        ResourceEvent::Done { .. } => FetchStreamEvent::Done { id },
+        ResourceEvent::Error { code, reason, .. } => {
+            let error = if code == "cancelled" {
+                FetchError::Cancelled
+            } else {
+                FetchError::Network(format!("{code}: {reason}"))
+            };
+            FetchStreamEvent::Error { id, error }
+        }
+        ResourceEvent::Cancelled { .. } => FetchStreamEvent::Error {
+            id,
+            error: FetchError::Cancelled,
+        },
+    }
+}
+
+/// The browser-side `WebSocket` backend (Stage 16 Phase 3, Rec 11):
+/// the renderer never opens a socket — `connect` asks the shell
+/// (over the tab's event channel) to run
+/// `NetworkBroker::serve_websocket` in the browser process, and
+/// `send` / `close` forward to that pump. The `events` sender the
+/// trait hands to `connect` is the realm's own `WsEvent` channel —
+/// the production backend does not use it: socket events come back
+/// over IPC (`BrowserToRenderer::WebSocketEvent`) and the renderer
+/// forwards them into the realm. `send` / `close` spawn their
+/// forward on the tab runtime handle instead of blocking the tab
+/// thread on the channel.
+pub struct PlutoWebSocketBackend {
+    /// The tab's event sender (to the shell).
+    events: tokio::sync::mpsc::Sender<pluto_ipc::RendererToBrowser>,
+    /// The tab thread's tokio runtime handle.
+    handle: tokio::runtime::Handle,
+}
+
+impl PlutoWebSocketBackend {
+    pub fn new(
+        events: tokio::sync::mpsc::Sender<pluto_ipc::RendererToBrowser>,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self { events, handle }
+    }
+}
+
+impl WebSocketBackend for PlutoWebSocketBackend {
+    fn connect(&self, request: WsConnectRequest, _events: mpsc::Sender<WsEvent>) {
+        let out = self.events.clone();
+        self.handle.spawn(async move {
+            let _ = out
+                .send(pluto_ipc::RendererToBrowser::WebSocketOpen {
+                    socket_id: request.id,
+                    url: request.url,
+                    protocols: request.protocols,
+                    origin: request.origin,
+                })
+                .await;
+        });
+    }
+
+    fn send(&self, id: u64, data: Vec<u8>, is_binary: bool) {
+        let out = self.events.clone();
+        self.handle.spawn(async move {
+            let _ = out
+                .send(pluto_ipc::RendererToBrowser::WebSocketSend {
+                    socket_id: id,
+                    data,
+                    is_binary,
+                })
+                .await;
+        });
+    }
+
+    fn close(&self, id: u64, code: Option<u16>, reason: String) {
+        let out = self.events.clone();
+        self.handle.spawn(async move {
+            let _ = out
+                .send(pluto_ipc::RendererToBrowser::WebSocketClose {
+                    socket_id: id,
+                    code,
+                    reason,
+                })
+                .await;
         });
     }
 }

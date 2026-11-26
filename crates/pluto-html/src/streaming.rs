@@ -590,20 +590,20 @@ impl Parser {
                 // selection itself. Any other element classifies
                 // with its real picture/media context (walked from
                 // the DOM), not the old hardcoded false/false.
-                let (in_picture, in_media) = {
+                let (in_picture, media_tag) = {
                     let dom = self.shared_dom();
                     let dom = dom.lock().unwrap();
                     let mut parent = dom.get(node).and_then(|n| n.parent);
                     let mut picture = false;
-                    let mut media = false;
+                    let mut media: Option<String> = None;
                     while let Some(p) = parent {
                         match dom.tag(p) {
                             Some("picture") => {
                                 picture = true;
                                 break;
                             }
-                            Some("video" | "audio") => {
-                                media = true;
+                            Some(t @ ("video" | "audio")) => {
+                                media = Some(t.to_string());
                                 break;
                             }
                             _ => parent = dom.get(p).and_then(|n| n.parent),
@@ -650,7 +650,7 @@ impl Parser {
                         &namespace,
                         &attrs,
                         in_picture,
-                        in_media,
+                        media_tag.as_deref(),
                         self.viewport_width,
                         self.viewport_dpr,
                     ) {

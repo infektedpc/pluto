@@ -35,6 +35,7 @@
 //! See `crates/pluto-js/README.md` for the pinned engine version, the
 //! probe verdict, the public API surface, and the performance notes.
 
+pub mod activation;
 pub mod bytecode;
 pub mod bindings;
 pub mod observers;

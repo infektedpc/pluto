@@ -126,6 +126,14 @@ during bootstrap, verified against the actual sources:
   CanvasRenderingContext2D with tainting policy, `<use>`/`<image>`/
   `<foreignObject>`, external `<img src=*.svg>` decode; IPC
   protocol 9 → 10.
+- **M8 — done.** Audio/video + SPA/real-time APIs: video-frame
+  transport measured at 1080p60 before any decoder code, new
+  `pluto-media` crate (demux/decode, audio sink with the audio
+  clock as A/V master, autoplay policy), `Destination::Media`/
+  `WebSocket`, History API with per-entry `{url, state, scroll}`,
+  same-document navigation with `hashchange`/`popstate`, WebSocket
+  transport, `ReadableStream` + chunked fetch + `EventSource`,
+  IntersectionObserver fix; IPC protocol 10 → 13.
 
-Full workspace suite: 1029 tests, all passing. See `ARCHITECTURE.md`
+Full workspace suite: 1116 tests, all passing. See `ARCHITECTURE.md`
 for the full M1–M12 roadmap.

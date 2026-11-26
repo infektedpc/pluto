@@ -296,6 +296,14 @@ impl Compositor {
     pub fn reset_scroll(&mut self) {
         self.scroll.set((0.0, 0.0));
     }
+    /// Set the scroll offset outright (Stage 16 Phase 3, Rec 8 —
+    /// finisher): the traversal / reload scroll restore, applied
+    /// once the new list lands. Clamped to the current list's
+    /// bounds, like `scroll_by`.
+    pub fn set_scroll(&mut self, x: f32, y: f32) {
+        let (max_x, max_y) = self.max_scroll.get();
+        self.scroll.set((x.clamp(0.0, max_x), y.clamp(0.0, max_y)));
+    }
 }
 
 /// Maximum viewport scroll for a display list: the list's damage

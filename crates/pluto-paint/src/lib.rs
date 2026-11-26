@@ -29,6 +29,7 @@ use pluto_layout::{
 };
 
 use crate::canvas::canvas_blob_id;
+use crate::canvas::video_blob_id;
 use crate::path::{VectorVertex, clip_colored_triangles, linear_gradient_quad};
 use crate::raster::rasterize_gradient_rect;
 use crate::svg::{
@@ -1252,7 +1253,12 @@ impl DisplayList {
                     }
                 }
             }
-            if let Some(resource) = bx.image {
+            // Stage 16 (M8 Phase 2, Rec 5): the poster (`bx.image`)
+            // is skipped while the video is live — the frame Blob
+            // below replaces it. When the video is not live the
+            // poster paints exactly like an `<img>`.
+            let video_live = bx.svg_canvas == Some(SvgCanvasKind::Video) && bx.video_live;
+            if let Some(resource) = bx.image.filter(|_| !video_live) {
                 list.0.push(DisplayItem::Image {
                     resource: ResourceId(resource),
                     x: bx.x,
@@ -1305,6 +1311,35 @@ impl DisplayList {
                         y: bx.y,
                         width: bx.width,
                         height: bx.height,
+                    });
+                }
+            }
+            // Stage 16 (M8 Phase 2, Rec 5): a `<video>` box paints
+            // its current frame as a Blob at the box's rect when
+            // live (the shell holds the latest frame under the
+            // deterministic `video_blob_id` and re-uploads it on
+            // every presented frame); with no frame yet and no
+            // poster it paints black, like a browser's empty
+            // video box; with a poster and no frame yet, the
+            // poster above is the picture.
+            if bx.svg_canvas == Some(SvgCanvasKind::Video)
+                && let Some(video_id) = bx.dom
+            {
+                if bx.video_live {
+                    list.0.push(DisplayItem::Blob {
+                        resource: video_blob_id(video_id),
+                        x: bx.x,
+                        y: bx.y,
+                        width: bx.width,
+                        height: bx.height,
+                    });
+                } else if bx.image.is_none() {
+                    list.0.push(DisplayItem::FillRect {
+                        x: bx.x,
+                        y: bx.y,
+                        width: bx.width,
+                        height: bx.height,
+                        color: [0.0, 0.0, 0.0, 1.0],
                     });
                 }
             }
@@ -3251,6 +3286,78 @@ mod tests {
             },
         );
         list.validate(&resources).expect("image resolves");
+    }
+
+    #[test]
+    fn display_list_paints_video_frame_poster_or_black() {
+        use pluto_layout::{ElementState, ImageInfo, ImageMap, Theme, VideoInfo};
+        // Stage 16 (M8 Phase 2, Rec 5): a live video paints its
+        // frame Blob (poster suppressed); a not-live video with a
+        // poster paints the poster; a not-live video with neither
+        // paints a black rect at the box's rect.
+        for (has_frame, poster, want_blob, want_image, want_black) in [
+            (true, true, true, false, false),
+            (false, true, false, true, false),
+            (false, false, false, false, true),
+        ] {
+            let dom =
+                parse_html("<html><body><video src=\"v.mp4\"></video></body></html>");
+            let video_id = find_tag(&dom, "video");
+            let mut images = ImageMap::default();
+            images.videos.insert(
+                video_id,
+                VideoInfo {
+                    width: 640,
+                    height: 360,
+                    has_frame,
+                },
+            );
+            if poster {
+                images.by_node.insert(
+                    video_id,
+                    ImageInfo {
+                        resource: 42,
+                        width: 640,
+                        height: 360,
+                    },
+                );
+            }
+            let sheet = Stylesheet::parse("");
+            let tree = LayoutTree::build_with_state_and_images(
+                &dom,
+                &sheet,
+                1024.0,
+                768.0,
+                &ElementState::default(),
+                &images,
+                Theme::Light,
+            )
+            .expect("layout builds");
+            let mut cache = SvgRasterCache::new();
+            let (list, _blobs) = DisplayList::build_with_svg_and_canvas(
+                &tree,
+                &dom,
+                &mut cache,
+                &HashMap::new(),
+                &[],
+                &[],
+            );
+            let blob_id = crate::canvas::video_blob_id(video_id);
+            let has_blob = list.0.iter().any(|i| {
+                matches!(i, DisplayItem::Blob { resource, width, height, .. }
+                    if *resource == blob_id && (*width, *height) == (640.0, 360.0))
+            });
+            let has_image = list.0.iter().any(|i| {
+                matches!(i, DisplayItem::Image { resource, .. } if *resource == ResourceId(42))
+            });
+            let has_black = list.0.iter().any(|i| {
+                matches!(i, DisplayItem::FillRect { color, width, height, .. }
+                    if *color == [0.0, 0.0, 0.0, 1.0] && (*width, *height) == (640.0, 360.0))
+            });
+            assert_eq!(has_blob, want_blob, "has_frame={has_frame} poster={poster}: blob");
+            assert_eq!(has_image, want_image, "has_frame={has_frame} poster={poster}: image");
+            assert_eq!(has_black, want_black, "has_frame={has_frame} poster={poster}: black");
+        }
     }
 
     #[test]

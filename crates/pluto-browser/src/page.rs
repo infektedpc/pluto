@@ -400,6 +400,9 @@ fn map_html_destination(d: HtmlDestination) -> Destination {
         HtmlDestination::Image => Destination::Image,
         HtmlDestination::Font => Destination::Font,
         HtmlDestination::Fetch => Destination::Fetch,
+        HtmlDestination::Audio => Destination::Audio,
+        HtmlDestination::Video => Destination::Video,
+        HtmlDestination::WebSocket => Destination::WebSocket,
         HtmlDestination::Other => Destination::Other,
     }
 }

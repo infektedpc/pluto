@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_bytes.workspace = true
 postcard.workspace = true
 http.workspace = true
 thiserror.workspace = true

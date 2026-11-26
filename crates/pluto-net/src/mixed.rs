@@ -31,6 +31,10 @@
 //! no `Destination` variant yet (the scanner maps them to
 //! `Destination::Other`, which is blockable) — when audio/video
 //! destinations land, they join `is_upgradable` here.
+//! (Stage 16 Phase 1, Rec 2: they landed — `Destination::Audio`
+//! and `Destination::Video` are upgradable, and
+//! `Destination::WebSocket` is blockable over `ws:` — see
+//! `mixed_content_decision`.)
 //!
 //! The initiator half needs the parser/scanner to label `imageset`
 //! discoveries: `pluto-html/src/scanner.rs` labels them
@@ -85,7 +89,10 @@ pub enum Initiator {
 /// blocking. Plain images today; audio/video join when Pluto has
 /// destinations for them (see the module docs).
 fn is_upgradable(destination: Destination) -> bool {
-    matches!(destination, Destination::Image)
+    matches!(
+        destination,
+        Destination::Image | Destination::Audio | Destination::Video
+    )
 }
 
 /// Is `host` an IP literal (v4 or v6)? Upgrading an IP host is
@@ -112,6 +119,20 @@ pub fn mixed_content_decision(
     let page_https = page_origin.starts_with("https://");
     if !page_https {
         return MixedContentDecision::Allow;
+    }
+    // WebSocket schemes are network schemes, not "elsewhere": a
+    // `ws://` subresource on an https page is mixed content and
+    // BLOCKS (Mixed Content L2 treats websockets as blockable);
+    // `wss://` is allowed. This is checked BEFORE the non-http
+    // early return below — the gate used to `Allow` any non-http
+    // scheme, so a WebSocket transport that bypasses
+    // `execute_fetch` would have silently allowed `ws://` on https
+    // (Stage 16 Phase 1, Rec 2). Any transport that opens its own
+    // socket must call this gate with `Destination::WebSocket`.
+    match url.scheme_str() {
+        Some("ws") => return MixedContentDecision::Block,
+        Some("wss") => return MixedContentDecision::Allow,
+        _ => {}
     }
     if url.scheme_str() != Some("http") {
         // https, or a non-network scheme the caller routes
@@ -453,6 +474,81 @@ mod tests {
                 "https://example.com",
                 &uri("https://cdn.example.com/x.js"),
                 Destination::Script,
+                false,
+                RequestMode::NoCors,
+                Initiator::Normal
+            ),
+            MixedContentDecision::Allow
+        );
+    }
+
+    // --- Stage 16 Phase 1, Rec 2: media + WebSocket destinations ---
+
+    #[test]
+    fn https_page_upgrades_audio_and_video() {
+        for (dest, url) in [
+            (Destination::Audio, "http://cdn.example.com/song.mp3"),
+            (Destination::Video, "http://cdn.example.com/clip.mp4"),
+        ] {
+            assert_eq!(
+                mixed_content_decision(
+                    "https://example.com",
+                    &uri(url),
+                    dest,
+                    false,
+                    RequestMode::NoCors,
+                    Initiator::Normal
+                ),
+                MixedContentDecision::Upgrade(uri(&url.replace("http://", "https://"))),
+                "{dest:?} must auto-upgrade like an image"
+            );
+        }
+        // An IP host still blocks instead of upgrading.
+        assert_eq!(
+            mixed_content_decision(
+                "https://example.com",
+                &uri("http://192.0.2.1/clip.mp4"),
+                Destination::Video,
+                false,
+                RequestMode::NoCors,
+                Initiator::Normal
+            ),
+            MixedContentDecision::Block
+        );
+    }
+
+    #[test]
+    fn ws_on_https_blocks_wss_allows() {
+        // `ws://` on an https page is blockable mixed content —
+        // the gate must NOT fall through to the non-http Allow.
+        assert_eq!(
+            mixed_content_decision(
+                "https://example.com",
+                &uri("ws://example.com/chat"),
+                Destination::WebSocket,
+                false,
+                RequestMode::NoCors,
+                Initiator::Normal
+            ),
+            MixedContentDecision::Block
+        );
+        assert_eq!(
+            mixed_content_decision(
+                "https://example.com",
+                &uri("wss://example.com/chat"),
+                Destination::WebSocket,
+                false,
+                RequestMode::NoCors,
+                Initiator::Normal
+            ),
+            MixedContentDecision::Allow
+        );
+        // An http page allows either: no mixed content there.
+        assert_eq!(
+            mixed_content_decision(
+                "http://example.com",
+                &uri("ws://example.com/chat"),
+                Destination::WebSocket,
                 false,
                 RequestMode::NoCors,
                 Initiator::Normal

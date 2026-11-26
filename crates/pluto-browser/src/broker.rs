@@ -23,7 +23,7 @@
 //!   renderer skips profile writes (`security` / `cookies` /
 //!   blocker refresh) — the broker owns them.
 
-use pluto_ipc::{Destination, RendererToBrowser, ResourceEvent, ResourceRequest};
+use pluto_ipc::{Destination, RendererToBrowser, ResourceEvent, ResourceRequest, WebSocketEvent};
 use pluto_net::{NetError, ResourceLoader, Response};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -86,6 +86,202 @@ impl NetworkBroker {
             token.cancel();
         }
     }
+
+    /// Serve one WebSocket (Stage 16 Phase 3, Rec 11): run the
+    /// handshake on the shared loader and pump the socket — the
+    /// renderer never opens a socket itself. `commands` carries
+    /// the shell-forwarded `Send` / `Close` asks; socket lifecycle
+    /// (open / message / close / error) goes to `events`, with
+    /// exactly one terminal event. Returns when the socket ends
+    /// (close frame, error, or the command channel closing — a
+    /// dropped command channel means the tab went away, so the
+    /// socket is closed, not left dangling).
+    pub async fn serve_websocket(
+        &self,
+        socket_id: u64,
+        url: String,
+        protocols: Vec<String>,
+        origin: String,
+        mut commands: mpsc::Receiver<WsCommand>,
+        events: mpsc::Sender<WebSocketEvent>,
+    ) {
+        // The handshake runs through the loader's gated path
+        // (HSTS / mixed-content / blocker / CSP `connect-src` /
+        // `Origin` header) with a `WebSocket` destination — the
+        // same gates as `fetch()`, never a raw socket.
+        let request = ResourceRequest {
+            request_id: socket_id,
+            tab_id: 0,
+            epoch: 0,
+            url: url.clone(),
+            destination: Destination::WebSocket,
+            priority: pluto_ipc::Priority::Medium,
+            method: "GET".to_string(),
+            headers: Vec::new(),
+            is_imageset: false,
+            mode: pluto_ipc::RequestMode::Cors,
+            credentials: pluto_ipc::CredentialsMode::Include,
+            origin: origin.clone(),
+            top_level_site: origin,
+            upgrade_insecure_requests: false,
+            integrity: None,
+            body: None,
+        };
+        let cancel = CancellationToken::new();
+        let connected = self
+            .loader
+            .connect_websocket(request, protocols, cancel.clone())
+            .await;
+        let (stream, protocol) = match connected {
+            Ok(pair) => pair,
+            Err(e) => {
+                let _ = events
+                    .send(WebSocketEvent::Error {
+                        socket_id,
+                        message: e.to_string(),
+                    })
+                    .await;
+                return;
+            }
+        };
+        let (mut write, mut read) = stream.split();
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+        let _ = events
+            .send(WebSocketEvent::Opened {
+                socket_id,
+                protocol,
+            })
+            .await;
+        loop {
+            tokio::select! {
+                cmd = commands.recv() => {
+                    let Some(cmd) = cmd else {
+                        // Tab gone: close the socket and end.
+                        let _ = write.send(Message::Close(None)).await;
+                        break;
+                    };
+                    match cmd {
+                        WsCommand::Send { data, is_binary } => {
+                            let msg = if is_binary {
+                                Message::Binary(data.into())
+                            } else {
+                                match String::from_utf8(data) {
+                                    Ok(text) => Message::Text(text.into()),
+                                    Err(_) => continue, // Not UTF-8 text: drop, stay open.
+                                }
+                            };
+                            if write.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        WsCommand::Close { code, reason } => {
+                            let frame = CloseFrame {
+                                code: code
+                                    .map(CloseCode::from)
+                                    .unwrap_or(CloseCode::Normal),
+                                reason: reason.into(),
+                            };
+                            let _ = write.send(Message::Close(Some(frame))).await;
+                            let _ = write.close().await;
+                            // The peer's close reply (or the socket
+                            // end) delivers the terminal `Closed`
+                            // event below; if the socket is already
+                            // gone the read arm ends the pump.
+                        }
+                    }
+                }
+                msg = read.next() => {
+                    let Some(msg) = msg else {
+                        let _ = events
+                            .send(WebSocketEvent::Closed {
+                                socket_id,
+                                code: Some(1006),
+                                reason: String::new(),
+                                clean: false,
+                            })
+                            .await;
+                        break;
+                    };
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            if events
+                                .send(WebSocketEvent::Message {
+                                    socket_id,
+                                    // `Utf8Bytes`: no `into_bytes` —
+                                    // borrow the bytes and copy them.
+                                    data: text.as_bytes().to_vec(),
+                                    is_binary: false,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(Message::Binary(data)) => {
+                            if events
+                                .send(WebSocketEvent::Message {
+                                    socket_id,
+                                    data: data.into(),
+                                    is_binary: true,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(Message::Close(frame)) => {
+                            let (code, reason) = match frame {
+                                Some(f) => (Some(u16::from(f.code)), f.reason.to_string()),
+                                None => (Some(1005), String::new()),
+                            };
+                            let _ = events
+                                .send(WebSocketEvent::Closed {
+                                    socket_id,
+                                    code,
+                                    reason,
+                                    clean: true,
+                                })
+                                .await;
+                            break;
+                        }
+                        // Ping: tungstenite queues the Pong in its
+                        // read path (RFC 6455 §5.5.2) — polling
+                        // the stream is the reply. Pong / raw
+                        // frames are not application messages.
+                        Ok(Message::Ping(_)) => {}
+                        Ok(Message::Pong(_)) => {}
+                        Ok(Message::Frame(_)) => {}
+                        Err(e) => {
+                            let _ = events
+                                .send(WebSocketEvent::Closed {
+                                    socket_id,
+                                    code: Some(1006),
+                                    reason: e.to_string(),
+                                    clean: false,
+                                })
+                                .await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        cancel.cancel();
+    }
+}
+
+/// Commands the shell forwards to a browser-side WebSocket pump
+/// (Stage 16 Phase 3, Rec 11): one message, or the close
+/// handshake. The pump owns the socket; the shell only routes.
+#[derive(Debug, Clone)]
+pub enum WsCommand {
+    Send { data: Vec<u8>, is_binary: bool },
+    Close { code: Option<u16>, reason: String },
 }
 
 // ------------------------------------------------------------------ handle
@@ -126,6 +322,63 @@ impl BrokerHandle {
                 self.pending.lock().await.remove(&request_id);
             }
         }
+    }
+
+    /// Stream one request through the broker (Stage 16 Phase 3,
+    /// Rec 12): send the ask and return the event receiver,
+    /// uncollapsed — headers, then chunks, then exactly one
+    /// terminal event. No byte-cap enforcement here (the 10 MiB
+    /// whole-response cap lives in `fetch`, not in the stream):
+    /// the service's `Stream` caps (1 GiB / 600 s) bound the
+    /// stream, and the realm buffers only what the page actually
+    /// reads. The second return value is the broker request id,
+    /// for [`BrokerHandle::cancel_stream`].
+    pub async fn fetch_stream(
+        self: &Arc<Self>,
+        mut request: ResourceRequest,
+        cancel: CancellationToken,
+    ) -> (mpsc::Receiver<ResourceEvent>, u64) {
+        let request_id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        request.request_id = request_id;
+        let (tx, rx) = mpsc::channel::<ResourceEvent>(64);
+        self.pending.lock().await.insert(request_id, tx);
+        let sent = self
+            .out
+            .send(RendererToBrowser::RequestResource(request.clone()))
+            .await
+            .is_ok();
+        if !sent {
+            self.pending.lock().await.remove(&request_id);
+            return (rx, request_id);
+        }
+        // The caller owns cancellation: it watches `cancel` and
+        // calls `cancel_stream` when it fires (the token is the
+        // same one `PlutoFetchBackend` stores per fetch id, so
+        // `controller.abort()` reaches the broker).
+        let _ = cancel;
+        (rx, request_id)
+    }
+
+    /// Cancel a streaming fetch by broker request id (Stage 16
+    /// Phase 3, Rec 12): send `CancelResource` and forget the
+    /// pending entry. No-op when the fetch already ended.
+    pub async fn cancel_stream(&self, request_id: u64) {
+        let _ = self
+            .out
+            .send(RendererToBrowser::CancelResource { request_id })
+            .await;
+        self.pending.lock().await.remove(&request_id);
+    }
+
+    /// Forget a streaming fetch's pending entry (Stage 16 Phase 3,
+    /// Rec 12): the forwarding task calls this when the stream
+    /// ends, so a completed stream does not leak its sender in
+    /// `pending` (no more events arrive after the terminal one,
+    /// so nothing else would ever remove it).
+    pub async fn finish_stream(&self, request_id: u64) {
+        self.pending.lock().await.remove(&request_id);
     }
 
     /// Fetch one request through the broker: send the ask, then

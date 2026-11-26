@@ -78,19 +78,63 @@ pub const TTFB_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Per-destination cap on *decoded* body bytes. A gzip bomb is
 /// caught by the decoded cap, not the encoded one.
+///
+/// Stage 16 Phase 1, Rec 2: media gets a streaming-scale cap
+/// (2 GiB) instead of the 10 MiB `Other` cap, which would
+/// silently truncate any real audio/video file. This is an
+/// interim bound, not a design: bodies are still buffered whole
+/// today, so a 2 GiB media load still holds 2 GiB in memory —
+/// true streaming delivery (Rec 12) replaces the buffer with a
+/// chunk channel and the cap with a per-chunk / idle bound.
+///
+/// Stage 16 Phase 3, Rec 12: `Stream` (a `fetch()` whose body
+/// is consumed as a `ReadableStream`, or an `EventSource`) gets
+/// 1 GiB / 600 s — its own caps, not the 10 MiB / 20 s `Fetch`
+/// limits that would kill any long-lived stream. The 10 MiB bound
+/// still applies where a body is *buffered whole* (`.text()` /
+/// `.json()` / `.blob()` / `.arrayBuffer()`), enforced in the
+/// realm at the buffering point — the cap always protected memory,
+/// and a streaming reader that never buffers is not that risk.
+/// Backpressure is the real control: the chunk channel is bounded
+/// (64 in flight), so a reader that stops reading stalls the
+/// network read instead of growing memory.
 pub fn byte_cap(destination: Destination) -> usize {
     const MIB: usize = 1024 * 1024;
     match destination {
         Destination::Image => 50 * MIB,
+        Destination::Audio | Destination::Video => 2048 * MIB,
+        Destination::Stream => 1024 * MIB,
         _ => 10 * MIB,
     }
 }
 
 /// Per-destination total timeout for a fetch (connect + headers +
 /// body).
+///
+/// Stage 16 Phase 1, Rec 2: media gets 10 minutes instead of
+/// 20 s — a progressive media load over a slow link legitimately
+/// runs long, and the 20 s fetch timeout would kill it. Interim
+/// like the cap above: Rec 12 replaces the total timeout for
+/// streams with an idle timeout. `WebSocket` keeps the fetch
+/// treatment (20 s) for the handshake only in the sense that the
+/// WS connect path (`connect_websocket`) does not go through this
+/// timeout at all — the handshake owns its own lifetime (a
+/// connect timeout on the socket, then the socket lives until
+/// close), so this function's `WebSocket` arm is unreachable in
+/// practice and stays conservative.
+///
+/// Stage 16 Phase 3, Rec 12: `Stream` gets the media treatment
+/// (600 s total). A per-chunk idle timeout is the follow-up —
+/// the total bound still kills a stream that stalls for 10
+/// minutes straight, which is the bound that matters for a hung
+/// connection; an SSE stream that trickles inside the bound runs
+/// until the server or the page closes it.
 pub fn total_timeout(destination: Destination) -> Duration {
     match destination {
         Destination::Document => Duration::from_secs(30),
+        Destination::Audio | Destination::Video | Destination::Stream => {
+            Duration::from_secs(600)
+        }
         _ => Duration::from_secs(20),
     }
 }
@@ -668,7 +712,10 @@ async fn run_fetch(
 ///   autoupgraded"); parse-and-ignore at most, never enforce;
 /// * no report sending — `Violation` records are console-report
 ///   only in v1 (no `report-uri` / `report-to` network sends).
-fn csp_pre_request_check(
+/// Stage 16 Phase 3 (Rec 11): `pub(crate)` so the WebSocket
+/// connect path (`websocket.rs`) can run the same pre-request CSP
+/// check as the fetch path — one gate, not two copies.
+pub(crate) fn csp_pre_request_check(
     scheduler: &Scheduler,
     request: &ResourceRequest,
     url: &str,
@@ -1475,7 +1522,16 @@ fn cache_request_headers(request: &ResourceRequest) -> header::HeaderMap {
         Destination::Script => "*/*",
         Destination::Image => "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         Destination::Font => "font/*,*/*;q=0.1",
-        Destination::Fetch | Destination::Other => "*/*",
+        // Stage 16 Phase 1, Rec 2: media advertises what it is;
+        // WebSocket never goes through this builder (its
+        // handshake owns its headers, Rec 11) but the match must
+        // stay total.
+        Destination::Audio => "audio/*,*/*;q=0.8",
+        Destination::Video => "video/*,*/*;q=0.8",
+        Destination::Fetch
+        | Destination::Stream
+        | Destination::WebSocket
+        | Destination::Other => "*/*",
     };
     let mut headers = header::HeaderMap::new();
     if let Ok(value) = accept.parse() {
@@ -1681,7 +1737,16 @@ fn build_request(
         Destination::Script => "*/*",
         Destination::Image => "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         Destination::Font => "font/*,*/*;q=0.1",
-        Destination::Fetch | Destination::Other => "*/*",
+        // Stage 16 Phase 1, Rec 2: media advertises what it is;
+        // WebSocket never goes through this builder (its
+        // handshake owns its headers, Rec 11) but the match must
+        // stay total.
+        Destination::Audio => "audio/*,*/*;q=0.8",
+        Destination::Video => "video/*,*/*;q=0.8",
+        Destination::Fetch
+        | Destination::Stream
+        | Destination::WebSocket
+        | Destination::Other => "*/*",
     };
     let mut headers = header::HeaderMap::new();
     headers.insert(

@@ -588,6 +588,34 @@ pub struct ComputedIntersection {
     pub is_intersecting: bool,
 }
 
+impl ComputedIntersection {
+    /// Shift the rects from page coordinates into
+    /// viewport-relative coordinates (Stage 16 Phase 1, Rec 10):
+    /// the spec's `boundingClientRect` / `rootBounds` /
+    /// `intersectionRect` are all relative to the viewport, so
+    /// the viewport scroll offset comes off each one. An empty
+    /// intersection (`[0, 0, 0, 0]`, no overlap) stays empty —
+    /// shifting it would invent a position for a rect that has
+    /// none. The ratio is scroll-independent and untouched.
+    pub fn to_viewport_relative(&self, scroll: (f32, f32)) -> Self {
+        let (sx, sy) = (scroll.0 as f64, scroll.1 as f64);
+        let shift = |r: [f64; 4]| [r[0] - sx, r[1] - sy, r[2], r[3]];
+        let intersection_rect =
+            if self.intersection_rect[2] > 0.0 && self.intersection_rect[3] > 0.0 {
+                shift(self.intersection_rect)
+            } else {
+                [0.0, 0.0, 0.0, 0.0]
+            };
+        Self {
+            target_rect: shift(self.target_rect),
+            root_bounds: shift(self.root_bounds),
+            intersection_rect,
+            ratio: self.ratio,
+            is_intersecting: self.is_intersecting,
+        }
+    }
+}
+
 /// One entry to deliver to an `IntersectionObserver` callback.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IntersectionObserverEntry {
@@ -597,12 +625,14 @@ pub struct IntersectionObserverEntry {
     /// the worker passes its tab clock), not of delivery.
     pub time: f64,
     /// The root's bounds after `rootMargin` (the viewport's
-    /// visible region for a viewport root).
+    /// visible region for a viewport root), VIEWPORT-relative
+    /// (Stage 16 Phase 1, Rec 10 — the spec's rects are
+    /// viewport-relative, not page coordinates).
     pub root_bounds: [f64; 4],
-    /// The target's border box.
+    /// The target's border box, viewport-relative.
     pub bounding_client_rect: [f64; 4],
-    /// The clipped intersection (`[0, 0, 0, 0]` when not
-    /// intersecting).
+    /// The clipped intersection, viewport-relative
+    /// (`[0, 0, 0, 0]` when not intersecting).
     pub intersection_rect: [f64; 4],
     /// `intersection area / target area`.
     pub ratio: f64,
@@ -627,6 +657,29 @@ struct IntersectionObservation {
     last_reported: Option<(f64, bool)>,
 }
 
+/// The options one `IntersectionObserver` was constructed with
+/// (Stage 16 Phase 1, Rec 10): per OBSERVER, not per `observe()`
+/// call — the spec parses `root` / `rootMargin` / `threshold` in
+/// the constructor, and `observe(target)` takes no options.
+/// Stored at construction so `observe()` can look them up.
+#[derive(Debug, Clone)]
+pub struct IntersectionObserverOptions {
+    pub root: Option<DomKey>,
+    pub root_margin: RootMargin,
+    /// Thresholds, sorted and deduplicated.
+    pub thresholds: Vec<f64>,
+}
+
+impl Default for IntersectionObserverOptions {
+    fn default() -> Self {
+        Self {
+            root: None,
+            root_margin: RootMargin::default(),
+            thresholds: vec![0.0],
+        }
+    }
+}
+
 /// The `IntersectionObserver` registry: every observation of every
 /// observer in one tab, plus their `lastReported` ratios and the
 /// pending entries awaiting the queued delivery task.
@@ -643,6 +696,11 @@ struct IntersectionObservation {
 #[derive(Debug, Default)]
 pub struct IntersectionObserverRegistry {
     observations: Vec<IntersectionObservation>,
+    /// Constructor options per observer id (Stage 16 Phase 1,
+    /// Rec 10). Survives `disconnect()` — an observer can
+    /// `observe()` again after disconnecting, with the same
+    /// options it was constructed with.
+    observer_options: std::collections::HashMap<u64, IntersectionObserverOptions>,
     /// Observer ids in creation order (first `observe()` call).
     observer_order: Vec<u64>,
     /// Entries gathered since the last delivery, grouped by
@@ -655,28 +713,50 @@ pub struct IntersectionObserverRegistry {
 }
 
 impl IntersectionObserverRegistry {
-    /// Observe `target` with `observer_id` (replaces an existing
-    /// observation for the same observer + target, per spec).
-    /// `thresholds` are sorted and deduplicated.
-    pub fn observe(
+    /// Record an observer's constructor options (Stage 16 Phase 1,
+    /// Rec 10). `thresholds` are sorted and deduplicated. Called
+    /// from `__pluto_new`, before any `observe()`; an observer
+    /// with no recorded options observes with the defaults
+    /// (viewport root, no margin, threshold `[0]`).
+    pub fn configure_observer(
         &mut self,
         observer_id: u64,
-        target: DomKey,
         root: Option<DomKey>,
         root_margin: RootMargin,
         thresholds: Vec<f64>,
     ) {
-        self.observations
-            .retain(|o| !(o.observer_id == observer_id && o.target == target));
         let mut thresholds = thresholds;
         thresholds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         thresholds.dedup_by(|a, b| *a == *b);
+        self.observer_options.insert(
+            observer_id,
+            IntersectionObserverOptions {
+                root,
+                root_margin,
+                thresholds,
+            },
+        );
+    }
+
+    /// Observe `target` with `observer_id` (replaces an existing
+    /// observation for the same observer + target, per spec),
+    /// using the options the observer was constructed with
+    /// (Stage 16 Phase 1, Rec 10 — options live on the
+    /// constructor, not on `observe()`).
+    pub fn observe(&mut self, observer_id: u64, target: DomKey) {
+        let options = self
+            .observer_options
+            .get(&observer_id)
+            .cloned()
+            .unwrap_or_default();
+        self.observations
+            .retain(|o| !(o.observer_id == observer_id && o.target == target));
         self.observations.push(IntersectionObservation {
             observer_id,
             target,
-            root,
-            root_margin,
-            thresholds,
+            root: options.root,
+            root_margin: options.root_margin,
+            thresholds: options.thresholds,
             last_reported: None,
         });
         if !self.observer_order.contains(&observer_id) {
@@ -684,15 +764,43 @@ impl IntersectionObserverRegistry {
         }
     }
 
-    /// Stop observing `target` for `observer_id`.
+    /// Stop observing `target` for `observer_id`. Already-queued
+    /// pending entries for that observer + target are dropped —
+    /// `unobserve()` must not deliver an entry for a target the
+    /// page just stopped watching (Stage 16 Phase 1, Rec 10).
     pub fn unobserve(&mut self, observer_id: u64, target: DomKey) {
         self.observations
             .retain(|o| !(o.observer_id == observer_id && o.target == target));
+        self.drop_pending_for(observer_id, Some(target));
     }
 
-    /// Drop every observation of `observer_id`.
+    /// Drop every observation of `observer_id`, and every
+    /// already-queued pending entry for it (Stage 16 Phase 1,
+    /// Rec 10). The constructor options survive, so the observer
+    /// can `observe()` again with the same options.
     pub fn disconnect(&mut self, observer_id: u64) {
         self.observations.retain(|o| o.observer_id != observer_id);
+        self.drop_pending_for(observer_id, None);
+    }
+
+    /// Drop pending entries for `observer_id` — all of them when
+    /// `target` is `None`, only that target's when `Some`.
+    fn drop_pending_for(&mut self, observer_id: u64, target: Option<DomKey>) {
+        for (id, entries) in self.pending.iter_mut() {
+            if *id == observer_id {
+                match target {
+                    Some(t) => entries.retain(|e| e.target != t),
+                    None => entries.clear(),
+                }
+            }
+        }
+        self.pending.retain(|(_, entries)| !entries.is_empty());
+        if self.pending.is_empty() {
+            // Nothing left to deliver: the queued task (if any)
+            // drains an empty queue, so the flag can clear now
+            // and the next gather re-arms it.
+            self.delivery_queued = false;
+        }
     }
 
     /// True when any observation exists.
@@ -887,7 +995,8 @@ mod intersection_tests {
     fn intersection_initial_entry_then_quiet() {
         let (a, _) = keys();
         let mut reg = IntersectionObserverRegistry::default();
-        reg.observe(1, a, None, RootMargin::default(), vec![0.0]);
+        reg.configure_observer(1, None, RootMargin::default(), vec![0.0]);
+        reg.observe(1, a);
         let map = geo_map(vec![(a, geo(1.0, true))]);
         let provider = |_: u64, k: DomKey| map.get(&k).copied();
         assert!(reg.gather(&provider, 100.0), "initial entry queues a task");
@@ -905,7 +1014,8 @@ mod intersection_tests {
     fn intersection_threshold_band_crossing() {
         let (a, _) = keys();
         let mut reg = IntersectionObserverRegistry::default();
-        reg.observe(1, a, None, RootMargin::default(), vec![0.5]);
+        reg.configure_observer(1, None, RootMargin::default(), vec![0.5]);
+        reg.observe(1, a);
         // Initial entry at ratio 0 (out of view).
         let mut map = geo_map(vec![(a, geo(0.0, false))]);
         assert!(reg.gather(&|_, k| map.get(&k).copied(), 0.0));
@@ -941,7 +1051,8 @@ mod intersection_tests {
     fn intersection_unrendered_target_gets_no_entry() {
         let (a, _) = keys();
         let mut reg = IntersectionObserverRegistry::default();
-        reg.observe(1, a, None, RootMargin::default(), vec![0.0]);
+        reg.configure_observer(1, None, RootMargin::default(), vec![0.0]);
+        reg.observe(1, a);
         // No geometry at all: nothing queued, and the initial
         // entry still waits.
         assert!(!reg.gather(&|_, _| None, 0.0));
@@ -955,8 +1066,10 @@ mod intersection_tests {
     fn intersection_take_records_drains_pending() {
         let (a, b) = keys();
         let mut reg = IntersectionObserverRegistry::default();
-        reg.observe(1, a, None, RootMargin::default(), vec![0.0]);
-        reg.observe(2, b, None, RootMargin::default(), vec![0.0]);
+        reg.configure_observer(1, None, RootMargin::default(), vec![0.0]);
+        reg.observe(1, a);
+        reg.configure_observer(2, None, RootMargin::default(), vec![0.0]);
+        reg.observe(2, b);
         let map = geo_map(vec![(a, geo(1.0, true)), (b, geo(0.0, false))]);
         assert!(reg.gather(&|_, k| map.get(&k).copied(), 0.0));
         let recs = reg.take_records(1);
@@ -970,10 +1083,79 @@ mod intersection_tests {
     }
 
     #[test]
+    fn intersection_disconnect_and_unobserve_drop_pending() {
+        let (a, b) = keys();
+        let mut reg = IntersectionObserverRegistry::default();
+        reg.configure_observer(1, None, RootMargin::default(), vec![0.0]);
+        reg.observe(1, a);
+        reg.configure_observer(2, None, RootMargin::default(), vec![0.0]);
+        reg.observe(2, b);
+        let map = geo_map(vec![(a, geo(1.0, true)), (b, geo(1.0, true))]);
+        assert!(reg.gather(&|_, k| map.get(&k).copied(), 0.0));
+        assert!(reg.has_pending());
+        reg.disconnect(1);
+        // Observer 1's entries are gone; observer 2's remain.
+        let batches = reg.take_pending();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].0, 2);
+        // A fresh entry for observer 2, then unobserve drops it.
+        let map = geo_map(vec![(b, geo(0.0, false))]);
+        assert!(reg.gather(&|_, k| map.get(&k).copied(), 16.0));
+        assert!(reg.has_pending());
+        reg.unobserve(2, b);
+        assert!(!reg.has_pending());
+        assert!(reg.take_pending().is_empty());
+    }
+
+    #[test]
+    fn intersection_observe_without_configure_uses_defaults() {
+        // `observe()` with no recorded constructor options uses
+        // the defaults (viewport root, threshold [0]).
+        let (a, _) = keys();
+        let mut reg = IntersectionObserverRegistry::default();
+        reg.observe(1, a);
+        let map = geo_map(vec![(a, geo(1.0, true))]);
+        assert!(reg.gather(&|_, k| map.get(&k).copied(), 0.0));
+        reg.take_pending();
+        // 0.25: no threshold in [0] is crossed and
+        // isIntersecting stays true — quiet.
+        let map = geo_map(vec![(a, geo(0.25, true))]);
+        assert!(!reg.gather(&|_, k| map.get(&k).copied(), 16.0));
+    }
+
+    #[test]
+    fn computed_intersection_to_viewport_relative() {
+        let g = ComputedIntersection {
+            target_rect: [10.0, 200.0, 100.0, 50.0],
+            root_bounds: [0.0, 100.0, 1024.0, 768.0],
+            intersection_rect: [10.0, 200.0, 100.0, 50.0],
+            ratio: 1.0,
+            is_intersecting: true,
+        };
+        let v = g.to_viewport_relative((5.0, 100.0));
+        assert_eq!(v.target_rect, [5.0, 100.0, 100.0, 50.0]);
+        assert_eq!(v.root_bounds, [-5.0, 0.0, 1024.0, 768.0]);
+        assert_eq!(v.intersection_rect, [5.0, 100.0, 100.0, 50.0]);
+        assert_eq!(v.ratio, 1.0);
+        // An empty intersection stays empty, not shifted.
+        let g = ComputedIntersection {
+            target_rect: [10.0, 200.0, 100.0, 50.0],
+            root_bounds: [0.0, 100.0, 1024.0, 768.0],
+            intersection_rect: [0.0, 0.0, 0.0, 0.0],
+            ratio: 0.0,
+            is_intersecting: false,
+        };
+        let v = g.to_viewport_relative((5.0, 100.0));
+        assert_eq!(v.intersection_rect, [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(v.target_rect, [5.0, 100.0, 100.0, 50.0]);
+    }
+
+    #[test]
     fn intersection_second_gather_before_delivery_merges() {
         let (a, _) = keys();
         let mut reg = IntersectionObserverRegistry::default();
-        reg.observe(1, a, None, RootMargin::default(), vec![0.0, 0.5]);
+        reg.configure_observer(1, None, RootMargin::default(), vec![0.0, 0.5]);
+        reg.observe(1, a);
         let mut map = geo_map(vec![(a, geo(0.0, false))]);
         assert!(reg.gather(&|_, k| map.get(&k).copied(), 0.0), "first gather queues a task");
         // A second gather before the task runs: the new entry joins

@@ -53,6 +53,9 @@ async fn spawned_renderer_child_exchanges_messages_headless() {
     renderer
         .send(&BrowserToRenderer::CommitNavigation {
             url: "about:blank".to_string(),
+            state_json: None,
+            traversal: false,
+            scroll: (0.0, 0.0),
         })
         .await
         .expect("navigation sends");
@@ -205,6 +208,9 @@ async fn sandboxed_renderer_exchange_under_trap_diagnostics() {
     renderer
         .send(&BrowserToRenderer::CommitNavigation {
             url: "about:blank".to_string(),
+            state_json: None,
+            traversal: false,
+            scroll: (0.0, 0.0),
         })
         .await
         .expect("navigation sends");
@@ -367,7 +373,12 @@ async fn no_socket_renderer_loads_real_page_via_broker() {
         .expect("visibility sends");
     let url = format!("http://127.0.0.1:{port}/");
     renderer
-        .send(&BrowserToRenderer::CommitNavigation { url: url.clone() })
+        .send(&BrowserToRenderer::CommitNavigation {
+                url: url.clone(),
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
         .await
         .expect("navigation sends");
 

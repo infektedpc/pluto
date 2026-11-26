@@ -560,6 +560,31 @@ impl ImageStore {
                     map.broken.insert(id);
                 }
             }
+        } else if dom.tag(id) == Some("video") {
+            // Stage 16 (M8 Phase 2, Rec 5): a `<video poster>`
+            // attaches its poster bytes to the video node, so
+            // layout hands paint an `image` to draw until the
+            // first frame is presentable (the poster URL was
+            // fetched through the image store by the scanner's
+            // `video[poster]` arm, so a Ready entry means the
+            // pixels are here; a Broken poster maps nothing —
+            // paint draws black instead).
+            if let Some(poster) = dom.attr(id, "poster") {
+                let resolved = pluto_html::resolve_url(base_url, poster);
+                match self.by_url.get(&resolved) {
+                    Some(ImageState::Ready { id: rid, width, height }) => {
+                        map.by_node.insert(
+                            id,
+                            ImageInfo {
+                                resource: rid.0,
+                                width: *width,
+                                height: *height,
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
         } else if dom.tag(id) == Some("image") {
             // Stage 15 (M7 Phase 3, Rec 10): an SVG `<image>`
             // resolves its `href` (plain wins, `xlink:href`

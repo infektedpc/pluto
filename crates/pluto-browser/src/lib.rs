@@ -40,9 +40,35 @@ use cosmic::app::{Core, Task};
 use cosmic::iced::{Alignment, Length};
 use cosmic::{Application, Element, executor, widget};
 use pluto_ipc::{BrowserToRenderer, CommandSender, InputEvent, RendererToBrowser};
-use pluto_paint::{DisplayList, ResourceId, ResourceTable, perf};
+use pluto_paint::{DisplayList, Resource, ResourceId, ResourceTable, perf};
+use std::collections::HashSet;
 use std::sync::Arc;
 use viewport::WebViewport;
+
+/// One session-history entry (Stage 16 Phase 3, Rec 8 — finisher):
+/// the committed URL, the `history.state` JSON the page pushed for
+/// it (`None` = no state, `history.state` reads `null`), and the
+/// viewport scroll the page was last left at. The shell owns the
+/// entries; the worker mirrors the current entry's state in its
+/// realm and fires `popstate` on traversal. Scroll is restored on
+/// traversal / reload when the new list lands (see Tab's
+/// `pending_scroll_restore`); a fresh navigation resets it.
+#[derive(Debug, Clone, PartialEq)]
+struct HistoryEntry {
+    url: String,
+    state_json: Option<String>,
+    scroll: (f32, f32),
+}
+
+impl HistoryEntry {
+    fn new(url: String) -> Self {
+        HistoryEntry {
+            url,
+            state_json: None,
+            scroll: (0.0, 0.0),
+        }
+    }
+}
 
 /// One tab (Stage 11 Rec 4): its own compositor holder, history,
 /// title, favicon, renderer channel, and load state. The worker
@@ -67,21 +93,56 @@ struct Tab {
     /// per insert batch after a submit — the M5 broker moves
     /// resources to shared memory and removes this copy).
     resources: Arc<ResourceTable>,
+    /// The latest decoded video frame per `<video>` element
+    /// (Stage 16 Phase 1, Rec 1): keyed by the frame's
+    /// `element_id`, holding exactly one frame per element — a
+    /// new frame overwrites the old one, so a slow shell never
+    /// accumulates a backlog (the drop policy lives here and in
+    /// `pluto_media::FrameChannel`). No `<video>` element exists
+    /// yet (Phase 2), so nothing reads this map today; the shell
+    /// accepts and stores frames now so the channel is live
+    /// before the first element paints. Staleness is enforced
+    /// worker-side, like `ResourceReady` (the worker drops stale
+    /// epochs before sending).
+    video_frames: std::collections::HashMap<u64, pluto_ipc::VideoFrame>,
+    /// Frame-blob ids whose RGBA pixels changed since the last
+    /// presented primitive (Stage 16, M8 Phase 2, Rec 5):
+    /// the shell converts each presented YUV frame into the
+    /// tab's live resource table and marks its blob id here;
+    /// the viewport drains the set in `prepare()` and calls
+    /// `PaintRenderer::advance_image_frame` for each id, so
+    /// the GPU re-uploads just that texture. Shared with the
+    /// viewport by `Arc<Mutex>` — the primitive must be
+    /// `Send + Sync`, so `Rc<RefCell>` cannot ride in it.
+    video_dirty: Arc<std::sync::Mutex<HashSet<ResourceId>>>,
     /// Minimal session history (R17), per tab: every committed
-    /// URL, in order, plus the index of the current entry.
+    /// entry, in order, plus the index of the current entry.
     /// Address-bar navigation and link clicks push entries (in
     /// `DidCommit`); Back/Forward move the index and navigate
     /// with `history_nav` set, so the commit they cause does not
-    /// push a duplicate. `:visited` reads the same committed
-    /// URLs worker-side — the worker's set and this history hold
-    /// the same URLs, with no IPC change. Stage 10 Rec 8:
-    /// `history.json` in the profile (newest 50) is saved on
-    /// every push of the ACTIVE tab only — per-tab persistence
-    /// is a follow-up, so a background tab's history does not
-    /// survive a restart.
-    history: Vec<String>,
+    /// push a duplicate. Stage 16 Phase 3, Rec 8 (finisher):
+    /// entries carry the page's `history.state` JSON and the
+    /// scroll the page was left at, so a traversal restores both
+    /// and the worker fires `popstate` after the commit.
+    /// `:visited` reads the same committed URLs worker-side — the
+    /// worker's set and this history hold the same URLs, with no
+    /// IPC change. Stage 10 Rec 8: `history.json` in the profile
+    /// (newest 50) is saved on every push of the ACTIVE tab only
+    /// — per-tab persistence is a follow-up, so a background tab's
+    /// history does not survive a restart.
+    history: Vec<HistoryEntry>,
     history_index: usize,
     history_nav: bool,
+    /// The scroll to restore once the traversed / reloaded page's
+    /// list lands (Stage 16 Phase 3, Rec 8 — finisher): applied in
+    /// the `SubmitDisplayList` arm, when the new list's max-scroll
+    /// is known — a plain `set_scroll` at commit time would clamp
+    /// against the OLD page's bounds.
+    pending_scroll_restore: Option<(f32, f32)>,
+    /// WebSocket pumps for this tab (Stage 16 Phase 3, Rec 11 —
+    /// finisher): `socket_id` → the broker pump's command sender.
+    /// A socket's events are routed back to this tab's renderer.
+    ws_commands: std::collections::HashMap<u64, tokio::sync::mpsc::Sender<crate::broker::WsCommand>>,
     /// The page title, from the worker's `TitleChanged` (Stage
     /// 11 Rec 8); the URL until the first title arrives. Shown
     /// in the tab strip and, for the active tab, the window title.
@@ -131,9 +192,13 @@ impl Tab {
             compositor: Compositor::new(),
             renderer_tx: None,
             resources: Arc::new(ResourceTable::new()),
+            video_frames: std::collections::HashMap::new(),
+            video_dirty: Arc::new(std::sync::Mutex::new(HashSet::new())),
             history: Vec::new(),
             history_index: 0,
             history_nav: false,
+            pending_scroll_restore: None,
+            ws_commands: std::collections::HashMap::new(),
             title: url.clone(),
             favicon_id: None,
             url_input: url.clone(),
@@ -250,6 +315,11 @@ pub enum Message {
     /// events were already forwarded to the tab as they arrived;
     /// this is just the task's completion signal (no-op).
     BrokerServeDone,
+    /// A WebSocket pump finished (Stage 16 Phase 3, Rec 11 —
+    /// finisher): the `socket_id`'s entry is removed from its
+    /// tab's pump map. The pump's events were already forwarded
+    /// to the tab's renderer as they arrived.
+    WebSocketDone(u64),
     /// The viewport widget's bounds changed (window resize, or the
     /// first frame reporting the real page area).
     ViewportResized(f32, f32),
@@ -329,6 +399,58 @@ impl PlutoBrowser {
         };
     }
 
+    /// Convert one stored YUV frame to RGBA and insert it under
+    /// its deterministic video blob id (Stage 16, M8 Phase 2,
+    /// Rec 5), marking the id dirty so the viewport's next
+    /// `prepare()` re-uploads the texture. A frame that fails
+    /// conversion (zero size, short planes) is dropped — the
+    /// previous frame stays on screen, the next presented frame
+    /// replaces it.
+    fn convert_video_frame(&mut self, tab_index: usize, element_id: u64) {
+        use pluto_media::yuv420_to_rgba;
+        use pluto_paint::canvas::video_blob_id;
+        let Some(frame) = self.tabs[tab_index]
+            .video_frames
+            .get(&element_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(rgba) = yuv420_to_rgba(&frame) else {
+            return;
+        };
+        // `element_id` IS the slotmap key's ffi value (stamped
+        // by the session from the element's `DomKey`), so the
+        // key round-trips through `KeyData::from_ffi`.
+        let node_id =
+            pluto_html::NodeId::from(slotmap::KeyData::from_ffi(element_id));
+        let blob = video_blob_id(node_id);
+        let tab = &mut self.tabs[tab_index];
+        Arc::make_mut(&mut tab.resources).resources.insert(
+            blob,
+            Resource::Image {
+                width: frame.width,
+                height: frame.height,
+                rgba,
+            },
+        );
+        tab.video_dirty.lock().unwrap().insert(blob);
+    }
+
+    /// Convert every stored frame of a tab (called when the tab
+    /// becomes active — its frames arrived as YUV while it was
+    /// in the background).
+    fn convert_stored_video_frames(&mut self, tab_index: usize) {
+        let ids: Vec<u64> = self.tabs[tab_index]
+            .video_frames
+            .keys()
+            .copied()
+            .collect();
+        for id in ids {
+            self.convert_video_frame(tab_index, id);
+        }
+    }
+
     /// Open a new tab on `url` and select it (Stage 11 Rec 4).
     /// The tab's renderer starts with the subscription (its id
     /// keys it), and the pending navigation flushes on
@@ -388,6 +510,21 @@ impl PlutoBrowser {
             }
         }
     }
+    /// Tell a tab's worker the shell's session-history length and
+    /// index (Stage 16 Phase 3, Rec 8 — finisher): the worker's
+    /// realm mirrors them, so `history.length` and the `popstate`
+    /// guard agree with the shell after every push / replace /
+    /// traversal. No-op when the tab has no renderer yet.
+    fn send_history_sync(&mut self, tab_id: u64) {
+        if let Some(tab) = self.tab_mut(tab_id) {
+            if let Some(tx) = &tab.renderer_tx {
+                let _ = tx.send(BrowserToRenderer::HistorySync {
+                    length: tab.history.len(),
+                    index: tab.history_index,
+                });
+            }
+        }
+    }
 
     /// Record a theme change and forward it to every tab's worker
     /// as `SetTheme` (M6 Phase 3, Rec 12). A repeat of the current
@@ -411,26 +548,79 @@ impl PlutoBrowser {
     /// stays visible until the new list lands: the holder keeps
     /// the last-good list.
     fn commit(&mut self, url: String) {
+        self.commit_tab(self.active_tab, url);
+    }
+
+    /// Start a navigation in tab `tab_index` (Stage 16 Phase 3,
+    /// Rec 8 — finisher): the same commit, addressed at one tab,
+    /// so a background tab's JS traversal (`HistoryGo`) navigates
+    /// that tab instead of the active one.
+    ///
+    /// A Back/Forward commit (`history_nav`, set by
+    /// `traverse_to` before calling here) is a traversal — the
+    /// target entry's `history.state` JSON rides in
+    /// `CommitNavigation` and the worker restores it and fires
+    /// `popstate` after the commit; a reload of the current entry
+    /// restores its state and its scroll too. A fresh navigation
+    /// carries `None` / `false` and resets the scroll. The scroll
+    /// to restore is stashed in `pending_scroll_restore` and
+    /// applied when the new list lands (its max-scroll is known
+    /// only then).
+    fn commit_tab(&mut self, tab_index: usize, url: String) {
         // Stage 13 Rec 12c: restart policy — a dead tab (three
         // crashes in 60 s) accepts no navigation except Reload,
         // which clears `dead` before calling here.
-        if self.active().dead {
-            self.active_mut().status =
+        if self.tabs[tab_index].dead {
+            self.tabs[tab_index].status =
                 "Renderer crashed repeatedly — press Reload to retry".to_string();
             return;
         }
-        self.active_mut().crashed = false;
+        self.tabs[tab_index].crashed = false;
         // Stage 13 Rec 11: the page being left is the referrer
         // for the next navigation's document fetch (the broker's
         // loader holds the referrer context in broker mode).
-        let prev_url = self.active().active_url.clone();
+        let prev_url = self.tabs[tab_index].active_url.clone();
         self.broker.loader().set_referrer_document(&prev_url);
+        // Stage 16 Phase 3, Rec 8 (finisher): what the worker
+        // restores. A traversal takes the target entry's state and
+        // scroll; a reload takes the current entry's; a fresh
+        // navigation takes neither. The page being left keeps its
+        // scroll in its entry — except on a traversal, where
+        // `traverse_to` already saved it before moving the index.
+        // A stale `history_nav` (a traversal whose `DidCommit`
+        // never arrived) only counts when the URL is the entry
+        // the index points at — anything else is fresh.
+        let (state_json, traversal, restore_scroll) = {
+            let tab = &mut self.tabs[tab_index];
+            let is_traversal = tab.history_nav
+                && !tab.history.is_empty()
+                && tab.history[tab.history_index].url == url;
+            if is_traversal {
+                let entry = &tab.history[tab.history_index];
+                (entry.state_json.clone(), true, Some(entry.scroll))
+            } else {
+                tab.history_nav = false;
+                if !tab.history.is_empty() {
+                    let idx = tab.history_index;
+                    tab.history[idx].scroll = tab.compositor.scroll();
+                }
+                if !tab.history.is_empty() && tab.history[tab.history_index].url == url {
+                    let entry = &tab.history[tab.history_index];
+                    (entry.state_json.clone(), false, Some(entry.scroll))
+                } else {
+                    (None, false, None)
+                }
+            }
+        };
         let has_renderer = {
-            let tab = self.active_mut();
+            let tab = &mut self.tabs[tab_index];
             tab.active_url = url.clone();
             tab.url_input = url.clone();
             tab.title = url.clone();
-            tab.compositor.reset_scroll();
+            match restore_scroll {
+                Some(scroll) => tab.pending_scroll_restore = Some(scroll),
+                None => tab.compositor.reset_scroll(),
+            }
             // A navigation expects a new display list: until it
             // activates, frames presenting the old list count as
             // deadline-missed (Stage 8 Rec 2).
@@ -447,10 +637,49 @@ impl PlutoBrowser {
             tab.renderer_tx.is_some()
         };
         if has_renderer {
-            self.send_command(BrowserToRenderer::CommitNavigation { url });
+            let tab_id = self.tabs[tab_index].id;
+            self.send_command_to(
+                tab_id,
+                BrowserToRenderer::CommitNavigation {
+                    url,
+                    state_json,
+                    traversal,
+                    // A traversal / reload restores the entry's
+                    // scroll; a fresh navigation starts at the top.
+                    scroll: restore_scroll.unwrap_or((0.0, 0.0)),
+                },
+            );
         } else {
-            self.active_mut().pending_url = Some(url);
+            self.tabs[tab_index].pending_url = Some(url);
         }
+    }
+
+    /// Move to the history entry at `index` in tab `tab_index`
+    /// (Back/Forward, a History-panel click, or a JS
+    /// `HistoryGo`): save the scroll of the entry being left,
+    /// move the index, and commit with the target entry's state
+    /// and scroll (a traversal). A no-op when the index is out
+    /// of range, or when the index is already current.
+    fn traverse_to_tab(&mut self, tab_index: usize, index: usize) {
+        let url = {
+            let tab = &mut self.tabs[tab_index];
+            if index >= tab.history.len() || index == tab.history_index {
+                return;
+            }
+            if !tab.history.is_empty() {
+                let idx = tab.history_index;
+                tab.history[idx].scroll = tab.compositor.scroll();
+            }
+            tab.history_index = index;
+            tab.history_nav = true;
+            tab.history[index].url.clone()
+        };
+        self.commit_tab(tab_index, url);
+    }
+
+    /// Move the ACTIVE tab to the history entry at `index`.
+    fn traverse_to(&mut self, index: usize) {
+        self.traverse_to_tab(self.active_tab, index);
     }
 
     /// The hamburger menu panel: one text button per working
@@ -536,10 +765,10 @@ impl PlutoBrowser {
                             .into(),
                     );
                 }
-                for url in history.iter().rev().take(HISTORY_PANEL_LIMIT) {
+                for entry in history.iter().rev().take(HISTORY_PANEL_LIMIT) {
                     children.push(
-                        widget::button::text(url.clone())
-                            .on_press(Message::NavigateTo(url.clone()))
+                        widget::button::text(entry.url.clone())
+                            .on_press(Message::NavigateTo(entry.url.clone()))
                             .width(Length::Fill)
                             .into(),
                     );
@@ -768,7 +997,9 @@ impl Application for PlutoBrowser {
         let history = load_history();
         let history_index = history.len().saturating_sub(1);
         let mut first_tab = Tab::new(0, url.clone());
-        first_tab.history = history;
+        // Persisted history stores URLs only (Stage 10 Rec 8) —
+        // restored entries have no state and no scroll.
+        first_tab.history = history.into_iter().map(HistoryEntry::new).collect();
         first_tab.history_index = history_index;
         let app = Self {
             core,
@@ -881,7 +1112,10 @@ impl Application for PlutoBrowser {
                     // it at once, with no re-fetch and no re-layout.
                     // Its worker already knows the window size
                     // (resizes go to every tab), so there is
-                    // nothing to re-sync here.
+                    // nothing to re-sync here. Its stored video
+                    // frames convert now (they arrived as YUV
+                    // while the tab was in the background).
+                    self.convert_stored_video_frames(index);
                     self.sync_window_title();
                 }
             }
@@ -924,7 +1158,15 @@ impl Application for PlutoBrowser {
                     if let Ok(mut counters) = perf::global().lock() {
                         counters.note_navigation_start();
                     }
-                    self.send_command_to(tab_id, BrowserToRenderer::CommitNavigation { url });
+                    self.send_command_to(
+                        tab_id,
+                        BrowserToRenderer::CommitNavigation {
+                            url,
+                            state_json: None,
+                            traversal: false,
+                            scroll: (0.0, 0.0),
+                        },
+                    );
                 }
             }
             Message::WindowFocused(visible) => {
@@ -952,7 +1194,7 @@ impl Application for PlutoBrowser {
                 };
                 let is_active = tab_index == self.active_tab;
                 match event {
-                    RendererToBrowser::DidCommit { url, status } => {
+                    RendererToBrowser::DidCommit { url, status, replace } => {
                         eprintln!("[pluto] page loaded: {url}");
                         // Stage 13 Rec 12c: the crash page commits
                         // like any page, but it must not touch the
@@ -974,26 +1216,52 @@ impl Application for PlutoBrowser {
                         tab.dead = false;
                         // History (R17): a back/forward commit only
                         // moves the index (already done in Back/Forward);
-                        // any other commit — address bar, reload, link
-                        // click — pushes a new entry after truncating
-                        // the forward entries, unless it is the entry
-                        // we are already on (a reload).
+                        // a `location.replace()` commit rewrites the
+                        // current entry in place (Stage 16 Phase 3,
+                        // Rec 8 — finisher); any other commit — address
+                        // bar, reload, link click — pushes a new entry
+                        // after truncating the forward entries, unless
+                        // it is the entry we are already on (a reload).
+                        // A replace or push changes the length, so the
+                        // worker is re-synced after either.
+                        let mut history_changed = false;
                         if tab.history_nav {
                             tab.history_nav = false;
+                        } else if replace {
+                            if let Some(entry) = tab.history.get_mut(tab.history_index) {
+                                entry.url = url.clone();
+                                entry.state_json = None;
+                                entry.scroll = (0.0, 0.0);
+                            } else {
+                                tab.history.push(HistoryEntry::new(url.clone()));
+                                tab.history_index = tab.history.len() - 1;
+                            }
+                            history_changed = true;
                         } else if tab.history.is_empty()
-                            || tab.history[tab.history_index] != url
+                            || tab.history[tab.history_index].url != url
                         {
                             tab.history.truncate(tab.history_index + 1);
-                            tab.history.push(url);
+                            tab.history.push(HistoryEntry::new(url.clone()));
                             tab.history_index = tab.history.len() - 1;
+                            history_changed = true;
+                        }
+                        if history_changed {
                             // Stage 10 Rec 8: persist on every push
                             // of the ACTIVE tab only (the profile
                             // pattern: save on every mutation, like
                             // bookmarks) — a background tab's history
                             // does not overwrite the file.
                             if is_active {
-                                save_history(&tab.history);
+                                let urls: Vec<String> = tab
+                                    .history
+                                    .iter()
+                                    .map(|entry| entry.url.clone())
+                                    .collect();
+                                save_history(&urls);
                             }
+                            let tab_id = tab.id;
+                            drop(tab);
+                            self.send_history_sync(tab_id);
                         }
                         if is_active {
                             self.sync_window_title();
@@ -1027,6 +1295,17 @@ impl Application for PlutoBrowser {
                                                 "[pluto] display list pending: epoch {epoch} (active {})",
                                                 tab.compositor.epoch()
                                             );
+                                        }
+                                        // Stage 16 Phase 3, Rec 8
+                                        // (finisher): the traversed /
+                                        // reloaded page's scroll, restored
+                                        // once the new list's max-scroll
+                                        // is known — the clamp here is
+                                        // against the NEW page's bounds.
+                                        if let Some((x, y)) =
+                                            tab.pending_scroll_restore.take()
+                                        {
+                                            tab.compositor.set_scroll(x, y);
                                         }
                                     }
                                     Err(err) => eprintln!(
@@ -1074,6 +1353,27 @@ impl Application for PlutoBrowser {
                         Arc::make_mut(&mut tab.resources)
                             .resources
                             .insert(resource_id, resource);
+                    }
+                    RendererToBrowser::VideoFrame { epoch: _, frame } => {
+                        // One decoded video frame, out-of-band
+                        // (Stage 16 Phase 1, Rec 1): keep only the
+                        // latest frame per element — a new frame
+                        // overwrites the old one, so the shell
+                        // never holds a backlog. Stage 16 Phase 2
+                        // (Rec 5): the ACTIVE tab's frame is
+                        // converted to RGBA at once and inserted
+                        // under its deterministic blob id; a
+                        // background tab's frame waits as YUV
+                        // until the tab is selected (see
+                        // `convert_stored_video_frames`), so an
+                        // unseen tab never burns conversion time.
+                        let is_active = tab_index == self.active_tab;
+                        let tab = &mut self.tabs[tab_index];
+                        let element_id = frame.element_id;
+                        tab.video_frames.insert(element_id, frame);
+                        if is_active {
+                            self.convert_video_frame(tab_index, element_id);
+                        }
                     }
                     RendererToBrowser::LoadProgress { received, total } => {
                         // Stage 11 Rec 9: document-load progress —
@@ -1186,6 +1486,9 @@ impl Application for PlutoBrowser {
                             tab_id,
                             BrowserToRenderer::CommitNavigation {
                                 url: "about:crashed".to_string(),
+                                state_json: None,
+                                traversal: false,
+                                scroll: (0.0, 0.0),
                             },
                         );
                         let viewport = self.viewport;
@@ -1250,9 +1553,198 @@ impl Application for PlutoBrowser {
                             |message| cosmic::Action::App(message),
                         );
                     }
+                    RendererToBrowser::HistoryPush { url, state_json } => {
+                        // Stage 16 Phase 3, Rec 8 (finisher): the
+                        // page's `pushState` — truncate the forward
+                        // entries, append the new entry, update the
+                        // address bar. The page being left keeps its
+                        // scroll in its entry. The realm already
+                        // updated its own length/index optimistically;
+                        // `HistorySync` corrects it to the shell's.
+                        let (tab_id, persist) = {
+                            let tab = &mut self.tabs[tab_index];
+                            if !tab.history.is_empty() {
+                                let idx = tab.history_index;
+                                tab.history[idx].scroll = tab.compositor.scroll();
+                            }
+                            tab.history.truncate(tab.history_index + 1);
+                            tab.history.push(HistoryEntry {
+                                url: url.clone(),
+                                state_json,
+                                scroll: (0.0, 0.0),
+                            });
+                            tab.history_index = tab.history.len() - 1;
+                            tab.active_url = url.clone();
+                            tab.url_input = url.clone();
+                            let persist = if is_active {
+                                Some(
+                                    tab.history
+                                        .iter()
+                                        .map(|entry| entry.url.clone())
+                                        .collect::<Vec<String>>(),
+                                )
+                            } else {
+                                None
+                            };
+                            (tab.id, persist)
+                        };
+                        if let Some(urls) = persist {
+                            save_history(&urls);
+                        }
+                        if is_active {
+                            self.sync_window_title();
+                        }
+                        self.send_history_sync(tab_id);
+                    }
+                    RendererToBrowser::HistoryReplace { url, state_json } => {
+                        // `replaceState`: the current entry takes the
+                        // new URL and state in place — no new entry,
+                        // no truncation, no navigation. Empty history
+                        // (a replace before the first commit) pushes.
+                        let (tab_id, persist) = {
+                            let tab = &mut self.tabs[tab_index];
+                            if let Some(entry) = tab.history.get_mut(tab.history_index) {
+                                entry.url = url.clone();
+                                entry.state_json = state_json;
+                            } else {
+                                tab.history.push(HistoryEntry {
+                                    url: url.clone(),
+                                    state_json,
+                                    scroll: (0.0, 0.0),
+                                });
+                                tab.history_index = tab.history.len() - 1;
+                            }
+                            tab.active_url = url.clone();
+                            tab.url_input = url.clone();
+                            let persist = if is_active {
+                                Some(
+                                    tab.history
+                                        .iter()
+                                        .map(|entry| entry.url.clone())
+                                        .collect::<Vec<String>>(),
+                                )
+                            } else {
+                                None
+                            };
+                            (tab.id, persist)
+                        };
+                        if let Some(urls) = persist {
+                            save_history(&urls);
+                        }
+                        if is_active {
+                            self.sync_window_title();
+                        }
+                        self.send_history_sync(tab_id);
+                    }
+                    RendererToBrowser::HistoryGo { delta } => {
+                        // `history.back()` / `forward()` / `go(n)`
+                        // from JS: the shell moves the index (clamped)
+                        // and navigates with a traversal commit — the
+                        // worker restores the entry's state and fires
+                        // `popstate`. A delta that moves nowhere is a
+                        // no-op (no message back).
+                        if delta != 0 {
+                            let target = {
+                                let tab = &self.tabs[tab_index];
+                                let len = tab.history.len() as i32;
+                                let idx = tab.history_index as i32 + delta;
+                                idx.clamp(0, len.saturating_sub(1)) as usize
+                            };
+                            self.traverse_to_tab(tab_index, target);
+                            let tab_id = self.tabs[tab_index].id;
+                            self.send_history_sync(tab_id);
+                        }
+                    }
+                    RendererToBrowser::WebSocketOpen {
+                        socket_id,
+                        url,
+                        protocols,
+                        origin,
+                    } => {
+                        // Stage 16 Phase 3, Rec 11 (finisher): the
+                        // worker asked for a socket — run the pump on
+                        // the broker (the renderer never opens a
+                        // socket itself) and forward its events to
+                        // this tab's renderer as they arrive. The
+                        // pump's command sender is kept per tab so
+                        // `WebSocketSend` / `WebSocketClose` reach it.
+                        let (commands_tx, commands_rx) = tokio::sync::mpsc::channel(64);
+                        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
+                        self.tabs[tab_index].ws_commands.insert(socket_id, commands_tx);
+                        let Some(tx) = self.tabs[tab_index].renderer_tx.clone() else {
+                            return Task::none();
+                        };
+                        let broker = Arc::clone(&self.broker);
+                        return Task::perform(
+                            async move {
+                                let serve = broker.serve_websocket(
+                                    socket_id, url, protocols, origin, commands_rx, events_tx,
+                                );
+                                tokio::pin!(serve);
+                                loop {
+                                    tokio::select! {
+                                        _ = &mut serve => break,
+                                        event = events_rx.recv() => match event {
+                                            Some(event) => {
+                                                if tx.send(BrowserToRenderer::WebSocketEvent {
+                                                    socket_id,
+                                                    event,
+                                                })
+                                                .is_err()
+                                                {
+                                                    break;
+                                                }
+                                            }
+                                            None => break,
+                                        },
+                                    }
+                                }
+                                Message::WebSocketDone(socket_id)
+                            },
+                            |message| cosmic::Action::App(message),
+                        );
+                    }
+                    RendererToBrowser::WebSocketSend {
+                        socket_id,
+                        data,
+                        is_binary,
+                    } => {
+                        // Forward to the pump's command channel; a
+                        // closed or unknown socket drops the frame
+                        // (the worker already treats a closed socket
+                        // as an error on its next operation).
+                        if let Some(commands) = self.tabs[tab_index].ws_commands.get(&socket_id)
+                        {
+                            let _ = commands.try_send(crate::broker::WsCommand::Send {
+                                data,
+                                is_binary,
+                            });
+                        }
+                    }
+                    RendererToBrowser::WebSocketClose {
+                        socket_id,
+                        code,
+                        reason,
+                    } => {
+                        if let Some(commands) = self.tabs[tab_index].ws_commands.get(&socket_id)
+                        {
+                            let _ = commands.try_send(crate::broker::WsCommand::Close {
+                                code,
+                                reason,
+                            });
+                        }
+                    }
                 }
             }
             Message::BrokerServeDone => {}
+            Message::WebSocketDone(socket_id) => {
+                // The pump is gone: drop its command sender from
+                // whichever tab held it (a closed tab's map is
+                // already gone with the tab).
+                for tab in &mut self.tabs {
+                    tab.ws_commands.remove(&socket_id);
+                }
+            }
             Message::ViewportResized(width, height) => {
                 // Degenerate sizes (minimised window) carry no layout;
                 // a real size arrives when the window is restored.
@@ -1395,6 +1887,7 @@ impl Application for PlutoBrowser {
                             let next = (self.active_tab + 1) % self.tabs.len();
                             if next != self.active_tab {
                                 self.active_tab = next;
+                                self.convert_stored_video_frames(next);
                                 self.sync_window_title();
                             }
                             return Task::none();
@@ -1412,23 +1905,16 @@ impl Application for PlutoBrowser {
                 }));
             }
             Message::Back => {
-                let tab = self.active_mut();
-                if tab.history_index > 0 {
-                    tab.history_index -= 1;
-                    tab.history_nav = true;
-                    let url = tab.history[tab.history_index].clone();
-                    drop(tab);
-                    self.commit(url);
+                let index = self.active().history_index;
+                if index > 0 {
+                    self.traverse_to(index - 1);
                 }
             }
             Message::Forward => {
-                let tab = self.active_mut();
-                if tab.history_index + 1 < tab.history.len() {
-                    tab.history_index += 1;
-                    tab.history_nav = true;
-                    let url = tab.history[tab.history_index].clone();
-                    drop(tab);
-                    self.commit(url);
+                let tab = self.active();
+                let index = tab.history_index + 1;
+                if index < tab.history.len() {
+                    self.traverse_to(index);
                 }
             }
             Message::ToggleBookmark => {
@@ -1463,7 +1949,21 @@ impl Application for PlutoBrowser {
             Message::NavigateTo(url) => {
                 self.menu_open = false;
                 self.panel = None;
-                self.commit(url);
+                // A History-panel click is a traversal to that entry
+                // when it is one (state + scroll restore, `popstate`
+                // after the commit); a bookmark click is a fresh
+                // navigation. Repeated URLs pick the newest entry —
+                // the panel cannot tell them apart either.
+                if let Some(index) = self
+                    .active()
+                    .history
+                    .iter()
+                    .rposition(|entry| entry.url == url)
+                {
+                    self.traverse_to(index);
+                } else {
+                    self.commit(url);
+                }
             }
             Message::RemoveBookmark(url) => {
                 if self.bookmarks.remove(&url) {
@@ -1589,11 +2089,19 @@ impl Application for PlutoBrowser {
 
         // The viewport draws whatever the compositor holder
         // currently holds; the worker updates it from its thread.
+        // Stage 16 (M8 Phase 2, Rec 5): the viewport reads
+        // the tab's LIVE resource table, not the compositor's
+        // submit-time snapshot — a video frame converted after
+        // the last submit must still reach `prepare()` (the
+        // table is insert-only, so the live table is always a
+        // superset of the submitted one; the display list itself
+        // still goes through pending/activate).
         let web_view = cosmic::iced::widget::Shader::new(WebViewport {
             clear_color: [1.0, 1.0, 1.0, 1.0],
             display: active.compositor.display(),
-            resources: active.compositor.resources(),
+            resources: Arc::clone(&active.resources),
             scroll: active.compositor.scroll(),
+            video_dirty: Arc::clone(&active.video_dirty),
         })
         .width(Length::Fill)
         .height(Length::Fill);
@@ -1834,12 +2342,13 @@ mod tests {
     fn history_panel_is_capped_and_most_recent_first() {
         // The panel's slice logic, over a 60-entry session
         // history: the newest 50, newest first.
-        let history: Vec<String> = (0..60)
-            .map(|i| format!("https://example.com/{i}"))
+        let history: Vec<HistoryEntry> = (0..60)
+            .map(|i| HistoryEntry::new(format!("https://example.com/{i}")))
             .collect();
-        let shown: Vec<&String> = history.iter().rev().take(HISTORY_PANEL_LIMIT).collect();
+        let shown: Vec<&HistoryEntry> =
+            history.iter().rev().take(HISTORY_PANEL_LIMIT).collect();
         assert_eq!(shown.len(), HISTORY_PANEL_LIMIT);
-        assert_eq!(shown[0], "https://example.com/59");
-        assert_eq!(shown[49], "https://example.com/10");
+        assert_eq!(shown[0].url, "https://example.com/59");
+        assert_eq!(shown[49].url, "https://example.com/10");
     }
 }

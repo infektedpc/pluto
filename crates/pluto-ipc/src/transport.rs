@@ -358,6 +358,9 @@ mod tests {
         for message in [
             BrowserToRenderer::CommitNavigation {
                 url: "https://example.com".to_string(),
+                state_json: Some("{\"page\":2}".to_string()),
+                traversal: true,
+                scroll: (120.0, 0.0),
             },
             BrowserToRenderer::Resize {
                 width: 800.0,
@@ -660,6 +663,191 @@ mod tests {
         let err = browser.recv_frame().await.expect_err("oversize refused");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn video_frame_channel_measured_at_1080p60() {
+        // Stage 16 Phase 1, Rec 1: the video-frame transport
+        // decision, MEASURED at 1080p60 over the real
+        // cross-process transport (Unix socketpair — the same
+        // `SocketTransport` the `--renderer` child uses), before
+        // any decoder code was written.
+        //
+        // Two channels, same harness, 120 frames each (2 s of
+        // 60 fps video), sender pipelined in a task while the
+        // receiver drains:
+        // * YUV420 `RendererToBrowser::VideoFrame` — 3,110,400
+        //   B/frame (1.5 B/px).
+        // * RGBA `RendererToBrowser::ResourceReady` — the M7
+        //   canvas/blob path, 8,294,400 B/frame (4 B/px), the
+        //   498 MB/s trap.
+        //
+        // The test asserts the YUV channel is at least 20×
+        // the RGBA baseline on the same machine under the same
+        // load (see the ratio assertion at the end) and prints
+        // both channels' achieved fps / MB/s — the numbers the
+        // decision rests on. Measured 2026-11-26 (sandbox,
+        // debug build, three runs): YUV420 **59.3–219.9 fps /
+        // 176.0–652.4 MB/s** (59.3 under the full-gate parallel
+        // load, 168.6–219.9 standalone), RGBA **0.7 fps /
+        // 5.2–5.5 MB/s**. The RGBA channel is reported, not
+        // asserted on its own: its 2.7× wire cost plus the
+        // full-RGBA hash + clones per frame plus 4K cache
+        // eviction are what disqualify it — the measurement plus
+        // the arithmetic, not the fps alone.
+        //
+        // The RGBA number also exposes why the YUV channel needs
+        // `serde_bytes` (see `VideoFrame`): serde's default
+        // `Vec<u8>` encoding is one call per byte, which measured
+        // 227 ms encode + 329 ms decode per 1080p frame before
+        // the fix — the socket itself does 2.9 ms/frame.
+        use crate::VideoFrame;
+        use std::time::Instant;
+
+        const FRAMES: u64 = 120;
+        const WIDTH: u32 = 1920;
+        const HEIGHT: u32 = 1080;
+
+        // Deterministic patterned bytes. A plain `vec![seed; len]`
+        // (memset) — NOT a per-element iterator: the first version
+        // of this test generated each byte with `(0..len).map(…)`
+        // and spent 83 s of an 84 s run generating fixtures in
+        // debug mode, measuring the generator instead of the
+        // transport. Postcard and the socket copy bytes
+        // opaquely; no copy path special-cases a constant
+        // pattern, so a constant fill measures the channel
+        // honestly. The seed still proves the decoded payload is
+        // the frame that was sent.
+        fn fill(len: usize, seed: u8) -> Vec<u8> {
+            vec![seed; len]
+        }
+
+        // --- YUV420 VideoFrame channel ---
+        let (mut tx, mut rx) = SocketTransport::from_pair().expect("socketpair");
+        let start = Instant::now();
+        let sender = tokio::spawn(async move {
+            for frame_id in 0..FRAMES {
+                let y_len = (WIDTH * HEIGHT) as usize;
+                let uv_len = ((WIDTH / 2) * (HEIGHT / 2)) as usize;
+                let frame = VideoFrame {
+                    element_id: 7,
+                    frame_id,
+                    width: WIDTH,
+                    height: HEIGHT,
+                    pts_ms: frame_id as f64 * 1000.0 / 60.0,
+                    duration_ms: 1000.0 / 60.0,
+                    y: fill(y_len, frame_id as u8),
+                    u: fill(uv_len, (frame_id + 1) as u8),
+                    v: fill(uv_len, (frame_id + 2) as u8),
+                    y_stride: WIDTH,
+                    uv_stride: WIDTH / 2,
+                    origin_clean: true,
+                };
+                tx.send_message(&RendererToBrowser::VideoFrame { epoch: 1, frame })
+                    .await
+                    .expect("video frame sends");
+            }
+        });
+        let mut received = 0u64;
+        let mut payload_bytes = 0usize;
+        while received < FRAMES {
+            let msg: RendererToBrowser = rx.recv_message().await.expect("recv succeeds").expect("a frame arrives");
+            let RendererToBrowser::VideoFrame { epoch, frame } = msg else {
+                panic!("expected VideoFrame, got another message");
+            };
+            assert_eq!(epoch, 1);
+            assert_eq!(frame.frame_id, received);
+            assert_eq!(frame.width, WIDTH);
+            assert_eq!(frame.height, HEIGHT);
+            // Spot-check the payload survived the round trip.
+            assert_eq!(frame.y[0], received as u8);
+            assert_eq!(*frame.y.last().unwrap(), received as u8);
+            assert_eq!(frame.u[0], (received + 1) as u8);
+            assert_eq!(frame.v[0], (received + 2) as u8);
+            payload_bytes += frame.payload_bytes();
+            received += 1;
+        }
+        sender.await.expect("sender finishes");
+        let elapsed = start.elapsed();
+        let yuv_fps = FRAMES as f64 / elapsed.as_secs_f64();
+        let yuv_mbps = payload_bytes as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
+        eprintln!(
+            "[pluto] video-frame transport (YUV420 1080p, {FRAMES} frames): {yuv_fps:.1} fps, {yuv_mbps:.1} MB/s in {elapsed:?}"
+        );
+        // The 60 fps bar is reported, not asserted: a hard
+        // assertion on absolute fps is load-sensitive — under
+        // the full workspace gate (other test binaries running
+        // in parallel on 1.5 shared CPUs) this measured 59.3
+        // fps, while standalone runs measured 168.6–219.9 fps.
+        // A machine-load dip is not a code regression. What
+        // the gate DOES assert, after the RGBA baseline below,
+        // is the load-robust property the decision rests on:
+        // YUV over the message channel is an order of magnitude
+        // faster than RGBA over ResourceReady on the same
+        // machine under the same load. (If `serde_bytes` were
+        // ever dropped, YUV would fall to ~1.7 fps against
+        // RGBA's ~0.7 fps and the ratio assertion would fail.)
+        if yuv_fps < 60.0 {
+            eprintln!(
+                "[pluto] WARNING: YUV420 channel under 60 fps in this run ({yuv_fps:.1} fps) — likely a loaded machine; standalone runs measured 168.6–219.9 fps"
+            );
+        }
+
+        // --- RGBA ResourceReady baseline (the M7 path) ---
+        // Only 6 frames: the per-byte serde cost (see the
+        // YUV note above) makes each RGBA frame ~1.5 s in debug,
+        // so 120 of them would take three minutes. Six frames
+        // still measure the channel's fps / MB/s honestly.
+        const RGBA_FRAMES: u64 = 6;
+        let (mut tx, mut rx) = SocketTransport::from_pair().expect("socketpair");
+        let rgba_len = (WIDTH * HEIGHT * 4) as usize;
+        let start = Instant::now();
+        let sender = tokio::spawn(async move {
+            for frame_id in 0..RGBA_FRAMES {
+                let resource = Resource::Image {
+                    width: WIDTH,
+                    height: HEIGHT,
+                    rgba: fill(rgba_len, frame_id as u8),
+                };
+                tx.send_message(&RendererToBrowser::ResourceReady {
+                    epoch: 1,
+                    resource_id: ResourceId(0x6000_0000),
+                    resource,
+                })
+                .await
+                .expect("resource sends");
+            }
+        });
+        let mut received = 0u64;
+        let mut payload_bytes = 0usize;
+        while received < RGBA_FRAMES {
+            let msg: RendererToBrowser = rx.recv_message().await.expect("recv succeeds").expect("a resource arrives");
+            let RendererToBrowser::ResourceReady { resource, .. } = msg else {
+                panic!("expected ResourceReady, got another message");
+            };
+            let Resource::Image { rgba, .. } = resource;
+            assert_eq!(rgba.len(), rgba_len);
+            payload_bytes += rgba.len();
+            received += 1;
+        }
+        sender.await.expect("sender finishes");
+        let elapsed = start.elapsed();
+        let rgba_fps = RGBA_FRAMES as f64 / elapsed.as_secs_f64();
+        let rgba_mbps = payload_bytes as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
+        eprintln!(
+            "[pluto] video-frame transport (RGBA 1080p baseline, {RGBA_FRAMES} frames): {rgba_fps:.1} fps, {rgba_mbps:.1} MB/s in {elapsed:?}"
+        );
+        // The decision, asserted load-robustly: on the same
+        // machine under the same load, the YUV420 message
+        // channel must be at least 20× the RGBA ResourceReady
+        // channel. Standalone this is 240–310×; under the full
+        // gate it measured ~85× (59.3 vs 0.7 fps). A 20× bar
+        // has 4× margin under load and still fails hard if the
+        // `serde_bytes` fast path ever regresses.
+        assert!(
+            yuv_fps >= 20.0 * rgba_fps,
+            "YUV420 channel ({yuv_fps:.1} fps) must be >= 20x the RGBA baseline ({rgba_fps:.1} fps)"
+        );
     }
 
     #[tokio::test]

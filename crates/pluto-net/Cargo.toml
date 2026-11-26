@@ -45,3 +45,7 @@ psl = "2"
 # `Resolve` is implemented for any `Service<Name>`, so this is the
 # hook a Pluto-owned resolver uses.
 tower-service = "0.3"
+# Stage 16 Phase 3 (Rec 11): WebSocket transport — see the
+# workspace pin comment for the version story.
+tokio-tungstenite.workspace = true
+futures-util.workspace = true

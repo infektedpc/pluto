@@ -62,17 +62,24 @@
 
 pub mod dom;
 pub mod events;
-pub mod forms;
+pub mod eventsource;
 pub mod fetch;
+pub mod forms;
+pub mod history;
+pub mod media;
 pub mod observers;
 pub mod permissions;
 pub mod storage;
+pub mod streams;
+pub mod websocket;
 #[cfg(test)]
 pub mod test_host;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_canvas;
+#[cfg(test)]
+mod tests_media;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -110,6 +117,12 @@ pub const REQUEST_SYMBOL: &str = "pluto.request";
 /// `Symbol.for("pluto.abortSignal")` — the per-AbortSignal id property.
 pub const ABORT_SIGNAL_SYMBOL: &str = "pluto.abortSignal";
 
+/// `Symbol.for("pluto.targetId")` — the standalone-`EventTarget` id
+/// property (Stage 16 Phase 3, Rec 11/12): a `WebSocket` /
+/// `EventSource` object carries its registry target id under this
+/// symbol, so `target_id_of_this` can resolve it without a `DomKey`.
+pub const TARGET_ID_SYMBOL: &str = "pluto.targetId";
+
 /// `Symbol.for("pluto.url")` — the per-URL / per-URLSearchParams id property.
 pub const URL_SYMBOL: &str = "pluto.url";
 
@@ -125,6 +138,13 @@ pub const WINDOW_TARGET_ID: u64 = u64::MAX;
 /// can be dropped in any order relative to the realm. The JS values
 /// (wrappers, listeners, pending fetches) live in the registry Maps.
 pub struct BindingState {
+    /// The tab's user-activation state (Stage 16 Phase 1, Rec 7),
+    /// shared with `TabJs`: the same `Rc` survives navigation
+    /// (sticky activation persists; transient is cleared by
+    /// `TabJs::navigate`), and `navigator.userActivation` reads
+    /// it through this handle. The renderer records gestures
+    /// into it from the trusted `InputEvent` path.
+    pub user_activation: Rc<RefCell<crate::activation::UserActivation>>,
     /// The host document, set by the per-tab worker via
     /// [`crate::TabJs::set_dom_host`]. `None` until then: bindings
     /// that need a document throw `InvalidStateError` (M4: the
@@ -232,6 +252,11 @@ pub struct BindingState {
     /// `Image()` / `<img>` load state, by node key: whether the
     /// current `src` has loaded, and its intrinsic size.
     pub image_states: HashMap<DomKey, dom::ImageLoadState>,
+    /// `<video>` / `<audio>` media state, by node key (Stage 16,
+    /// M8 Phase 2, Rec 4): one [`media::MediaState`] per element,
+    /// following the `image_states` pattern — the JS object holds
+    /// only the key, the session + candidates live here.
+    pub media_states: HashMap<DomKey, media::MediaState>,
     /// Next `Animation` registry id (M6 Phase 3, Rec 11).
     pub next_animation_id: u64,
     /// WAAPI animation object ids, by (element, host anim id) —
@@ -254,11 +279,83 @@ pub struct BindingState {
     /// (host ids are monotonic, so a fresh `animate()` never
     /// collides with a tombstone).
     pub animation_tombstones: std::collections::HashSet<(DomKey, u64)>,
+    /// The current session-history state (Stage 16 Phase 3, Rec 8):
+    /// the JSON `pushState` / `replaceState` stored, or `None`
+    /// (JS `null`). Restored from `CommitNavigation.state_json` on
+    /// traversal / reload; cleared on a fresh navigation. Only
+    /// JSON-serializable state survives — `JSON.stringify` at
+    /// store time, `JSON.parse` at read time; a `Map` / `Date` /
+    /// function degrades to its JSON shape (documented in
+    /// `bindings/history.rs`).
+    pub history_state_json: Option<String>,
+    /// The session-history length mirrored from the shell (Stage 16
+    /// Phase 3, Rec 8): `HistorySync` is authoritative; before the
+    /// first sync after a navigation the realm reports 1 (its own
+    /// entry). `pushState` bumps it locally (truncate-forward +
+    /// push) so `history.length` is right even with no shell
+    /// round-trip yet.
+    pub history_length: usize,
+    /// The session-history index mirrored from the shell (Stage 16
+    /// Phase 3, Rec 8): the current entry's position, for the
+    /// local `pushState` length bookkeeping above.
+    pub history_index: usize,
+    /// Next `ReadableStream` id (Stage 16 Phase 3, Rec 12).
+    pub next_stream_id: u64,
+    /// Live stream state, by stream id: the queued chunks + the
+    /// closed / errored flags + the fetch feeding it (if any).
+    pub stream_states: HashMap<u64, streams::StreamState>,
+    /// Body ids whose stream finished (`Done` arrived — Stage 16
+    /// Phase 3, Rec 12): `.text()` / `.json()` / `.blob()` /
+    /// `.arrayBuffer()` read the buffer directly then; before that
+    /// they wait via the registry's `bodyWaiters` Map.
+    pub response_complete: std::collections::HashSet<u64>,
+    /// Body id → the `ReadableStream` id behind `Response.body`
+    /// (Stage 16 Phase 3, Rec 12): `abort()` errors the live
+    /// stream through this, and `clone()` leaves the stream
+    /// untouched (it copies the buffered bytes instead).
+    pub response_streams: HashMap<u64, u64>,
+    /// Stream-fetch id → the body id its `Headers` event created
+    /// (Stage 16 Phase 3, Rec 12): the chunk / done / error router
+    /// and `abort()` find the response through this.
+    pub fetch_bodies: HashMap<u64, u64>,
+    /// `Response.clone()` tees (Stage 16 Phase 3, Rec 12):
+    /// source body id → clone body ids. A clone made while the
+    /// source body is still streaming registers here, so later
+    /// chunks fan out to the clone's buffer + stream as well as
+    /// the source's (spec `clone()` tees the stream — a clone made
+    /// immediately after `fetch()` resolves must still read the
+    /// full body). `Done` / `Error` finish every body in the tree
+    /// (transitively — a clone of a clone tees the clone).
+    pub body_tees: HashMap<u64, Vec<u64>>,
+    /// The WebSocket backend, set via
+    /// [`crate::TabJs::set_websocket_backend`]. `None` until then:
+    /// `new WebSocket()` throws a `TypeError` (same shape as a
+    /// missing fetch backend).
+    pub ws_backend: Option<std::sync::Arc<dyn websocket::WebSocketBackend>>,
+    /// Next `WebSocket` id (Stage 16 Phase 3, Rec 11).
+    pub next_ws_id: u64,
+    /// `WebSocket` state, by socket id: readyState / binaryType /
+    /// url — the JS object holds only the id, like `Response`.
+    pub ws_states: HashMap<u64, websocket::WsState>,
+    /// Next `EventSource` id (Stage 16 Phase 3, Rec 12).
+    pub next_event_source_id: u64,
+    /// `EventSource` state, by id: url / last-event-id / retry /
+    /// readyState / the in-flight stream fetch id.
+    pub event_sources: HashMap<u64, eventsource::EventSourceState>,
+    /// Stream-fetch id → `EventSource` id (Stage 16 Phase 3, Rec
+    /// 12): the stream-event router checks this first — an
+    /// `EventSource` fetch feeds the SSE parser, anything else
+    /// feeds a `fetch()` response stream.
+    pub event_source_fetches: HashMap<u64, u64>,
+    /// The SSE parser per `EventSource` id (Stage 16 Phase 3, Rec
+    /// 12): line buffer + the in-progress event fields.
+    pub sse_parsers: HashMap<u64, eventsource::SseParser>,
 }
 
 impl BindingState {
     pub fn new() -> Self {
         Self {
+            user_activation: Rc::new(RefCell::new(crate::activation::UserActivation::new())),
             host: None,
             fetch_backend: None,
             console_lines: Vec::new(),
@@ -292,12 +389,29 @@ impl BindingState {
             url_entries: HashMap::new(),
             response_urls: HashMap::new(),
             image_states: HashMap::new(),
+            media_states: HashMap::new(),
             next_animation_id: 1,
             animation_objects: HashMap::new(),
             css_animation_objects: HashMap::new(),
             animation_locals: HashMap::new(),
             animation_specs: HashMap::new(),
             animation_tombstones: std::collections::HashSet::new(),
+            history_state_json: None,
+            history_length: 1,
+            history_index: 0,
+            next_stream_id: 1,
+            stream_states: HashMap::new(),
+            response_complete: std::collections::HashSet::new(),
+            response_streams: HashMap::new(),
+            fetch_bodies: HashMap::new(),
+            body_tees: HashMap::new(),
+            ws_backend: None,
+            next_ws_id: 1,
+            ws_states: HashMap::new(),
+            next_event_source_id: 1,
+            event_sources: HashMap::new(),
+            event_source_fetches: HashMap::new(),
+            sse_parsers: HashMap::new(),
         }
     }
 }
@@ -368,6 +482,36 @@ pub fn registry<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
         // Stage 12 Rec 8: live `AbortSignal` objects, by id, so a
         // `Request.signal` read returns the same object.
         "abortSignals",
+        // Stage 16 Phase 3 (Rec 12): live `ReadableStream` objects,
+        // by stream id — `Response.body` and the `getReader()` queue
+        // live here as bytes + flags; pending `read()` resolvers
+        // live in the registry's `streamWaiters` Map (JS values
+        // never live in this struct).
+        "streams",
+        // Stage 16 Phase 3 (Rec 12): pending `read()` resolvers
+        // for a stream id — stream id → Array of
+        // `{ resolve, reject }` — drained when a chunk lands or
+        // the stream closes / errors.
+        "streamWaiters",
+        // Stage 16 Phase 3 (Rec 12): pending body-consumer
+        // promises (`.text()` / `.json()` / `.blob()` /
+        // `.arrayBuffer()` called before the body finished
+        // streaming) — body id → Array of
+        // `{ resolve, reject, method }`.
+        "bodyWaiters",
+        // Stage 16 Phase 3 (Rec 11): live `WebSocket` objects, by
+        // socket id — `close()` / `send()` look the object up here.
+        "webSockets",
+        // Stage 16 Phase 3 (Rec 12): live `EventSource` objects,
+        // by id — reconnect and `close()` look the object up here.
+        "eventSources",
+        // Stage 16 Phase 3 (Rec 11/12): standalone `EventTarget`
+        // objects (`WebSocket` / `EventSource` — no `DomKey`), by
+        // registry id, so dispatch can find them; and the `on*`
+        // handler-property values, by `"<target-id>:<type>"` key
+        // (see `install_event_handler_property`).
+        "standaloneTargets",
+        "onhandlers",
     ] {
         let map: Object = ctx.eval("new Map()")?;
         reg.set(name, map)?;
@@ -601,11 +745,13 @@ pub fn install_bindings(
     state: &Rc<RefCell<LoopState>>,
     bindings: &Rc<RefCell<BindingState>>,
     fetch_tx: std::sync::mpsc::Sender<fetch::FetchCompletion>,
+    stream_tx: std::sync::mpsc::Sender<fetch::FetchStreamEvent>,
+    ws_tx: std::sync::mpsc::Sender<websocket::WsEvent>,
 ) -> Result<(), JsError> {
     let bindings = Rc::clone(bindings);
     let state = Rc::clone(state);
     realm
-        .with_ctx(|ctx| install_bindings_in(ctx, &state, &bindings, fetch_tx))
+        .with_ctx(|ctx| install_bindings_in(ctx, &state, &bindings, fetch_tx, stream_tx, ws_tx))
         .map_err(JsError::Internal)
 }
 
@@ -614,6 +760,8 @@ fn install_bindings_in<'js>(
     state: &Rc<RefCell<LoopState>>,
     bindings: &Rc<RefCell<BindingState>>,
     fetch_tx: std::sync::mpsc::Sender<fetch::FetchCompletion>,
+    stream_tx: std::sync::mpsc::Sender<fetch::FetchStreamEvent>,
+    ws_tx: std::sync::mpsc::Sender<websocket::WsEvent>,
 ) -> Result<(), String> {
     // The registry first: everything else stores into it.
     let _ = registry(&ctx).map_err(|e| format!("install registry: {e}"))?;
@@ -624,7 +772,14 @@ fn install_bindings_in<'js>(
     dom::install_url(&ctx, bindings).map_err(|e| format!("install URL: {e}"))?;
     dom::install_dataset_helpers(&ctx, bindings)
         .map_err(|e| format!("install dataset helpers: {e}"))?;
-    fetch::install_fetch(&ctx, state, bindings, fetch_tx).map_err(|e| format!("install fetch: {e}"))?;
+    fetch::install_fetch(&ctx, state, bindings, fetch_tx, stream_tx.clone())
+        .map_err(|e| format!("install fetch: {e}"))?;
+    streams::install_streams(&ctx, bindings).map_err(|e| format!("install streams: {e}"))?;
+    history::install_history(&ctx, bindings).map_err(|e| format!("install history: {e}"))?;
+    websocket::install_websocket(&ctx, bindings, ws_tx)
+        .map_err(|e| format!("install websocket: {e}"))?;
+    eventsource::install_event_source(&ctx, bindings, stream_tx)
+        .map_err(|e| format!("install eventsource: {e}"))?;
     forms::install_form_data(&ctx, bindings).map_err(|e| format!("install FormData: {e}"))?;
     storage::install_storage(&ctx, bindings).map_err(|e| format!("install storage: {e}"))?;
     permissions::install_permissions(&ctx, bindings).map_err(|e| format!("install permissions: {e}"))?;

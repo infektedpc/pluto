@@ -67,6 +67,24 @@ pub fn canvas_blob_id(id: DomId) -> ResourceId {
     ResourceId(CANVAS_BLOB_ID_BASE | (id.data().as_ffi() as u32 & 0x00FF_FFFF))
 }
 
+/// Resource-id base for video frames (Stage 16, M8 Phase 2,
+/// Rec 5). Beside the canvas base: a video frame Blob is named
+/// `BASE | slot-index` for its element, so a scroll rebuild
+/// names the id the shell already holds (it re-uploads the
+/// latest frame under the same id).
+pub const VIDEO_BLOB_ID_BASE: u32 = 0x7000_0000;
+
+/// Deterministic blob id for a `<video>` element's current frame.
+pub fn video_blob_id(id: DomId) -> ResourceId {
+    ResourceId(VIDEO_BLOB_ID_BASE | (id.data().as_ffi() as u32 & 0x00FF_FFFF))
+}
+
+/// True when `id` names a video-frame Blob (Stage 16, M8
+/// Phase 2, Rec 5): the frame cache evicts these first.
+pub fn is_video_blob_id(id: ResourceId) -> bool {
+    (id.0 & 0xFF00_0000) == VIDEO_BLOB_ID_BASE
+}
+
 /// What a canvas operation can fail with. `Tainted` is the Rec 9
 /// readback refusal (surfaced to JS as a `SecurityError`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

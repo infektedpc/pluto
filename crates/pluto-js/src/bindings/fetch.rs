@@ -21,7 +21,19 @@
 //! M4 subset: `Response` has `ok` / `status` / `statusText` /
 //! `type` / `headers.get` / `text()` / `json()`; `Headers` has
 //! `get` (+ `has` / `set` / `append`, which are trivial once
-//! `get` exists). Streaming `body` is later.
+//! `get` exists).
+//!
+//! Stage 16 Phase 3, Rec 12: `fetch()` resolves at headers with a
+//! `Response` whose `body` is a live `ReadableStream` (see
+//! [`streams`]); the backend delivers
+//! [`FetchStreamEvent`]s (headers / chunk / done / error) over a
+//! second mpsc channel, drained by `TabJs` like completions.
+//! `text()` / `json()` / `blob()` / `arrayBuffer()` wait for the
+//! stream to finish (via the registry's `bodyWaiters` Map) when
+//! called before `Done`. The 10 MiB body cap moved from the
+//! transport to the buffering point — it always protected memory,
+//! and streaming readers are exempt by design
+//! ([`BODY_BUFFER_CAP`]).
 //!
 //! Stage 9 Rec 2: `init.mode` / `init.credentials` are threaded
 //! to the browser-side backend, which enforces them in `pluto-net`
@@ -40,12 +52,24 @@ use rquickjs::function::{Opt, This};
 use rquickjs::object::{Accessor, Property};
 use rquickjs::{Array, ArrayBuffer, Coerced, Ctx, FromJs, Function, IntoJs, Object, Symbol, Value};
 
+use crate::bindings::eventsource::resolve_event_source_stream_event;
+use crate::bindings::streams;
 use crate::bindings::{
     ABORT_SIGNAL_SYMBOL, BindingState, HEADERS_SYMBOL, REQUEST_SYMBOL, RESPONSE_SYMBOL, js,
     js_null, make_dom_error, map_delete, map_get, map_set, registry, registry_map,
     throw_type_error, to_dom_string,
 };
 use crate::event_loop::LoopState;
+
+/// The body-buffer cap (Stage 16 Phase 3, Rec 12): a response
+/// whose body is buffered (`.text()` etc., or a backend that only
+/// speaks `start_fetch`) is capped at 10 MiB — the cap always
+/// protected memory, so it moved to the buffering point. A
+/// `ReadableStream` reader is exempt: chunks flow through the
+/// stream without accumulating. A body that exceeds the cap while
+/// buffering errors the stream (the `Response` already resolved;
+/// reading its body rejects).
+pub const BODY_BUFFER_CAP: usize = 10 * 1024 * 1024;
 
 /// One `Request` object, as stored in [`BindingState::requests`].
 /// The JS object holds only the id; `fetch()` reads this back.
@@ -186,6 +210,46 @@ pub struct FetchCompletion {
     pub result: Result<FetchResponse, FetchError>,
 }
 
+/// One streaming fetch event (Stage 16 Phase 3, Rec 12): the
+/// chunk channel. The backend sends `Headers` once (the promise
+/// resolves then, with a `Response` whose `body` is a live
+/// stream), then one `Chunk` per body chunk, then exactly one
+/// terminal event (`Done`, or `Error` when the fetch fails before
+/// or during delivery). The `id` is the pending-fetch id. All
+/// variants carry plain Rust data — rquickjs values never cross
+/// threads.
+#[derive(Debug)]
+pub enum FetchStreamEvent {
+    /// Response headers arrived: status, reason, headers, and the
+    /// backend-computed response type. The promise resolves now.
+    Headers {
+        id: u64,
+        status: u16,
+        status_text: String,
+        headers: Vec<(String, String)>,
+        response_type: ResponseType,
+    },
+    /// One body chunk (already body-decoded by the backend).
+    Chunk { id: u64, bytes: Vec<u8> },
+    /// The body is complete (terminal).
+    Done { id: u64 },
+    /// The fetch failed (terminal): before `Headers` (the promise
+    /// rejects) or after it (the live stream errors).
+    Error { id: u64, error: FetchError },
+}
+
+impl FetchStreamEvent {
+    /// The pending-fetch id this event belongs to.
+    pub fn fetch_id(&self) -> u64 {
+        match self {
+            FetchStreamEvent::Headers { id, .. }
+            | FetchStreamEvent::Chunk { id, .. }
+            | FetchStreamEvent::Done { id }
+            | FetchStreamEvent::Error { id, .. } => *id,
+        }
+    }
+}
+
 /// The network backend for `fetch()`. Implemented by the integration
 /// wave with `pluto-net` (Stage-5 `RequestResource`: destination
 /// `fetch`, mode/credentials/origin/top-level-site/epoch).
@@ -199,6 +263,49 @@ pub struct FetchCompletion {
 pub trait FetchBackend: Send + Sync {
     /// Start a fetch. Send one outcome on `done`, exactly once.
     fn start_fetch(&self, request: FetchRequest, done: mpsc::Sender<FetchCompletion>);
+
+    /// Start a streaming fetch (Stage 16 Phase 3, Rec 12): send
+    /// `Headers` once, then one `Chunk` per body chunk, then
+    /// exactly one terminal event (`Done` / `Error`) on
+    /// `stream_tx`. The default implementation bridges a
+    /// `start_fetch`-only backend: it runs the whole fetch on a
+    /// helper thread and re-emits the buffered outcome as
+    /// `Headers` → one `Chunk` → `Done` (so `fetch()` resolves at
+    /// headers even for backends that buffer — the chunk is the
+    /// whole body, and the stream closes at once). Backends with
+    /// a real chunk channel override this.
+    fn start_stream_fetch(
+        &self,
+        request: FetchRequest,
+        stream_tx: mpsc::Sender<FetchStreamEvent>,
+    ) {
+        let (tx, rx) = mpsc::channel::<FetchCompletion>();
+        let id = request.id;
+        std::thread::spawn(move || {
+            let Ok(completion) = rx.recv() else {
+                return;
+            };
+            match completion.result {
+                Ok(resp) => {
+                    let _ = stream_tx.send(FetchStreamEvent::Headers {
+                        id,
+                        status: resp.status,
+                        status_text: resp.status_text,
+                        headers: resp.headers,
+                        response_type: resp.response_type,
+                    });
+                    if !resp.body.is_empty() {
+                        let _ = stream_tx.send(FetchStreamEvent::Chunk { id, bytes: resp.body });
+                    }
+                    let _ = stream_tx.send(FetchStreamEvent::Done { id });
+                }
+                Err(error) => {
+                    let _ = stream_tx.send(FetchStreamEvent::Error { id, error });
+                }
+            }
+        });
+        self.start_fetch(request, tx);
+    }
 
     /// Cancel an in-flight fetch (Stage 12 Rec 8: `AbortSignal`).
     /// Best effort: the backend should drop the request and send
@@ -221,11 +328,16 @@ pub trait FetchBackend: Send + Sync {
 }
 
 /// Install `fetch`, `Response`, and `Headers` on the global object.
+/// `fetch_tx` carries whole-response completions (the legacy
+/// `start_fetch` path, still drained by `TabJs`);
+/// `stream_tx` carries chunk events for `start_stream_fetch` —
+/// the path `fetch()` actually uses (Stage 16 Phase 3, Rec 12).
 pub fn install_fetch<'js>(
     ctx: &Ctx<'js>,
     _state: &Rc<RefCell<LoopState>>,
     bindings: &Rc<RefCell<BindingState>>,
     fetch_tx: mpsc::Sender<FetchCompletion>,
+    stream_tx: mpsc::Sender<FetchStreamEvent>,
 ) -> Result<(), String> {
     let globals = ctx.globals();
     install_response_prototype(ctx, bindings)?;
@@ -237,13 +349,14 @@ pub fn install_fetch<'js>(
     let fetch_fn = Function::new(
         ctx.clone(),
         move |ctx: Ctx<'js>, input: Value<'js>, init: Opt<Value<'js>>| -> rquickjs::Result<Value<'js>> {
-            fetch_impl(&ctx, &b, &fetch_tx, input, init.0)
+            fetch_impl(&ctx, &b, &stream_tx, input, init.0)
         },
     )
     .map_err(|e| format!("install fetch: {e}"))?;
     globals
         .set("fetch", fetch_fn)
         .map_err(|e| format!("install fetch: {e}"))?;
+    let _ = fetch_tx;
     Ok(())
 }
 
@@ -289,7 +402,7 @@ fn default_status_text(status: u16) -> &'static str {
 fn fetch_impl<'js>(
     ctx: &Ctx<'js>,
     bindings: &Rc<RefCell<BindingState>>,
-    fetch_tx: &mpsc::Sender<FetchCompletion>,
+    stream_tx: &mpsc::Sender<FetchStreamEvent>,
     input: Value<'js>,
     init: Option<Value<'js>>,
 ) -> rquickjs::Result<Value<'js>> {
@@ -463,11 +576,12 @@ fn fetch_impl<'js>(
     let backend = bindings.borrow().fetch_backend.clone();
     match backend {
         Some(backend) => {
-            // The backend owns delivery: it sends exactly one
-            // completion on the channel, from any thread. If the
-            // receiver is gone (navigation), the send fails silently
-            // and the pending entry is dropped with the realm.
-            backend.start_fetch(request, fetch_tx.clone());
+            // The backend owns delivery: it sends `Headers` /
+            // `Chunk` / `Done` (or `Error`) on the stream channel,
+            // from any thread. If the receiver is gone
+            // (navigation), the sends fail silently and the pending
+            // entry is dropped with the realm.
+            backend.start_stream_fetch(request, stream_tx.clone());
         }
         None => {
             // No backend attached: reject now (via the promise job
@@ -596,6 +710,459 @@ pub fn resolve_fetch<'js>(
     Ok(())
 }
 
+/// Route one chunk-channel event (Stage 16 Phase 3, Rec 12).
+/// Called by `TabJs` from a Networking-source Host task, like
+/// [`resolve_fetch`]. An `EventSource` fetch is routed to the SSE
+/// parser first; anything else feeds a `fetch()` response stream:
+/// `Headers` resolves the fetch promise with a `Response` whose
+/// `body` is a live stream, `Chunk` appends to the buffer (with
+/// the cap) and pushes to the stream, `Done` closes the stream
+/// and wakes the body waiters, `Error` errors the stream (and
+/// rejects the promise when headers never arrived).
+pub fn resolve_stream_event<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    stream_tx: &mpsc::Sender<FetchStreamEvent>,
+    event: FetchStreamEvent,
+) -> rquickjs::Result<()> {
+    if resolve_event_source_stream_event(ctx, bindings, stream_tx, &event)? {
+        return Ok(());
+    }
+    let id = event.fetch_id();
+    match event {
+        FetchStreamEvent::Headers {
+            status,
+            status_text,
+            headers,
+            response_type,
+            ..
+        } => {
+            let url = bindings
+                .borrow()
+                .pending_fetches
+                .get(&id)
+                .map(|r| r.url.clone())
+                .unwrap_or_default();
+            let response_obj = make_streaming_response(
+                ctx,
+                bindings,
+                id,
+                status,
+                &status_text,
+                headers,
+                response_type,
+                &url,
+                false,
+            )?;
+            let fetches = registry_map(ctx, "fetches")?;
+            let entry = map_get(ctx, &fetches, id)?;
+            // The promise resolves now; the pending entry stays
+            // until `Done` / `Error` (the fetch is still live —
+            // `has_pending_work` counts it, and `abort()` can
+            // still cancel it).
+            if let Some(entry_obj) = entry.as_object()
+                && let Ok(resolve) = entry_obj.get::<_, Function>("resolve")
+            {
+                let result: rquickjs::Result<Value> =
+                    resolve.call((Value::from(response_obj),));
+                if let Err(e) = result {
+                    bindings
+                        .borrow_mut()
+                        .errors
+                        .push(format!("fetch resolve threw: {e}"));
+                }
+                map_delete(ctx, &fetches, id);
+            }
+        }
+        FetchStreamEvent::Chunk { bytes, .. } => {
+            let Some(body_id) = bindings.borrow().fetch_bodies.get(&id).copied() else {
+                return Ok(()); // Headers never arrived / already gone.
+            };
+            // The chunk fans out to the source body and every
+            // `clone()` tee of it (see `body_tees`). Bind the tree
+            // first: a `borrow()` temporary in the `for` iterator
+            // lives through the whole loop, and `push_body_chunk`
+            // borrows mutably — nesting them panics.
+            let bodies = tee_tree(&bindings.borrow(), body_id);
+            for bid in bodies {
+                push_body_chunk(ctx, bindings, bid, &bytes)?;
+            }
+        }
+        FetchStreamEvent::Done { .. } => {
+            finish_stream_fetch(ctx, bindings, id, None)?;
+        }
+        FetchStreamEvent::Error { error, .. } => {
+            // Before `Headers`: the promise rejects (no response
+            // object exists yet). After `Headers`: the live stream
+            // errors and the body waiters reject.
+            let body_id = bindings.borrow().fetch_bodies.get(&id).copied();
+            match body_id {
+                None => {
+                    bindings.borrow_mut().pending_fetches.remove(&id);
+                    let fetches = registry_map(ctx, "fetches")?;
+                    let entry = map_get(ctx, &fetches, id)?;
+                    map_delete(ctx, &fetches, id);
+                    if let Some(entry_obj) = entry.as_object()
+                        && let Ok(reject) = entry_obj.get::<_, Function>("reject")
+                    {
+                        let reason: Value =
+                            ctx.eval(format!("new TypeError({:?})", error.to_string()))?;
+                        let result: rquickjs::Result<Value> = reject.call((reason,));
+                        if let Err(e) = result {
+                            bindings
+                                .borrow_mut()
+                                .errors
+                                .push(format!("fetch reject threw: {e}"));
+                        }
+                    }
+                }
+                Some(body_id) => {
+                    // The error finishes the source body and every
+                    // tee of it (see `finish_stream_fetch`).
+                    finish_stream_fetch(ctx, bindings, id, Some(&error.to_string()))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A stream fetch finished (`Done` — `error` is `None` — or
+/// `Error` after `Headers` — `error` is the message): finish the
+/// source body and every `clone()` tee of it, then drop the
+/// pending entry.
+///
+/// `Done`: close each stream, mark each body complete, wake each
+/// body's waiters. `Error`: error each stream and reject each
+/// body's waiters — the bodies are NOT marked complete, or a later
+/// `.text()` would read a partial buffer instead of rejecting.
+fn finish_stream_fetch<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    fetch_id: u64,
+    error: Option<&str>,
+) -> rquickjs::Result<()> {
+    let body_id = bindings.borrow().fetch_bodies.get(&fetch_id).copied();
+    if let Some(body_id) = body_id {
+        // Bind the tree first (see the Chunk arm): the `borrow()`
+        // temporary in the `for` iterator would live through the
+        // loop and panic on the stream calls' `borrow_mut`.
+        let bodies = tee_tree(&bindings.borrow(), body_id);
+        for bid in bodies {
+            // Bind first: a `borrow()` temporary in an `if let`
+            // scrutinee lives through the whole body, and the
+            // stream calls borrow mutably — nesting them panics.
+            let stream_id = bindings.borrow().response_streams.get(&bid).copied();
+            match error {
+                Some(msg) => {
+                    if let Some(stream_id) = stream_id {
+                        let _ = streams::stream_error(ctx, bindings, stream_id, msg);
+                    }
+                    reject_body_waiters(ctx, bindings, bid, msg)?;
+                }
+                None => {
+                    if let Some(stream_id) = stream_id {
+                        streams::stream_close(ctx, bindings, stream_id)?;
+                    }
+                    bindings.borrow_mut().response_complete.insert(bid);
+                    resolve_body_waiters(ctx, bindings, bid)?;
+                }
+            }
+        }
+        // The tee registrations die with the fetch (transitively —
+        // a tee of a tee is in the tree too).
+        let bodies = tee_tree(&bindings.borrow(), body_id);
+        for bid in bodies {
+            bindings.borrow_mut().body_tees.remove(&bid);
+        }
+    }
+    bindings.borrow_mut().pending_fetches.remove(&fetch_id);
+    bindings.borrow_mut().fetch_bodies.remove(&fetch_id);
+    let signal_id = bindings.borrow_mut().fetch_signals.remove(&fetch_id);
+    if let Some(signal_id) = signal_id
+        && let Some(state) = bindings.borrow_mut().abort_signals.get_mut(&signal_id)
+    {
+        state.fetch_ids.retain(|f| *f != fetch_id);
+    }
+    Ok(())
+}
+
+/// The source body id plus every `clone()` tee of it, transitively
+/// (a clone of a clone tees the clone — see `body_tees`).
+fn tee_tree(bindings: &BindingState, root: u64) -> Vec<u64> {
+    let mut out = vec![root];
+    let mut i = 0;
+    while i < out.len() {
+        if let Some(tees) = bindings.body_tees.get(&out[i]) {
+            out.extend(tees.iter().copied());
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Append one chunk to a body's buffer (with the cap) and push it
+/// to the body's stream. A body that grows past the cap while
+/// buffering errors the stream (the `Response` already resolved;
+/// reading its body rejects) — and a body whose stream already
+/// errored drops further chunks. Readers are exempt from the cap:
+/// the chunk still flows to the stream while it fits.
+fn push_body_chunk<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    body_id: u64,
+    bytes: &[u8],
+) -> rquickjs::Result<()> {
+    let stream_id = bindings.borrow().response_streams.get(&body_id).copied();
+    let Some(stream_id) = stream_id else {
+        return Ok(());
+    };
+    if bindings
+        .borrow()
+        .stream_states
+        .get(&stream_id)
+        .is_some_and(|s| s.error.is_some())
+    {
+        return Ok(()); // Already errored: drop further chunks.
+    }
+    let over_cap = {
+        let mut s = bindings.borrow_mut();
+        match s.response_bodies.get_mut(&body_id) {
+            Some(buf) => {
+                buf.extend_from_slice(bytes);
+                buf.len() > BODY_BUFFER_CAP
+            }
+            None => false,
+        }
+    };
+    if over_cap {
+        let _ = streams::stream_error(
+            ctx,
+            bindings,
+            stream_id,
+            "fetch: response body exceeds the 10 MiB buffer cap",
+        );
+        reject_body_waiters(
+            ctx,
+            bindings,
+            body_id,
+            "fetch: response body exceeds the 10 MiB buffer cap",
+        )?;
+    } else {
+        streams::stream_push_chunk(ctx, bindings, stream_id, bytes.to_vec())?;
+    }
+    Ok(())
+}
+
+/// Build a `Response` for a `Headers` event: an empty body buffer
+/// + a live `ReadableStream` (fed by later `Chunk` events, closed
+/// by `Done`). The fetch promise resolves with this object.
+pub fn make_streaming_response<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    fetch_id: u64,
+    status: u16,
+    status_text: &str,
+    headers: Vec<(String, String)>,
+    response_type: ResponseType,
+    url: &str,
+    redirected: bool,
+) -> rquickjs::Result<Object<'js>> {
+    let body_id = {
+        let mut s = bindings.borrow_mut();
+        let id = s.next_body_id;
+        s.next_body_id += 1;
+        s.response_bodies.insert(id, Vec::new());
+        s.response_headers.insert(id, headers);
+        s.response_urls.insert(id, (url.to_string(), redirected));
+        s.fetch_bodies.insert(fetch_id, id);
+        id
+    };
+    let (stream_obj, stream_id) = streams::new_stream(ctx, bindings, Some(fetch_id))?;
+    bindings
+        .borrow_mut()
+        .response_streams
+        .insert(body_id, stream_id);
+    let status_text = if status_text.is_empty() {
+        default_status_text(status).to_string()
+    } else {
+        status_text.to_string()
+    };
+    response_object(
+        ctx,
+        bindings,
+        body_id,
+        status,
+        &status_text,
+        response_type,
+        url,
+        redirected,
+        Some(stream_obj),
+    )
+}
+
+/// Wake every body waiter for `body_id` with the finished body
+/// (the value computed by kind — `text` / `json` / `blob` /
+/// `arrayBuffer` — from the buffer, exactly as the direct path
+/// computes it).
+fn resolve_body_waiters<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    body_id: u64,
+) -> rquickjs::Result<()> {
+    for (resolve, reject, kind) in take_body_waiters(ctx, body_id)? {
+        match body_value(ctx, bindings, body_id, &kind) {
+            Ok(value) => {
+                let _: Value = resolve.call((value,))?;
+            }
+            Err(reason) => {
+                let _: Value = reject.call((reason,))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject every body waiter for `body_id` with a `TypeError`.
+fn reject_body_waiters<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    body_id: u64,
+    msg: &str,
+) -> rquickjs::Result<()> {
+    for (_resolve, reject, _kind) in take_body_waiters(ctx, body_id)? {
+        let reason: Value = ctx.eval(format!("new TypeError({msg:?})"))?;
+        let _: Value = reject.call((reason,))?;
+    }
+    Ok(())
+}
+
+/// Take (and clear) the body waiters for `body_id` from the
+/// registry's `bodyWaiters` Map. Each record is
+/// `{ resolve, reject, kind }` with `kind` one of `"text"` /
+/// `"json"` / `"blob"` / `"arrayBuffer"`.
+fn take_body_waiters<'js>(
+    ctx: &Ctx<'js>,
+    body_id: u64,
+) -> rquickjs::Result<Vec<(Function<'js>, Function<'js>, String)>> {
+    let map = registry_map(ctx, "bodyWaiters")?;
+    let value = map_get(ctx, &map, body_id)?;
+    map_delete(ctx, &map, body_id);
+    let Some(arr) = value.as_object().and_then(|o| o.clone().into_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for i in 0..arr.len() {
+        let Ok(record) = arr.get::<Value>(i) else {
+            continue;
+        };
+        let Some(obj) = record.as_object() else {
+            continue;
+        };
+        let Ok(resolve) = obj.get::<_, Function>("resolve") else {
+            continue;
+        };
+        let Ok(reject) = obj.get::<_, Function>("reject") else {
+            continue;
+        };
+        let kind = obj.get::<_, String>("kind").unwrap_or_default();
+        out.push((resolve, reject, kind));
+    }
+    Ok(out)
+}
+
+/// The body value for a waiter kind, from the finished buffer —
+/// the same computation the direct (already-complete) path does
+/// in the `Response` prototype methods below. `Err` is the
+/// rejection reason (a `SyntaxError` value for a bad `json()`).
+fn body_value<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    body_id: u64,
+    kind: &str,
+) -> Result<Value<'js>, Value<'js>> {
+    let bytes = bindings
+        .borrow()
+        .response_bodies
+        .get(&body_id)
+        .cloned()
+        .unwrap_or_default();
+    match kind {
+        "json" => {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let json: Object = ctx.globals().get("JSON").map_err(|_| js_null(ctx))?;
+            let parse: Function = json.get("parse").map_err(|_| js_null(ctx))?;
+            match parse.call::<_, Value>((text,)) {
+                Ok(value) => Ok(value),
+                Err(_) => {
+                    let caught = ctx.catch();
+                    let msg = caught
+                        .as_object()
+                        .and_then(|o| o.get::<_, String>("message").ok())
+                        .unwrap_or_else(|| "JSON parse error".to_string());
+                    match ctx.eval::<Value, _>(format!("new SyntaxError({msg:?})")) {
+                        Ok(value) => Err(value),
+                        Err(_) => Err(js_null(ctx)),
+                    }
+                }
+            }
+        }
+        "blob" => {
+            let ty = bindings
+                .borrow()
+                .response_headers
+                .get(&body_id)
+                .and_then(|h| {
+                    h.iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, v)| v.clone())
+                })
+                .unwrap_or_default();
+            let blob = Object::new(ctx.clone()).map_err(|_| js_null(ctx))?;
+            blob.set("size", bytes.len() as f64).map_err(|_| js_null(ctx))?;
+            blob.set("type", ty).map_err(|_| js_null(ctx))?;
+            Ok(Value::from(blob))
+        }
+        "arrayBuffer" => {
+            let buffer = ArrayBuffer::new_copy(ctx.clone(), bytes.as_slice())
+                .map_err(|_| js_null(ctx))?;
+            buffer.into_js(ctx).map_err(|_| js_null(ctx))
+        }
+        _ => Ok(js(ctx, String::from_utf8_lossy(&bytes).into_owned())),
+    }
+}
+
+/// Register a body waiter: the caller (`.text()` etc.) created a
+/// promise whose resolve/reject wait for the stream to finish.
+/// Returns `true` when the waiter was registered (the caller
+/// returns the pending promise); `false` when the body is already
+/// complete (the caller reads the buffer directly).
+fn wait_for_body<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    body_id: u64,
+    kind: &str,
+    resolve: &Function<'js>,
+    reject: &Function<'js>,
+) -> rquickjs::Result<bool> {
+    if bindings.borrow().response_complete.contains(&body_id) {
+        return Ok(false);
+    }
+    let map = registry_map(ctx, "bodyWaiters")?;
+    let value = map_get(ctx, &map, body_id)?;
+    let arr = match value.as_object().and_then(|o| o.clone().into_array()) {
+        Some(arr) => arr,
+        None => Array::new(ctx.clone())?,
+    };
+    let record = Object::new(ctx.clone())?;
+    record.set("resolve", resolve.clone())?;
+    record.set("reject", reject.clone())?;
+    record.set("kind", kind)?;
+    arr.set(arr.len(), Value::from(record))?;
+    map_set(ctx, &map, body_id, Value::from(arr))?;
+    Ok(true)
+}
+
 /// Abort every fetch registered on `signal_id`: cancel the
 /// backend request, reject the promise with an `AbortError`, and
 /// drop the pending entry — so a late backend completion finds
@@ -627,6 +1194,40 @@ pub fn abort_signal<'js>(
     for fetch_id in fetch_ids {
         if let Some(backend) = &backend {
             backend.cancel_fetch(fetch_id);
+        }
+        // A fetch that already resolved at headers has a live
+        // stream: error it (and every `clone()` tee of it) and
+        // reject the body waiters (the promise is gone — it
+        // resolved already — so the abort surfaces through the
+        // stream / `.text()` instead).
+        // Bind first: a `borrow()` temporary in an `if let`
+        // scrutinee lives through the whole body, and the error /
+        // waiter calls borrow mutably — nesting them panics.
+        let body_id = bindings.borrow().fetch_bodies.get(&fetch_id).copied();
+        if let Some(body_id) = body_id {
+            // Bind the tree first (see the Chunk arm): the
+            // `borrow()` temporary in the `for` iterator would live
+            // through the loop and panic on the `borrow_mut`s.
+            let bodies = tee_tree(&bindings.borrow(), body_id);
+            for bid in bodies {
+                let stream_id = bindings.borrow().response_streams.get(&bid).copied();
+                if let Some(stream_id) = stream_id {
+                    let _ = streams::stream_error(
+                        ctx,
+                        bindings,
+                        stream_id,
+                        "The user aborted a request.",
+                    );
+                }
+                let _ = reject_body_waiters(
+                    ctx,
+                    bindings,
+                    bid,
+                    "The user aborted a request.",
+                );
+                bindings.borrow_mut().body_tees.remove(&bid);
+            }
+            bindings.borrow_mut().fetch_bodies.remove(&fetch_id);
         }
         bindings.borrow_mut().pending_fetches.remove(&fetch_id);
         bindings.borrow_mut().fetch_signals.remove(&fetch_id);
@@ -664,13 +1265,34 @@ pub fn abort_signal<'js>(
 }
 
 /// Build a `Response` wrapper for a completed fetch, storing its
-/// body + headers in [`BindingState`] under a fresh body id.
+/// body + headers in [`BindingState`] under a fresh body id. The
+/// `body` stream is a closed pre-loaded stream of the buffered
+/// bytes (a `Response` built from bytes has a body stream that is
+/// already complete), and the body is marked complete — so
+/// `.text()` etc. read the buffer directly.
+///
+/// `live` is `true` only for `clone()` of a still-streaming
+/// response (see `body_tees`): the stream stays open (later
+/// chunks fan out to it) and the body is NOT marked complete, so
+/// `.text()` waits for `Done` instead of reading the prefix.
 pub fn make_response<'js>(
     ctx: &Ctx<'js>,
     bindings: &Rc<RefCell<BindingState>>,
     response: &FetchResponse,
     url: &str,
     redirected: bool,
+) -> rquickjs::Result<Object<'js>> {
+    make_response_live(ctx, bindings, response, url, redirected, false)
+}
+
+/// [`make_response`] with the stream left live (see above).
+pub fn make_response_live<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    response: &FetchResponse,
+    url: &str,
+    redirected: bool,
+    live: bool,
 ) -> rquickjs::Result<Object<'js>> {
     let body_id = {
         let mut s = bindings.borrow_mut();
@@ -687,6 +1309,50 @@ pub fn make_response<'js>(
     } else {
         response.status_text.clone()
     };
+    let (stream_obj, stream_id) = streams::new_stream(ctx, bindings, None)?;
+    if !response.body.is_empty() {
+        streams::stream_push_chunk(ctx, bindings, stream_id, response.body.clone())?;
+    }
+    if live {
+        // The stream stays open for fanned-out chunks; the body is
+        // not complete, so `.text()` etc. wait for `Done`.
+    } else {
+        streams::stream_close(ctx, bindings, stream_id)?;
+        bindings.borrow_mut().response_complete.insert(body_id);
+    }
+    bindings
+        .borrow_mut()
+        .response_streams
+        .insert(body_id, stream_id);
+    response_object(
+        ctx,
+        bindings,
+        body_id,
+        response.status,
+        &status_text,
+        response.response_type,
+        url,
+        redirected,
+        Some(stream_obj),
+    )
+}
+
+/// The shared `Response` object builder: the body-id symbol, the
+/// status / type / url properties, the `headers` object, and the
+/// `body` stream (when one was built — every `Response` has one;
+/// a streamed response's is live, a buffered response's is a
+/// closed pre-loaded stream).
+fn response_object<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    body_id: u64,
+    status: u16,
+    status_text: &str,
+    response_type: ResponseType,
+    url: &str,
+    redirected: bool,
+    stream: Option<Object<'js>>,
+) -> rquickjs::Result<Object<'js>> {
     let protos = registry_map(ctx, "prototypes")?;
     let proto: Object = protos.get("response")?;
     let obj = Object::new_proto(ctx.clone(), Some(&proto))?;
@@ -694,15 +1360,12 @@ pub fn make_response<'js>(
     obj.set(sym.as_atom(), body_id as f64)?;
     // Status lives on the object (plain data properties; the
     // prototype's accessors read them).
-    obj.prop("status", Property::from(response.status as f64))?;
+    obj.prop("status", Property::from(status as f64))?;
     obj.prop("statusText", Property::from(status_text))?;
     // `type` likewise: the backend-set tainting (`basic` / `cors` /
     // `opaque` / `opaqueredirect` / `default`), read by the
     // prototype's `type` accessor below.
-    obj.prop(
-        "type",
-        Property::from(response.response_type.as_str()),
-    )?;
+    obj.prop("type", Property::from(response_type.as_str()))?;
     // `url` / `redirected` likewise (Fetch §2.2.6): the final URL
     // after redirects, and whether any redirect happened.
     obj.prop("url", Property::from(url))?;
@@ -710,6 +1373,11 @@ pub fn make_response<'js>(
     // The `headers` object shares the body id.
     let headers_obj = make_headers_object(ctx, bindings, body_id)?;
     obj.set("headers", headers_obj)?;
+    // `body`: the stream object itself (an own data property — it
+    // shadows nothing, and the prototype has no `body` accessor).
+    if let Some(stream) = stream {
+        obj.set("body", stream)?;
+    }
     Ok(obj)
 }
 
@@ -811,14 +1479,27 @@ fn install_response_prototype<'js>(
         .map_err(|e| format!("Response.type: {e}"))?;
 
     // `text()`: a promise resolved with the body as a string.
+    // When the stream has not finished yet, the promise waits
+    // (via `bodyWaiters`) for `Done` instead of reading a
+    // half-filled buffer.
     let b = Rc::clone(bindings);
     let text_fn = Function::new(
         ctx.clone(),
         move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
-            let (promise, resolve, _reject) = ctx.promise()?;
+            let (promise, resolve, reject) = ctx.promise()?;
             let body_id = body_id_of(&ctx, &this, RESPONSE_SYMBOL);
-            let text = body_id
-                .and_then(|id| b.borrow().response_bodies.get(&id).cloned())
+            let Some(body_id) = body_id else {
+                let _: Value = resolve.call((String::new(),))?;
+                return Ok(promise.into_value());
+            };
+            if wait_for_body(&ctx, &b, body_id, "text", &resolve, &reject)? {
+                return Ok(promise.into_value());
+            }
+            let text = b
+                .borrow()
+                .response_bodies
+                .get(&body_id)
+                .cloned()
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 .unwrap_or_default();
             let _: Value = resolve.call((text,))?;
@@ -838,8 +1519,18 @@ fn install_response_prototype<'js>(
         move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
             let (promise, resolve, reject) = ctx.promise()?;
             let body_id = body_id_of(&ctx, &this, RESPONSE_SYMBOL);
-            let text = body_id
-                .and_then(|id| b.borrow().response_bodies.get(&id).cloned())
+            let Some(body_id) = body_id else {
+                let _: Value = resolve.call((js_null(&ctx),))?;
+                return Ok(promise.into_value());
+            };
+            if wait_for_body(&ctx, &b, body_id, "json", &resolve, &reject)? {
+                return Ok(promise.into_value());
+            }
+            let text = b
+                .borrow()
+                .response_bodies
+                .get(&body_id)
+                .cloned()
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 .unwrap_or_default();
             let json: Object = ctx.globals().get("JSON")?;
@@ -890,29 +1581,37 @@ fn install_response_prototype<'js>(
 
     // `blob()`: a promise resolved with a `Blob`-shaped object
     // (`{ size, type }` — M4 has no `Blob` class yet; the size and
-    // the content type are what pages read most).
+    // the content type are what pages read most). Waits for the
+    // stream to finish, like `text()`.
     let b = Rc::clone(bindings);
     let blob_fn = Function::new(
         ctx.clone(),
         move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
-            let (promise, resolve, _reject) = ctx.promise()?;
+            let (promise, resolve, reject) = ctx.promise()?;
             let body_id = body_id_of(&ctx, &this, RESPONSE_SYMBOL);
-            let (size, ty) = match body_id {
-                Some(id) => {
-                    let s = b.borrow();
-                    let size = s.response_bodies.get(&id).map(|v| v.len()).unwrap_or(0);
-                    let ty = s
-                        .response_headers
-                        .get(&id)
-                        .and_then(|h| {
-                            h.iter()
-                                .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-                                .map(|(_, v)| v.clone())
-                        })
-                        .unwrap_or_default();
-                    (size, ty)
-                }
-                None => (0, String::new()),
+            let Some(body_id) = body_id else {
+                let blob = Object::new(ctx.clone())?;
+                blob.set("size", 0.0)?;
+                blob.set("type", String::new())?;
+                let _: Value = resolve.call((Value::from(blob),))?;
+                return Ok(promise.into_value());
+            };
+            if wait_for_body(&ctx, &b, body_id, "blob", &resolve, &reject)? {
+                return Ok(promise.into_value());
+            }
+            let (size, ty) = {
+                let s = b.borrow();
+                let size = s.response_bodies.get(&body_id).map(|v| v.len()).unwrap_or(0);
+                let ty = s
+                    .response_headers
+                    .get(&body_id)
+                    .and_then(|h| {
+                        h.iter()
+                            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+                            .map(|(_, v)| v.clone())
+                    })
+                    .unwrap_or_default();
+                (size, ty)
             };
             let blob = Object::new(ctx.clone())?;
             blob.set("size", size as f64)?;
@@ -927,15 +1626,28 @@ fn install_response_prototype<'js>(
         .map_err(|e| format!("Response.blob: {e}"))?;
 
     // `arrayBuffer()`: a promise resolved with the body bytes in a
-    // real `ArrayBuffer`.
+    // real `ArrayBuffer`. Waits for the stream to finish, like
+    // `text()`.
     let b = Rc::clone(bindings);
     let array_buffer_fn = Function::new(
         ctx.clone(),
         move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
-            let (promise, resolve, _reject) = ctx.promise()?;
+            let (promise, resolve, reject) = ctx.promise()?;
             let body_id = body_id_of(&ctx, &this, RESPONSE_SYMBOL);
-            let bytes = body_id
-                .and_then(|id| b.borrow().response_bodies.get(&id).cloned())
+            let Some(body_id) = body_id else {
+                let buffer = ArrayBuffer::new_copy(ctx.clone(), [0u8; 0])?;
+                let buffer_value: Value = buffer.into_js(&ctx)?;
+                let _: Value = resolve.call((buffer_value,))?;
+                return Ok(promise.into_value());
+            };
+            if wait_for_body(&ctx, &b, body_id, "arrayBuffer", &resolve, &reject)? {
+                return Ok(promise.into_value());
+            }
+            let bytes = b
+                .borrow()
+                .response_bodies
+                .get(&body_id)
+                .cloned()
                 .unwrap_or_default();
             let buffer = ArrayBuffer::new_copy(ctx.clone(), bytes.as_slice())?;
             let buffer_value: Value = buffer.into_js(&ctx)?;
@@ -949,8 +1661,12 @@ fn install_response_prototype<'js>(
         .map_err(|e| format!("Response.arrayBuffer: {e}"))?;
 
     // `clone()`: a new `Response` with an independent copy of the
-    // body + headers (reading one clone never disturbs the other —
-    // bodies are buffered bytes, not streams, in M4).
+    // body + headers (reading one clone never disturbs the other).
+    // When the source body is still streaming, the clone tees it
+    // (see `body_tees`): the clone starts with the bytes buffered
+    // so far, and later chunks fan out to both — a clone made
+    // immediately after `fetch()` resolves still reads the full
+    // body. A clone of a finished body is just the buffered copy.
     let b = Rc::clone(bindings);
     let clone_fn = Function::new(
         ctx.clone(),
@@ -992,7 +1708,26 @@ fn install_response_prototype<'js>(
                 body,
                 response_type: ty,
             };
-            make_response(&ctx, &b, &response, &url, redirected).map(Value::from)
+            // A clone of a still-streaming body gets a LIVE stream
+            // (see `make_response_live`) and registers as a tee of
+            // the source, so later chunks fan out to it.
+            let live = body_id
+                .is_some_and(|id| !b.borrow().response_complete.contains(&id));
+            let clone_obj =
+                make_response_live(&ctx, &b, &response, &url, redirected, live)?;
+            if live {
+                if let (Some(source_id), Some(clone_id)) = (
+                    body_id,
+                    body_id_of(&ctx, &clone_obj, RESPONSE_SYMBOL),
+                ) {
+                    b.borrow_mut()
+                        .body_tees
+                        .entry(source_id)
+                        .or_default()
+                        .push(clone_id);
+                }
+            }
+            Ok(Value::from(clone_obj))
         },
     )
     .map_err(|e| format!("Response.clone: {e}"))?;

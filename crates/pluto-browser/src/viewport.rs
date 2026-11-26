@@ -18,7 +18,8 @@ use cosmic::iced::widget::shader::{self, Pipeline, Primitive, Program};
 use cosmic::iced::wgpu;
 use cosmic::iced::{Rectangle, mouse};
 use pluto_paint::renderer::PaintRenderer;
-use pluto_paint::{DisplayList, ResourceTable};
+use pluto_paint::{DisplayList, ResourceId, ResourceTable};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -34,6 +35,13 @@ pub struct WebViewport {
     /// a view transform only: the renderer subtracts it in the
     /// vertex shader, so a wheel event never round-trips to layout.
     pub scroll: (f32, f32),
+    /// Frame-blob ids whose RGBA pixels changed since the last
+    /// presented primitive (Stage 16, M8 Phase 2, Rec 5):
+    /// shared with the shell's tab (`Arc<Mutex>` — the
+    /// primitive must be `Send + Sync`). Drained in
+    /// `prepare()`, never copied: an id is advanced exactly
+    /// once per conversion.
+    pub video_dirty: Arc<std::sync::Mutex<HashSet<ResourceId>>>,
 }
 
 /// State the viewport widget keeps across frames: the last widget
@@ -140,6 +148,7 @@ impl Program<crate::Message> for WebViewport {
             display: Arc::clone(&self.display),
             resources: Arc::clone(&self.resources),
             scroll: self.scroll,
+            video_dirty: Arc::clone(&self.video_dirty),
         }
     }
 }
@@ -151,6 +160,7 @@ pub struct WebPrimitive {
     display: Arc<DisplayList>,
     resources: Arc<ResourceTable>,
     scroll: (f32, f32),
+    video_dirty: Arc<std::sync::Mutex<HashSet<ResourceId>>>,
 }
 
 pub struct WebRenderPipeline {
@@ -184,6 +194,16 @@ impl Primitive for WebPrimitive {
         // `self.clear_color` is the fallback page background when the
         // display list has no canvas fill yet.
         let _ = self.clear_color;
+        // Stage 16 (M8 Phase 2, Rec 5): re-upload every video
+        // frame whose pixels changed since the last primitive —
+        // `advance_image_frame` marks the texture dirty so
+        // `prepare()` below re-uploads just that texture (the
+        // pre-existing gap: nothing called this for animated
+        // images either — video is the first caller). The set
+        // drains here, so an id is advanced once per conversion.
+        for id in self.video_dirty.lock().unwrap().drain() {
+            pipeline.renderer.advance_image_frame(id);
+        }
         pipeline.renderer.prepare(
             &self.display,
             &self.resources,

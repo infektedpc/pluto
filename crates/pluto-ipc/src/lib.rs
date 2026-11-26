@@ -58,6 +58,34 @@ pub mod transport;
 /// The protocol version every encoded message carries. Bump on any
 /// breaking change to the enums below.
 ///
+/// v13 (Stage 16 Phase 3, Rec 8/9/11 — finisher): the history
+/// and WebSocket message shapes change together.
+/// [`BrowserToRenderer::CommitNavigation`] gains `state_json`,
+/// `traversal`, and `scroll` (a Back/Forward traversal restores
+/// the entry's state and scroll and fires `popstate` after the
+/// commit; a reload restores both too; a plain navigation carries
+/// `None` / `false` / `(0.0, 0.0)`), and every
+/// [`WebSocketEvent`] variant gains `socket_id` (the broker's pump
+/// tags its events; the envelope carries it too). The bump is the
+/// shape change; v12 bytes are rejected by [`decode_message`].
+///
+/// v12 (Stage 16 Phase 3, Rec 8/9/11/12) adds the history and
+/// WebSocket messages: [`RendererToBrowser::HistoryPush`] /
+/// `HistoryReplace` / `HistoryGo` / `HistorySync` and
+/// `WebSocketOpen` / `WebSocketSend` / `WebSocketClose` /
+/// [`BrowserToRenderer::WebSocketEvent`], `DidCommit` gains
+/// `replace`, and [`Destination::Stream`] arrives. The bump is
+/// the shape change; v11 bytes are rejected by
+/// [`decode_message`].
+///
+/// v11 (Stage 16 Phase 1, Rec 2) adds `Destination::Audio`,
+/// `Destination::Video`, and `Destination::WebSocket` to the enum
+/// (media was `Other` before, so `media-src` never fired and media
+/// inherited the 10 MiB `Other` cap; WebSocket had no destination
+/// at all), plus [`RendererToBrowser::VideoFrame`] (Rec 1). The
+/// bump is the shape change; v10 bytes are rejected by
+/// [`decode_message`].
+///
 /// v10 (Stage 15 Phase 2, M7 Rec 4) appends one display-list
 /// variant at the end so existing variants keep their postcard
 /// discriminants: [`DisplayItem::VectorPath`] (tessellated vector
@@ -96,7 +124,7 @@ pub mod transport;
 /// `SetFocused` and `ScrollViewport`. v2 bytes are rejected by
 /// [`decode_message`] — Pluto ships one binary, so a bump is a
 /// clean break, not a migration.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// What went wrong decoding a versioned message.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -140,7 +168,26 @@ where
 pub enum BrowserToRenderer {
     /// Start loading this URL: fetch, parse, lay out at the current
     /// viewport, and report back with `DidCommit` + `SubmitDisplayList`.
-    CommitNavigation { url: String },
+    ///
+    /// Stage 16 Phase 3 (Rec 8/9): `state_json` is the session-history
+    /// state to restore for this entry (the JSON the page stored with
+    /// `pushState` / `replaceState` — `None` for a fresh navigation,
+    /// whose `history.state` is `null`). `traversal` is true only for
+    /// Back/Forward: after the commit the worker fires `popstate`
+    /// with the restored state; a reload of a stateful entry carries
+    /// its state with `traversal: false` and fires no `popstate`.
+    /// `scroll` is the viewport scroll to restore for the entry
+    /// (Stage 16 Phase 3, Rec 8 — finisher): a traversal or reload
+    /// carries the entry's saved scroll, a fresh navigation
+    /// `(0.0, 0.0)` — the worker's layout mirror and the shell's
+    /// compositor must agree, or fixed / sticky elements lay out
+    /// at the wrong offset until the next scroll event.
+    CommitNavigation {
+        url: String,
+        state_json: Option<String>,
+        traversal: bool,
+        scroll: (f32, f32),
+    },
     /// The layout viewport changed (window resize, first frame).
     /// Re-lay out the retained document; no refetch.
     Resize { width: f32, height: f32 },
@@ -172,6 +219,21 @@ pub enum BrowserToRenderer {
     /// — never a refetch). Appended at the end so existing variants
     /// keep their postcard discriminants.
     SetTheme { dark: bool },
+    /// Session-history sync (Stage 16 Phase 3, Rec 8): the shell is
+    /// authoritative for the session history, so after every
+    /// mutation it tells the worker the entry count and the current
+    /// index — the worker mirrors them as `history.length` and the
+    /// base for `pushState` truncation. Appended at the end so
+    /// existing variants keep their postcard discriminants.
+    HistorySync { length: usize, index: usize },
+    /// A WebSocket event for one socket (Stage 16 Phase 3, Rec 11):
+    /// the browser-side pump forwards the socket's lifecycle here.
+    /// Appended at the end so existing variants keep their
+    /// postcard discriminants.
+    WebSocketEvent {
+        socket_id: u64,
+        event: WebSocketEvent,
+    },
 }
 
 /// Messages from the renderer worker to the browser (shell).
@@ -199,7 +261,17 @@ pub enum RendererToBrowser {
     /// Navigation committed: the URL that actually loaded (after
     /// redirects) and the status line text. Sent when the fetch
     /// lands, before the display list.
-    DidCommit { url: String, status: String },
+    ///
+    /// Stage 16 Phase 3 (Rec 8): `replace` is true when the
+    /// navigation came from `location.replace()` — the shell
+    /// replaces the current history entry instead of pushing a new
+    /// one (the flag used to be threaded through
+    /// `request_navigation` and discarded in the worker).
+    DidCommit {
+        url: String,
+        status: String,
+        replace: bool,
+    },
     /// A load failed; the worker already rendered the error page and
     /// sent it as a `SubmitDisplayList` — this carries the reason
     /// for the status line.
@@ -289,6 +361,84 @@ pub enum RendererToBrowser {
     CompositingUpdate {
         epoch: u64,
         updates: Vec<CompositedUpdate>,
+    },
+    /// One decoded video frame (Stage 16 Phase 1, Rec 1): YUV420
+    /// planes for one `<video>` element, sent by the renderer as
+    /// soon as the decode thread produces it — NOT through
+    /// `ResourceReady`/`Blob`. The M7 canvas drain (hash-compare
+    /// + dirty flag, full-RGBA clone per frame) is the 498 MB/s
+    /// trap for video: a video frame differs every frame, so the
+    /// hash never skips. YUV420 is 1.5 bytes/px against RGBA's 4
+    /// (1080p: ~3.1 MB/frame vs ~8.3 MB), and the shell uploads
+    /// the planes straight into three R8 wgpu textures — no RGBA
+    /// conversion on the hot path (Phase 2). Measured at 1080p60
+    /// in `pluto-ipc`'s transport tests before any decoder code
+    /// was written; see `VideoFrame` for the numbers.
+    ///
+    /// `epoch` is the navigation epoch the frame belongs to; a
+    /// frame whose epoch is no longer current is stale and must
+    /// be dropped. Frames are NOT queued: the renderer keeps at
+    /// most one undelivered frame per element (see
+    /// `pluto_media::FrameChannel`) and drops older ones — a
+    /// slow shell sees the latest frame, never a backlog. The
+    /// display list names a frame by `frame_id` (Phase 2 adds the
+    /// `DisplayItem`); a list that names a frame the shell has
+    /// not received yet paints the previous frame (or the poster
+    /// when there is none).
+    VideoFrame {
+        epoch: u64,
+        frame: VideoFrame,
+    },
+    /// `history.pushState()` (Stage 16 Phase 3, Rec 8): the page
+    /// changed its URL + state without a navigation. The shell
+    /// truncates the forward entries, appends `{ url, state_json }`,
+    /// and updates the address bar — no fetch, no `popstate`. The
+    /// worker already updated its own document URL and realm state;
+    /// this message is the shell-side half. Appended at the end so
+    /// existing variants keep their postcard discriminants.
+    HistoryPush {
+        url: String,
+        state_json: Option<String>,
+    },
+    /// `history.replaceState()` / a same-document hash change
+    /// (Stage 16 Phase 3, Rec 8/9): replace the current entry's URL
+    /// + state in place, no new entry, no navigation.
+    HistoryReplace {
+        url: String,
+        state_json: Option<String>,
+    },
+    /// `history.back()` / `forward()` / `go(n)` from script (Stage
+    /// 16 Phase 3, Rec 8): the shell moves its index by `delta`
+    /// (clamped) and navigates with `CommitNavigation { traversal:
+    /// true }`, so the worker fires `popstate` after the commit.
+    /// A `delta` that moves nowhere is a no-op (no message back).
+    HistoryGo { delta: i32 },
+    /// Open a WebSocket (Stage 16 Phase 3, Rec 11): the worker
+    /// asks the browser-side broker to run the handshake — the
+    /// renderer never opens a socket itself. `origin` is the
+    /// document origin the handshake's `Origin` header carries.
+    /// The broker answers with `BrowserToRenderer::WebSocketEvent`
+    /// frames for this `socket_id`.
+    WebSocketOpen {
+        socket_id: u64,
+        url: String,
+        protocols: Vec<String>,
+        origin: String,
+    },
+    /// Send one WebSocket message (Stage 16 Phase 3, Rec 11):
+    /// text (`is_binary: false`, UTF-8) or binary. Client masking
+    /// is applied by the browser-side pump, never by script.
+    WebSocketSend {
+        socket_id: u64,
+        data: Vec<u8>,
+        is_binary: bool,
+    },
+    /// Close a WebSocket (Stage 16 Phase 3, Rec 11): the
+    /// browser-side pump sends the close frame and ends the pump.
+    WebSocketClose {
+        socket_id: u64,
+        code: Option<u16>,
+        reason: String,
     },
 }
 
@@ -582,9 +732,129 @@ pub enum Destination {
     Font,
     /// A `fetch()` call (Stage 7). CORS-gated at M5.
     Fetch,
+    /// An `<audio>` element's media (Stage 16 Phase 1, Rec 2):
+    /// split from `Video` so the gates can tell them apart —
+    /// both map to CSP `media-src` and are upgradable mixed
+    /// content, but a future `<audio>`-only rule (e.g. a
+    /// background-audio policy) needs the split.
+    Audio,
+    /// A `<video>` element's media (Stage 16 Phase 1, Rec 2).
+    /// See `Audio`.
+    Video,
+    /// A WebSocket handshake / connection (Stage 16 Phase 1,
+    /// Rec 2). `ws://` on an https page is blockable mixed
+    /// content (see `pluto_net::mixed`); `wss://` is allowed.
+    /// Maps to CSP `connect-src` and the blocker's `$websocket`
+    /// bit. No WebSocket transport exists yet (Rec 11) — the
+    /// destination exists now so the gates are correct before
+    /// the first socket opens.
+    WebSocket,
+    /// A streaming `fetch()` body (Stage 16 Phase 3, Rec 12):
+    /// the response is delivered to JS as a `ReadableStream`,
+    /// chunk by chunk, instead of buffered whole. It gets its own
+    /// caps (1 GiB / 600 s — see `pluto_net::service`) so a
+    /// long-lived stream (SSE, large download) is not killed by
+    /// the 20 s / 10 MiB `Fetch` limits; the 10 MiB bound still
+    /// applies where a body is *buffered* (`.text()` / `.json()`),
+    /// enforced in the realm. Maps to CSP `connect-src` and the
+    /// blocker's `xmlhttprequest` bit, like `Fetch`. Appended last
+    /// so existing variants keep their postcard discriminants.
+    Stream,
     /// Anything else (e.g. a future destination the parser does
     /// not know yet). Gets the most conservative caps.
     Other,
+}
+
+/// One decoded video frame, YUV420 planar (Stage 16 Phase 1,
+/// Rec 1) — the unit of the video-frame channel. YUV420 is the
+/// decoder's native output (openh264, rav1d) and the GPU's
+/// cheapest upload shape (three R8 textures, no CPU RGBA
+/// conversion), and at 1.5 bytes/px it is 2.7× smaller on the wire
+/// than RGBA: a 1080p frame is 1920×1080 + 2×(960×540) =
+/// 3,110,400 bytes vs 8,294,400 RGBA — ~187 MB/s at 60 fps
+/// instead of ~498 MB/s. A 4K frame is 12,441,600 bytes, still
+/// 5× under the 64 MiB frame cap with room for the rest of the
+/// page's traffic; RGBA 4K (33 MB) would evict half the 64 MiB
+/// image and GPU texture caches per frame.
+///
+/// The channel decision was measured, not assumed
+/// (`transport::tests::video_frame_channel_measured_at_1080p60`,
+/// 2026-11-26, sandbox, debug build, three runs): **YUV420 over
+/// the IPC message, 168.6–219.9 fps / 500.1–652.4 MB/s at
+/// 1080p standalone** (2.8–3.7× headroom over 60 fps) and
+/// **59.3 fps / 176.0 MB/s under the full workspace gate's
+/// parallel load** — essentially at the bar when the machine is
+/// busy, which is why the test asserts the load-robust ratio
+/// (YUV ≥ 20× RGBA) rather than an absolute 60 fps. The
+/// socket itself does 2.9 ms/frame, and with `serde_bytes` the
+/// codec is a memcpy. The RGBA-over-`ResourceReady` baseline
+/// measured **0.7 fps / 5.2–5.5 MB/s** on the same harness, so
+/// shared memory and direct wgpu upload were never needed: the
+/// message channel wins by two orders of magnitude, and the
+/// latest-only `FrameChannel` (`pluto-media`) drops instead of
+/// queueing when the consumer falls behind. The same per-byte
+/// serde trap also slows the existing M7
+/// `Resource::Image { rgba }` path — that path is unchanged
+/// here (out of scope), but `serde_bytes` on `Resource` is a
+/// known follow-up.
+///
+/// `origin_clean` is the per-frame tainting decision (Rec 3):
+/// same-origin or `data:` media is clean; cross-origin media is
+/// clean ONLY when its fetch was CORS-approved (`crossorigin`
+/// + a passing CORS check — the approval is recorded on the
+/// fetch, unlike `<img>` today, where no approval is recorded
+/// and every cross-origin image taints). A tainted frame still
+/// paints — it only blocks `drawImage(video)` readback
+/// (`getImageData` / `toDataURL`), exactly like a tainted canvas.
+///
+/// `pts_ms` / `duration_ms` are the presentation timestamps the
+/// A/V clock schedules against (Rec 6); `frame_id` is a
+/// per-element monotonic counter, so the shell can tell a new
+/// frame from a re-send of the last one without hashing pixels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VideoFrame {
+    /// Which `<video>` element this frame belongs to (the
+    /// element's `DomKey` as a `u64`).
+    pub element_id: u64,
+    /// Per-element monotonic frame counter.
+    pub frame_id: u64,
+    /// Frame dimensions in px. All three planes share them
+    /// (`u`/`v` are half-width, half-height: YUV420).
+    pub width: u32,
+    pub height: u32,
+    /// Presentation timestamp, ms on the media clock.
+    pub pts_ms: f64,
+    /// Frame duration, ms (from the container's frame rate).
+    pub duration_ms: f64,
+    /// Luma plane, `width × height` bytes, row stride
+    /// `y_stride`. Serialised as raw bytes (`serde_bytes` —
+    /// see the workspace `Cargo.toml` note): serde's default
+    /// `Vec<u8>` encoding is one call per byte, which measured
+    /// 227 ms encode + 329 ms decode per 1080p frame in debug.
+    #[serde(with = "serde_bytes")]
+    pub y: Vec<u8>,
+    /// Chroma planes, `(width/2) × (height/2)` bytes each,
+    /// row stride `uv_stride`. Same `serde_bytes` treatment.
+    #[serde(with = "serde_bytes")]
+    pub u: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub v: Vec<u8>,
+    /// Bytes per row of the luma plane (≥ `width`).
+    pub y_stride: u32,
+    /// Bytes per row of each chroma plane (≥ `width / 2`).
+    pub uv_stride: u32,
+    /// Whether this frame may be read back by script
+    /// (`drawImage(video)` → `getImageData`/`toDataURL`).
+    /// See the struct docs for the rule.
+    pub origin_clean: bool,
+}
+
+impl VideoFrame {
+    /// Bytes of YUV420 payload (all three planes), excluding
+    /// the message envelope. 1080p = 3,110,400; 4K = 12,441,600.
+    pub fn payload_bytes(&self) -> usize {
+        self.y.len() + self.u.len() + self.v.len()
+    }
 }
 
 /// Fetch priority, mirroring Chromium's five bands
@@ -674,6 +944,41 @@ pub enum ResourceEvent {
     /// The fetch was cancelled (renderer `CancelResource`,
     /// navigation epoch bump, tab close, or timeout).
     Cancelled { request_id: u64 },
+}
+
+/// One WebSocket lifecycle event, browser → renderer (Stage 16
+/// Phase 3, Rec 11). The browser-side pump owns the socket; the
+/// renderer only ever sees these plain-data events, delivered over
+/// the same mpsc bridge as fetch completions — rquickjs values
+/// never cross threads. `Opened` is sent once, after the 101,
+/// carrying the subprotocol the server selected ("" when none);
+/// `Message` carries one frame's payload (text frames are UTF-8
+/// bytes; `is_binary` distinguishes them); `Closed` is terminal
+/// (clean close, error, or tab close — the pump sends exactly one
+/// terminal event per socket); `Error` is a handshake / protocol
+/// failure before `Opened` (after `Opened`, failures arrive as
+/// `Closed` with `clean: false`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum WebSocketEvent {
+    Opened {
+        socket_id: u64,
+        protocol: String,
+    },
+    Message {
+        socket_id: u64,
+        data: Vec<u8>,
+        is_binary: bool,
+    },
+    Closed {
+        socket_id: u64,
+        code: Option<u16>,
+        reason: String,
+        clean: bool,
+    },
+    Error {
+        socket_id: u64,
+        message: String,
+    },
 }
 
 /// Modifier keys held during an input event (Stage 8 Rec 9, v3).
@@ -798,12 +1103,24 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_nine() {
+    fn protocol_version_is_thirteen() {
         // Bumped 5 -> 6 (Stage 13: ResourceRequest.body for form
         // POSTs), 6 -> 7 (Stage 13 Rec 12: SandboxReport +
         // Heartbeat), 7 -> 8 (Stage 14 Rec 9: CompositingUpdate),
-        // and 8 -> 9 (Stage 14 Phase 3, Rec 12: SetTheme).
-        assert_eq!(PROTOCOL_VERSION, 10);
+        // 8 -> 9 (Stage 14 Phase 3, Rec 12: SetTheme), 9 -> 10
+        // (Stage 15 Phase 2, M7 Rec 4: DisplayItem::VectorPath),
+        // 10 -> 11 (Stage 16 Phase 1, Rec 2:
+        // Destination::Audio/Video/WebSocket; Rec 1:
+        // RendererToBrowser::VideoFrame), and 11 -> 12 (Stage 16
+        // Phase 3, Rec 8/9/11/12: CommitNavigation carries
+        // state_json + traversal, DidCommit carries replace, new
+        // HistoryPush / HistoryReplace / HistoryGo / HistorySync
+        // and WebSocketOpen / Send / Close / Event messages, and
+        // Destination::Stream), and 12 -> 13 (Stage 16 Phase 3,
+        // finisher: CommitNavigation also carries the entry's
+        // scroll, and every WebSocketEvent variant carries
+        // `socket_id` — the Phase 3 wire shapes, completed).
+        assert_eq!(PROTOCOL_VERSION, 13);
     }
 
     #[test]
@@ -845,6 +1162,9 @@ mod tests {
         let messages = [
             BrowserToRenderer::CommitNavigation {
                 url: "https://example.com".to_string(),
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
             },
             BrowserToRenderer::Resize {
                 width: 800.0,
@@ -963,6 +1283,7 @@ mod tests {
             RendererToBrowser::DidCommit {
                 url: "https://example.com/".to_string(),
                 status: "Loaded https://example.com/".to_string(),
+                replace: false,
             },
             RendererToBrowser::LoadFailed {
                 url: "https://example.com".to_string(),
@@ -1022,6 +1343,71 @@ mod tests {
         ] {
             let bytes = encode_message(&message);
             let _: RendererToBrowser = decode_message(&bytes).expect("renderer message decodes");
+        }
+    }
+
+    #[test]
+    fn phase3_messages_round_trip_through_versioned_bytes() {
+        // Stage 16 Phase 3 (Rec 8/9/11/12): the history and
+        // WebSocket messages survive the versioned envelope,
+        // including a binary WS frame and a stateful traversal.
+        for message in [
+            BrowserToRenderer::HistorySync {
+                length: 3,
+                index: 1,
+            },
+            BrowserToRenderer::WebSocketEvent {
+                socket_id: 7,
+                event: WebSocketEvent::Message {
+                    socket_id: 7,
+                    data: vec![0, 1, 2, 255],
+                    is_binary: true,
+                },
+            },
+            BrowserToRenderer::WebSocketEvent {
+                socket_id: 7,
+                event: WebSocketEvent::Closed {
+                    socket_id: 7,
+                    code: Some(1000),
+                    reason: "done".to_string(),
+                    clean: true,
+                },
+            },
+        ] {
+            let back: BrowserToRenderer =
+                decode_message(&encode_message(&message)).expect("message decodes");
+            assert_eq!(back, message);
+        }
+        for message in [
+            RendererToBrowser::HistoryPush {
+                url: "https://example.com/app#view".to_string(),
+                state_json: Some("{\"view\":\"home\"}".to_string()),
+            },
+            RendererToBrowser::HistoryReplace {
+                url: "https://example.com/app#other".to_string(),
+                state_json: None,
+            },
+            RendererToBrowser::HistoryGo { delta: -2 },
+            RendererToBrowser::WebSocketOpen {
+                socket_id: 7,
+                url: "wss://example.com/chat".to_string(),
+                protocols: vec!["chat".to_string()],
+                origin: "https://example.com".to_string(),
+            },
+            RendererToBrowser::WebSocketSend {
+                socket_id: 7,
+                data: b"hello".to_vec(),
+                is_binary: false,
+            },
+            RendererToBrowser::WebSocketClose {
+                socket_id: 7,
+                code: Some(1000),
+                reason: String::new(),
+            },
+        ] {
+            let back: RendererToBrowser =
+                decode_message(&encode_message(&message)).expect("message decodes");
+            assert_eq!(back, message);
         }
     }
 
@@ -1106,6 +1492,9 @@ mod tests {
         let (tx, mut rx) = command_channel();
         tx.send(BrowserToRenderer::CommitNavigation {
             url: "https://example.com".to_string(),
+            state_json: None,
+            traversal: false,
+            scroll: (0.0, 0.0),
         })
         .expect("send succeeds while the receiver lives");
         tx.send(BrowserToRenderer::Resize {
@@ -1114,8 +1503,16 @@ mod tests {
         })
         .expect("send succeeds");
         match rx.recv().await.expect("first message arrives") {
-            BrowserToRenderer::CommitNavigation { url } => {
+            BrowserToRenderer::CommitNavigation {
+                url,
+                state_json,
+                traversal,
+                scroll,
+            } => {
                 assert_eq!(url, "https://example.com");
+                assert_eq!(state_json, None);
+                assert!(!traversal);
+                assert_eq!(scroll, (0.0, 0.0));
             }
             other => panic!("expected CommitNavigation, got {other:?}"),
         }

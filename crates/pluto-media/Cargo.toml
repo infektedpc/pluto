@@ -1,0 +1,17 @@
+[package]
+name = "pluto-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pluto-ipc.workspace = true
+thiserror.workspace = true
+symphonia.workspace = true
+openh264.workspace = true
+mp4.workspace = true
+matroska-demuxer.workspace = true
+cpal.workspace = true
+
+[dev-dependencies]
+# Tests read the fixture files from disk; no extra dev deps.

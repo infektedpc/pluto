@@ -35,6 +35,15 @@ pub struct TestHostLog {
     /// Navigation requests from `location.assign` / `replace` /
     /// `reload`, as `(url, replace)` in order.
     pub navigation_requests: Vec<(String, bool)>,
+    /// History API requests (Stage 16 Phase 3, Rec 8): `pushState`
+    /// / `replaceState` as `(url, state_json)` in order.
+    pub history_pushes: Vec<(String, Option<String>)>,
+    /// History API requests (Stage 16 Phase 3, Rec 8):
+    /// `replaceState` as `(url, state_json)` in order.
+    pub history_replaces: Vec<(String, Option<String>)>,
+    /// History API requests (Stage 16 Phase 3, Rec 8):
+    /// `back()` / `forward()` / `go()` as `delta` in order.
+    pub history_traversals: Vec<i32>,
     /// Image requests from `Image()` / `<img>.src`, as
     /// `(url, base_url)` in order.
     pub image_requests: Vec<(String, String)>,
@@ -1004,6 +1013,34 @@ impl DomHost for TestHost {
             .unwrap()
             .navigation_requests
             .push((url.to_string(), replace));
+    }
+
+    fn set_document_url(&mut self, url: &str) {
+        self.document_url = url.to_string();
+    }
+
+    fn request_history_push(&mut self, url: &str, state_json: Option<&str>) {
+        self.log
+            .lock()
+            .unwrap()
+            .history_pushes
+            .push((url.to_string(), state_json.map(|s| s.to_string())));
+    }
+
+    fn request_history_replace(&mut self, url: &str, state_json: Option<&str>) {
+        self.log
+            .lock()
+            .unwrap()
+            .history_replaces
+            .push((url.to_string(), state_json.map(|s| s.to_string())));
+    }
+
+    fn request_history_traversal(&mut self, delta: i32) {
+        self.log
+            .lock()
+            .unwrap()
+            .history_traversals
+            .push(delta);
     }
 
     fn attribute_names(&self, key: DomKey) -> Vec<String> {

@@ -40,6 +40,7 @@ pub mod redirect;
 pub mod referrer;
 pub mod service;
 pub mod sri;
+pub mod websocket;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

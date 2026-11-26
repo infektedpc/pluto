@@ -605,7 +605,10 @@ fn dom_rect<'js>(ctx: &Ctx<'js>, rect: [f64; 4]) -> rquickjs::Result<Object<'js>
 /// One `IntersectionObserverEntry` as a plain JS object. `time` is
 /// the computation timestamp (ms since the tab started), not the
 /// delivery time. `rootBounds` is always a rect in Pluto (same
-/// origin only — no cross-origin null root).
+/// origin only — no cross-origin null root). All three rects are
+/// VIEWPORT-relative (Stage 16 Phase 1, Rec 10): the tab converts
+/// the layout actor's page coordinates before the registry queues
+/// the entry.
 fn intersection_entry_to_js<'js>(
     ctx: &Ctx<'js>,
     state: &Rc<RefCell<BindingState>>,
@@ -650,11 +653,11 @@ fn install_intersection_observer<'js>(
              throw new TypeError('IntersectionObserver constructor requires new'); \
            if (typeof cb !== 'function') \
              throw new TypeError('IntersectionObserver: callback is not a function'); \
-           const id = IntersectionObserver.__pluto_new(cb, this); \
+           const id = IntersectionObserver.__pluto_new(cb, this, options); \
            Object.defineProperty(this, '__pluto_id', { value: id }); \
          }; \
-         IntersectionObserver.prototype.observe = function (target, options) { \
-           return IntersectionObserver.__pluto_observe(this.__pluto_id, target, options || {}); \
+         IntersectionObserver.prototype.observe = function (target) { \
+           return IntersectionObserver.__pluto_observe(this.__pluto_id, target); \
          }; \
          IntersectionObserver.prototype.unobserve = function (target) { \
            return IntersectionObserver.__pluto_unobserve(this.__pluto_id, target); \
@@ -672,17 +675,75 @@ fn install_intersection_observer<'js>(
         .get("IntersectionObserver")
         .map_err(|e| format!("IntersectionObserver global: {e}"))?;
 
-    // __pluto_new(callback, instance) -> id
+    // __pluto_new(callback, instance, options) -> id. The
+    // constructor parses `root` / `rootMargin` / `threshold`
+    // (Stage 16 Phase 1, Rec 10 — the options belong to the
+    // CONSTRUCTOR, per spec; the old shape parsed them in
+    // `observe()` instead, so `new IntersectionObserver(cb,
+    // { threshold: 0.5 })` silently observed with the default
+    // threshold 0). Invalid options throw here: RangeError for
+    // an out-of-range threshold, TypeError for a bad rootMargin
+    // or a non-Element root.
     let b = Rc::clone(bindings);
     let new_fn = Function::new(
         ctx.clone(),
-        move |ctx: Ctx<'js>, cb: Function<'js>, instance: Object<'js>| -> rquickjs::Result<f64> {
+        move |ctx: Ctx<'js>,
+              cb: Function<'js>,
+              instance: Object<'js>,
+              options: Opt<Value<'js>>|
+              -> rquickjs::Result<f64> {
             let id = {
                 let mut s = b.borrow_mut();
                 let id = s.next_intersection_observer_id;
                 s.next_intersection_observer_id += 1;
                 id
             };
+            let opts = options
+                .0
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_else(|| Object::new(ctx.clone()).unwrap());
+            let host = host_of(&b).map_err(|e| throw_type_error(&ctx, &e))?;
+            // `root`: null / undefined = the viewport; otherwise an
+            // Element. A root that is not an ancestor of the target
+            // is NOT an error — the geometry step reports it as
+            // never intersecting (the initial entry still fires).
+            let root = match opts.get::<_, Value>("root").ok() {
+                Some(v) if !v.is_null() && !v.is_undefined() => {
+                    let root_key = dom_key_of_value(&ctx, &b, &v)?;
+                    if host.borrow().node_type(root_key) != Some(1) {
+                        return Err(throw_type_error(
+                            &ctx,
+                            "IntersectionObserver: root is not an Element",
+                        ));
+                    }
+                    Some(root_key)
+                }
+                _ => None,
+            };
+            let root_margin = match opt_string(&opts, "rootMargin") {
+                None => RootMargin::default(),
+                Some(s) => RootMargin::parse(&s).ok_or_else(|| {
+                    throw_type_error(&ctx, "IntersectionObserver: invalid rootMargin")
+                })?,
+            };
+            let thresholds = match opt_thresholds(&opts) {
+                None => vec![0.0],
+                Some(ts) => {
+                    for t in &ts {
+                        if !(0.0..=1.0).contains(t) {
+                            return Err(throw_named(
+                                &ctx,
+                                "RangeError",
+                                "IntersectionObserver: threshold must be between 0 and 1",
+                            ));
+                        }
+                    }
+                    ts
+                }
+            };
+            b.borrow_mut()
+                .intersection_registry
+                .configure_observer(id as u64, root, root_margin, thresholds);
             let map = registry_map(&ctx, "intersectionObservers")?;
             map_set(&ctx, &map, id, js(&ctx, cb))?;
             let instances = registry_map(&ctx, "intersectionObserverInstances")?;
@@ -694,15 +755,12 @@ fn install_intersection_observer<'js>(
     ctor.set("__pluto_new", new_fn)
         .map_err(|e| format!("install __pluto_new intersection observer: {e}"))?;
 
-    // __pluto_observe(id, target, options)
+    // __pluto_observe(id, target) — option-less, per spec: the
+    // observer's options were fixed at construction.
     let b = Rc::clone(bindings);
     let observe_fn = Function::new(
         ctx.clone(),
-        move |ctx: Ctx<'js>,
-              id: f64,
-              target: Value<'js>,
-              options: Opt<Value<'js>>|
-              -> rquickjs::Result<()> {
+        move |ctx: Ctx<'js>, id: f64, target: Value<'js>| -> rquickjs::Result<()> {
             let key = dom_key_of_value(&ctx, &b, &target)?;
             let host = host_of(&b).map_err(|e| throw_type_error(&ctx, &e))?;
             // IntersectionObserver only observes Elements.
@@ -712,55 +770,7 @@ fn install_intersection_observer<'js>(
                     "IntersectionObserver.observe: target is not an Element",
                 ));
             }
-            let opts = options
-                .0
-                .and_then(|v| v.as_object().cloned())
-                .unwrap_or_else(|| Object::new(ctx.clone()).unwrap());
-            // `root`: null / undefined = the viewport; otherwise an
-            // Element. A root that is not an ancestor of the target
-            // is NOT an error — the geometry step reports it as
-            // never intersecting (the initial entry still fires).
-            let root = match opts.get::<_, Value>("root").ok() {
-                Some(v) if !v.is_null() && !v.is_undefined() => {
-                    let root_key = dom_key_of_value(&ctx, &b, &v)?;
-                    if host.borrow().node_type(root_key) != Some(1) {
-                        return Err(throw_type_error(
-                            &ctx,
-                            "IntersectionObserver.observe: root is not an Element",
-                        ));
-                    }
-                    Some(root_key)
-                }
-                _ => None,
-            };
-            let root_margin = match opt_string(&opts, "rootMargin") {
-                None => RootMargin::default(),
-                Some(s) => RootMargin::parse(&s).ok_or_else(|| {
-                    throw_type_error(&ctx, "IntersectionObserver.observe: invalid rootMargin")
-                })?,
-            };
-            let thresholds = match opt_thresholds(&opts) {
-                None => vec![0.0],
-                Some(ts) => {
-                    for t in &ts {
-                        if !(0.0..=1.0).contains(t) {
-                            return Err(throw_named(
-                                &ctx,
-                                "RangeError",
-                                "IntersectionObserver.observe: threshold must be between 0 and 1",
-                            ));
-                        }
-                    }
-                    ts
-                }
-            };
-            b.borrow_mut().intersection_registry.observe(
-                id as u64,
-                key,
-                root,
-                root_margin,
-                thresholds,
-            );
+            b.borrow_mut().intersection_registry.observe(id as u64, key);
             Ok(())
         },
     )

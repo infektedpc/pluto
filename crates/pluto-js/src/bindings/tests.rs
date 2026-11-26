@@ -13,9 +13,11 @@ use std::sync::mpsc;
 
 use pluto_ipc::{Origin, RequestMode};
 
+use crate::bindings::fetch::FetchStreamEvent;
 use crate::bindings::fetch::{
     FetchBackend, FetchCompletion, FetchError, FetchRequest, FetchResponse, ResponseType,
 };
+use crate::bindings::websocket::{WebSocketBackend, WsConnectRequest, WsEvent};
 use crate::bindings::events::TypedEventKind;
 use crate::host::{CanvasCall, DomHost};
 use crate::bindings::test_host::{TestHost, TestHostLog};
@@ -1232,7 +1234,7 @@ fn intersection_observer_fires_initial_entry_after_paint_then_stays_quiet() {
     assert!(root.is_none(), "no root option means the viewport");
     let mut geometry = HashMap::new();
     geometry.insert((id, target), full_geometry());
-    tab.run_intersection_observers_with_geometry(&geometry, 42.0);
+    tab.run_intersection_observers_with_geometry(&geometry, 42.0, (0.0, 0.0));
     // Still nothing delivered: the callback is a queued task, after
     // paint — it must not run inline in the step.
     assert_eq!(read_num(&mut tab, "__entries.length"), 0.0);
@@ -1261,7 +1263,7 @@ fn intersection_observer_fires_initial_entry_after_paint_then_stays_quiet() {
         100.0
     );
     // A second step with unchanged geometry delivers nothing.
-    tab.run_intersection_observers_with_geometry(&geometry, 58.0);
+    tab.run_intersection_observers_with_geometry(&geometry, 58.0, (0.0, 0.0));
     tab.run_until_idle().unwrap();
     assert_eq!(read_num(&mut tab, "__entries.length"), 1.0);
 }
@@ -1272,20 +1274,20 @@ fn intersection_observer_options_validation_take_records_and_threshold() {
     run(
         &mut tab,
         "globalThis.__entries = []; \
-         const io = new IntersectionObserver((entries) => { \
-           for (const e of entries) globalThis.__entries.push(e); \
-         }); \
          const app = document.getElementById('app'); \
          let range_err = ''; \
-         try { io.observe(app, { threshold: 1.5 }); } catch (e) { range_err = e.name; } \
+         try { new IntersectionObserver(() => {}, { threshold: 1.5 }); } catch (e) { range_err = e.name; } \
          let margin_err = ''; \
-         try { io.observe(app, { rootMargin: '10em' }); } catch (e) { margin_err = e.name; } \
+         try { new IntersectionObserver(() => {}, { rootMargin: '10em' }); } catch (e) { margin_err = e.name; } \
          let el_err = ''; \
-         try { io.observe(document.createTextNode('x')); } catch (e) { el_err = e.name; } \
+         try { new IntersectionObserver(() => {}).observe(document.createTextNode('x')); } catch (e) { el_err = e.name; } \
          globalThis.__range_err = range_err; \
          globalThis.__margin_err = margin_err; \
          globalThis.__el_err = el_err; \
-         io.observe(app, { threshold: [0.5] });",
+         const io = new IntersectionObserver((entries) => { \
+           for (const e of entries) globalThis.__entries.push(e); \
+         }, { threshold: [0.5] }); \
+         io.observe(app);",
     );
     assert_eq!(read_str(&mut tab, "__range_err"), "RangeError");
     assert_eq!(read_str(&mut tab, "__margin_err"), "TypeError");
@@ -1300,7 +1302,7 @@ fn intersection_observer_options_validation_take_records_and_threshold() {
     out_of_view.is_intersecting = false;
     let mut geometry = HashMap::new();
     geometry.insert((id, target), out_of_view);
-    tab.run_intersection_observers_with_geometry(&geometry, 0.0);
+    tab.run_intersection_observers_with_geometry(&geometry, 0.0, (0.0, 0.0));
     // takeRecords() returns the pending entry before the task runs,
     // and the task then has nothing left to deliver. Read through
     // `eval_value` (which drains microtasks but never runs tasks):
@@ -1323,7 +1325,7 @@ fn intersection_observer_options_validation_take_records_and_threshold() {
     quarter.intersection_rect = [0.0, 0.0, 100.0, 12.5];
     quarter.ratio = 0.25;
     geometry.insert((id, target), quarter);
-    tab.run_intersection_observers_with_geometry(&geometry, 16.0);
+    tab.run_intersection_observers_with_geometry(&geometry, 16.0, (0.0, 0.0));
     tab.run_until_idle().unwrap();
     assert_eq!(read_num(&mut tab, "__entries.length"), 1.0);
     assert_eq!(read_num(&mut tab, "__entries[0].intersectionRatio"), 0.25);
@@ -1332,7 +1334,7 @@ fn intersection_observer_options_validation_take_records_and_threshold() {
     forty.intersection_rect = [0.0, 0.0, 100.0, 20.0];
     forty.ratio = 0.4;
     geometry.insert((id, target), forty);
-    tab.run_intersection_observers_with_geometry(&geometry, 32.0);
+    tab.run_intersection_observers_with_geometry(&geometry, 32.0, (0.0, 0.0));
     tab.run_until_idle().unwrap();
     assert_eq!(read_num(&mut tab, "__entries.length"), 1.0);
     // 60%: crosses 0.5 upward — fires.
@@ -1340,10 +1342,158 @@ fn intersection_observer_options_validation_take_records_and_threshold() {
     sixty.intersection_rect = [0.0, 0.0, 100.0, 30.0];
     sixty.ratio = 0.6;
     geometry.insert((id, target), sixty);
-    tab.run_intersection_observers_with_geometry(&geometry, 48.0);
+    tab.run_intersection_observers_with_geometry(&geometry, 48.0, (0.0, 0.0));
     tab.run_until_idle().unwrap();
     assert_eq!(read_num(&mut tab, "__entries.length"), 2.0);
     assert_eq!(read_num(&mut tab, "__entries[1].intersectionRatio"), 0.6);
+}
+
+// Stage 16 Phase 1, Rec 10: entry rects are viewport-relative
+// after scrolling, and the constructor's threshold is the one
+// that gates entries.
+#[test]
+fn intersection_observer_rects_are_viewport_relative_after_scroll() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "globalThis.__entries = []; \
+         const io = new IntersectionObserver((entries) => { \
+           for (const e of entries) globalThis.__entries.push(e); \
+         }, { threshold: [0.5] }); \
+         io.observe(document.getElementById('app'));",
+    );
+    let targets = tab.intersection_observation_targets();
+    assert_eq!(targets.len(), 1);
+    let (id, target, _, _) = targets[0];
+    // Page coordinates, as the layout actor measures them: the
+    // target sits at y=200..250 on the page; the viewport is
+    // scrolled 100px down, so its viewport-relative rect is
+    // y=100..150 and the root bounds start at y=0.
+    let mut geo = full_geometry();
+    geo.target_rect = [0.0, 200.0, 100.0, 50.0];
+    geo.root_bounds = [0.0, 100.0, 1024.0, 768.0];
+    geo.intersection_rect = [0.0, 200.0, 100.0, 50.0];
+    geo.ratio = 1.0;
+    let mut geometry = HashMap::new();
+    geometry.insert((id, target), geo);
+    tab.run_intersection_observers_with_geometry(&geometry, 0.0, (0.0, 100.0));
+    tab.run_until_idle().unwrap();
+    assert_eq!(read_num(&mut tab, "__entries.length"), 1.0);
+    assert_eq!(
+        read_num(&mut tab, "__entries[0].boundingClientRect.y"),
+        100.0,
+        "page y=200 minus 100px of scroll"
+    );
+    assert_eq!(
+        read_num(&mut tab, "__entries[0].boundingClientRect.top"),
+        100.0
+    );
+    assert_eq!(read_num(&mut tab, "__entries[0].rootBounds.y"), 0.0);
+    assert_eq!(
+        read_num(&mut tab, "__entries[0].rootBounds.top"),
+        0.0
+    );
+    assert_eq!(
+        read_num(&mut tab, "__entries[0].intersectionRect.y"),
+        100.0
+    );
+    // A within-band move (1.0 -> 0.75, still above the 0.5
+    // threshold) delivers nothing.
+    let mut seventy_five = geo;
+    seventy_five.intersection_rect = [0.0, 200.0, 100.0, 37.5];
+    seventy_five.ratio = 0.75;
+    geometry.insert((id, target), seventy_five);
+    tab.run_intersection_observers_with_geometry(&geometry, 16.0, (0.0, 100.0));
+    tab.run_until_idle().unwrap();
+    assert_eq!(read_num(&mut tab, "__entries.length"), 1.0);
+}
+
+// Stage 16 Phase 1, Rec 10: `disconnect()` / `unobserve()` drop
+// already-queued pending entries — a disconnected observer never
+// delivers a stale entry.
+#[test]
+fn intersection_observer_disconnect_and_unobserve_drop_pending_entries() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "globalThis.__entries = []; \
+         const io = new IntersectionObserver((entries) => { \
+           for (const e of entries) globalThis.__entries.push(e); \
+         }); \
+         const io2 = new IntersectionObserver((entries) => { \
+           for (const e of entries) globalThis.__entries.push(e); \
+         }); \
+         io.observe(document.getElementById('app')); \
+         io2.observe(document.getElementById('app'));",
+    );
+    let targets = tab.intersection_observation_targets();
+    assert_eq!(targets.len(), 2);
+    let mut geometry = HashMap::new();
+    for (id, target, _, _) in &targets {
+        geometry.insert((*id, *target), full_geometry());
+    }
+    // Both observers gather an initial entry…
+    tab.run_intersection_observers_with_geometry(&geometry, 0.0, (0.0, 0.0));
+    // …then one disconnects and the other unobserves, before the
+    // delivery task runs. `eval_value` evaluates synchronously
+    // (it never runs tasks), so the disconnect lands first — a
+    // `run()` here would drive the loop and the queued delivery
+    // task (DomManipulation) would outrank the Script task.
+    tab.eval_value(
+        "(io.disconnect(), io2.unobserve(document.getElementById('app')), 0)",
+    )
+    .unwrap();
+    tab.run_until_idle().unwrap();
+    assert_eq!(
+        read_num(&mut tab, "__entries.length"),
+        0.0,
+        "no entry may be delivered after disconnect/unobserve"
+    );
+    // takeRecords() agrees: the pending entries are gone too.
+    assert_eq!(
+        read_num(&mut tab, "io.takeRecords().length"),
+        0.0
+    );
+}
+
+// ---------------------------------------------------------------- Stage 16 Phase 1, Rec 7
+
+#[test]
+fn user_activation_and_autoplay_policy() {
+    use crate::activation::AutoplayDecision;
+    let mut tab = test_tab();
+    // Fresh tab: no activation of either kind.
+    assert!(!read_bool(&mut tab, "navigator.userActivation.isActive"));
+    assert!(!read_bool(
+        &mut tab,
+        "navigator.userActivation.hasBeenActive"
+    ));
+    assert!(!tab.user_activation_is_active());
+    assert!(!tab.user_activation_has_been_active());
+    // No activation: unmuted autoplay is muted-only; muted plays.
+    assert_eq!(tab.autoplay_decision(false), AutoplayDecision::MutedOnly);
+    assert_eq!(tab.autoplay_decision(true), AutoplayDecision::Allow);
+    // A trusted gesture (what the renderer records from a
+    // pointerdown / keydown `InputEvent`): both flags go live
+    // and sound is unlocked.
+    tab.note_user_activation();
+    assert!(read_bool(&mut tab, "navigator.userActivation.isActive"));
+    assert!(read_bool(
+        &mut tab,
+        "navigator.userActivation.hasBeenActive"
+    ));
+    assert!(tab.user_activation_is_active());
+    assert!(tab.user_activation_has_been_active());
+    assert_eq!(tab.autoplay_decision(false), AutoplayDecision::Allow);
+    // Navigation clears transient but keeps sticky (so sound
+    // stays unlocked after a same-tab navigation).
+    tab.navigate().unwrap();
+    assert!(!read_bool(&mut tab, "navigator.userActivation.isActive"));
+    assert!(read_bool(
+        &mut tab,
+        "navigator.userActivation.hasBeenActive"
+    ));
+    assert_eq!(tab.autoplay_decision(false), AutoplayDecision::Allow);
 }
 
 // ---------------------------------------------------------------- Stage 12 Rec 7: binding batch
@@ -2171,4 +2321,479 @@ fn css_animation_in_get_animations() {
     let logged = log.lock().unwrap();
     assert_eq!(logged.css_controls.len(), 1);
     assert_eq!(logged.css_controls[0].1, "fade");
+}
+
+
+
+
+
+// ---------------------------------------------------------------- Stage 16 Phase 3: history, streams, WebSocket, EventSource
+
+/// A tab whose host records side effects into a shared log the test
+/// can read after the host has moved into the tab.
+fn test_tab_with_log() -> (TabJs, Arc<Mutex<TestHostLog>>) {
+    let log = Arc::new(Mutex::new(TestHostLog::default()));
+    let mut tab = TabJs::new(&RealmConfig::default()).unwrap();
+    tab.set_dom_host(Box::new(TestHost::from_html_with_log(DOC, Arc::clone(&log))));
+    (tab, log)
+}
+
+/// A fake streaming backend: answers every fetch with the same
+/// status / headers, then the configured chunks in order, then
+/// `Done` — over the chunk channel (`start_stream_fetch` is
+/// overridden; `start_fetch` is never called).
+struct ChunkedBackend {
+    requests: Arc<Mutex<Vec<FetchRequest>>>,
+    status: u16,
+    headers: Vec<(String, String)>,
+    chunks: Vec<Vec<u8>>,
+}
+
+impl ChunkedBackend {
+    fn new(
+        status: u16,
+        headers: Vec<(String, String)>,
+        chunks: Vec<Vec<u8>>,
+    ) -> (Arc<Self>, Arc<Mutex<Vec<FetchRequest>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(Self {
+            requests: Arc::clone(&requests),
+            status,
+            headers,
+            chunks,
+        });
+        (backend, requests)
+    }
+
+    fn json_chunks(chunks: &[&str]) -> (Arc<Self>, Arc<Mutex<Vec<FetchRequest>>>) {
+        Self::new(
+            200,
+            vec![("content-type".to_string(), "application/json".to_string())],
+            chunks.iter().map(|c| c.as_bytes().to_vec()).collect(),
+        )
+    }
+}
+
+impl FetchBackend for ChunkedBackend {
+    fn start_fetch(&self, request: FetchRequest, done: mpsc::Sender<FetchCompletion>) {
+        let _ = done.send(FetchCompletion {
+            id: request.id,
+            result: Err(FetchError::Network(
+                "chunked backend: start_fetch is never called".to_string(),
+            )),
+        });
+    }
+
+    fn start_stream_fetch(
+        &self,
+        request: FetchRequest,
+        stream_tx: mpsc::Sender<FetchStreamEvent>,
+    ) {
+        let id = request.id;
+        self.requests.lock().unwrap().push(request);
+        let _ = stream_tx.send(FetchStreamEvent::Headers {
+            id,
+            status: self.status,
+            status_text: "OK".to_string(),
+            headers: self.headers.clone(),
+            response_type: ResponseType::Basic,
+        });
+        for chunk in &self.chunks {
+            let _ = stream_tx.send(FetchStreamEvent::Chunk {
+                id,
+                bytes: chunk.clone(),
+            });
+        }
+        let _ = stream_tx.send(FetchStreamEvent::Done { id });
+    }
+}
+
+/// A fake `WebSocket` backend: opens at once (negotiating
+/// `"chat"`), echoes every `send()` back as a message, and closes
+/// cleanly on `close()`.
+struct FakeWsBackend {
+    connects: Arc<Mutex<Vec<WsConnectRequest>>>,
+    sends: Arc<Mutex<Vec<(u64, Vec<u8>, bool)>>>,
+    closes: Arc<Mutex<Vec<(u64, Option<u16>, String)>>>,
+    senders: Arc<Mutex<HashMap<u64, mpsc::Sender<WsEvent>>>>,
+}
+
+impl FakeWsBackend {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            connects: Arc::new(Mutex::new(Vec::new())),
+            sends: Arc::new(Mutex::new(Vec::new())),
+            closes: Arc::new(Mutex::new(Vec::new())),
+            senders: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+}
+
+impl WebSocketBackend for FakeWsBackend {
+    fn connect(&self, request: WsConnectRequest, events: mpsc::Sender<WsEvent>) {
+        self.senders
+            .lock()
+            .unwrap()
+            .insert(request.id, events.clone());
+        self.connects.lock().unwrap().push(request.clone());
+        let _ = events.send(WsEvent::Opened {
+            id: request.id,
+            protocol: "chat".to_string(),
+        });
+    }
+
+    fn send(&self, id: u64, data: Vec<u8>, is_binary: bool) {
+        self.sends.lock().unwrap().push((id, data.clone(), is_binary));
+        if let Some(tx) = self.senders.lock().unwrap().get(&id) {
+            let _ = tx.send(WsEvent::Message { id, data, is_binary });
+        }
+    }
+
+    fn close(&self, id: u64, code: Option<u16>, reason: String) {
+        self.closes
+            .lock()
+            .unwrap()
+            .push((id, code, reason.clone()));
+        if let Some(tx) = self.senders.lock().unwrap().get(&id) {
+            let _ = tx.send(WsEvent::Closed {
+                id,
+                code,
+                reason,
+                clean: true,
+            });
+        }
+    }
+}
+
+#[test]
+fn history_push_replace_state_length() {
+    let (mut tab, log) = test_tab_with_log();
+    run(
+        &mut tab,
+        "globalThis.__before = [history.length, history.state].join('|'); \
+         history.pushState({page: 2}, '', '/page2'); \
+         globalThis.__after_push = [history.length, JSON.stringify(history.state), location.pathname].join('|'); \
+         history.replaceState({page: 3}, '', '/page3'); \
+         globalThis.__after_replace = [history.length, JSON.stringify(history.state), location.pathname].join('|'); \
+         try { history.pushState(null, '', 'https://other.com/x'); globalThis.__x = 'no-throw'; } \
+         catch (e) { globalThis.__x = e.name; }",
+    );
+    assert_eq!(read_str(&mut tab, "__before"), "1|");
+    assert_eq!(read_str(&mut tab, "__after_push"), "2|{\"page\":2}|/page2");
+    assert_eq!(
+        read_str(&mut tab, "__after_replace"),
+        "2|{\"page\":3}|/page3"
+    );
+    assert_eq!(read_str(&mut tab, "__x"), "SecurityError");
+    let log = log.lock().unwrap();
+    assert_eq!(
+        log.history_pushes,
+        vec![(
+            "https://example.com/page2".to_string(),
+            Some("{\"page\":2}".to_string())
+        )]
+    );
+    assert_eq!(
+        log.history_replaces,
+        vec![(
+            "https://example.com/page3".to_string(),
+            Some("{\"page\":3}".to_string())
+        )]
+    );
+    // pushState never fetches: no navigation request was logged.
+    assert!(log.navigation_requests.is_empty());
+}
+
+#[test]
+fn history_back_forward_go_request_traversal() {
+    let (mut tab, log) = test_tab_with_log();
+    run(
+        &mut tab,
+        "history.back(); history.forward(); history.go(-2); history.go(0); globalThis.__r = history.length;",
+    );
+    assert_eq!(read_num(&mut tab, "__r"), 1.0);
+    assert_eq!(log.lock().unwrap().history_traversals, vec![-1, 1, -2, 0]);
+}
+
+#[test]
+fn history_popstate_fires_with_state() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "const seen = []; \
+         window.addEventListener('popstate', (e) => seen.push(JSON.stringify(e.state))); \
+         window.onpopstate = (e) => seen.push('handler:' + JSON.stringify(e.state)); \
+         globalThis.__seen = seen;",
+    );
+    // The renderer calls both after a Back/Forward commit: the
+    // realm state first, then the popstate dispatch.
+    tab.set_history_state(Some("{\"page\":5}".to_string()));
+    tab.dispatch_popstate(Some("{\"page\":5}".to_string()));
+    tab.run_until_idle().unwrap();
+    assert_eq!(
+        read_str(&mut tab, "__seen.join(',')"),
+        "{\"page\":5},handler:{\"page\":5}"
+    );
+    assert_eq!(
+        read_str(&mut tab, "JSON.stringify(history.state)"),
+        "{\"page\":5}"
+    );
+}
+
+#[test]
+fn hashchange_fires_with_urls() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "const seen = []; \
+         window.addEventListener('hashchange', (e) => seen.push(e.oldURL + '->' + e.newURL)); \
+         window.onhashchange = (e) => seen.push('handler:' + e.newURL); \
+         globalThis.__seen = seen;",
+    );
+    tab.dispatch_hashchange(
+        "https://example.com/page".to_string(),
+        "https://example.com/page#section".to_string(),
+    );
+    tab.run_until_idle().unwrap();
+    assert_eq!(
+        read_str(&mut tab, "__seen.join(',')"),
+        "https://example.com/page->https://example.com/page#section,handler:https://example.com/page#section"
+    );
+}
+
+#[test]
+fn window_capture_listener_fires_once() {
+    // Regression test for the `propagation_path` fix (Stage 16
+    // Phase 3, Rec 9): a window target used to build
+    // `[window, window]`, so a capture listener ran twice (capture
+    // + target phase) and a bubble listener twice (target + bubble
+    // phase). A window event must run each listener exactly once.
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "let n = 0; let m = 0; \
+         window.addEventListener('click', () => n++, true); \
+         window.addEventListener('click', () => m++, false); \
+         window.dispatchEvent(new Event('click', { bubbles: true })); \
+         globalThis.__r = [n, m].join(',');",
+    );
+    assert_eq!(read_str(&mut tab, "__r"), "1,1");
+}
+
+#[test]
+fn fetch_stream_delivers_chunks_incrementally() {
+    let (backend, _) = ChunkedBackend::json_chunks(&["hel", "lo ", "world"]);
+    let mut tab = test_tab();
+    tab.set_fetch_backend(backend);
+    run(
+        &mut tab,
+        "fetch('/x').then(async (r) => { \
+           const reader = r.body.getReader(); \
+           const c1 = await reader.read(); \
+           const c2 = await reader.read(); \
+           const c3 = await reader.read(); \
+           const c4 = await reader.read(); \
+           globalThis.__r = [c1.value.length, c1.value[0], c2.value.length, c2.value[0], c3.value.length, c3.value[0], c4.done].join('|'); \
+         });",
+    );
+    assert_eq!(read_str(&mut tab, "__r"), "3|104|3|108|5|119|true");
+}
+
+#[test]
+fn fetch_text_waits_for_stream_done() {
+    let (backend, _) = ChunkedBackend::json_chunks(&["hel", "lo ", "world"]);
+    let mut tab = test_tab();
+    tab.set_fetch_backend(backend);
+    run(
+        &mut tab,
+        "fetch('/x').then((r) => r.text()).then((t) => { globalThis.__r = t; });",
+    );
+    assert_eq!(read_str(&mut tab, "__r"), "hello world");
+}
+
+#[test]
+fn fetch_stream_body_over_cap_rejects() {
+    // The 10 MiB cap moved to the buffering point (Stage 16 Phase
+    // 3, Rec 12): a body that grows past it while buffering errors
+    // the stream, so `.text()` rejects instead of reading a
+    // half-filled buffer.
+    let big = vec![b'x'; 11 * 1024 * 1024];
+    let (backend, _) = ChunkedBackend::new(
+        200,
+        vec![("content-type".to_string(), "text/plain".to_string())],
+        vec![big],
+    );
+    let mut tab = test_tab();
+    tab.set_fetch_backend(backend);
+    run(
+        &mut tab,
+        "fetch('/x').then((r) => r.text()).then(\
+           () => { globalThis.__r = 'resolved'; }, \
+           (e) => { globalThis.__r = 'rejected:' + e.name; });",
+    );
+    assert_eq!(read_str(&mut tab, "__r"), "rejected:TypeError");
+}
+
+#[test]
+fn websocket_echo_round_trip() {
+    let backend = FakeWsBackend::new();
+    let mut tab = test_tab();
+    tab.set_websocket_backend(backend.clone());
+    run(
+        &mut tab,
+        "const ws = new WebSocket('ws://example.com/echo', 'chat'); \
+         const log = []; \
+         ws.onopen = () => log.push('open:' + ws.protocol + ':' + ws.readyState); \
+         ws.onmessage = (e) => log.push(e.data instanceof Uint8Array ? 'bin:' + e.data[0] + ',' + e.data[1] : 'msg:' + e.data); \
+         ws.onclose = (e) => log.push('close:' + e.code + ':' + e.wasClean + ':' + ws.readyState); \
+         ws.onerror = () => log.push('error'); \
+         globalThis.__ws = ws; globalThis.__log = log;",
+    );
+    assert_eq!(read_str(&mut tab, "__log.join(',')"), "open:chat:1");
+    assert_eq!(read_num(&mut tab, "__ws.readyState"), 1.0);
+    assert_eq!(read_str(&mut tab, "__ws.binaryType"), "arraybuffer");
+    tab.eval_value("__ws.send('hi')").unwrap();
+    tab.run_until_idle().unwrap();
+    assert_eq!(
+        read_str(&mut tab, "__log.join(',')"),
+        "open:chat:1,msg:hi"
+    );
+    tab.eval_value("__ws.send(new Uint8Array([104, 105]).buffer)")
+        .unwrap();
+    tab.run_until_idle().unwrap();
+    assert_eq!(
+        read_str(&mut tab, "__log.join(',')"),
+        "open:chat:1,msg:hi,bin:104,105"
+    );
+    tab.eval_value("__ws.close(1000, 'done')").unwrap();
+    tab.run_until_idle().unwrap();
+    assert_eq!(
+        read_str(&mut tab, "__log.join(',')"),
+        "open:chat:1,msg:hi,bin:104,105,close:1000:true:3"
+    );
+    let connects = backend.connects.lock().unwrap();
+    assert_eq!(connects.len(), 1);
+    assert_eq!(connects[0].url, "ws://example.com/echo");
+    assert_eq!(connects[0].protocols, vec!["chat".to_string()]);
+    assert_eq!(connects[0].origin, "https://example.com");
+    assert_eq!(backend.sends.lock().unwrap().len(), 2);
+    assert_eq!(
+        backend.closes.lock().unwrap().clone(),
+        vec![(1, Some(1000), "done".to_string())]
+    );
+}
+
+#[test]
+fn websocket_binary_type_blob() {
+    let backend = FakeWsBackend::new();
+    let mut tab = test_tab();
+    tab.set_websocket_backend(backend);
+    run(
+        &mut tab,
+        "const ws = new WebSocket('ws://example.com/echo'); \
+         ws.binaryType = 'blob'; \
+         ws.onopen = () => ws.send(new Uint8Array([1, 2, 3]).buffer); \
+         ws.onmessage = (e) => { globalThis.__r = e.data.size + ':' + e.data.type; };",
+    );
+    assert_eq!(read_str(&mut tab, "__r"), "3:");
+}
+
+#[test]
+fn websocket_requires_backend() {
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "try { new WebSocket('ws://example.com/'); globalThis.__r = 'no-throw'; } \
+         catch (e) { globalThis.__r = e.name; }",
+    );
+    assert_eq!(read_str(&mut tab, "__r"), "TypeError");
+}
+
+#[test]
+fn event_source_receives_streamed_events() {
+    let (backend, requests) = ChunkedBackend::new(
+        200,
+        vec![("content-type".to_string(), "text/event-stream".to_string())],
+        vec![
+            b"data: hello\n\n".to_vec(),
+            b"event: custom\ndata: world\n\n".to_vec(),
+            b"id: 42\ndata: with-id\nretry: 50\n\n".to_vec(),
+        ],
+    );
+    let mut tab = test_tab();
+    tab.set_fetch_backend(backend);
+    run(
+        &mut tab,
+        "const es = new EventSource('/sse'); \
+         let opens = 0; let errs = 0; const msgs = []; \
+         es.onopen = () => opens++; \
+         es.onerror = () => errs++; \
+         es.onmessage = (e) => msgs.push(e.data + '#' + e.lastEventId); \
+         es.addEventListener('custom', (e) => msgs.push('custom:' + e.data)); \
+         setTimeout(() => { es.close(); globalThis.__r = opens + '|' + errs + '|' + msgs.slice(0, 3).join(','); }, 400);",
+    );
+    let report = read_str(&mut tab, "__r");
+    let parts: Vec<&str> = report.split('|').collect();
+    assert_eq!(parts.len(), 3);
+    let opens: u32 = parts[0].parse().unwrap();
+    let errs: u32 = parts[1].parse().unwrap();
+    assert!(opens >= 2, "expected a reconnect (opens={opens})");
+    assert!(errs >= 1, "expected an error event (errs={errs})");
+    assert_eq!(parts[2], "hello#,custom:world,with-id#42");
+    // The reconnect sends the last event id back.
+    let requests = requests.lock().unwrap();
+    assert!(requests.len() >= 2, "expected a reconnect fetch");
+    let second = &requests[1];
+    assert!(
+        second.headers.iter().any(|(n, v)| n == "Last-Event-ID" && v == "42"),
+        "reconnect must send Last-Event-ID: 42 (headers: {:?})",
+        second.headers
+    );
+}
+
+
+
+#[test]
+fn location_hash_setter_requests_navigation() {
+    // `#section`: a fragment-only change goes through
+    // `request_navigation`; the renderer takes the same-document
+    // path for it (in-place entry update, scroll, `hashchange`).
+    let (mut tab, log) = test_tab_with_log();
+    run(&mut tab, "location.hash = '#section';");
+    assert_eq!(
+        log.lock().unwrap().navigation_requests,
+        vec![("https://example.com/#section".to_string(), false),]
+    );
+    // No leading `#` — the setter adds it.
+    let (mut tab, log) = test_tab_with_log();
+    run(&mut tab, "location.hash = 'plain';");
+    assert_eq!(
+        log.lock().unwrap().navigation_requests,
+        vec![("https://example.com/#plain".to_string(), false),]
+    );
+    // Setting the fragment to its current value is a no-op: the
+    // document has no fragment, so `hash = ''` records nothing.
+    let (mut tab, log) = test_tab_with_log();
+    run(&mut tab, "location.hash = '';");
+    assert!(log.lock().unwrap().navigation_requests.is_empty());
+}
+
+#[test]
+fn location_search_pathname_setters_navigate() {
+    let (mut tab, log) = test_tab_with_log();
+    run(
+        &mut tab,
+        "location.search = '?q=1'; location.pathname = '/other';",
+    );
+    assert_eq!(
+        log.lock().unwrap().navigation_requests,
+        vec![
+            ("https://example.com/?q=1".to_string(), false),
+            ("https://example.com/other".to_string(), false),
+        ]
+    );
+    // No-op when nothing changes: no query to remove.
+    let (mut tab, log) = test_tab_with_log();
+    run(&mut tab, "location.search = '';");
+    assert!(log.lock().unwrap().navigation_requests.is_empty());
 }

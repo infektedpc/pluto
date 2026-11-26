@@ -671,16 +671,35 @@ pub struct ImageInfo {
     pub height: u32,
 }
 
+/// One video element's decoded state, as layout sees it
+/// (Stage 16 Phase 2, Rec 5): the intrinsic size once
+/// `HAVE_METADATA` (from the demuxer), and whether a frame is
+/// currently presentable (a decoded frame has been presented
+/// for this element — paint then draws the frame Blob instead
+/// of the poster).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoInfo {
+    pub width: u32,
+    pub height: u32,
+    pub has_frame: bool,
+}
+
 /// Images the worker has decoded for this document (Stage 11,
 /// M3): per-`<img>` node (intrinsic size + resource id), the
 /// nodes whose image is known-broken (alt text renders instead),
 /// and background-image URLs (raw CSS url → intrinsic size +
 /// resource id, so paint can place `cover` / `contain`).
+/// `videos` (Stage 16 Phase 2, Rec 5) carries the same for
+/// `<video>` elements: intrinsic size + frame liveness. The
+/// poster image itself rides `by_node` (the video node maps to
+/// its poster resource, like an `<img>`), so paint needs no
+/// second lookup for it.
 #[derive(Debug, Clone, Default)]
 pub struct ImageMap {
     pub by_node: HashMap<DomId, ImageInfo>,
     pub broken: HashSet<DomId>,
     pub backgrounds: HashMap<String, ImageInfo>,
+    pub videos: HashMap<DomId, VideoInfo>,
 }
 
 impl ImageMap {
@@ -709,6 +728,19 @@ impl ImageMap {
         }
         for &id in self.broken.symmetric_difference(&old.broken) {
             if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        // Stage 16 Phase 2 (Rec 5): a video whose metadata
+        // arrived (or whose frame liveness flipped) dirties
+        // its node the same way an image arrival does.
+        for (&id, info) in &self.videos {
+            if old.videos.get(&id) != Some(info) && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        for &id in old.videos.keys() {
+            if !self.videos.contains_key(&id) && !out.contains(&id) {
                 out.push(id);
             }
         }
@@ -885,6 +917,11 @@ pub enum SvgCanvasKind {
     Svg,
     /// A `<canvas>` element (HTML namespace).
     Canvas,
+    /// A `<video>` element (HTML namespace; Stage 16 Phase 2,
+    /// Rec 5): a replaced-element leaf like canvas, sized by
+    /// the decoded intrinsic size (300×150 default) — paint
+    /// draws the current frame Blob, the poster, or black.
+    Video,
 }
 
 /// One laid-out box: an element or a text leaf, in page coordinates.
@@ -943,7 +980,15 @@ pub struct LayoutBox {
     /// is such an element's atomic leaf, `None` otherwise. Paint
     /// reads this to find the boxes whose vector / bitmap content
     /// it must produce; layout sizes the leaf, it does not draw it.
+    /// `Some(Video)` (Stage 16 Phase 2, Rec 5) is the same marker
+    /// for a `<video>` leaf — paint draws the frame Blob, the
+    /// poster, or black; `video_live` says which.
     pub svg_canvas: Option<SvgCanvasKind>,
+    /// True when this `<video>` box has a presentable frame
+    /// (Stage 16 Phase 2, Rec 5): from the [`ImageMap`] the tree
+    /// was built with. Paint draws the frame Blob when true, the
+    /// poster (`image`) when false.
+    pub video_live: bool,
     /// The DOM id of the nearest ancestor box (`None` for the
     /// root box).
     pub parent: Option<DomId>,
@@ -1020,6 +1065,24 @@ pub fn is_svg_element(dom: &Dom, id: DomId) -> bool {
 /// (Stage 15, M7 Phase 1, Rec 2).
 pub fn is_canvas_element(dom: &Dom, id: DomId) -> bool {
     dom.tag(id) == Some("canvas")
+        && dom
+            .namespace(id)
+            .is_some_and(|ns| ns.is_empty() || ns == pluto_html::NS_HTML)
+}
+
+/// True when `id` is a `<video>` element in the HTML namespace
+/// (Stage 16 Phase 2, Rec 5).
+pub fn is_video_element(dom: &Dom, id: DomId) -> bool {
+    dom.tag(id) == Some("video")
+        && dom
+            .namespace(id)
+            .is_some_and(|ns| ns.is_empty() || ns == pluto_html::NS_HTML)
+}
+
+/// True when `id` is an `<audio>` element in the HTML namespace
+/// (Stage 16 Phase 2, Rec 5).
+pub fn is_audio_element(dom: &Dom, id: DomId) -> bool {
+    dom.tag(id) == Some("audio")
         && dom
             .namespace(id)
             .is_some_and(|ns| ns.is_empty() || ns == pluto_html::NS_HTML)
@@ -2322,8 +2385,14 @@ impl<'a, 't> Builder<'a, 't> {
         // Stage 15 (M7 Phase 1, Rec 2): an `<svg>` / `<canvas>` with
         // an author `display: block` is still a replaced-element
         // leaf — its children must never build (no boxes, no leaked
-        // SVG `<text>`).
-        if is_svg_element(self.dom, id) || is_canvas_element(self.dom, id) {
+        // SVG `<text>`). Stage 16 Phase 2 (Rec 5): the same for
+        // `<video>` / `<audio>` — a video is a replaced leaf
+        // whatever its display, and audio takes no space at all.
+        if is_svg_element(self.dom, id)
+            || is_canvas_element(self.dom, id)
+            || is_video_element(self.dom, id)
+            || is_audio_element(self.dom, id)
+        {
             let style = self.style_for(id, parent_style);
             return self.build_atomic(id, &style);
         }
@@ -2443,17 +2512,20 @@ impl<'a, 't> Builder<'a, 't> {
         if self.dom.tag(id) == Some("img")
             || is_svg_element(self.dom, id)
             || is_canvas_element(self.dom, id)
+            || is_video_element(self.dom, id)
+            || is_audio_element(self.dom, id)
         {
             // Replaced element (Stage 11 Rec 2 for `<img>`, Stage
-            // 15 Rec 2 for `<svg>` / `<canvas>`): an `<img>` is
-            // atomic even though the UA sheet says `display:
-            // inline` — called here as the inline element itself,
-            // it has no text children to collect, so it becomes
-            // its own leaf instead of vanishing. Same for SVG /
-            // canvas, whose children must never contribute inline
-            // text (an author `display: inline` on an `<svg>` must
-            // not re-open the leak the UA `inline-block` rule
-            // closes).
+            // 15 Rec 2 for `<svg>` / `<canvas>`, Stage 16 Rec 5
+            // for `<video>` / `<audio>`): an `<img>` is atomic
+            // even though the UA sheet says `display: inline` —
+            // called here as the inline element itself, it has no
+            // text children to collect, so it becomes its own leaf
+            // instead of vanishing. Same for SVG / canvas / video
+            // / audio, whose children must never contribute inline
+            // text (an author `display: inline` on a `<video>`
+            // must not re-open the leak the UA `inline-block`
+            // rule closes).
             self.flush_spans(spans, parent_style, out);
             if let Some(node) = self.build_atomic(id, style) {
                 out.push(node);
@@ -2489,15 +2561,19 @@ impl<'a, 't> Builder<'a, 't> {
                     if tag == "img"
                         || is_svg_element(self.dom, child)
                         || is_canvas_element(self.dom, child)
+                        || is_video_element(self.dom, child)
+                        || is_audio_element(self.dom, child)
                     {
                         // Replaced element (Stage 11 Rec 2 for
                         // `<img>`, Stage 15 Rec 2 for `<svg>` /
-                        // `<canvas>`): an `<img>` is atomic even
+                        // `<canvas>`, Stage 16 Rec 5 for `<video>`
+                        // / `<audio>`): an `<img>` is atomic even
                         // though the UA sheet says `display: inline`
                         // — it never contributes inline text, so
                         // recursing into it (as for a span) would
-                        // drop it entirely. Same for SVG / canvas,
-                        // whose children must never leak text.
+                        // drop it entirely. Same for SVG / canvas /
+                        // video / audio, whose children must never
+                        // leak text.
                         self.flush_spans(spans, parent_style, out);
                         if let Some(node) = self.build_atomic(child, &child_style) {
                             out.push(node);
@@ -2579,6 +2655,20 @@ impl<'a, 't> Builder<'a, 't> {
             SvgCanvasKind::Canvas => {
                 let w = parse_svg_attr_length(self.dom.attr(id, "width")).unwrap_or(300.0);
                 let h = parse_svg_attr_length(self.dom.attr(id, "height")).unwrap_or(150.0);
+                (w, h, Some(w / h))
+            }
+            // `<video>` never routes here (`build_atomic` has
+            // its own branch, with the HTML width/height
+            // attribute scaling the `<img>` branch does); the
+            // arm exists for exhaustiveness and answers with
+            // the same size the branch would.
+            SvgCanvasKind::Video => {
+                let (w, h) = self
+                    .images
+                    .videos
+                    .get(&id)
+                    .map(|v| (v.width as f32, v.height as f32))
+                    .unwrap_or((300.0, 150.0));
                 (w, h, Some(w / h))
             }
         };
@@ -2839,6 +2929,95 @@ impl<'a, 't> Builder<'a, 't> {
                     taffy_style.size.height = Dimension::length(h);
                 }
             }
+            let node = self
+                .taffy
+                .new_leaf_with_context(taffy_style, None)
+                .ok()?;
+            self.meta.insert(
+                node,
+                BoxMeta {
+                    dom: Some(id),
+                    style: style.clone(),
+                    children: Vec::new(),
+                    text: None,
+                    svg_canvas: None,
+                },
+            );
+            return Some(node);
+        }
+        // Stage 16 Phase 2 (Rec 5): `<video>` is a replaced-
+        // element leaf, sized by the decoded intrinsic size
+        // once HAVE_METADATA, 300×150 before it (mirroring
+        // `<img>`); width/height attributes override one axis
+        // and scale the other by the intrinsic ratio; CSS
+        // width/height win over both. Fallback children never
+        // build — the leaf replaces them, like `<img>`. The
+        // `Video` marker on the BoxMeta tells paint this box
+        // draws a frame Blob / poster / black.
+        if tag == "video" {
+            let (iw, ih) = self
+                .images
+                .videos
+                .get(&id)
+                .map(|info| (info.width as f32, info.height as f32))
+                .unwrap_or((300.0, 150.0));
+            let mut w = iw;
+            let mut h = ih;
+            let attr_w = self
+                .dom
+                .attr(id, "width")
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|v| *v > 0.0);
+            let attr_h = self
+                .dom
+                .attr(id, "height")
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|v| *v > 0.0);
+            if let Some(aw) = attr_w {
+                w = aw;
+                if attr_h.is_none() && iw > 0.0 {
+                    h = ih * (aw / iw);
+                }
+            }
+            if let Some(ah) = attr_h {
+                h = ah;
+                if attr_w.is_none() && ih > 0.0 {
+                    w = iw * (ah / ih);
+                }
+            }
+            let mut taffy_style = to_taffy_style(style, self.viewport);
+            if w > 0.0 && h > 0.0 {
+                taffy_style.aspect_ratio = Some(w / h);
+            }
+            if style.width.is_none() && style.height.is_none() {
+                taffy_style.size.width = Dimension::length(w);
+                taffy_style.size.height = Dimension::length(h);
+            }
+            let node = self
+                .taffy
+                .new_leaf_with_context(taffy_style, None)
+                .ok()?;
+            self.meta.insert(
+                node,
+                BoxMeta {
+                    dom: Some(id),
+                    style: style.clone(),
+                    children: Vec::new(),
+                    text: None,
+                    svg_canvas: Some(SvgCanvasKind::Video),
+                },
+            );
+            return Some(node);
+        }
+        // Stage 16 Phase 2 (Rec 5): `<audio>` renders as a
+        // zero-size leaf — no visual at all — unless controls
+        // exist, and the controls UI is deferred (M8 does not
+        // build it). Forcing 0×0 here, whatever the style
+        // says, is the honest shape of that deferral.
+        if tag == "audio" {
+            let mut taffy_style = to_taffy_style(style, self.viewport);
+            taffy_style.size.width = Dimension::length(0.0);
+            taffy_style.size.height = Dimension::length(0.0);
             let node = self
                 .taffy
                 .new_leaf_with_context(taffy_style, None)
@@ -3611,6 +3790,13 @@ fn collect_boxes(
     // computed style; paint needs its intrinsic size for
     // cover/contain placement, so both ride the box.
     let image = m.dom.and_then(|d| images.by_node.get(&d)).map(|i| i.resource);
+    // Stage 16 Phase 2 (Rec 5): a video box is live when the
+    // map says a frame is presentable for its node.
+    let video_live = m
+        .dom
+        .and_then(|d| images.videos.get(&d))
+        .map(|v| v.has_frame)
+        .unwrap_or(false);
     let (background_image, background_image_size) = m
         .style
         .background_image
@@ -3673,6 +3859,7 @@ fn collect_boxes(
         background_image,
         background_image_size,
         svg_canvas: m.svg_canvas,
+        video_live,
         parent: parent_dom,
         matrix,
         is_stacking_context: stacking,
@@ -9321,5 +9508,118 @@ mod tests {
         );
         let a = find_element(&dom, dom.root().unwrap(), "a").unwrap();
         assert_eq!(styles[&a].color, [0x12, 0x34, 0x56]);
+    }
+
+    // ---- Stage 16 Phase 2 (Rec 5): <video> / <audio> leaves ----
+
+    /// Build `html` with an image map carrying `videos`.
+    fn video_tree(html: &str, videos: ImageMap) -> (Dom, LayoutTree) {
+        let dom = parse_html(html);
+        let sheet = Stylesheet::parse("");
+        let tree = LayoutTree::build_with_state_and_images(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            &videos,
+            Theme::Light,
+        )
+        .expect("layout builds");
+        (dom, tree)
+    }
+
+    #[test]
+    fn video_defaults_to_300x150_before_metadata() {
+        let (dom, tree) = video_tree(
+            "<html><body><video src=\"v.mp4\">fallback text</video></body></html>",
+            ImageMap::new(),
+        );
+        let video = box_for(&tree, &dom, "video");
+        assert_eq!((video.width, video.height), (300.0, 150.0));
+        assert_eq!(video.svg_canvas, Some(SvgCanvasKind::Video));
+        assert!(!video.video_live);
+        // Fallback children never build: the fallback text has
+        // no box anywhere in the tree.
+        assert!(
+            !tree.boxes().iter().any(|b| b.text.as_ref().is_some_and(|t| t
+                .spans
+                .iter()
+                .any(|s| s.text.contains("fallback")))),
+            "no fallback text under the video leaf"
+        );
+    }
+
+    #[test]
+    fn video_uses_intrinsic_size_and_liveness_from_the_map() {
+        let dom = parse_html("<html><body><video src=\"v.mp4\"></video></body></html>");
+        let video_id = find_element(&dom, dom.root().unwrap(), "video").expect("video");
+        let mut images = ImageMap::new();
+        images.videos.insert(
+            video_id,
+            VideoInfo {
+                width: 640,
+                height: 360,
+                has_frame: true,
+            },
+        );
+        let sheet = Stylesheet::parse("");
+        let tree = LayoutTree::build_with_state_and_images(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            &images,
+            Theme::Light,
+        )
+        .expect("layout builds");
+        let video = box_for(&tree, &dom, "video");
+        assert_eq!((video.width, video.height), (640.0, 360.0));
+        assert!(video.video_live);
+    }
+
+    #[test]
+    fn video_width_attribute_scales_by_intrinsic_ratio() {
+        let dom = parse_html(
+            "<html><body><video src=\"v.mp4\" width=\"320\"></video></body></html>",
+        );
+        let video_id = find_element(&dom, dom.root().unwrap(), "video").expect("video");
+        let mut images = ImageMap::new();
+        images.videos.insert(
+            video_id,
+            VideoInfo {
+                width: 640,
+                height: 360,
+                has_frame: false,
+            },
+        );
+        let sheet = Stylesheet::parse("");
+        let tree = LayoutTree::build_with_state_and_images(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            &images,
+            Theme::Light,
+        )
+        .expect("layout builds");
+        let video = box_for(&tree, &dom, "video");
+        assert_eq!((video.width, video.height), (320.0, 180.0));
+    }
+
+    #[test]
+    fn audio_is_a_zero_size_leaf() {
+        let (dom, tree) = video_tree(
+            "<html><body><audio src=\"a.mp3\" controls></audio><p>after</p></body></html>",
+            ImageMap::new(),
+        );
+        let audio = box_for(&tree, &dom, "audio");
+        assert_eq!((audio.width, audio.height), (0.0, 0.0));
+        // The following paragraph still lays out (the audio took
+        // no space and broke nothing).
+        let p = box_for(&tree, &dom, "p");
+        assert!(p.height > 0.0);
     }
 }

@@ -486,7 +486,17 @@ pub fn directive_for_destination(destination: Destination) -> Option<&'static st
         Destination::Stylesheet => Some("style-src"),
         Destination::Image => Some("img-src"),
         Destination::Font => Some("font-src"),
-        Destination::Fetch => Some("connect-src"),
+        // Stage 16 Phase 3, Rec 12: a streaming fetch is still a
+        // fetch — `connect-src`, like `Fetch`.
+        Destination::Fetch | Destination::Stream => Some("connect-src"),
+        // Stage 16 Phase 1, Rec 2: media finally consults
+        // `media-src` (before this it fell to `Other` →
+        // `default-src`, so `media-src 'none'` leaked), and a
+        // WebSocket handshake is a `connect-src` fetch.
+        Destination::Audio | Destination::Video => Some("media-src"),
+        // Stage 16 Phase 3, Rec 12: a streaming fetch is still a
+        // fetch — `connect-src`, like `Fetch`.
+        Destination::WebSocket => Some("connect-src"),
         Destination::Other => Some("default-src"),
     }
 }
@@ -1718,8 +1728,34 @@ mod tests {
             directive_for_destination(Destination::Fetch),
             Some("connect-src")
         );
+        // Stage 16 Phase 1, Rec 2: media consults `media-src`
+        // (before this it fell to `Other` → `default-src`, so
+        // `media-src 'none'` leaked); WebSocket is `connect-src`.
+        assert_eq!(
+            directive_for_destination(Destination::Audio),
+            Some("media-src")
+        );
+        assert_eq!(
+            directive_for_destination(Destination::Video),
+            Some("media-src")
+        );
+        assert_eq!(
+            directive_for_destination(Destination::WebSocket),
+            Some("connect-src")
+        );
         // Top-level navigations are not fetch-gated.
         assert_eq!(directive_for_destination(Destination::Document), None);
+    }
+
+    #[test]
+    fn media_src_none_blocks_media_but_not_images() {
+        // `media-src 'none'` must block a <video>/<audio> load
+        // even when `default-src` would allow it — the old
+        // `Other` → `default-src` mapping leaked exactly this.
+        let o = doc_origin();
+        let p = set(&["media-src 'none'; default-src *"], &[]);
+        assert!(!p.check("media-src", "https://cdn.example.com/clip.mp4", &o));
+        assert!(p.check("img-src", "https://cdn.example.com/pic.png", &o));
     }
 
     #[test]

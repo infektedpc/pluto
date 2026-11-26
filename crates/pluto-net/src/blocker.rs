@@ -117,10 +117,12 @@ const T_ALL: u32 = (1 << 13) - 1;
 /// `xmlhttprequest` (covers `fetch()`); `Document` is `document`
 /// (top-level navigations only — subdocument/iframe loads have no
 /// `Destination` yet, so `$subdocument` rules never match a Pluto
-/// request in this milestone). Types with no `Destination`
-/// (`media`, `object`, `websocket`, `ping`, `popup`) can only
-/// appear in a rule's mask; a rule restricted to *only* those
-/// types never matches.
+/// request in this milestone). Stage 16 Phase 1, Rec 2: `Audio` /
+/// `Video` are `media` and `WebSocket` is `websocket`, so `$media`
+/// and `$websocket` rules finally match. Types with no
+/// `Destination` (`object`, `ping`, `popup`) can only appear in a
+/// rule's mask; a rule restricted to *only* those types never
+/// matches.
 fn destination_bit(destination: Destination) -> u32 {
     match destination {
         Destination::Document => T_DOCUMENT,
@@ -128,7 +130,11 @@ fn destination_bit(destination: Destination) -> u32 {
         Destination::Script => T_SCRIPT,
         Destination::Image => T_IMAGE,
         Destination::Font => T_FONT,
-        Destination::Fetch => T_XHR,
+        // Stage 16 Phase 3, Rec 12: a streaming fetch is a fetch
+        // for blocker purposes (`$xmlhttprequest` rules match it).
+        Destination::Fetch | Destination::Stream => T_XHR,
+        Destination::Audio | Destination::Video => T_MEDIA,
+        Destination::WebSocket => T_WEBSOCKET,
         Destination::Other => T_OTHER,
     }
 }
@@ -1657,6 +1663,52 @@ mod tests {
     }
 
     // --- @@ exceptions, $important, $document -------------------------
+
+    // Stage 16 Phase 1, Rec 2: `$media` and `$websocket` rules
+    // finally match — before this the bits existed but no
+    // destination could produce them, so a `$websocket`-only rule
+    // never matched anything.
+    #[test]
+    fn media_and_websocket_type_options_match() {
+        let b = blocker_with("||ads.example.com^$media\n||ws.example.com^$websocket\n");
+        assert!(blocked(
+            &b,
+            "https://ads.example.com/preroll.mp4",
+            Destination::Video,
+            PAGE
+        )
+        .is_some());
+        assert!(blocked(
+            &b,
+            "https://ads.example.com/jingle.mp3",
+            Destination::Audio,
+            PAGE
+        )
+        .is_some());
+        // A $media rule does not block images or scripts.
+        assert!(blocked(
+            &b,
+            "https://ads.example.com/banner.png",
+            Destination::Image,
+            PAGE
+        )
+        .is_none());
+        assert!(blocked(
+            &b,
+            "https://ws.example.com/socket",
+            Destination::WebSocket,
+            PAGE
+        )
+        .is_some());
+        // A $websocket rule does not block a fetch to the same host.
+        assert!(blocked(
+            &b,
+            "https://ws.example.com/api",
+            Destination::Fetch,
+            PAGE
+        )
+        .is_none());
+    }
 
     #[test]
     fn exception_overrides_block() {

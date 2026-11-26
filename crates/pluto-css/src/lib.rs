@@ -2833,6 +2833,13 @@ img { display: inline; }
    by namespace, so an author `display: inline` cannot re-open the
    leak. */
 svg, canvas { display: inline-block; }
+/* Stage 16 (M8 Phase 2, Rec 5): `<video>` is a replaced element
+   — the `inline-block` display routes it through `build_atomic`
+   (the same leaf the `img` branch builds); layout also
+   special-cases the tag, so an author `display: inline` cannot
+   re-open the fallback-text leak. `<audio>` takes no space
+   (no controls UI in M8), but it is still an atomic leaf. */
+video, audio { display: inline-block; }
 "#;
 
 // ---- top-level parsing ----

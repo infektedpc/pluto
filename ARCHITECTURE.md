@@ -723,6 +723,88 @@ Goal: streaming media, modern SPA routing, and live bidirectional web apps.
   live chat apps over WebSockets, and embedded HTML5 video/audio players
   run natively.
 
+**Built — Stage 16 Phase 1 (2026-11-26):** media transport,
+destinations, decode stack, autoplay policy — Recs 1, 2, 3, 7, 10.
+`pluto-media` is the 9th crate: symphonia 0.5.5 (MP3/FLAC/Vorbis/
+WAV/AAC-in-MP4), openh264 0.9.10 (H.264 only — the codec of the
+overwhelming majority of real-world web video), mp4 0.14.0 (ISO
+BMFF), matroska-demuxer 0.8.1 (pure Rust WebM demux). AV1 (rav1d)
+is a later decoder swap, not a redesign; VP9 has no decoder in the
+offline registry (only `rav1e`, an encoder) and reports
+unsupported, never a fake frame; symphonia 0.5 has no Opus/ALAC.
+`RendererToBrowser::VideoFrame` carries one decoded frame per
+element (the shell keeps exactly one per `element_id` — a slow
+shell never accumulates a backlog). `Destination` splits media
+out of `Other` (`Audio` / `Video`, so `media-src` fires and media
+inherits the right cap) and gains `WebSocket`. User activation is
+the one handle, shared with every fresh `BindingState` (sticky
+activation survives navigation); the autoplay policy defaults to
+no autoplay with sound. `IntersectionObserver`'s constructor
+options move to the constructor, where the spec puts them.
+`PROTOCOL_VERSION` 10 → 11. Gate 1054/1054.
+
+**Built — Stage 16 Phase 2 (2026-11-26):** media session,
+audio sink, A/V clock, replaced-element leaf — Recs 4, 5, 6.
+`MediaSession` is the `<video>` / `<audio>` state machine
+(`pluto-js` `bindings/media.rs` drives it); the media element
+is a replaced-element leaf in layout/paint with intrinsic sizing
+from the decoded frame. The audio sink is cpal (null fallback
+when no device exists) and the audio clock is the A/V master —
+video is never scheduled by counting 16 ms tab ticks (the tick
+drifts ~4% against 16.67 ms and there is no shell vsync signal).
+Frames convert YUV → RGBA in the shell into the tab's live
+resource table, marked dirty per blob id so the viewport
+re-uploads just that texture. The phase-2 gate caught two
+timing-dependent failures; the fix was deterministic clock
+injection (`cfg(test)` manual clock, production untouched,
+`presented > 5` threshold kept) in `session.rs` + `sink.rs`.
+`PROTOCOL_VERSION` 11 → 12. Gate 1092/1092.
+
+**Built — Stage 16 Phase 3 (2026-11-26, finisher):** History
+API, same-document navigation, WebSocket transport,
+`ReadableStream` + `EventSource` — Recs 8, 9, 11, 12. The phase-3
+worker landed bindings without wiring and a non-compiling tree
+(255 errors: a dropped `libc` dep, un-updated `CommitNavigation`
+/ `DidCommit` / `WebSocketEvent` consumers); the finisher
+restored the build and wired every path. The shell owns the
+session history as `{url, state_json, scroll}` entries:
+`pushState` / `replaceState` arrive as `HistoryPush` /
+`HistoryReplace` (staged by the sync drain, forwarded by the
+async drain), `history.back()` / `forward()` / `go(n)` as
+`HistoryGo` (the shell moves the index, clamped, and commits
+with a traversal); `CommitNavigation` carries `state_json`,
+`traversal`, and the entry's `scroll` (the worker's layout
+mirror and the shell's compositor must agree, or fixed / sticky
+elements lay out at the wrong offset); a traversal restores the
+state into the fresh realm and fires `popstate` after the commit
+(`pending_popstate`, consumed in `handle_nav_outcome`);
+`location.replace()` rides `nav_replace` to `DidCommit` and the
+shell rewrites the current entry in place. `HistorySync`
+(`{length, index}`) re-syncs the realm after every push /
+replace / traversal — the shell is authoritative. A navigation
+whose URL differs only in the fragment is same-document: no
+fetch, no new entry — the URL updates in place, the anchor
+(`NodeRect` geometry, clamped to `PageMaxScroll`) scrolls into
+view, `hashchange` fires, and the entry's URL moves via a
+`HistoryReplace` carrying the current state. No bfcache: Pluto
+keeps none — a traversal re-fetches and rebuilds in a fresh
+realm. WebSockets run on the broker (`serve_websocket`,
+tokio-tungstenite, NOT the shared hyper client — no shared
+client exists for the upgrade), gated by the `Destination::
+WebSocket` handshake path; the shell routes `WebSocketOpen` /
+`Send` / `Close` to a per-tab pump (`ws_commands`, cleaned up
+by `Message::WebSocketDone`) and forwards its events as
+`BrowserToRenderer::WebSocketEvent { socket_id, event }`, which
+the renderer converts to `WsEvent` and delivers on the JS loop.
+`ReadableStream` / `getReader` / `cancel` / `read` and
+`EventSource` (retry, Last-Event-ID, CORS) ride the chunked
+fetch channel (`FetchStreamEvent`). `PROTOCOL_VERSION` 12 → 13
+(`CommitNavigation` fields + `WebSocketEvent.socket_id`).
+Deferred: Service workers, WebRTC, MediaSource/MSE (needs Joel's
+scoping decision), BroadcastChannel, `navigator.onLine`, full
+WebVTT rendering, `<video>` controls UI, Fullscreen/PiP/Media
+Session APIs, M5-remainder items, shell vsync signal.
+
 ### Milestone 9: Built-in Developer Tools ("Pluto DevTools")
 
 Goal: inspect, debug, and profile websites directly inside Pluto without

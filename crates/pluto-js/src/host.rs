@@ -625,6 +625,33 @@ pub trait DomHost {
     /// document's `document_url` reflects it. Default: ignore.
     fn request_navigation(&mut self, _url: &str, _replace: bool) {}
 
+    /// Set the document URL without navigating (Stage 16 Phase 3,
+    /// Rec 8/9): `history.pushState` / `replaceState` and
+    /// same-document hash changes update the URL in place, so
+    /// `location.href` reads the new URL immediately. The host
+    /// records it; the shell learns the new URL from the
+    /// `HistoryPush` / `HistoryReplace` message. Default: ignore.
+    fn set_document_url(&mut self, _url: &str) {}
+
+    /// Record a `history.pushState()` for the shell (Stage 16 Phase
+    /// 3, Rec 8): the host forwards it as `HistoryPush` on the
+    /// next tick drain. `state_json` is the serialized state, or
+    /// `None` for `null`. Default: ignore.
+    fn request_history_push(&mut self, _url: &str, _state_json: Option<&str>) {}
+
+    /// Record a `history.replaceState()` for the shell (Stage 16
+    /// Phase 3, Rec 8): like `request_history_push`, but the shell
+    /// replaces the current entry instead of pushing. Default:
+    /// ignore.
+    fn request_history_replace(&mut self, _url: &str, _state_json: Option<&str>) {}
+
+    /// Ask the shell to move the session-history index by `delta`
+    /// (Stage 16 Phase 3, Rec 8): `history.back()` / `forward()` /
+    /// `go(n)`. The shell navigates with `CommitNavigation {
+    /// traversal: true }`; a delta that moves nowhere is a no-op.
+    /// Default: ignore.
+    fn request_history_traversal(&mut self, _delta: i32) {}
+
     /// Attribute names of `key`, in source order (empty for stale
     /// keys). Backs `dataset` (which needs the `data-*` subset) and
     /// `cloneNode` (which copies attributes).
@@ -649,6 +676,26 @@ pub trait DomHost {
     /// `notify_image_failed`, which fire `load` / `error` on the
     /// element. Default: ignore (the image never loads).
     fn request_image(&mut self, _url: &str, _base_url: &str) {}
+
+    // --- Stage 16 (M8 Phase 2, Rec 4): media + track fetches ---
+
+    /// Ask the shell to fetch a media candidate for the element
+    /// `key` (resolved `url` against `base_url`, `mime_hint` from
+    /// the `<source type>` or ""). The shell routes it through
+    /// the broker (same gates as preloads: mixed content, CSP
+    /// media-src, blocker) and reports back via
+    /// `TabJs::deliver_media` / `notify_media_failed`, which
+    /// load the session or try the next candidate. Default:
+    /// ignore (the media never loads).
+    fn request_media(&mut self, _key: DomKey, _url: &str, _base_url: &str, _mime_hint: &str) {}
+
+    /// Ask the shell to fetch a `<track>` file for the element
+    /// `key` (`track_idx` is the index in the element's
+    /// `track_elements`, in document order). The shell reports
+    /// back via `TabJs::deliver_track` / `notify_track_failed`,
+    /// which parse the WebVTT into the session. Default: ignore
+    /// (the track stays cue-less).
+    fn request_track(&mut self, _key: DomKey, _track_idx: usize, _url: &str, _base_url: &str) {}
 
     // --- Stage 8 Rec 7: MutationObserver (DOM-side registry) ---
 

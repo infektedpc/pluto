@@ -28,12 +28,15 @@ use rquickjs::object::{Accessor, Property};
 use rquickjs::{Array, Coerced, Ctx, FromJs, Function, Object, Symbol, Value};
 use url::Url;
 
-use crate::bindings::events::{dispatch_to_target, install_window_listeners};
+use crate::bindings::events::{
+    dispatch_to_target, install_event_handler_property, install_window_listeners,
+};
+use crate::bindings::media;
 use crate::bindings::{
-    BindingState, CANVAS_GRADIENT_SYMBOL, DOMKEY_SYMBOL, URL_SYMBOL, dom_key_of_this,
-    dom_key_of_this_opt, format_console_arg, js, js_null, map_delete, map_get, map_set, registry,
-    registry_map, throw_dom, throw_host_error, throw_named, throw_type_error, to_dom_string,
-    wrapper_id_of,
+    BindingState, CANVAS_GRADIENT_SYMBOL, DOMKEY_SYMBOL, URL_SYMBOL, WINDOW_TARGET_ID,
+    dom_key_of_this, dom_key_of_this_opt, format_console_arg, js, js_null, map_delete, map_get,
+    map_set, registry, registry_map, throw_dom, throw_host_error, throw_named,
+    throw_type_error, to_dom_string, wrapper_id_of,
 };
 use crate::host::{
     AnimateSpec, AnimationInfo, CanvasCall, CanvasGradientKindSpec, CanvasGradientSpec,
@@ -185,10 +188,13 @@ pub fn wrap_node<'js>(
         // `src` / `complete` / `naturalWidth` / `naturalHeight`);
         // `<canvas>` elements get the canvas prototype
         // (HTMLCanvasElement: `width` / `height` / `getContext` /
-        // `toDataURL`); every other element gets the plain element
-        // prototype.
+        // `toDataURL`); `<video>` / `<audio>` get the media
+        // prototypes (HTMLMediaElement + video/audio extras);
+        // every other element gets the plain element prototype.
         1 if host.borrow().tag_name(key).as_deref() == Some("img") => "imageElement",
         1 if host.borrow().tag_name(key).as_deref() == Some("canvas") => "canvasElement",
+        1 if host.borrow().tag_name(key).as_deref() == Some("video") => "videoElement",
+        1 if host.borrow().tag_name(key).as_deref() == Some("audio") => "audioElement",
         1 => "element",
         3 => "text",
         _ => "node",
@@ -303,6 +309,31 @@ pub fn install_prototypes<'js>(
         .map_err(|e| format!("prototypes canvasElement: {e}"))?;
     install_image_constructor(ctx, bindings)
         .map_err(|e| format!("install Image: {e}"))?;
+
+    // --- HTMLMediaElement.prototype (proto: Element.prototype) ---
+    // Only `<video>` / `<audio>` wrappers chain here (via the
+    // video/audio prototypes below); the methods read the state
+    // map, so a non-media element can never reach them.
+    let media_proto = Object::new_proto(ctx.clone(), Some(&element))
+        .map_err(|e| format!("HTMLMediaElement prototype: {e}"))?;
+    media::install_media_methods(ctx, bindings, &media_proto)?;
+    protos
+        .set("mediaElement", media_proto.clone())
+        .map_err(|e| format!("prototypes mediaElement: {e}"))?;
+    // --- HTMLVideoElement.prototype (proto: media) ---
+    let video = Object::new_proto(ctx.clone(), Some(&media_proto))
+        .map_err(|e| format!("HTMLVideoElement prototype: {e}"))?;
+    media::install_video_methods(ctx, bindings, &video)?;
+    protos
+        .set("videoElement", video)
+        .map_err(|e| format!("prototypes videoElement: {e}"))?;
+    // --- HTMLAudioElement.prototype (proto: media) ---
+    let audio = Object::new_proto(ctx.clone(), Some(&media_proto))
+        .map_err(|e| format!("HTMLAudioElement prototype: {e}"))?;
+    media::install_audio_methods(ctx, bindings, &audio)?;
+    protos
+        .set("audioElement", audio)
+        .map_err(|e| format!("prototypes audioElement: {e}"))?;
 
     // --- Text.prototype (proto: Node.prototype) ---
     let text = Object::new_proto(ctx.clone(), Some(&node))
@@ -660,7 +691,7 @@ fn matches_selector<'js>(
 /// Resolve `input` against the document base URL. Returns the
 /// absolute URL, or `input` unchanged when it cannot be resolved
 /// (no base known / unparseable — the caller records it as-is).
-fn resolve_url(state: &Rc<RefCell<BindingState>>, input: &str) -> String {
+pub(crate) fn resolve_url(state: &Rc<RefCell<BindingState>>, input: &str) -> String {
     let base = host_of(state)
         .ok()
         .and_then(|h| h.borrow().document_url())
@@ -3819,6 +3850,16 @@ pub fn install_window<'js>(
         .prop("onerror", Property::from(rquickjs::Null).writable().enumerable())
         .map_err(|e| format!("install onerror: {e}"))?;
 
+    // `window.onpopstate` / `window.onhashchange` (Stage 16 Phase
+    // 3, Recs 8/9): registry-wired handler properties, so assigning
+    // them registers a listener under the same
+    // `"<target-id>:<type>"` key `addEventListener` uses and the
+    // handler fires when the renderer dispatches the event.
+    for name in ["popstate", "hashchange"] {
+        install_event_handler_property(ctx, bindings, &globals, WINDOW_TARGET_ID, name)
+            .map_err(|e| format!("install window.on{name}: {e}"))?;
+    }
+
     install_location(ctx, bindings).map_err(|e| format!("install location: {e}"))?;
 
     // `window.getComputedStyle` (M6 Phase 3, Rec 11): a read-only
@@ -3883,6 +3924,15 @@ pub fn install_window<'js>(
 /// and the shell performs the navigation (the next document's
 /// `document_url` is then what `location` reads). With no host
 /// URL known, `location` reads as `about:blank`.
+/// The host's document URL, parsed (or `about:blank` when unknown).
+fn location_url(bindings: &Rc<RefCell<BindingState>>) -> Url {
+    let raw = host_of(bindings)
+        .ok()
+        .and_then(|h| h.borrow().document_url())
+        .unwrap_or_else(|| "about:blank".to_string());
+    Url::parse(&raw).unwrap_or_else(|_| Url::parse("about:blank").unwrap())
+}
+
 fn install_location<'js>(
     ctx: &Ctx<'js>,
     bindings: &Rc<RefCell<BindingState>>,
@@ -3891,13 +3941,7 @@ fn install_location<'js>(
     let location = Object::new(ctx.clone()).map_err(|e| format!("location object: {e}"))?;
 
     // The current URL, parsed (or `about:blank` when unknown).
-    let current_url = |b: &Rc<RefCell<BindingState>>| -> Url {
-        let raw = host_of(b)
-            .ok()
-            .and_then(|h| h.borrow().document_url())
-            .unwrap_or_else(|| "about:blank".to_string());
-        Url::parse(&raw).unwrap_or_else(|_| Url::parse("about:blank").unwrap())
-    };
+    let current_url = |b: &Rc<RefCell<BindingState>>| -> Url { location_url(b) };
 
     // href (getter + setter: setting `href` navigates, like assign).
     let b = Rc::clone(bindings);
@@ -3950,8 +3994,60 @@ fn install_location<'js>(
             };
             Ok(js(&ctx, value))
         };
+        if !matches!(part, 4 | 5 | 6) {
+            location
+                .prop(prop, Accessor::from(get))
+                .map_err(|e| format!("location.{prop}: {e}"))?;
+            continue;
+        }
+        // `pathname` / `search` / `hash` setters (Stage 16 Phase
+        // 3, Rec 9). `search` / `pathname` change more than the
+        // fragment, so they are ordinary navigations. `hash` only
+        // ever changes the fragment: the request goes through
+        // `request_navigation` and the renderer takes the
+        // same-document path (in-place entry update, scroll to the
+        // anchor, `hashchange`) when the URL differs only by
+        // fragment; setting the fragment to its current value is
+        // a no-op (and a setter that changes nothing — e.g. on a
+        // cannot-be-a-base URL — records nothing).
+        let b = Rc::clone(bindings);
+        let set = move |ctx: Ctx<'js>, This(_this): This<Value<'js>>, value: Value<'js>| -> rquickjs::Result<()> {
+            let v = to_dom_string(&ctx, &value)?;
+            let mut url = location_url(&b);
+            match part {
+                4 => {
+                    url.set_path(&v);
+                }
+                5 => {
+                    if v.is_empty() {
+                        url.set_query(None);
+                    } else {
+                        let q = v.strip_prefix('?').unwrap_or(&v);
+                        url.set_query(Some(q));
+                    }
+                }
+                6 => {
+                    let new_fragment: Option<String> = if v.is_empty() {
+                        None
+                    } else {
+                        Some(v.strip_prefix('#').unwrap_or(&v).to_string())
+                    };
+                    if url.fragment().map(|f| f.to_string()) == new_fragment {
+                        return Ok(()); // Fragment unchanged: no-op.
+                    }
+                    url.set_fragment(new_fragment.as_deref());
+                }
+                _ => unreachable!(),
+            }
+            let new_href = url.to_string();
+            if new_href == location_url(&b).to_string() {
+                return Ok(()); // Nothing changed: no-op.
+            }
+            navigate_to(&ctx, &b, &new_href, false);
+            Ok(())
+        };
         location
-            .prop(prop, Accessor::from(get))
+            .prop(prop, Accessor::new(get, set))
             .map_err(|e| format!("location.{prop}: {e}"))?;
     }
 
