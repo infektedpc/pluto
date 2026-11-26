@@ -25,14 +25,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use pluto_css::{Selector, Stylesheet};
+use pluto_css::{Affine, Selector, Stylesheet};
 use pluto_html::observers::{MutationObserverOptions, ObserverMutationRecord};
 use pluto_html::{
     Dom, NodeId, NodeKind, Parser, QueuedScript, ScriptPaused, parse_fragment,
     resolve_url,
 };
 use pluto_ipc::{Destination, Origin, Priority, RequestMode, ResourceRequest};
-use pluto_js::host::{AnimateSpec, AnimationInfo, WaapiOp};
+use pluto_js::host::{
+    AnimateSpec, AnimationInfo, CanvasCall, CanvasGradientKindSpec, CanvasImageData,
+    CanvasOutcome, CanvasPaintSpec, WaapiOp,
+};
 use pluto_js::{
     DomHost, DomHostError, DomKey, FetchBackend, FetchCompletion, FetchError, FetchRequest,
     FetchResponse, Geometry, JsError, RealmConfig, ResponseType, TabJs,
@@ -175,6 +178,33 @@ pub struct BrowserDomHost {
     /// the tab thread refreshes this from the engine (starts on
     /// `process_animation_outcome`, ends on `animationend`).
     css_animations: std::collections::HashMap<DomKey, Vec<String>>,
+    /// The current document's CSP policies (Stage 15, M7 Phase 1,
+    /// Rec 11): the load task replaces this from the document
+    /// response's `content-security-policy` headers before the
+    /// parse starts, so the tab thread's script gate and the
+    /// style gate read the CURRENT document's policies in both
+    /// fetch modes — the worker-side loader only holds them in
+    /// Direct mode (in Broker mode the browser process owns the
+    /// fetch). Empty until a navigation stores one (allow-all).
+    csp: std::sync::Arc<std::sync::Mutex<pluto_net::csp::PolicySet>>,
+    /// 2D canvas backing stores by element (Stage 15, M7 Phase
+    /// 3, Rec 8/9): the real `pluto-paint` rasteriser, host-owned;
+    /// the tab thread drains dirty bitmaps into `ResourceReady` +
+    /// `Blob` frames (the same path as the Phase 2 SVG rasteriser).
+    canvases: std::collections::HashMap<DomKey, pluto_paint::canvas::Canvas2d>,
+    /// Canvas gradients by host id (allocated by
+    /// `CreateGradient`).
+    canvas_gradients: std::collections::HashMap<u64, pluto_paint::canvas::CanvasGradient>,
+    /// Next canvas gradient id.
+    next_canvas_gradient_id: u64,
+    /// Decoded pixels for `<img>` elements, by element
+    /// (`(width, height, rgba, origin_clean)`): the tab thread
+    /// feeds these when an image load lands (see
+    /// `set_image_pixels`). A copy of the decoded bytes — bounded
+    /// by the image cache's 64 MiB cap, so the host copy is at
+    /// most another 64 MiB in the pathological all-images-drawn
+    /// case.
+    canvas_image_pixels: std::collections::HashMap<DomKey, (u32, u32, Vec<u8>, bool)>,
 }
 
 impl BrowserDomHost {
@@ -216,6 +246,13 @@ impl BrowserDomHost {
             next_waapi_id: 1,
             waapi_known: std::collections::HashMap::new(),
             css_animations: std::collections::HashMap::new(),
+            csp: std::sync::Arc::new(std::sync::Mutex::new(
+                pluto_net::csp::PolicySet::new(),
+            )),
+            canvases: std::collections::HashMap::new(),
+            canvas_gradients: std::collections::HashMap::new(),
+            next_canvas_gradient_id: 1,
+            canvas_image_pixels: std::collections::HashMap::new(),
         }
     }
 
@@ -223,6 +260,22 @@ impl BrowserDomHost {
     /// navigation start and clears it when the parse finishes).
     pub fn set_parser(&mut self, parser: Option<Rc<RefCell<Parser>>>) {
         self.parser = parser;
+    }
+
+    /// Replace the current document's CSP policies (Stage 15, M7
+    /// Phase 1, Rec 11): the load task calls this from the
+    /// document response's headers before the parse starts. The
+    /// replacement is unconditional — a document with no CSP
+    /// headers clears the previous document's policies, so a
+    /// navigation off a CSP page never keeps gating under them.
+    pub fn set_csp_policies(&self, policies: pluto_net::csp::PolicySet) {
+        *self.csp.lock().unwrap() = policies;
+    }
+
+    /// The current document's CSP policy container (shared with
+    /// the tab thread's script gate).
+    pub fn csp_policies(&self) -> std::sync::Arc<std::sync::Mutex<pluto_net::csp::PolicySet>> {
+        std::sync::Arc::clone(&self.csp)
     }
 
     /// Re-point the live `Dom` (an encoding restart swaps the
@@ -261,6 +314,97 @@ impl BrowserDomHost {
     /// once the loader exists — Stage 13 Rec 10c).
     pub fn set_cookie_jar(&mut self, jar: Arc<std::sync::Mutex<pluto_net::CookieJar>>) {
         self.cookie_jar = Some(jar);
+    }
+
+    /// Record decoded pixels for an `<img>` element (Stage 15,
+    /// M7 Phase 3, Rec 8/9): the tab thread calls this when an
+    /// image load lands, so a later `drawImage(img)` has the
+    /// bitmap synchronously (the JS host cannot reach the image
+    /// store). `origin_clean` is decided by the caller from the
+    /// document base URL: same-origin or `data:` is clean, any
+    /// other cross-origin image taints a canvas it is drawn
+    /// into (Rec 9; the pipeline records no CORS approval for
+    /// `<img>`, so cross-origin always taints).
+    pub fn set_image_pixels(
+        &mut self,
+        key: DomKey,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        origin_clean: bool,
+    ) {
+        self.canvas_image_pixels
+            .insert(key, (width, height, rgba, origin_clean));
+    }
+
+    /// A canvas's size from its `width` / `height` attributes
+    /// (300×150 default).
+    fn canvas_attr_size(&self, key: DomKey) -> (u32, u32) {
+        let dom = self.dom.lock().unwrap();
+        let n = |name: &str, default: u32| {
+            dom.attr(key, name)
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .map(|v| v.max(0.0) as u32)
+                .unwrap_or(default)
+        };
+        (n("width", 300), n("height", 150))
+    }
+
+    /// Ensure a backing store exists for `key`, sized from the
+    /// attributes (re-created — state reset — when the attributes
+    /// moved since the store was made, e.g. via `setAttribute`).
+    /// An oversize attribute pair falls back to 300×150 (the
+    /// `Resize` path refuses oversize explicitly instead).
+    fn canvas_ensure(&mut self, key: DomKey) -> &mut pluto_paint::canvas::Canvas2d {
+        let (w, h) = self.canvas_attr_size(key);
+        let needs_new = match self.canvases.get(&key) {
+            Some(c) => c.width() != w || c.height() != h,
+            None => true,
+        };
+        if needs_new {
+            let canvas = pluto_paint::canvas::Canvas2d::new(w, h).unwrap_or_else(|| {
+                pluto_paint::canvas::Canvas2d::new(300, 150)
+                    .expect("300x150 is under the raster cap")
+            });
+            self.canvases.insert(key, canvas);
+        }
+        self.canvases.get_mut(&key).expect("just ensured")
+    }
+
+    /// A [`CanvasPaintSpec`] as a paint (a gradient id resolves
+    /// through the gradient table; an unknown id is `None` and
+    /// the caller keeps the old paint).
+    fn paint_spec_to_paint(
+        &self,
+        spec: &CanvasPaintSpec,
+    ) -> Option<pluto_paint::canvas::CanvasPaint> {
+        use pluto_paint::canvas::CanvasPaint;
+        match spec {
+            CanvasPaintSpec::Color(c) => Some(CanvasPaint::Solid(*c)),
+            CanvasPaintSpec::Gradient(id) => self
+                .canvas_gradients
+                .get(id)
+                .cloned()
+                .map(CanvasPaint::Gradient),
+        }
+    }
+
+    /// A paint as a [`CanvasPaintSpec`] (a gradient resolves back
+    /// to its host id by value).
+    fn paint_to_spec(&self, paint: &pluto_paint::canvas::CanvasPaint) -> CanvasPaintSpec {
+        use pluto_paint::canvas::CanvasPaint;
+        match paint {
+            CanvasPaint::Solid(c) => CanvasPaintSpec::Color(*c),
+            CanvasPaint::Gradient(g) => {
+                let id = self
+                    .canvas_gradients
+                    .iter()
+                    .find(|(_, v)| **v == *g)
+                    .map(|(id, _)| *id)
+                    .unwrap_or(0);
+                CanvasPaintSpec::Gradient(id)
+            }
+        }
     }
 
     /// Take a JS-queued focus change for the tab thread to apply
@@ -412,12 +556,16 @@ impl BrowserDomHost {
     /// executed. Unlike `clone_from` (fragment `Dom` → live
     /// `Dom`), both sides here are the one live arena.
     fn clone_within(&self, dom: &mut Dom, key: DomKey, deep: bool) -> Option<DomKey> {
-        let (kind, attrs) = match dom.get(key) {
-            Some(n) => (n.kind.clone(), n.attrs.clone()),
+        let (kind, attrs, ns) = match dom.get(key) {
+            Some(n) => (n.kind.clone(), n.attrs.clone(), n.ns.clone()),
             None => return None,
         };
         let new_key = match &kind {
-            NodeKind::Element { tag } => dom.create_element_with_attrs(tag, attrs),
+            // Stage 15 (M7 Phase 1, Rec 1): a clone keeps its
+            // namespace — a cloned `<svg><path>` stays SVG.
+            NodeKind::Element { tag } => {
+                dom.create_element_with_attrs_ns(tag, attrs, &ns)
+            }
             NodeKind::Text(data) => dom.create_text(data),
             NodeKind::Comment(data) => dom.create_comment(data),
             NodeKind::Doctype {
@@ -459,6 +607,14 @@ impl BrowserDomHost {
     pub fn inline_script_text(&self, node: NodeId) -> String {
         let dom = self.dom.lock().unwrap();
         script_text(&dom, node)
+    }
+
+    /// One attribute of a node in the live `Dom` (Stage 15, M7
+    /// Phase 1, Rec 11): the CSP gate reads a script element's
+    /// `nonce` before deciding whether its inline text may run.
+    pub fn node_attr(&self, node: NodeId, name: &str) -> Option<String> {
+        let dom = self.dom.lock().unwrap();
+        dom.attr(node, name).map(str::to_string)
     }
 
     /// Build the `Document` the layout actor should lay out right
@@ -728,12 +884,30 @@ impl DomHost for BrowserDomHost {
     fn node_name(&self, key: DomKey) -> Option<String> {
         self.dom.lock().unwrap().get(key).map(|n| match &n.kind {
             NodeKind::Document => "#document".to_string(),
-            NodeKind::Element { tag } => tag.to_ascii_uppercase(),
+            // Stage 15 (M7 Phase 1, Rec 1): nodeName is the
+            // uppercase tag for HTML elements, but the qualified
+            // name as-is for foreign elements (case matters in
+            // SVG: `foreignObject`, not `FOREIGNOBJECT`).
+            NodeKind::Element { tag } => {
+                if n.ns.is_empty() {
+                    tag.to_ascii_uppercase()
+                } else {
+                    tag.clone()
+                }
+            }
             NodeKind::Text(_) => "#text".to_string(),
             NodeKind::Comment(_) => "#comment".to_string(),
             NodeKind::Doctype { name, .. } => name.clone(),
             NodeKind::ProcessingInstruction { target, .. } => target.clone(),
         })
+    }
+
+    fn namespace_uri(&self, key: DomKey) -> Option<String> {
+        self.dom
+            .lock()
+            .unwrap()
+            .namespace(key)
+            .map(|ns| ns.to_string())
     }
 
     fn get_element_by_id(&self, id: &str) -> Option<DomKey> {
@@ -869,6 +1043,20 @@ impl DomHost for BrowserDomHost {
 
     fn create_element(&mut self, tag: &str) -> Option<DomKey> {
         Some(self.dom.lock().unwrap().create_element(tag))
+    }
+
+    fn create_element_ns(&mut self, namespace: &str, tag: &str) -> Option<DomKey> {
+        Some(
+            self.dom
+                .lock()
+                .unwrap()
+                .create_element_ns(namespace, tag),
+        )
+    }
+
+    fn eval_allowed(&self) -> bool {
+        let policies = self.csp.lock().unwrap();
+        pluto_net::csp::eval_allowed(&policies, &Origin::from_url(&self.base_url))
     }
 
     fn create_text_node(&mut self, data: &str) -> Option<DomKey> {
@@ -1542,6 +1730,452 @@ impl DomHost for BrowserDomHost {
     fn take_pending_form_submits(&mut self) -> Vec<(DomKey, Option<DomKey>)> {
         std::mem::take(&mut self.pending_form_submits)
     }
+
+    // --- Stage 15 (M7 Phase 3, Rec 8/9): 2D canvas ---
+
+    fn canvas_call(&mut self, key: DomKey, call: CanvasCall) -> CanvasOutcome {
+        use pluto_paint::canvas::{
+            Canvas2d, CanvasGradient, CanvasGradientKind, CanvasPaint, parse_canvas_color,
+        };
+        use pluto_paint::DecodedImage;
+        match call {
+            CanvasCall::Ensure => {
+                let (w, h) = {
+                    let c = self.canvas_ensure(key);
+                    (c.width(), c.height())
+                };
+                CanvasOutcome::Size(w, h)
+            }
+            CanvasCall::Resize(w, h) => {
+                let ok = match self.canvases.get_mut(&key) {
+                    Some(c) => c.resize(w, h),
+                    None => match Canvas2d::new(w, h) {
+                        Some(c) => {
+                            self.canvases.insert(key, c);
+                            true
+                        }
+                        None => false,
+                    },
+                };
+                CanvasOutcome::Bool(ok)
+            }
+            CanvasCall::SetFill(spec) => {
+                if let Some(paint) = self.paint_spec_to_paint(&spec) {
+                    self.canvas_ensure(key).set_fill(paint);
+                }
+                CanvasOutcome::None
+            }
+            CanvasCall::FillStyle => {
+                let paint = self.canvas_ensure(key).fill_paint().clone();
+                CanvasOutcome::Paint(self.paint_to_spec(&paint))
+            }
+            CanvasCall::SetFillText(text) => {
+                // An unparseable colour leaves the paint
+                // unchanged, per spec, and the getter then reads
+                // the old value back.
+                if let Some(color) = parse_canvas_color(&text) {
+                    self.canvas_ensure(key).set_fill(CanvasPaint::Solid(color));
+                }
+                let paint = self.canvas_ensure(key).fill_paint().clone();
+                CanvasOutcome::Paint(self.paint_to_spec(&paint))
+            }
+            CanvasCall::SetStroke(spec) => {
+                if let Some(paint) = self.paint_spec_to_paint(&spec) {
+                    self.canvas_ensure(key).set_stroke(paint);
+                }
+                CanvasOutcome::None
+            }
+            CanvasCall::StrokeStyle => {
+                let paint = self.canvas_ensure(key).stroke_paint().clone();
+                CanvasOutcome::Paint(self.paint_to_spec(&paint))
+            }
+            CanvasCall::SetStrokeText(text) => {
+                if let Some(color) = parse_canvas_color(&text) {
+                    self.canvas_ensure(key)
+                        .set_stroke(CanvasPaint::Solid(color));
+                }
+                let paint = self.canvas_ensure(key).stroke_paint().clone();
+                CanvasOutcome::Paint(self.paint_to_spec(&paint))
+            }
+            CanvasCall::SetLineWidth(w) => {
+                self.canvas_ensure(key).set_line_width(w as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::LineWidth => {
+                let w = self.canvas_ensure(key).line_width();
+                CanvasOutcome::Number(w as f64)
+            }
+            CanvasCall::SetLineCap(cap) => {
+                self.canvas_ensure(key).set_line_cap(&cap);
+                CanvasOutcome::None
+            }
+            CanvasCall::LineCap => {
+                let cap = self.canvas_ensure(key).line_cap().to_string();
+                CanvasOutcome::Text(cap)
+            }
+            CanvasCall::SetLineJoin(join) => {
+                self.canvas_ensure(key).set_line_join(&join);
+                CanvasOutcome::None
+            }
+            CanvasCall::LineJoin => {
+                let join = self.canvas_ensure(key).line_join().to_string();
+                CanvasOutcome::Text(join)
+            }
+            CanvasCall::SetFont(font) => {
+                self.canvas_ensure(key).set_font(&font);
+                CanvasOutcome::None
+            }
+            CanvasCall::Font => {
+                let font = self.canvas_ensure(key).font().to_string();
+                CanvasOutcome::Text(font)
+            }
+            CanvasCall::SetTextAlign(align) => {
+                self.canvas_ensure(key).set_text_align(&align);
+                CanvasOutcome::None
+            }
+            CanvasCall::TextAlign => {
+                let align = self.canvas_ensure(key).text_align().to_string();
+                CanvasOutcome::Text(align)
+            }
+            CanvasCall::SetTextBaseline(baseline) => {
+                self.canvas_ensure(key).set_text_baseline(&baseline);
+                CanvasOutcome::None
+            }
+            CanvasCall::TextBaseline => {
+                let baseline = self.canvas_ensure(key).text_baseline().to_string();
+                CanvasOutcome::Text(baseline)
+            }
+            CanvasCall::FillRect(x, y, w, h) => {
+                self.canvas_ensure(key)
+                    .fill_rect(x as f32, y as f32, w as f32, h as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::ClearRect(x, y, w, h) => {
+                self.canvas_ensure(key)
+                    .clear_rect(x as f32, y as f32, w as f32, h as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::StrokeRect(x, y, w, h) => {
+                self.canvas_ensure(key)
+                    .stroke_rect(x as f32, y as f32, w as f32, h as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::BeginPath => {
+                self.canvas_ensure(key).begin_path();
+                CanvasOutcome::None
+            }
+            CanvasCall::MoveTo(x, y) => {
+                self.canvas_ensure(key).move_to(x as f32, y as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::LineTo(x, y) => {
+                self.canvas_ensure(key).line_to(x as f32, y as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::ClosePath => {
+                self.canvas_ensure(key).close_path();
+                CanvasOutcome::None
+            }
+            CanvasCall::RectPath(x, y, w, h) => {
+                self.canvas_ensure(key)
+                    .rect_path(x as f32, y as f32, w as f32, h as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::Arc(x, y, r, start, end, ccw) => {
+                self.canvas_ensure(key).arc(
+                    x as f32,
+                    y as f32,
+                    r as f32,
+                    start as f32,
+                    end as f32,
+                    ccw,
+                );
+                CanvasOutcome::None
+            }
+            CanvasCall::QuadraticCurveTo(cpx, cpy, x, y) => {
+                self.canvas_ensure(key).quadratic_curve_to(
+                    cpx as f32,
+                    cpy as f32,
+                    x as f32,
+                    y as f32,
+                );
+                CanvasOutcome::None
+            }
+            CanvasCall::BezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) => {
+                self.canvas_ensure(key).bezier_curve_to(
+                    cp1x as f32,
+                    cp1y as f32,
+                    cp2x as f32,
+                    cp2y as f32,
+                    x as f32,
+                    y as f32,
+                );
+                CanvasOutcome::None
+            }
+            CanvasCall::Fill(evenodd) => {
+                self.canvas_ensure(key).fill(evenodd);
+                CanvasOutcome::None
+            }
+            CanvasCall::Stroke => {
+                self.canvas_ensure(key).stroke();
+                CanvasOutcome::None
+            }
+            CanvasCall::Clip => {
+                self.canvas_ensure(key).clip();
+                CanvasOutcome::None
+            }
+            CanvasCall::Save => {
+                self.canvas_ensure(key).save();
+                CanvasOutcome::None
+            }
+            CanvasCall::Restore => {
+                self.canvas_ensure(key).restore();
+                CanvasOutcome::None
+            }
+            CanvasCall::Translate(x, y) => {
+                self.canvas_ensure(key).translate(x as f32, y as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::Scale(x, y) => {
+                self.canvas_ensure(key).scale(x as f32, y as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::Rotate(rad) => {
+                self.canvas_ensure(key).rotate(rad as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::SetTransform(m) => {
+                self.canvas_ensure(key).set_transform(pluto_css::Affine {
+                    a: m[0] as f32,
+                    b: m[1] as f32,
+                    c: m[2] as f32,
+                    d: m[3] as f32,
+                    e: m[4] as f32,
+                    f: m[5] as f32,
+                });
+                CanvasOutcome::None
+            }
+            CanvasCall::ResetTransform => {
+                self.canvas_ensure(key).reset_transform();
+                CanvasOutcome::None
+            }
+            CanvasCall::GetTransform => {
+                let m = self.canvas_ensure(key).transform();
+                CanvasOutcome::Transform([
+                    m.a as f64,
+                    m.b as f64,
+                    m.c as f64,
+                    m.d as f64,
+                    m.e as f64,
+                    m.f as f64,
+                ])
+            }
+            CanvasCall::CreateGradient(spec) => {
+                let kind = match spec.kind {
+                    CanvasGradientKindSpec::Linear(x1, y1, x2, y2) => {
+                        CanvasGradientKind::Linear {
+                            x1: x1 as f32,
+                            y1: y1 as f32,
+                            x2: x2 as f32,
+                            y2: y2 as f32,
+                        }
+                    }
+                    CanvasGradientKindSpec::Radial(x1, y1, r1, x2, y2, r2) => {
+                        CanvasGradientKind::Radial {
+                            x1: x1 as f32,
+                            y1: y1 as f32,
+                            r1: r1 as f32,
+                            x2: x2 as f32,
+                            y2: y2 as f32,
+                            r2: r2 as f32,
+                        }
+                    }
+                };
+                let mut gradient = CanvasGradient::new(kind);
+                for (offset, color) in spec.stops {
+                    gradient.add_stop(offset, color);
+                }
+                let id = self.next_canvas_gradient_id;
+                self.next_canvas_gradient_id += 1;
+                self.canvas_gradients.insert(id, gradient);
+                CanvasOutcome::GradientId(id)
+            }
+            CanvasCall::AddColorStop(id, offset, color) => {
+                let parsed = parse_canvas_color(&color);
+                match (parsed, self.canvas_gradients.get_mut(&id)) {
+                    (Some(c), Some(g)) => {
+                        g.add_stop(offset, c);
+                        CanvasOutcome::Bool(true)
+                    }
+                    _ => CanvasOutcome::Bool(false),
+                }
+            }
+            CanvasCall::FillText(text, x, y, _max_width) => {
+                self.canvas_ensure(key)
+                    .fill_text(&text, x as f32, y as f32, false);
+                CanvasOutcome::None
+            }
+            CanvasCall::StrokeText(text, x, y, _max_width) => {
+                self.canvas_ensure(key)
+                    .fill_text(&text, x as f32, y as f32, true);
+                CanvasOutcome::None
+            }
+            CanvasCall::MeasureText(text) => {
+                let w = self.canvas_ensure(key).measure_text(&text);
+                CanvasOutcome::Number(w as f64)
+            }
+            CanvasCall::DrawImageCanvas {
+                src,
+                sx,
+                sy,
+                sw,
+                sh,
+                dx,
+                dy,
+                dw,
+                dh,
+            } => {
+                let Some(src_img) = self.canvases.get(&src).map(|c| c.bitmap()) else {
+                    return CanvasOutcome::Bool(false);
+                };
+                let src_tainted = self
+                    .canvases
+                    .get(&src)
+                    .is_some_and(|c| !c.origin_clean());
+                let drawn = self.canvas_ensure(key).draw_image(
+                    &src_img,
+                    (sx as f32, sy as f32, sw as f32, sh as f32),
+                    (dx as f32, dy as f32, dw as f32, dh as f32),
+                );
+                if drawn && src_tainted {
+                    self.canvas_ensure(key).taint();
+                }
+                CanvasOutcome::Bool(drawn)
+            }
+            CanvasCall::DrawImageElement {
+                src,
+                sx,
+                sy,
+                sw,
+                sh,
+                dx,
+                dy,
+                dw,
+                dh,
+            } => {
+                let Some((w, h, rgba, origin_clean)) =
+                    self.canvas_image_pixels.get(&src).cloned()
+                else {
+                    return CanvasOutcome::Bool(false);
+                };
+                let src_img = DecodedImage {
+                    width: w,
+                    height: h,
+                    rgba,
+                };
+                let drawn = self.canvas_ensure(key).draw_image(
+                    &src_img,
+                    (sx as f32, sy as f32, sw as f32, sh as f32),
+                    (dx as f32, dy as f32, dw as f32, dh as f32),
+                );
+                if drawn && !origin_clean {
+                    self.canvas_ensure(key).taint();
+                }
+                CanvasOutcome::Bool(drawn)
+            }
+            CanvasCall::GetImageData(x, y, w, h) => {
+                let (w, h) = (w.max(0.0) as u32, h.max(0.0) as u32);
+                match self
+                    .canvas_ensure(key)
+                    .get_image_data(x as i32, y as i32, w, h)
+                {
+                    Ok(img) => CanvasOutcome::ImageData(CanvasImageData {
+                        width: img.width,
+                        height: img.height,
+                        data: img.rgba,
+                    }),
+                    Err(pluto_paint::canvas::CanvasError::Tainted) => CanvasOutcome::Tainted,
+                    Err(_) => CanvasOutcome::ImageData(CanvasImageData {
+                        width: w,
+                        height: h,
+                        data: vec![0u8; (w as usize) * (h as usize) * 4],
+                    }),
+                }
+            }
+            CanvasCall::PutImageData {
+                width,
+                height,
+                data,
+                dx,
+                dy,
+            } => {
+                let mut data = data;
+                data.resize((width as usize) * (height as usize) * 4, 0);
+                self.canvas_ensure(key).put_image_data(
+                    &DecodedImage {
+                        width,
+                        height,
+                        rgba: data,
+                    },
+                    dx as i32,
+                    dy as i32,
+                );
+                CanvasOutcome::None
+            }
+            CanvasCall::ToDataUrl => match self.canvas_ensure(key).to_data_url() {
+                Ok(url) => CanvasOutcome::Text(url),
+                Err(pluto_paint::canvas::CanvasError::Tainted) => CanvasOutcome::Tainted,
+                Err(_) => CanvasOutcome::Text("data:,".to_string()),
+            },
+            CanvasCall::OriginClean => {
+                let clean = self
+                    .canvases
+                    .get(&key)
+                    .is_some_and(|c| c.origin_clean());
+                CanvasOutcome::Bool(clean)
+            }
+            CanvasCall::Bitmap => {
+                let bmp = self.canvases.get(&key).map(|c| {
+                    let img = c.bitmap();
+                    (img.width, img.height, img.rgba)
+                });
+                CanvasOutcome::Bitmap(bmp)
+            }
+            CanvasCall::SetImagePixels {
+                key: src,
+                width,
+                height,
+                data,
+                origin_clean,
+            } => {
+                self.canvas_image_pixels
+                    .insert(src, (width, height, data, origin_clean));
+                CanvasOutcome::None
+            }
+        }
+    }
+
+    fn canvas_live_keys(&self) -> Vec<DomKey> {
+        self.dom.lock().unwrap().all_node_ids()
+            .into_iter()
+            .filter(|id| self.canvases.contains_key(id))
+            .collect()
+    }
+
+    fn canvas_take_dirty(&mut self) -> Vec<(DomKey, u32, u32, Vec<u8>)> {
+        let keys = self.canvas_live_keys();
+        let mut out = Vec::new();
+        for key in keys {
+            if let Some(c) = self.canvases.get_mut(&key)
+                && c.dirty()
+            {
+                let img = c.take_bitmap();
+                out.push((key, img.width, img.height, img.rgba));
+            }
+        }
+        out
+    }
+
 }
 
 impl BrowserDomHost {
@@ -1651,6 +2285,9 @@ impl DomHost for SharedHost {
     fn node_name(&self, key: DomKey) -> Option<String> {
         self.0.lock().unwrap().node_name(key)
     }
+    fn namespace_uri(&self, key: DomKey) -> Option<String> {
+        self.0.lock().unwrap().namespace_uri(key)
+    }
     fn title(&self) -> Option<String> {
         self.0.lock().unwrap().title()
     }
@@ -1659,6 +2296,12 @@ impl DomHost for SharedHost {
     }
     fn create_element(&mut self, tag: &str) -> Option<DomKey> {
         self.0.lock().unwrap().create_element(tag)
+    }
+    fn create_element_ns(&mut self, namespace: &str, tag: &str) -> Option<DomKey> {
+        self.0.lock().unwrap().create_element_ns(namespace, tag)
+    }
+    fn eval_allowed(&self) -> bool {
+        self.0.lock().unwrap().eval_allowed()
     }
     fn create_text_node(&mut self, data: &str) -> Option<DomKey> {
         self.0.lock().unwrap().create_text_node(data)
@@ -1870,6 +2513,17 @@ impl DomHost for SharedHost {
     }
     fn take_pending_form_submits(&mut self) -> Vec<(DomKey, Option<DomKey>)> {
         self.0.lock().unwrap().take_pending_form_submits()
+    }
+
+    // Stage 15 (M7 Phase 3, Rec 8/9): 2D canvas.
+    fn canvas_call(&mut self, key: DomKey, call: CanvasCall) -> CanvasOutcome {
+        self.0.lock().unwrap().canvas_call(key, call)
+    }
+    fn canvas_live_keys(&self) -> Vec<DomKey> {
+        self.0.lock().unwrap().canvas_live_keys()
+    }
+    fn canvas_take_dirty(&mut self) -> Vec<(DomKey, u32, u32, Vec<u8>)> {
+        self.0.lock().unwrap().canvas_take_dirty()
     }
 }
 
@@ -2250,6 +2904,14 @@ pub enum ExecMsg {
         /// cancelled after sending must not execute in the new
         /// document's realm).
         epoch: u64,
+        /// The `<script>` element (Stage 15, M7 Phase 1, Rec 11):
+        /// the CSP gate reads its `nonce` before an inline script
+        /// runs.
+        node: NodeId,
+        /// True for an inline script (no `src`): only inline
+        /// scripts are CSP-gated at execution time — external
+        /// scripts were already gated by the fetch pipeline.
+        inline: bool,
         source: String,
         url: String,
         reply: oneshot::Sender<()>,
@@ -2352,6 +3014,14 @@ impl ScriptHooks for LoadHooks {
         self.host.lock().unwrap().set_parser(Some(Rc::clone(parser)));
     }
 
+    fn set_document_csp(&mut self, policies: pluto_net::csp::PolicySet) {
+        // Stage 15 (M7 Phase 1, Rec 11): stash the document's CSP
+        // on the shared host before the first chunk is fed, so the
+        // tab thread's script gate reads the CURRENT document's
+        // policies in both fetch modes.
+        self.host.lock().unwrap().set_csp_policies(policies);
+    }
+
     fn parser_restarted(&mut self, parser: &Rc<RefCell<Parser>>) {
         // An encoding restart swaps the parser — and its arena —
         // for a fresh one: the host must follow it.
@@ -2386,6 +3056,8 @@ impl LoadHooks {
         let epoch = self.epoch;
         self.round_trip(|reply| ExecMsg::Classic {
             epoch,
+            node: paused.script,
+            inline: paused.inline,
             source,
             url,
             reply,
@@ -2450,21 +3122,69 @@ impl LoadHooks {
 
 /// The main-loop side of script execution: runs scripts on the
 /// `TabJs` the tab thread owns. One is created per [`ExecMsg`] (it
-/// holds no state beyond the shared host handle).
+/// holds the shared host handle plus the CSP gate).
 pub struct ScriptExecutor {
     host: Rc<std::sync::Mutex<BrowserDomHost>>,
+    /// The CSP gate for inline scripts (Stage 15, M7 Phase 1,
+    /// Rec 11): the tab loader's current document policies plus the
+    /// document origin. `None` when the tab has no loader policies
+    /// (tests) — then everything is allowed, as before.
+    csp: Option<(
+        std::sync::Arc<std::sync::Mutex<pluto_net::csp::PolicySet>>,
+        Origin,
+    )>,
 }
 
 impl ScriptExecutor {
-    pub fn new(host: Rc<std::sync::Mutex<BrowserDomHost>>) -> Self {
-        Self { host }
+    pub fn new(
+        host: Rc<std::sync::Mutex<BrowserDomHost>>,
+        csp: Option<(
+            std::sync::Arc<std::sync::Mutex<pluto_net::csp::PolicySet>>,
+            Origin,
+        )>,
+    ) -> Self {
+        Self { host, csp }
+    }
+
+    /// Whether an inline script may run under the document's CSP
+    /// (Stage 15, M7 Phase 1, Rec 11): `inline_script_allowed` on
+    /// the tab loader's current document policies, with the
+    /// element's `nonce` and the exact script bytes. External
+    /// scripts are never gated here — the fetch pipeline already
+    /// gated them. `None` policies (tests, no loader) allow
+    /// everything, as before.
+    fn inline_script_allowed(&self, node: NodeId, source: &str) -> bool {
+        let Some((policies, origin)) = &self.csp else {
+            return true;
+        };
+        let nonce = self.host.lock().unwrap().node_attr(node, "nonce");
+        let policies = policies.lock().unwrap();
+        pluto_net::csp::inline_script_allowed(
+            &policies,
+            origin,
+            nonce.as_deref(),
+            source.as_bytes(),
+        )
     }
 
     /// Execute one classic script. Errors are recorded at the
     /// per-script boundary inside `eval_script`; only a
     /// realm-killing error escapes it (the tab thread reads
     /// `TabJs::realm_poisoned`).
-    pub fn exec_classic(&mut self, tab: &mut TabJs, source: &str, url: &str) {
+    pub fn exec_classic(
+        &mut self,
+        tab: &mut TabJs,
+        node: NodeId,
+        source: &str,
+        url: &str,
+        inline: bool,
+    ) {
+        // Stage 15 (M7 Phase 1, Rec 11): a CSP-blocked inline
+        // script never runs — it is skipped, not executed.
+        if inline && !self.inline_script_allowed(node, source) {
+            eprintln!("[pluto] CSP blocked inline script ({url})");
+            return;
+        }
         if let Err(e) = tab.eval_script(source, url) {
             eprintln!("[pluto] script killed the realm ({url}): {e}");
         }
@@ -2506,6 +3226,7 @@ impl ScriptExecutor {
         // URL (Stage 12 Rec 1) — "inline.js" is not a URL, so the
         // resolver could never join against it. A classic inline
         // script keeps the friendly name (it only labels errors).
+        let inline = src.is_none();
         let url = match src {
             Some(src) => src,
             None if is_module => self.host.lock().unwrap().base_url().to_string(),
@@ -2516,7 +3237,7 @@ impl ScriptExecutor {
                 eprintln!("[pluto] module killed the realm ({url}): {e}");
             }
         } else {
-            self.exec_classic(tab, &source, &url);
+            self.exec_classic(tab, node, &source, &url, inline);
         }
     }
 
@@ -2896,6 +3617,88 @@ mod tests {
         assert_eq!(read_num(&mut tab, "__img.naturalWidth"), 320.0);
     }
 
+    // ------------------------------------------- Stage 15 (M7 Phase 3, Rec 8/9)
+    //
+    // Canvas through the PRODUCTION host (`BrowserDomHost` +
+    // `SharedHost`): the same dispatch the binding tests exercise
+    // against `TestHost`, plus the dirty drain the tab thread
+    // feeds into `ResourceReady` + `Blob` frames.
+
+    #[test]
+    fn production_host_canvas_fill_rect_and_dirty_drain() {
+        let (mut tab, host) = wiring_setup(WIRING_DOC, "https://example.com/page");
+        tab.eval_script(
+            "const c = document.createElement('canvas'); \
+             c.id = 'c'; c.width = 4; c.height = 2; \
+             document.body.appendChild(c); \
+             const x = c.getContext('2d'); \
+             x.fillStyle = '#ff0000'; \
+             x.fillRect(0, 0, 2, 2); \
+             globalThis.__px = () => { \
+               const d = x.getImageData(0, 0, 1, 1); \
+               return [d.data[0], d.data[1], d.data[2], d.data[3]].join(','); \
+             };",
+            "canvas.js",
+        )
+        .expect("canvas script runs");
+        assert_eq!(read_str(&mut tab, "__px()"), "255,0,0,255");
+        let key = host.lock().unwrap().get_element_by_id("c").unwrap();
+        assert_eq!(host.lock().unwrap().canvas_live_keys(), vec![key]);
+        let dirty = host.lock().unwrap().canvas_take_dirty();
+        assert_eq!(dirty.len(), 1, "one dirty canvas drains once");
+        assert_eq!(dirty[0].0, key);
+        assert_eq!((dirty[0].1, dirty[0].2), (4, 2));
+        assert_eq!(&dirty[0].3[0..4], &[255, 0, 0, 255]);
+        assert!(
+            host.lock().unwrap().canvas_take_dirty().is_empty(),
+            "the drain clears the dirty flag — no re-send while unchanged"
+        );
+    }
+
+    #[test]
+    fn production_host_canvas_taint_via_set_image_pixels() {
+        let (mut tab, host) = wiring_setup(WIRING_DOC, "https://example.com/page");
+        tab.eval_script(
+            "const c = document.createElement('canvas'); \
+             c.id = 'c'; c.width = 2; c.height = 2; \
+             document.body.appendChild(c); \
+             const x = c.getContext('2d'); \
+             const pic = document.getElementById('pic'); \
+             globalThis.__read = () => { \
+               try { const d = x.getImageData(0, 0, 2, 2); return 'ok:' + d.data[0]; } \
+               catch (e) { return 'err:' + e.name; } \
+             };",
+            "canvas.js",
+        )
+        .expect("canvas script runs");
+        let pic = host.lock().unwrap().get_element_by_id("pic").unwrap();
+        let red = vec![255u8, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255];
+        tab.notify_image_loaded(pic, 2, 2);
+        // The notify is a queued host task (`run_turn` runs one
+        // task): drain it before drawing, or the draw script sits
+        // behind it and `drawImage` sees an incomplete image.
+        tab.run_until_idle().unwrap();
+        host.lock().unwrap().set_image_pixels(
+            pic,
+            2,
+            2,
+            red.clone(),
+            false,
+        );
+        tab.eval_script("x.drawImage(pic, 0, 0);", "canvas.js")
+            .expect("cross-origin draw runs");
+        assert_eq!(read_str(&mut tab, "__read()"), "err:SecurityError");
+        // Same pixels, same origin: a width reset clears the
+        // taint (fresh backing store), then the draw reads back.
+        host.lock().unwrap().set_image_pixels(pic, 2, 2, red, true);
+        tab.eval_script(
+            "c.width = 2; x.drawImage(pic, 0, 0);",
+            "canvas.js",
+        )
+        .expect("same-origin draw runs");
+        assert_eq!(read_str(&mut tab, "__read()"), "ok:255");
+    }
+
     #[test]
     fn production_host_typed_events_reach_js_with_fields() {
         use pluto_js::bindings::events::TypedEventKind;
@@ -3236,5 +4039,109 @@ mod tests {
         assert_eq!(host.query_selector(root, "a:visited"), None);
         // `:not(:visited)` therefore matches every link here.
         assert_eq!(host.query_selector_all(root, "a:not(:visited)").len(), 2);
+    }
+
+    /// Stage 15 (M7 Phase 1, Rec 11): the `ScriptExecutor` CSP
+    /// gate — an inline script blocked by `script-src 'none'`
+    /// never runs; a nonce-listed script runs; with no policies
+    /// everything runs, as before.
+    #[test]
+    fn script_executor_csp_gate_blocks_inline_script() {
+        use std::sync::Arc;
+        let html = "<!doctype html><html><head>\
+            <script>globalThis.__a = 1;</script>\
+            <script nonce=\"abc\">globalThis.__b = 2;</script>\
+            </head><body></body></html>";
+        let find_script = |host: &Rc<std::sync::Mutex<BrowserDomHost>>, nonce: bool| {
+            let snapshot = host.lock().unwrap().dom_snapshot();
+            let mut stack = vec![snapshot.root().unwrap()];
+            while let Some(id) = stack.pop() {
+                if snapshot.tag(id) == Some("script")
+                    && snapshot.attr(id, "nonce").is_some() == nonce
+                {
+                    return id;
+                }
+                stack.extend(snapshot.children(id).iter().rev());
+            }
+            panic!("script node not found (nonce={nonce})")
+        };
+        let setup = || {
+            let (layout_tx, layout_rx) = mpsc::channel::<LayoutJob>();
+            std::thread::spawn(move || layout_thread(layout_rx));
+            let host = BrowserDomHost::new(
+                Arc::new(Mutex::new(pluto_html::parse(html))),
+                layout_tx,
+                (1024.0, 768.0),
+                ElementState::default(),
+                "http://127.0.0.1/",
+                Rc::new(std::sync::Mutex::new(Vec::new())),
+                Rc::new(Cell::new(false)),
+            );
+            let host_rc = Rc::new(std::sync::Mutex::new(host));
+            let mut tab = TabJs::new(&RealmConfig::default()).expect("realm");
+            tab.set_dom_host(Box::new(SharedHost(Rc::clone(&host_rc))));
+            (tab, host_rc)
+        };
+        // `script-src 'none'`: both scripts blocked.
+        let (mut tab, host) = setup();
+        let plain = find_script(&host, false);
+        let nonced = find_script(&host, true);
+        let policies = Arc::new(Mutex::new(pluto_net::csp::PolicySet::from_headers(
+            &["script-src 'none'"],
+            &[],
+        )));
+        let mut exec = ScriptExecutor::new(
+            Rc::clone(&host),
+            Some((Arc::clone(&policies), Origin::from_url("http://127.0.0.1/"))),
+        );
+        exec.exec_classic(&mut tab, plain, "globalThis.__a = 1;", "inline.js", true);
+        exec.exec_classic(&mut tab, nonced, "globalThis.__b = 2;", "inline.js", true);
+        assert_eq!(read_str(&mut tab, "typeof globalThis.__a"), "undefined");
+        assert_eq!(read_str(&mut tab, "typeof globalThis.__b"), "undefined");
+        // `script-src 'nonce-abc'`: only the nonce-listed script runs.
+        let (mut tab, host) = setup();
+        let plain = find_script(&host, false);
+        let nonced = find_script(&host, true);
+        let policies = Arc::new(Mutex::new(pluto_net::csp::PolicySet::from_headers(
+            &["script-src 'nonce-abc'"],
+            &[],
+        )));
+        let mut exec = ScriptExecutor::new(
+            Rc::clone(&host),
+            Some((Arc::clone(&policies), Origin::from_url("http://127.0.0.1/"))),
+        );
+        exec.exec_classic(&mut tab, plain, "globalThis.__a = 1;", "inline.js", true);
+        exec.exec_classic(&mut tab, nonced, "globalThis.__b = 2;", "inline.js", true);
+        assert_eq!(read_str(&mut tab, "typeof globalThis.__a"), "undefined");
+        assert_eq!(read_num(&mut tab, "globalThis.__b"), 2.0);
+        // No policies: everything runs, as before.
+        let (mut tab, host) = setup();
+        let plain = find_script(&host, false);
+        let mut exec = ScriptExecutor::new(Rc::clone(&host), None);
+        exec.exec_classic(&mut tab, plain, "globalThis.__a = 1;", "inline.js", true);
+        assert_eq!(read_num(&mut tab, "globalThis.__a"), 1.0);
+    }
+
+    /// Stage 15 (M7 Phase 1, Rec 11): the `DomHost::eval_allowed`
+    /// seam — the host's document CSP decides: `script-src 'none'`
+    /// forbids eval, `'unsafe-eval'` allows it, and no policies
+    /// allow it. Not yet wired to execution (see the hook's doc).
+    #[test]
+    fn host_eval_allowed_follows_document_csp() {
+        let (_tab, host) = thrash_setup();
+        assert!(host.lock().unwrap().eval_allowed());
+        host.lock().unwrap().set_csp_policies(
+            pluto_net::csp::PolicySet::from_headers(&["script-src 'none'"], &[]),
+        );
+        assert!(!host.lock().unwrap().eval_allowed());
+        host.lock().unwrap().set_csp_policies(
+            pluto_net::csp::PolicySet::from_headers(&["script-src 'unsafe-eval'"], &[]),
+        );
+        assert!(host.lock().unwrap().eval_allowed());
+        // A later document with no CSP clears the previous one.
+        host.lock()
+            .unwrap()
+            .set_csp_policies(pluto_net::csp::PolicySet::from_headers(&[], &[]));
+        assert!(host.lock().unwrap().eval_allowed());
     }
 }

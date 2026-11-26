@@ -92,6 +92,13 @@ rayon = "1"
 # M3 formats only — the full default set pulls decoders Pluto never
 # uses. image 0.25 is already in the lock via iced/libcosmic.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# Stage 15 (M7 Phase 2, Rec 3/4): lyon 1.0 is the path tessellator
+# (fill + stroke) for inline SVG. Verified present in the offline
+# registry cache (lyon 1.0.19, lyon_tessellation 1.0.23,
+# lyon_path 1.0.19, lyon_geom 1.0.20) before the dep was added.
+# resvg/usvg are deliberately NOT added: they would pull a whole
+# SVG stack and violate the from-scratch rule in spirit.
+lyon = "1"
 # fontdb 0.23 is the version cosmic-text 0.19 uses; pluto-paint names
 # it directly to resolve serialised glyph keys back to font ids.
 fontdb = "0.23"

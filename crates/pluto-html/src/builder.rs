@@ -467,7 +467,10 @@ impl TreeBuilder {
     fn create_element_raw(&mut self, tag: &str, attrs: Vec<(String, String)>, ns: &str) -> NodeId {
         let id = {
             let mut dom = self.dom.lock().unwrap();
-            dom.create_element_with_attrs(tag, attrs.clone())
+            // Stage 15 (M7 Phase 1, Rec 1): the namespace lives on
+            // the arena node now, so `parse()` callers (layout,
+            // paint, JS, scanner) can read it without the side maps.
+            dom.create_element_with_attrs_ns(tag, attrs.clone(), ns)
         };
         let qname = if ns.is_empty() {
             QName::html(tag)
@@ -515,17 +518,18 @@ impl TreeBuilder {
 
     /// Shallow-clone an element node (same tag/attrs/namespace).
     fn clone_element(&mut self, id: NodeId) -> NodeId {
-        let (tag, attrs) = {
+        let (tag, attrs, ns) = {
             let dom = self.dom.lock().unwrap();
             let tag = dom.tag(id).unwrap_or("").to_string();
             let attrs = dom.get(id).map(|n| n.attrs.clone()).unwrap_or_default();
-            (tag, attrs)
+            let ns = dom.namespace(id).unwrap_or("").to_string();
+            (tag, attrs, ns)
         };
         let full = self.full_attrs.get(&id).cloned().unwrap_or_default();
         let qname = self.names.get(&id).cloned().unwrap_or_else(|| QName::html(&tag));
         let nid = {
             let mut dom = self.dom.lock().unwrap();
-            dom.create_element_with_attrs(&tag, attrs)
+            dom.create_element_with_attrs_ns(&tag, attrs, &ns)
         };
         self.names.insert(nid, qname);
         self.full_attrs.insert(nid, full);
@@ -2288,7 +2292,14 @@ impl TreeBuilder {
                 let cur = self.current_node();
                 let cur_tag = cur.and_then(|c| self.tag_of(c));
                 let script_node = cur;
-                let is_script = cur_tag.as_deref() == Some("script");
+                // Stage 15 (M7 Phase 1, Rec 11): the script-pause
+                // test is namespace-aware — only an HTML `<script>`
+                // executes. An SVG `<script>` is inert by rule, not
+                // by routing luck (it never reaches `Mode::Text`,
+                // but the pause must not fire for it either).
+                let cur_ns = cur.map(|c| self.ns_of(c));
+                let is_script = cur_tag.as_deref() == Some("script")
+                    && cur_ns.as_deref().is_some_and(|ns| ns.is_empty() || ns == NS_HTML);
                 self.pop();
                 self.mode = self.original_mode;
                 if is_script {

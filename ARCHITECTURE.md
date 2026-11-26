@@ -616,6 +616,98 @@ charts, icons, and 2D web graphics.
   sets (GitHub/Heroicons), and `<canvas>` charts or 2D browser games
   render accurately.
 
+**Built — Stage 15 Phase 1 (2026-11-25):** namespace, layout,
+fill/stroke, security — Recs 1, 2, 6, 11. The arena `Node` carries
+an `ns` field (`""` = HTML namespace); `document.createElementNS`
+creates namespaced nodes, `namespaceURI` is observable from JS,
+and `nodeName`/`tagName` preserve case for foreign elements.
+`<svg>`/`<canvas>` are replaced-element leaves (intrinsic sizing
+from `width`/`height`/`viewBox` + `preserveAspectRatio`, canvas
+300×150 default; children build no boxes, so SVG text cannot leak
+into flow). `ComputedStyle` gains inherited `fill`/`stroke`/
+`stroke-width`/`stop-color`; presentation attributes sit at
+specificity 0, below every author rule. CSP inline helpers are
+wired to execution: inline `<script>` and `<style>` are gated by
+the document's policies (host-carried copy — the broker-mode
+worker never sees the response), SVG `<script>` is inert by
+namespace, not routing luck. IPC `PROTOCOL_VERSION` unchanged (9).
+Painting of SVG/canvas content (paths, tessellation) is Phase 2+.
+
+**Built — Stage 15 Phase 2 (2026-11-25):** paths, tessellation,
+vector pipeline, raster-first slice, gradients — Recs 3, 4, 5, 7.
+`pluto-paint::path` owns one path type (`SvgPath`) with a full
+SVG path-data parser (all commands incl. arc-to-cubic) and shape
+builders (rect/circle/ellipse/line/polyline/polygon); lyon 1.0
+(verified in the offline registry cache — no resvg/usvg)
+tessellates fills (nonzero/evenodd) and strokes (width/cap/join/
+miter; dasharray renders solid, documented). `DisplayItem::
+VectorPath` (flat coloured triangles, one item per shape) is the
+7th wgpu pipeline — a sibling of the rect pipeline (same vertex
+layout, group 0 only, so the Haswell 2-bind-group cap holds;
+`PROTOCOL_VERSION` 9 → 10, variant appended last). Worker-side
+CPU rasteriser (`pluto-paint::raster` + `svg`): radial / multi-stop
+gradients rasterise to a coverage mask with per-pixel gradient
+evaluation (per-vertex colours cannot express a radial gradient)
+into an RGBA bitmap at the box's used size, re-rastered on resize;
+the bitmap travels as a `Blob` via `ResourceReady` before the
+submit that names it (deterministic ids, `SvgRasterCache` in the
+layout actor, `ImageCache::insert_with_id` on the tab thread;
+raster cap (64 MiB − 4 KiB) / 4 px so every bitmap fits one IPC
+frame). Gradients are shared: CSS `linear-gradient()` /
+`radial-gradient()` is a `Value::Gradient` with a computed-style
+slot (one property with `url()` — setting one clears the other);
+linear backgrounds are a vector quad (one strip per stop segment,
+exact for any stop count — the strip is the rect polygon clipped
+to the stop range, since an iso-line at `t = 0`/`1` passes exactly
+through a corner and f32 rounding decided whether it survived);
+radial backgrounds rasterise like SVG fills; SVG
+`<linearGradient>` / `<radialGradient>` defs resolve `fill=
+"url(#id)"` with `gradientTransform` and `objectBoundingBox` /
+`userSpaceOnUse`. Deferred: OffscreenCanvas, full SVG `<text>`,
+SMIL, filters/masks/clipPath, patterns, `<use>`/`<image>`/
+`<foreignObject>`, gradient `href` inheritance, nested-`<svg>`
+`viewBox`, SVG 2 geometry properties, full WAAPI on SVG
+attributes, WebGL; 2D canvas (`CanvasRenderingContext2D`) is a
+later M7 phase.
+
+**Built — Stage 15 Phase 3 (2026-11-25):** 2D canvas API,
+tainting policy, `<use>`/`<image>`/`<foreignObject>`, external
+SVG — Recs 8, 9, 10, 12. `pluto-paint::canvas` owns the
+`Canvas2d` rasteriser (bitmap + context state; paths flattened
+to line segments, coverage-mask clip, per-pixel gradients,
+nearest-neighbour `drawImage`, PNG `toDataURL` via the `image`
+crate; raster cap 16,776,192 px, resize past it refused).
+`HTMLCanvasElement` + `getContext('2d')` follow the
+`imageElement` pattern: one plain-data `DomHost::canvas_call`
+dispatch (host-owned bitmaps, no paint dependency in
+`pluto-js`), `TestHost` implements it against the real
+rasteriser via a dev-dependency. The bitmap lives worker-side:
+the tab thread drains dirty canvases before each collect
+(hash-compared, so an unchanged canvas is never re-sent) and
+fresh bitmaps ride `ResourceReady` + `Blob` (deterministic ids
+from `0x6000_0000`) before the submit that names them; scroll
+re-collects carry the same payload, so canvases survive scroll.
+**Tainting (Rec 9, conservative — spec-stricter):** the bitmap
+carries an origin-clean flag; `drawImage` of a cross-origin
+image without CORS approval taints, and `getImageData` /
+`toDataURL` throw `SecurityError` when tainted, while
+`putImageData` stays allowed (writes only, exposes nothing);
+a canvas drawn from a tainted canvas inherits the taint. The
+image pipeline records no CORS approval for `<img>`, so every
+cross-origin image taints; `data:` and same-origin images are
+clean (origin compared with `pluto-ipc::Origin`, the same
+tainting model as `pluto-net::cors::tainting_for`). Same-
+document `<use href="#id">` only (external `<use>` skipped;
+cycles refused, never looped); `<svg><image>` goes through the
+image pipeline and the M7 rasteriser; `<foreignObject>` gets a
+real clipped viewport box. External SVG (`<img src=*.svg>`,
+`<picture>` SVG `<source>`) decodes via the M7 rasteriser
+after the Stage 9 fetch gates, sniffed structurally (first
+element `<svg>`, never content-type trust). `PROTOCOL_VERSION`
+unchanged (10). Deferred (unchanged): OffscreenCanvas, full SVG
+`<text>`, SMIL, filters/masks/clipPath, patterns, SVG 2
+geometry properties, full WAAPI on SVG attributes, WebGL.
+
 ### Milestone 8: Audio, Video & Real-Time Web APIs
 
 Goal: streaming media, modern SPA routing, and live bidirectional web apps.

@@ -347,6 +347,14 @@ impl ResourceLoader {
         self.scheduler.hsts_store()
     }
 
+    /// The current document's CSP policy container (Stage 9 Rec 8,
+    /// Stage 15 Rec 11): empty until a document response stores
+    /// one. The tab thread reads it to gate inline script / style
+    /// execution; the fetch-side gate reads the same container.
+    pub fn csp_policies(&self) -> Arc<std::sync::Mutex<crate::csp::PolicySet>> {
+        self.scheduler.csp_policies()
+    }
+
     /// The shared cookie jar this loader's scheduler consults
     /// (Stage 13 Rec 9). `pluto-browser` loads it from
     /// `cookies.json` at startup and saves it back after

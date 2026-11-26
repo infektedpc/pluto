@@ -61,6 +61,9 @@ pub use observers::{
     RootMargin, MAX_ROUNDS, ObservedSizes, ResizeBoxKind, ResizeObserverEntry,
     ResizeObserverRegistry, ResizeStepOutcome,
 };
-pub use host::{DomHost, DomHostError, DomKey, Geometry};
+pub use host::{
+    CanvasCall, CanvasGradientKindSpec, CanvasGradientSpec, CanvasImageData, CanvasOutcome,
+    CanvasPaintSpec, DomHost, DomHostError, DomKey, Geometry,
+};
 pub use realm::{DEFAULT_MEMORY_LIMIT_BYTES, DEFAULT_SCRIPT_BUDGET, RealmConfig, TabRealm};
 pub use tab::{TabJs, TurnOutcome};

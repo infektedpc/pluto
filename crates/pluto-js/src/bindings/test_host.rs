@@ -22,7 +22,10 @@ use std::sync::{Arc, Mutex};
 use pluto_html::observers::{MutationObserverOptions, ObserverMutationRecord};
 use pluto_html::{Dom, NodeId, NodeKind, parse, parse_fragment};
 
-use crate::host::{AnimateSpec, AnimationInfo, DomHost, DomHostError, DomKey, Geometry, WaapiOp};
+use crate::host::{
+    AnimateSpec, AnimationInfo, CanvasCall, CanvasGradientKindSpec, CanvasImageData,
+    CanvasOutcome, CanvasPaintSpec, DomHost, DomHostError, DomKey, Geometry, WaapiOp,
+};
 
 /// Host-visible side effects the test host records (navigation +
 /// image requests), shared with the test through an `Arc` so the
@@ -93,6 +96,21 @@ pub struct TestHost {
     pub waapi_controls: Vec<(DomKey, u64, WaapiOp)>,
     /// CSS play-state controls received, in order.
     pub css_controls: Vec<(DomKey, String, WaapiOp)>,
+    /// 2D canvas backing stores by element (Stage 15, M7 Phase
+    /// 3, Rec 8/9): the real `pluto-paint` rasteriser, so binding
+    /// tests exercise the production drawing code.
+    pub canvases: std::collections::HashMap<DomKey, pluto_paint::canvas::Canvas2d>,
+    /// Canvas gradients by host id (allocated by
+    /// `CreateGradient`).
+    pub canvas_gradients: std::collections::HashMap<u64, pluto_paint::canvas::CanvasGradient>,
+    /// Next canvas gradient id.
+    pub next_canvas_gradient_id: u64,
+    /// Decoded pixels for `<img>` elements, by element
+    /// (`(width, height, rgba, origin_clean)` — set via
+    /// `SetImagePixels`, as the production host is fed by the
+    /// tab thread when an image loads).
+    pub canvas_image_pixels:
+        std::collections::HashMap<DomKey, (u32, u32, Vec<u8>, bool)>,
 }
 
 impl TestHost {
@@ -122,6 +140,10 @@ impl TestHost {
             css_animations: std::collections::HashMap::new(),
             waapi_controls: Vec::new(),
             css_controls: Vec::new(),
+            canvases: std::collections::HashMap::new(),
+            canvas_gradients: std::collections::HashMap::new(),
+            next_canvas_gradient_id: 1,
+            canvas_image_pixels: std::collections::HashMap::new(),
         }
     }
 
@@ -220,9 +242,13 @@ impl TestHost {
     /// other element — they are inert (never executed).
     fn clone_from(&mut self, frag: &Dom, id: NodeId) -> Option<DomKey> {        let node = frag.get(id)?;
         let new_key = match &node.kind {
-            NodeKind::Element { tag } => self
-                .dom
-                .create_element_with_attrs(tag, node.attrs.clone()),
+            // Stage 15 (M7 Phase 1, Rec 1): a clone keeps its
+            // namespace — a cloned `<svg><path>` stays SVG.
+            NodeKind::Element { tag } => self.dom.create_element_with_attrs_ns(
+                tag,
+                node.attrs.clone(),
+                &node.ns,
+            ),
             NodeKind::Text(data) => self.dom.create_text(data),
             NodeKind::Comment(data) => self.dom.create_comment(data),
             NodeKind::Doctype { name, public_id, system_id } => {
@@ -249,14 +275,16 @@ impl TestHost {
         // Clone the kind + attributes first: creating the new node
         // mutates the arena, so no borrow of the old node may live
         // across the match.
-        let (kind, attrs) = match self.dom.get(id) {
-            Some(n) => (n.kind.clone(), n.attrs.clone()),
+        let (kind, attrs, ns) = match self.dom.get(id) {
+            Some(n) => (n.kind.clone(), n.attrs.clone(), n.ns.clone()),
             None => return None,
         };
         let new_key = match &kind {
-            NodeKind::Element { tag } => self
-                .dom
-                .create_element_with_attrs(tag, attrs),
+            // Stage 15 (M7 Phase 1, Rec 1): a clone keeps its
+            // namespace — a cloned `<svg><path>` stays SVG.
+            NodeKind::Element { tag } => {
+                self.dom.create_element_with_attrs_ns(tag, attrs, &ns)
+            }
             NodeKind::Text(data) => self.dom.create_text(data),
             NodeKind::Comment(data) => self.dom.create_comment(data),
             NodeKind::Doctype { name, public_id, system_id } => {
@@ -317,6 +345,81 @@ fn is_void(tag: &str) -> bool {
         "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta"
             | "source" | "track" | "wbr"
     )
+}
+
+impl TestHost {
+    /// A canvas's size from its `width` / `height` attributes
+    /// (300×150 default).
+    fn canvas_attr_size(&self, key: DomKey) -> (u32, u32) {
+        let n = |name: &str, default: u32| {
+            self.dom
+                .attr(key, name)
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .map(|v| v.max(0.0) as u32)
+                .unwrap_or(default)
+        };
+        (n("width", 300), n("height", 150))
+    }
+
+    /// Ensure a backing store exists for `key`, sized from the
+    /// attributes (re-created — state reset — when the attributes
+    /// moved since the store was made, e.g. via `setAttribute`).
+    /// An oversize attribute pair falls back to 300×150 (the
+    /// `Resize` path refuses oversize explicitly instead).
+    fn canvas_ensure(&mut self, key: DomKey) -> &mut pluto_paint::canvas::Canvas2d {
+        let (w, h) = self.canvas_attr_size(key);
+        let needs_new = match self.canvases.get(&key) {
+            Some(c) => c.width() != w || c.height() != h,
+            None => true,
+        };
+        if needs_new {
+            let canvas = pluto_paint::canvas::Canvas2d::new(w, h).unwrap_or_else(|| {
+                pluto_paint::canvas::Canvas2d::new(300, 150)
+                    .expect("300x150 is under the raster cap")
+            });
+            self.canvases.insert(key, canvas);
+        }
+        self.canvases.get_mut(&key).expect("just ensured")
+    }
+
+    /// A [`CanvasPaintSpec`] as a paint (a gradient id resolves
+    /// through the gradient table; an unknown id is `None` and
+    /// the caller keeps the old paint).
+    fn paint_spec_to_paint(
+        &self,
+        spec: &CanvasPaintSpec,
+    ) -> Option<pluto_paint::canvas::CanvasPaint> {
+        use pluto_paint::canvas::CanvasPaint;
+        match spec {
+            CanvasPaintSpec::Color(c) => Some(CanvasPaint::Solid(*c)),
+            CanvasPaintSpec::Gradient(id) => self
+                .canvas_gradients
+                .get(id)
+                .cloned()
+                .map(CanvasPaint::Gradient),
+        }
+    }
+
+    /// A paint as a [`CanvasPaintSpec`] (a gradient resolves back
+    /// to its host id by value).
+    fn paint_to_spec(
+        &self,
+        paint: &pluto_paint::canvas::CanvasPaint,
+    ) -> CanvasPaintSpec {
+        use pluto_paint::canvas::CanvasPaint;
+        match paint {
+            CanvasPaint::Solid(c) => CanvasPaintSpec::Color(*c),
+            CanvasPaint::Gradient(g) => {
+                let id = self
+                    .canvas_gradients
+                    .iter()
+                    .find(|(_, v)| **v == *g)
+                    .map(|(id, _)| *id)
+                    .unwrap_or(0);
+                CanvasPaintSpec::Gradient(id)
+            }
+        }
+    }
 }
 
 impl DomHost for TestHost {
@@ -526,6 +629,10 @@ impl DomHost for TestHost {
         self.dom.tag(key).map(|t| t.to_string())
     }
 
+    fn namespace_uri(&self, key: DomKey) -> Option<String> {
+        self.dom.namespace(key).map(|ns| ns.to_string())
+    }
+
     fn node_type(&self, key: DomKey) -> Option<u16> {
         self.dom.get(key).map(|n| match &n.kind {
             NodeKind::Document => 9,
@@ -540,7 +647,17 @@ impl DomHost for TestHost {
     fn node_name(&self, key: DomKey) -> Option<String> {
         self.dom.get(key).map(|n| match &n.kind {
             NodeKind::Document => "#document".to_string(),
-            NodeKind::Element { tag } => tag.to_ascii_uppercase(),
+            // Stage 15 (M7 Phase 1, Rec 1): nodeName is the
+            // uppercase tag for HTML elements, but the qualified
+            // name as-is for foreign elements (case matters in
+            // SVG: `foreignObject`, not `FOREIGNOBJECT`).
+            NodeKind::Element { tag } => {
+                if n.ns.is_empty() {
+                    tag.to_ascii_uppercase()
+                } else {
+                    tag.clone()
+                }
+            }
             NodeKind::Text(_) => "#text".to_string(),
             NodeKind::Comment(_) => "#comment".to_string(),
             NodeKind::Doctype { name, .. } => name.clone(),
@@ -638,6 +755,10 @@ impl DomHost for TestHost {
 
     fn create_element(&mut self, tag: &str) -> Option<DomKey> {
         Some(self.dom.create_element(tag))
+    }
+
+    fn create_element_ns(&mut self, namespace: &str, tag: &str) -> Option<DomKey> {
+        Some(self.dom.create_element_ns(namespace, tag))
     }
 
     fn create_text_node(&mut self, data: &str) -> Option<DomKey> {
@@ -989,6 +1110,452 @@ impl DomHost for TestHost {
             .unwrap()
             .image_requests
             .push((url.to_string(), base_url.to_string()));
+    }
+
+    // --- Stage 15 (M7 Phase 3, Rec 8/9): 2D canvas ---
+
+    fn canvas_call(&mut self, key: DomKey, call: CanvasCall) -> CanvasOutcome {
+        use pluto_paint::canvas::{
+            Canvas2d, CanvasGradient, CanvasGradientKind, CanvasPaint, parse_canvas_color,
+        };
+        use pluto_paint::DecodedImage;
+        match call {
+            CanvasCall::Ensure => {
+                let (w, h) = {
+                    let c = self.canvas_ensure(key);
+                    (c.width(), c.height())
+                };
+                CanvasOutcome::Size(w, h)
+            }
+            CanvasCall::Resize(w, h) => {
+                let ok = match self.canvases.get_mut(&key) {
+                    Some(c) => c.resize(w, h),
+                    None => match Canvas2d::new(w, h) {
+                        Some(c) => {
+                            self.canvases.insert(key, c);
+                            true
+                        }
+                        None => false,
+                    },
+                };
+                CanvasOutcome::Bool(ok)
+            }
+            CanvasCall::SetFill(spec) => {
+                if let Some(paint) = self.paint_spec_to_paint(&spec) {
+                    self.canvas_ensure(key).set_fill(paint);
+                }
+                CanvasOutcome::None
+            }
+            CanvasCall::FillStyle => {
+                let paint = self.canvas_ensure(key).fill_paint().clone();
+                CanvasOutcome::Paint(self.paint_to_spec(&paint))
+            }
+            CanvasCall::SetFillText(text) => {
+                // An unparseable colour leaves the paint
+                // unchanged, per spec, and the getter then reads
+                // the old value back.
+                if let Some(color) = parse_canvas_color(&text) {
+                    self.canvas_ensure(key).set_fill(CanvasPaint::Solid(color));
+                }
+                let paint = self.canvas_ensure(key).fill_paint().clone();
+                CanvasOutcome::Paint(self.paint_to_spec(&paint))
+            }
+            CanvasCall::SetStroke(spec) => {
+                if let Some(paint) = self.paint_spec_to_paint(&spec) {
+                    self.canvas_ensure(key).set_stroke(paint);
+                }
+                CanvasOutcome::None
+            }
+            CanvasCall::StrokeStyle => {
+                let paint = self.canvas_ensure(key).stroke_paint().clone();
+                CanvasOutcome::Paint(self.paint_to_spec(&paint))
+            }
+            CanvasCall::SetStrokeText(text) => {
+                if let Some(color) = parse_canvas_color(&text) {
+                    self.canvas_ensure(key)
+                        .set_stroke(CanvasPaint::Solid(color));
+                }
+                let paint = self.canvas_ensure(key).stroke_paint().clone();
+                CanvasOutcome::Paint(self.paint_to_spec(&paint))
+            }
+            CanvasCall::SetLineWidth(w) => {
+                self.canvas_ensure(key).set_line_width(w as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::LineWidth => {
+                let w = self.canvas_ensure(key).line_width();
+                CanvasOutcome::Number(w as f64)
+            }
+            CanvasCall::SetLineCap(cap) => {
+                self.canvas_ensure(key).set_line_cap(&cap);
+                CanvasOutcome::None
+            }
+            CanvasCall::LineCap => {
+                let cap = self.canvas_ensure(key).line_cap().to_string();
+                CanvasOutcome::Text(cap)
+            }
+            CanvasCall::SetLineJoin(join) => {
+                self.canvas_ensure(key).set_line_join(&join);
+                CanvasOutcome::None
+            }
+            CanvasCall::LineJoin => {
+                let join = self.canvas_ensure(key).line_join().to_string();
+                CanvasOutcome::Text(join)
+            }
+            CanvasCall::SetFont(font) => {
+                self.canvas_ensure(key).set_font(&font);
+                CanvasOutcome::None
+            }
+            CanvasCall::Font => {
+                let font = self.canvas_ensure(key).font().to_string();
+                CanvasOutcome::Text(font)
+            }
+            CanvasCall::SetTextAlign(align) => {
+                self.canvas_ensure(key).set_text_align(&align);
+                CanvasOutcome::None
+            }
+            CanvasCall::TextAlign => {
+                let align = self.canvas_ensure(key).text_align().to_string();
+                CanvasOutcome::Text(align)
+            }
+            CanvasCall::SetTextBaseline(baseline) => {
+                self.canvas_ensure(key).set_text_baseline(&baseline);
+                CanvasOutcome::None
+            }
+            CanvasCall::TextBaseline => {
+                let baseline = self.canvas_ensure(key).text_baseline().to_string();
+                CanvasOutcome::Text(baseline)
+            }
+            CanvasCall::FillRect(x, y, w, h) => {
+                self.canvas_ensure(key)
+                    .fill_rect(x as f32, y as f32, w as f32, h as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::ClearRect(x, y, w, h) => {
+                self.canvas_ensure(key)
+                    .clear_rect(x as f32, y as f32, w as f32, h as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::StrokeRect(x, y, w, h) => {
+                self.canvas_ensure(key)
+                    .stroke_rect(x as f32, y as f32, w as f32, h as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::BeginPath => {
+                self.canvas_ensure(key).begin_path();
+                CanvasOutcome::None
+            }
+            CanvasCall::MoveTo(x, y) => {
+                self.canvas_ensure(key).move_to(x as f32, y as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::LineTo(x, y) => {
+                self.canvas_ensure(key).line_to(x as f32, y as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::ClosePath => {
+                self.canvas_ensure(key).close_path();
+                CanvasOutcome::None
+            }
+            CanvasCall::RectPath(x, y, w, h) => {
+                self.canvas_ensure(key)
+                    .rect_path(x as f32, y as f32, w as f32, h as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::Arc(x, y, r, start, end, ccw) => {
+                self.canvas_ensure(key).arc(
+                    x as f32,
+                    y as f32,
+                    r as f32,
+                    start as f32,
+                    end as f32,
+                    ccw,
+                );
+                CanvasOutcome::None
+            }
+            CanvasCall::QuadraticCurveTo(cpx, cpy, x, y) => {
+                self.canvas_ensure(key).quadratic_curve_to(
+                    cpx as f32,
+                    cpy as f32,
+                    x as f32,
+                    y as f32,
+                );
+                CanvasOutcome::None
+            }
+            CanvasCall::BezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) => {
+                self.canvas_ensure(key).bezier_curve_to(
+                    cp1x as f32,
+                    cp1y as f32,
+                    cp2x as f32,
+                    cp2y as f32,
+                    x as f32,
+                    y as f32,
+                );
+                CanvasOutcome::None
+            }
+            CanvasCall::Fill(evenodd) => {
+                self.canvas_ensure(key).fill(evenodd);
+                CanvasOutcome::None
+            }
+            CanvasCall::Stroke => {
+                self.canvas_ensure(key).stroke();
+                CanvasOutcome::None
+            }
+            CanvasCall::Clip => {
+                self.canvas_ensure(key).clip();
+                CanvasOutcome::None
+            }
+            CanvasCall::Save => {
+                self.canvas_ensure(key).save();
+                CanvasOutcome::None
+            }
+            CanvasCall::Restore => {
+                self.canvas_ensure(key).restore();
+                CanvasOutcome::None
+            }
+            CanvasCall::Translate(x, y) => {
+                self.canvas_ensure(key).translate(x as f32, y as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::Scale(x, y) => {
+                self.canvas_ensure(key).scale(x as f32, y as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::Rotate(rad) => {
+                self.canvas_ensure(key).rotate(rad as f32);
+                CanvasOutcome::None
+            }
+            CanvasCall::SetTransform(m) => {
+                self.canvas_ensure(key).set_transform(pluto_css::Affine {
+                    a: m[0] as f32,
+                    b: m[1] as f32,
+                    c: m[2] as f32,
+                    d: m[3] as f32,
+                    e: m[4] as f32,
+                    f: m[5] as f32,
+                });
+                CanvasOutcome::None
+            }
+            CanvasCall::ResetTransform => {
+                self.canvas_ensure(key).reset_transform();
+                CanvasOutcome::None
+            }
+            CanvasCall::GetTransform => {
+                let m = self.canvas_ensure(key).transform();
+                CanvasOutcome::Transform([
+                    m.a as f64,
+                    m.b as f64,
+                    m.c as f64,
+                    m.d as f64,
+                    m.e as f64,
+                    m.f as f64,
+                ])
+            }
+            CanvasCall::CreateGradient(spec) => {
+                let kind = match spec.kind {
+                    CanvasGradientKindSpec::Linear(x1, y1, x2, y2) => {
+                        CanvasGradientKind::Linear {
+                            x1: x1 as f32,
+                            y1: y1 as f32,
+                            x2: x2 as f32,
+                            y2: y2 as f32,
+                        }
+                    }
+                    CanvasGradientKindSpec::Radial(x1, y1, r1, x2, y2, r2) => {
+                        CanvasGradientKind::Radial {
+                            x1: x1 as f32,
+                            y1: y1 as f32,
+                            r1: r1 as f32,
+                            x2: x2 as f32,
+                            y2: y2 as f32,
+                            r2: r2 as f32,
+                        }
+                    }
+                };
+                let mut gradient = CanvasGradient::new(kind);
+                for (offset, color) in spec.stops {
+                    gradient.add_stop(offset, color);
+                }
+                let id = self.next_canvas_gradient_id;
+                self.next_canvas_gradient_id += 1;
+                self.canvas_gradients.insert(id, gradient);
+                CanvasOutcome::GradientId(id)
+            }
+            CanvasCall::AddColorStop(id, offset, color) => {
+                let parsed = parse_canvas_color(&color);
+                match (parsed, self.canvas_gradients.get_mut(&id)) {
+                    (Some(c), Some(g)) => {
+                        g.add_stop(offset, c);
+                        CanvasOutcome::Bool(true)
+                    }
+                    _ => CanvasOutcome::Bool(false),
+                }
+            }
+            CanvasCall::FillText(text, x, y, _max_width) => {
+                self.canvas_ensure(key)
+                    .fill_text(&text, x as f32, y as f32, false);
+                CanvasOutcome::None
+            }
+            CanvasCall::StrokeText(text, x, y, _max_width) => {
+                self.canvas_ensure(key)
+                    .fill_text(&text, x as f32, y as f32, true);
+                CanvasOutcome::None
+            }
+            CanvasCall::MeasureText(text) => {
+                let w = self.canvas_ensure(key).measure_text(&text);
+                CanvasOutcome::Number(w as f64)
+            }
+            CanvasCall::DrawImageCanvas {
+                src,
+                sx,
+                sy,
+                sw,
+                sh,
+                dx,
+                dy,
+                dw,
+                dh,
+            } => {
+                let Some(src_img) = self.canvases.get(&src).map(|c| c.bitmap()) else {
+                    return CanvasOutcome::Bool(false);
+                };
+                let src_tainted = self
+                    .canvases
+                    .get(&src)
+                    .is_some_and(|c| !c.origin_clean());
+                let drawn = self.canvas_ensure(key).draw_image(
+                    &src_img,
+                    (sx as f32, sy as f32, sw as f32, sh as f32),
+                    (dx as f32, dy as f32, dw as f32, dh as f32),
+                );
+                if drawn && src_tainted {
+                    self.canvas_ensure(key).taint();
+                }
+                CanvasOutcome::Bool(drawn)
+            }
+            CanvasCall::DrawImageElement {
+                src,
+                sx,
+                sy,
+                sw,
+                sh,
+                dx,
+                dy,
+                dw,
+                dh,
+            } => {
+                let Some((w, h, rgba, origin_clean)) =
+                    self.canvas_image_pixels.get(&src).cloned()
+                else {
+                    return CanvasOutcome::Bool(false);
+                };
+                let src_img = DecodedImage {
+                    width: w,
+                    height: h,
+                    rgba,
+                };
+                let drawn = self.canvas_ensure(key).draw_image(
+                    &src_img,
+                    (sx as f32, sy as f32, sw as f32, sh as f32),
+                    (dx as f32, dy as f32, dw as f32, dh as f32),
+                );
+                if drawn && !origin_clean {
+                    self.canvas_ensure(key).taint();
+                }
+                CanvasOutcome::Bool(drawn)
+            }
+            CanvasCall::GetImageData(x, y, w, h) => {
+                let (w, h) = (w.max(0.0) as u32, h.max(0.0) as u32);
+                match self
+                    .canvas_ensure(key)
+                    .get_image_data(x as i32, y as i32, w, h)
+                {
+                    Ok(img) => CanvasOutcome::ImageData(CanvasImageData {
+                        width: img.width,
+                        height: img.height,
+                        data: img.rgba,
+                    }),
+                    Err(pluto_paint::canvas::CanvasError::Tainted) => CanvasOutcome::Tainted,
+                    Err(_) => CanvasOutcome::ImageData(CanvasImageData {
+                        width: w,
+                        height: h,
+                        data: vec![0u8; (w as usize) * (h as usize) * 4],
+                    }),
+                }
+            }
+            CanvasCall::PutImageData {
+                width,
+                height,
+                data,
+                dx,
+                dy,
+            } => {
+                let mut data = data;
+                data.resize((width as usize) * (height as usize) * 4, 0);
+                self.canvas_ensure(key).put_image_data(
+                    &DecodedImage {
+                        width,
+                        height,
+                        rgba: data,
+                    },
+                    dx as i32,
+                    dy as i32,
+                );
+                CanvasOutcome::None
+            }
+            CanvasCall::ToDataUrl => match self.canvas_ensure(key).to_data_url() {
+                Ok(url) => CanvasOutcome::Text(url),
+                Err(pluto_paint::canvas::CanvasError::Tainted) => CanvasOutcome::Tainted,
+                Err(_) => CanvasOutcome::Text("data:,".to_string()),
+            },
+            CanvasCall::OriginClean => {
+                let clean = self
+                    .canvases
+                    .get(&key)
+                    .is_some_and(|c| c.origin_clean());
+                CanvasOutcome::Bool(clean)
+            }
+            CanvasCall::Bitmap => {
+                let bmp = self.canvases.get(&key).map(|c| {
+                    let img = c.bitmap();
+                    (img.width, img.height, img.rgba)
+                });
+                CanvasOutcome::Bitmap(bmp)
+            }
+            CanvasCall::SetImagePixels {
+                key: src,
+                width,
+                height,
+                data,
+                origin_clean,
+            } => {
+                self.canvas_image_pixels
+                    .insert(src, (width, height, data, origin_clean));
+                CanvasOutcome::None
+            }
+        }
+    }
+
+    fn canvas_live_keys(&self) -> Vec<DomKey> {
+        self.dom
+            .all_node_ids()
+            .into_iter()
+            .filter(|id| self.canvases.contains_key(id))
+            .collect()
+    }
+
+    fn canvas_take_dirty(&mut self) -> Vec<(DomKey, u32, u32, Vec<u8>)> {
+        let keys = self.canvas_live_keys();
+        let mut out = Vec::new();
+        for key in keys {
+            if let Some(c) = self.canvases.get_mut(&key)
+                && c.dirty()
+            {
+                let img = c.take_bitmap();
+                out.push((key, img.width, img.height, img.rgba));
+            }
+        }
+        out
     }
 }
 

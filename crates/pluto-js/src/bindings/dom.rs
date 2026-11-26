@@ -30,11 +30,15 @@ use url::Url;
 
 use crate::bindings::events::{dispatch_to_target, install_window_listeners};
 use crate::bindings::{
-    BindingState, DOMKEY_SYMBOL, URL_SYMBOL, dom_key_of_this, dom_key_of_this_opt,
-    format_console_arg, js, js_null, map_delete, map_get, map_set, registry, registry_map,
-    throw_dom, throw_host_error, throw_named, throw_type_error, to_dom_string, wrapper_id_of,
+    BindingState, CANVAS_GRADIENT_SYMBOL, DOMKEY_SYMBOL, URL_SYMBOL, dom_key_of_this,
+    dom_key_of_this_opt, format_console_arg, js, js_null, map_delete, map_get, map_set, registry,
+    registry_map, throw_dom, throw_host_error, throw_named, throw_type_error, to_dom_string,
+    wrapper_id_of,
 };
-use crate::host::{AnimateSpec, AnimationInfo, DomHost, DomKey, WaapiOp, WaapiStep};
+use crate::host::{
+    AnimateSpec, AnimationInfo, CanvasCall, CanvasGradientKindSpec, CanvasGradientSpec,
+    CanvasOutcome, CanvasPaintSpec, DomHost, DomKey, WaapiOp, WaapiStep,
+};
 
 /// One `URL` / `URLSearchParams` value, by id.
 ///
@@ -179,8 +183,12 @@ pub fn wrap_node<'js>(
         9 => "document",
         // `<img>` elements get the image prototype (HTMLImageElement:
         // `src` / `complete` / `naturalWidth` / `naturalHeight`);
-        // every other element gets the plain element prototype.
+        // `<canvas>` elements get the canvas prototype
+        // (HTMLCanvasElement: `width` / `height` / `getContext` /
+        // `toDataURL`); every other element gets the plain element
+        // prototype.
         1 if host.borrow().tag_name(key).as_deref() == Some("img") => "imageElement",
+        1 if host.borrow().tag_name(key).as_deref() == Some("canvas") => "canvasElement",
         1 => "element",
         3 => "text",
         _ => "node",
@@ -284,6 +292,15 @@ pub fn install_prototypes<'js>(
     protos
         .set("imageElement", image)
         .map_err(|e| format!("prototypes imageElement: {e}"))?;
+    // --- HTMLCanvasElement.prototype (proto: Element.prototype) ---
+    // Only `<canvas>` wrappers chain here (see `wrap_node`); the
+    // methods read the tag so a non-`canvas` can never reach them.
+    let canvas = Object::new_proto(ctx.clone(), Some(&element))
+        .map_err(|e| format!("HTMLCanvasElement prototype: {e}"))?;
+    install_canvas_methods(ctx, bindings, &canvas)?;
+    protos
+        .set("canvasElement", canvas)
+        .map_err(|e| format!("prototypes canvasElement: {e}"))?;
     install_image_constructor(ctx, bindings)
         .map_err(|e| format!("install Image: {e}"))?;
 
@@ -483,6 +500,26 @@ fn install_node_methods<'js>(
         };
         Ok(match host.borrow().node_name(key) {
             Some(n) => js(&ctx, n),
+            None => js_null(&ctx),
+        })
+    })?;
+
+    // namespaceURI (Stage 15, M7 Phase 1, Rec 1): the element's
+    // namespace URI. The host stores "" for the HTML namespace
+    // (the parser's convention); the DOM spec reports that as
+    // "http://www.w3.org/1999/xhtml". Non-elements report null.
+    let b = Rc::clone(bindings);
+    def_getter(ctx, node, "namespaceURI", move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+        let Some(key) = dom_key_of_this_opt(&ctx, &b, &this)? else {
+            return Ok(js_null(&ctx));
+        };
+        let host = match host_of(&b) {
+            Ok(h) => h,
+            Err(_) => return Ok(js_null(&ctx)),
+        };
+        Ok(match host.borrow().namespace_uri(key) {
+            Some(ns) if ns.is_empty() => js(&ctx, "http://www.w3.org/1999/xhtml".to_string()),
+            Some(ns) => js(&ctx, ns),
             None => js_null(&ctx),
         })
     })?;
@@ -1054,7 +1091,9 @@ fn install_element_methods<'js>(
     bindings: &Rc<RefCell<BindingState>>,
     element: &Object<'js>,
 ) -> Result<(), String> {
-    // tagName (uppercase, per HTML).
+    // tagName: the qualified name — uppercase for HTML elements,
+    // as-is for foreign elements (Stage 15, M7 Phase 1, Rec 1:
+    // case matters in SVG: `foreignObject`, not `FOREIGNOBJECT`).
     let b = Rc::clone(bindings);
     def_getter(ctx, element, "tagName", move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
         let Some(key) = dom_key_of_this_opt(&ctx, &b, &this)? else {
@@ -1064,8 +1103,13 @@ fn install_element_methods<'js>(
             Ok(h) => h,
             Err(_) => return Ok(js_null(&ctx)),
         };
-        Ok(match host.borrow().tag_name(key) {
-            Some(t) => js(&ctx, t.to_ascii_uppercase()),
+        let (tag, ns) = {
+            let h = host.borrow();
+            (h.tag_name(key), h.namespace_uri(key))
+        };
+        Ok(match tag {
+            Some(t) if ns.is_none_or(|n| n.is_empty()) => js(&ctx, t.to_ascii_uppercase()),
+            Some(t) => js(&ctx, t),
             None => js_null(&ctx),
         })
     })?;
@@ -1882,6 +1926,972 @@ fn install_image_constructor<'js>(
     Ok(())
 }
 
+/// `HTMLCanvasElement` + `CanvasRenderingContext2D` (Stage 15,
+/// M7 Phase 3, Rec 8/9). The prototype chains off
+/// `Element.prototype`; only `<canvas>` wrappers reach it (see
+/// `wrap_node`). The bitmap lives in the host (one `Canvas2d`
+/// per canvas element, in `pluto-paint`); the binding only
+/// forwards calls through [`DomHost::canvas_call`] and formats
+/// results. `getContext('2d')` returns the same context object
+/// on every call (registry-cached by wrapper id, like
+/// `classList` / `style`); a host without canvas support
+/// returns `null` from `getContext` instead of a context.
+///
+/// Departures, flagged here: `ImageData.data` is a real
+/// `Uint8ClampedArray`; `getTransform()` returns a plain
+/// `{a, b, c, d, e, f}` object (not a `DOMMatrix`);
+/// `measureText()` returns `{width}` only; `fillText` honours
+/// the `font` size but not its family (system font);
+/// `putImageData` ignores the dirty-rect arguments;
+/// `globalAlpha` / `globalCompositeOperation` / shadows /
+/// `setLineDash` / `arcTo` / `ellipse` are not exposed.
+fn install_canvas_methods<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    canvas: &Object<'js>,
+) -> Result<(), String> {
+    // width / height: reflect the content attributes (300×150
+    // default); setting one resizes the bitmap AND resets the
+    // context state, per spec (the host's `Resize`).
+    for (prop, is_width, default) in [("width", true, 300.0), ("height", false, 150.0)] {
+        let b = Rc::clone(bindings);
+        let get = move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<f64> {
+            let Some(key) = dom_key_of_this_opt(&ctx, &b, &this)? else {
+                return Ok(default);
+            };
+            let host = match host_of(&b) {
+                Ok(h) => h,
+                Err(_) => return Ok(default),
+            };
+            let attr = if is_width { "width" } else { "height" };
+            Ok(host
+                .borrow()
+                .get_attribute(key, attr)
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(default))
+        };
+        let b = Rc::clone(bindings);
+        let set = move |ctx: Ctx<'js>, This(this): This<Object<'js>>, value: Value<'js>| -> rquickjs::Result<()> {
+            let key = dom_key_of_this(&ctx, &b, &this)?;
+            let n = to_dom_string(&ctx, &value)?
+                .parse::<f64>()
+                .unwrap_or(0.0)
+                .max(0.0) as u64;
+            let host = host_of(&b).map_err(|e| throw_type_error(&ctx, &e))?;
+            if !host.borrow().validate(key) {
+                return Err(throw_type_error(&ctx, "the element is no longer in the document"));
+            }
+            // The sibling dimension comes from the live bitmap
+            // (or the attribute default when there is none yet).
+            let (w, h) = match host.borrow_mut().canvas_call(key, CanvasCall::Ensure) {
+                CanvasOutcome::Size(w, h) => (w, h),
+                _ => (300, 150),
+            };
+            let (nw, nh) = if is_width {
+                (n as u32, h)
+            } else {
+                (w, n as u32)
+            };
+            let attr = if is_width { "width" } else { "height" };
+            if !host.borrow_mut().set_attribute(key, attr, &format!("{n}")) {
+                return Err(throw_type_error(&ctx, "the element is no longer in the document"));
+            }
+            // A refused resize (over the raster cap) leaves the
+            // bitmap as it was — the attribute still reads the
+            // requested size (the spec sets the attribute; the
+            // bitmap is what the host could allocate).
+            let _ = host.borrow_mut().canvas_call(key, CanvasCall::Resize(nw, nh));
+            Ok(())
+        };
+        def_accessor(ctx, canvas, prop, get, set)?;
+    }
+
+    // getContext('2d'): the cached context object, or `null`
+    // for any other kind / a host without canvas support.
+    let b = Rc::clone(bindings);
+    let get_context = move |ctx: Ctx<'js>, This(this): This<Object<'js>>, kind: Value<'js>| -> rquickjs::Result<Value<'js>> {
+        let Some(key) = dom_key_of_this_opt(&ctx, &b, &this)? else {
+            return Ok(js_null(&ctx));
+        };
+        let kind = to_dom_string(&ctx, &kind).unwrap_or_default();
+        if kind != "2d" {
+            return Ok(js_null(&ctx));
+        }
+        match call_canvas(&ctx, &b, key, CanvasCall::Ensure) {
+            Ok(CanvasOutcome::Unsupported) => Ok(js_null(&ctx)),
+            Ok(_) => Ok(Value::from(get_or_create_context(&ctx, &b, key)?)),
+            Err(e) => Err(e),
+        }
+    };
+    def_method(
+        ctx,
+        canvas,
+        "getContext",
+        Function::new(ctx.clone(), get_context).map_err(|e| format!("getContext: {e}"))?,
+    )?;
+
+    // toDataURL(): the bitmap as a PNG data URL — refused
+    // (`SecurityError`) when the canvas is tainted (Rec 9).
+    let b = Rc::clone(bindings);
+    let to_data_url = move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+        let key = dom_key_of_this(&ctx, &b, &this)?;
+        match call_canvas(&ctx, &b, key, CanvasCall::ToDataUrl)? {
+            CanvasOutcome::Text(url) => Ok(js(&ctx, url)),
+            CanvasOutcome::Tainted => Err(throw_dom(
+                &ctx,
+                "SecurityError",
+                "toDataURL: the canvas is tainted by cross-origin data",
+            )),
+            _ => Ok(js(&ctx, "data:,")),
+        }
+    };
+    def_method(
+        ctx,
+        canvas,
+        "toDataURL",
+        Function::new(ctx.clone(), to_data_url).map_err(|e| format!("toDataURL: {e}"))?,
+    )?;
+    Ok(())
+}
+
+/// Format a solid paint colour the way the `fillStyle` /
+/// `strokeStyle` getters return it.
+fn format_canvas_color(color: [u8; 4]) -> String {
+    if color[3] == 255 {
+        format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2])
+    } else {
+        format!(
+            "rgba({}, {}, {}, {})",
+            color[0],
+            color[1],
+            color[2],
+            color[3] as f32 / 255.0
+        )
+    }
+}
+
+/// Call the host's canvas operation for `key` (a stale key
+/// throws `TypeError`).
+fn call_canvas(
+    ctx: &Ctx<'_>,
+    state: &Rc<RefCell<BindingState>>,
+    key: DomKey,
+    call: CanvasCall,
+) -> rquickjs::Result<CanvasOutcome> {
+    let host = host_of(state).map_err(|e| throw_type_error(ctx, &e))?;
+    if !host.borrow().validate(key) {
+        return Err(throw_type_error(ctx, "the node is no longer in the document"));
+    }
+    Ok(host.borrow_mut().canvas_call(key, call))
+}
+
+/// The host gradient id carried by a `CanvasGradient` object,
+/// if `obj` is one.
+fn gradient_id_of<'js>(ctx: &Ctx<'js>, obj: &Object<'js>) -> rquickjs::Result<Option<u64>> {
+    let sym = Symbol::new_global(ctx.clone(), CANVAS_GRADIENT_SYMBOL)?;
+    let value: Value = obj.get(sym.as_atom())?;
+    Ok(value.as_number().map(|n| n as u64))
+}
+
+/// A `CanvasPaintSpec` as a JS value: a colour string, or the
+/// live `CanvasGradient` object for a gradient id.
+fn paint_to_js<'js>(
+    ctx: &Ctx<'js>,
+    _state: &Rc<RefCell<BindingState>>,
+    paint: &CanvasPaintSpec,
+) -> rquickjs::Result<Value<'js>> {
+    match paint {
+        CanvasPaintSpec::Color(c) => Ok(js(ctx, format_canvas_color(*c))),
+        CanvasPaintSpec::Gradient(id) => {
+            let map = registry_map(ctx, "canvasGradients")?;
+            let v = map_get(ctx, &map, *id)?;
+            if v.is_undefined() || v.is_null() {
+                Ok(js_null(ctx))
+            } else {
+                Ok(v)
+            }
+        }
+    }
+}
+
+/// Argument helpers for the variadic context methods: numbers
+/// coerce leniently (a missing / non-numeric argument is 0).
+fn carg<'js>(ctx: &Ctx<'js>, args: &[Value<'js>], i: usize) -> f64 {
+    args.get(i)
+        .and_then(|v| f64::from_js(ctx, v.clone()).ok())
+        .unwrap_or(0.0)
+}
+
+fn carg_opt<'js>(ctx: &Ctx<'js>, args: &[Value<'js>], i: usize) -> Option<f64> {
+    args.get(i).and_then(|v| {
+        if v.is_undefined() || v.is_null() {
+            None
+        } else {
+            f64::from_js(ctx, v.clone()).ok()
+        }
+    })
+}
+
+fn sarg<'js>(ctx: &Ctx<'js>, args: &[Value<'js>], i: usize) -> rquickjs::Result<String> {
+    match args.get(i) {
+        Some(v) => to_dom_string(ctx, v),
+        None => Ok(String::new()),
+    }
+}
+
+/// The `CanvasRenderingContext2D` object for `key`, creating and
+/// registry-caching it on first `getContext` (identity-stable).
+fn get_or_create_context<'js>(
+    ctx: &Ctx<'js>,
+    state: &Rc<RefCell<BindingState>>,
+    key: DomKey,
+) -> rquickjs::Result<Object<'js>> {
+    let wid = state
+        .borrow()
+        .wrapper_ids
+        .get(&key)
+        .copied()
+        .ok_or_else(|| throw_type_error(ctx, "canvas has no wrapper"))?;
+    let map = registry_map(ctx, "canvasContexts")?;
+    let existing = map_get(ctx, &map, wid)?;
+    if let Some(obj) = existing.as_object() {
+        return Ok(obj.clone());
+    }
+    let obj = Object::new(ctx.clone())?;
+    install_context_methods(ctx, state, key, &obj)
+        .map_err(|e| throw_named(ctx, "TypeError", &e))?;
+    map_set(ctx, &map, wid, Value::from(obj.clone()))?;
+    Ok(obj)
+}
+
+/// One `CanvasGradient` object for a host gradient id: an
+/// `addColorStop` method closing over the id (and the canvas
+/// key, which the host call routes through).
+fn make_gradient_object<'js>(
+    ctx: &Ctx<'js>,
+    state: &Rc<RefCell<BindingState>>,
+    key: DomKey,
+    id: u64,
+) -> rquickjs::Result<Object<'js>> {
+    let obj = Object::new(ctx.clone())?;
+    let sym = Symbol::new_global(ctx.clone(), CANVAS_GRADIENT_SYMBOL)?;
+    obj.set(sym.as_atom(), id as f64)?;
+    let b = Rc::clone(state);
+    let add = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, offset: Value<'js>, color: Value<'js>| -> rquickjs::Result<()> {
+            let off = f64::from_js(&ctx, offset).unwrap_or(0.0) as f32;
+            let col = to_dom_string(&ctx, &color)?;
+            match call_canvas(&ctx, &b, key, CanvasCall::AddColorStop(id, off, col))? {
+                CanvasOutcome::Bool(true) => Ok(()),
+                CanvasOutcome::Bool(false) => Err(throw_dom(
+                    &ctx,
+                    "SyntaxError",
+                    "addColorStop: the colour could not be parsed",
+                )),
+                _ => Ok(()),
+            }
+        },
+    )
+    .map_err(|e| throw_named(ctx, "TypeError", &format!("addColorStop: {e}")))?;
+    obj.set("addColorStop", add)?;
+    let map = registry_map(ctx, "canvasGradients")?;
+    map_set(ctx, &map, id, Value::from(obj.clone()))?;
+    Ok(obj)
+}
+
+/// The methods + accessors of one `CanvasRenderingContext2D`
+/// object. Every method closes over the canvas `key` and
+/// forwards to [`DomHost::canvas_call`]; `getImageData` /
+/// `toDataURL` refusals (`Tainted`) become `SecurityError`s
+/// (Rec 9).
+fn install_context_methods<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    key: DomKey,
+    obj: &Object<'js>,
+) -> Result<(), String> {
+    // A no-argument method forwarding one `CanvasCall`.
+    macro_rules! simple {
+        ($name:literal, $call:expr) => {{
+            let b = Rc::clone(bindings);
+            let f = Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, This(_this): This<Object<'js>>| -> rquickjs::Result<()> {
+                    let _ = call_canvas(&ctx, &b, key, $call)?;
+                    Ok(())
+                },
+            )
+            .map_err(|e| format!("{}: {e}", $name))?;
+            obj.set($name, f).map_err(|e| format!("{}: {e}", $name))?;
+        }};
+    }
+    // A 4-number rect method (`fillRect` / `clearRect` /
+    // `strokeRect`).
+    macro_rules! rect {
+        ($name:literal, $call:expr) => {{
+            let b = Rc::clone(bindings);
+            let f = Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, args: Rest<Value<'js>>| -> rquickjs::Result<()> {
+                    let a = &args.0;
+                    let _ = call_canvas(
+                        &ctx,
+                        &b,
+                        key,
+                        $call(carg(&ctx, a, 0), carg(&ctx, a, 1), carg(&ctx, a, 2), carg(&ctx, a, 3)),
+                    )?;
+                    Ok(())
+                },
+            )
+            .map_err(|e| format!("{}: {e}", $name))?;
+            obj.set($name, f).map_err(|e| format!("{}: {e}", $name))?;
+        }};
+    }
+    rect!("fillRect", CanvasCall::FillRect);
+    rect!("clearRect", CanvasCall::ClearRect);
+    rect!("strokeRect", CanvasCall::StrokeRect);
+    simple!("beginPath", CanvasCall::BeginPath);
+    simple!("closePath", CanvasCall::ClosePath);
+    simple!("stroke", CanvasCall::Stroke);
+    simple!("clip", CanvasCall::Clip);
+    simple!("save", CanvasCall::Save);
+    simple!("restore", CanvasCall::Restore);
+    simple!("resetTransform", CanvasCall::ResetTransform);
+
+    // moveTo / lineTo.
+    for (name, is_move) in [("moveTo", true), ("lineTo", false)] {
+        let b = Rc::clone(bindings);
+        let f = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, args: Rest<Value<'js>>| -> rquickjs::Result<()> {
+                let a = &args.0;
+                let call = if is_move {
+                    CanvasCall::MoveTo(carg(&ctx, a, 0), carg(&ctx, a, 1))
+                } else {
+                    CanvasCall::LineTo(carg(&ctx, a, 0), carg(&ctx, a, 1))
+                };
+                let _ = call_canvas(&ctx, &b, key, call)?;
+                Ok(())
+            },
+        )
+        .map_err(|e| format!("{name}: {e}"))?;
+        obj.set(name, f).map_err(|e| format!("{name}: {e}"))?;
+    }
+
+    // rect(x, y, w, h) — the path method (not fillRect).
+    {
+        let b = Rc::clone(bindings);
+        let f = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, args: Rest<Value<'js>>| -> rquickjs::Result<()> {
+                let a = &args.0;
+                let _ = call_canvas(
+                    &ctx,
+                    &b,
+                    key,
+                    CanvasCall::RectPath(
+                        carg(&ctx, a, 0),
+                        carg(&ctx, a, 1),
+                        carg(&ctx, a, 2),
+                        carg(&ctx, a, 3),
+                    ),
+                )?;
+                Ok(())
+            },
+        )
+        .map_err(|e| format!("rect: {e}"))?;
+        obj.set("rect", f).map_err(|e| format!("rect: {e}"))?;
+    }
+
+    // arc(x, y, r, start, end, anticlockwise?).
+    {
+        let b = Rc::clone(bindings);
+        let f = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, args: Rest<Value<'js>>| -> rquickjs::Result<()> {
+                let a = &args.0;
+                let ccw = a
+                    .get(5)
+                    .and_then(|v| bool::from_js(&ctx, v.clone()).ok())
+                    .unwrap_or(false);
+                let _ = call_canvas(
+                    &ctx,
+                    &b,
+                    key,
+                    CanvasCall::Arc(
+                        carg(&ctx, a, 0),
+                        carg(&ctx, a, 1),
+                        carg(&ctx, a, 2),
+                        carg(&ctx, a, 3),
+                        carg(&ctx, a, 4),
+                        ccw,
+                    ),
+                )?;
+                Ok(())
+            },
+        )
+        .map_err(|e| format!("arc: {e}"))?;
+        obj.set("arc", f).map_err(|e| format!("arc: {e}"))?;
+    }
+
+    // quadraticCurveTo / bezierCurveTo.
+    {
+        let b = Rc::clone(bindings);
+        let f = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, args: Rest<Value<'js>>| -> rquickjs::Result<()> {
+                let a = &args.0;
+                let _ = call_canvas(
+                    &ctx,
+                    &b,
+                    key,
+                    CanvasCall::QuadraticCurveTo(
+                        carg(&ctx, a, 0),
+                        carg(&ctx, a, 1),
+                        carg(&ctx, a, 2),
+                        carg(&ctx, a, 3),
+                    ),
+                )?;
+                Ok(())
+            },
+        )
+        .map_err(|e| format!("quadraticCurveTo: {e}"))?;
+        obj.set("quadraticCurveTo", f)
+            .map_err(|e| format!("quadraticCurveTo: {e}"))?;
+    }
+    {
+        let b = Rc::clone(bindings);
+        let f = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, args: Rest<Value<'js>>| -> rquickjs::Result<()> {
+                let a = &args.0;
+                let _ = call_canvas(
+                    &ctx,
+                    &b,
+                    key,
+                    CanvasCall::BezierCurveTo(
+                        carg(&ctx, a, 0),
+                        carg(&ctx, a, 1),
+                        carg(&ctx, a, 2),
+                        carg(&ctx, a, 3),
+                        carg(&ctx, a, 4),
+                        carg(&ctx, a, 5),
+                    ),
+                )?;
+                Ok(())
+            },
+        )
+        .map_err(|e| format!("bezierCurveTo: {e}"))?;
+        obj.set("bezierCurveTo", f)
+            .map_err(|e| format!("bezierCurveTo: {e}"))?;
+    }
+
+    // fill(rule?) — "evenodd" selects the evenodd rule.
+    {
+        let b = Rc::clone(bindings);
+        let f = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, args: Rest<Value<'js>>| -> rquickjs::Result<()> {
+                let evenodd = args
+                    .0
+                    .first()
+                    .and_then(|v| String::from_js(&ctx, v.clone()).ok())
+                    .is_some_and(|s| s == "evenodd");
+                let _ = call_canvas(&ctx, &b, key, CanvasCall::Fill(evenodd))?;
+                Ok(())
+            },
+        )
+        .map_err(|e| format!("fill: {e}"))?;
+        obj.set("fill", f).map_err(|e| format!("fill: {e}"))?;
+    }
+
+    // translate / scale / rotate (radians).
+    for (name, kind) in [("translate", 0u8), ("scale", 1u8), ("rotate", 2u8)] {
+        let b = Rc::clone(bindings);
+        let f = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, args: Rest<Value<'js>>| -> rquickjs::Result<()> {
+                let a = &args.0;
+                let call = match kind {
+                    0 => CanvasCall::Translate(carg(&ctx, a, 0), carg(&ctx, a, 1)),
+                    1 => CanvasCall::Scale(carg(&ctx, a, 0), carg(&ctx, a, 1)),
+                    _ => CanvasCall::Rotate(carg(&ctx, a, 0)),
+                };
+                let _ = call_canvas(&ctx, &b, key, call)?;
+                Ok(())
+            },
+        )
+        .map_err(|e| format!("{name}: {e}"))?;
+        obj.set(name, f).map_err(|e| format!("{name}: {e}"))?;
+    }
+
+    // setTransform(a, b, c, d, e, f) — no arguments resets.
+    {
+        let b = Rc::clone(bindings);
+        let f = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, args: Rest<Value<'js>>| -> rquickjs::Result<()> {
+                let a = &args.0;
+                let call = if a.is_empty() {
+                    CanvasCall::ResetTransform
+                } else {
+                    CanvasCall::SetTransform([
+                        carg(&ctx, a, 0),
+                        carg(&ctx, a, 1),
+                        carg(&ctx, a, 2),
+                        carg(&ctx, a, 3),
+                        carg(&ctx, a, 4),
+                        carg(&ctx, a, 5),
+                    ])
+                };
+                let _ = call_canvas(&ctx, &b, key, call)?;
+                Ok(())
+            },
+        )
+        .map_err(|e| format!("setTransform: {e}"))?;
+        obj.set("setTransform", f)
+            .map_err(|e| format!("setTransform: {e}"))?;
+    }
+
+    // getTransform() — a plain {a, b, c, d, e, f} object.
+    {
+        let b = Rc::clone(bindings);
+        let f = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, This(_this): This<Object<'js>>| -> rquickjs::Result<Object<'js>> {
+                let m = match call_canvas(&ctx, &b, key, CanvasCall::GetTransform)? {
+                    CanvasOutcome::Transform(m) => m,
+                    _ => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                };
+                let o = Object::new(ctx.clone())?;
+                for (i, name) in ["a", "b", "c", "d", "e", "f"].iter().enumerate() {
+                    o.set(*name, m[i])?;
+                }
+                Ok(o)
+            },
+        )
+        .map_err(|e| format!("getTransform: {e}"))?;
+        obj.set("getTransform", f)
+            .map_err(|e| format!("getTransform: {e}"))?;
+    }
+
+    // fillText / strokeText (text, x, y, maxWidth?).
+    for (name, is_stroke) in [("fillText", false), ("strokeText", true)] {
+        let b = Rc::clone(bindings);
+        let f = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, args: Rest<Value<'js>>| -> rquickjs::Result<()> {
+                let a = &args.0;
+                let text = sarg(&ctx, a, 0)?;
+                let call = if is_stroke {
+                    CanvasCall::StrokeText(
+                        text,
+                        carg(&ctx, a, 1),
+                        carg(&ctx, a, 2),
+                        carg_opt(&ctx, a, 3),
+                    )
+                } else {
+                    CanvasCall::FillText(
+                        text,
+                        carg(&ctx, a, 1),
+                        carg(&ctx, a, 2),
+                        carg_opt(&ctx, a, 3),
+                    )
+                };
+                let _ = call_canvas(&ctx, &b, key, call)?;
+                Ok(())
+            },
+        )
+        .map_err(|e| format!("{name}: {e}"))?;
+        obj.set(name, f).map_err(|e| format!("{name}: {e}"))?;
+    }
+
+    // measureText(text) — {width} only (see the header note).
+    {
+        let b = Rc::clone(bindings);
+        let f = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, text: Value<'js>| -> rquickjs::Result<Object<'js>> {
+                let text = to_dom_string(&ctx, &text)?;
+                let w = match call_canvas(&ctx, &b, key, CanvasCall::MeasureText(text))? {
+                    CanvasOutcome::Number(w) => w,
+                    _ => 0.0,
+                };
+                let o = Object::new(ctx.clone())?;
+                o.set("width", w)?;
+                Ok(o)
+            },
+        )
+        .map_err(|e| format!("measureText: {e}"))?;
+        obj.set("measureText", f)
+            .map_err(|e| format!("measureText: {e}"))?;
+    }
+
+    // createLinearGradient / createRadialGradient.
+    {
+        let b = Rc::clone(bindings);
+        let f = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, args: Rest<Value<'js>>| -> rquickjs::Result<Object<'js>> {
+                let a = &args.0;
+                let spec = CanvasGradientSpec {
+                    kind: CanvasGradientKindSpec::Linear(
+                        carg(&ctx, a, 0),
+                        carg(&ctx, a, 1),
+                        carg(&ctx, a, 2),
+                        carg(&ctx, a, 3),
+                    ),
+                    stops: Vec::new(),
+                };
+                match call_canvas(&ctx, &b, key, CanvasCall::CreateGradient(spec))? {
+                    CanvasOutcome::GradientId(id) => make_gradient_object(&ctx, &b, key, id),
+                    _ => Err(throw_type_error(&ctx, "the canvas has no gradient support")),
+                }
+            },
+        )
+        .map_err(|e| format!("createLinearGradient: {e}"))?;
+        obj.set("createLinearGradient", f)
+            .map_err(|e| format!("createLinearGradient: {e}"))?;
+    }
+    {
+        let b = Rc::clone(bindings);
+        let f = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, args: Rest<Value<'js>>| -> rquickjs::Result<Object<'js>> {
+                let a = &args.0;
+                let spec = CanvasGradientSpec {
+                    kind: CanvasGradientKindSpec::Radial(
+                        carg(&ctx, a, 0),
+                        carg(&ctx, a, 1),
+                        carg(&ctx, a, 2),
+                        carg(&ctx, a, 3),
+                        carg(&ctx, a, 4),
+                        carg(&ctx, a, 5),
+                    ),
+                    stops: Vec::new(),
+                };
+                match call_canvas(&ctx, &b, key, CanvasCall::CreateGradient(spec))? {
+                    CanvasOutcome::GradientId(id) => make_gradient_object(&ctx, &b, key, id),
+                    _ => Err(throw_type_error(&ctx, "the canvas has no gradient support")),
+                }
+            },
+        )
+        .map_err(|e| format!("createRadialGradient: {e}"))?;
+        obj.set("createRadialGradient", f)
+            .map_err(|e| format!("createRadialGradient: {e}"))?;
+    }
+
+    // drawImage(source, dx, dy) / (source, dx, dy, dw, dh) /
+    // (source, sx, sy, sw, sh, dx, dy, dw, dh). A source that is
+    // not fully loaded draws nothing (spec); a cross-origin
+    // `<img>` source taints the canvas in the host (Rec 9).
+    {
+        let b = Rc::clone(bindings);
+        let f = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, args: Rest<Value<'js>>| -> rquickjs::Result<bool> {
+                let a = &args.0;
+                let Some(src_obj) = a.first().and_then(|v| v.as_object()) else {
+                    return Err(throw_type_error(&ctx, "drawImage: the source is not an image or canvas"));
+                };
+                let Some(wid) = wrapper_id_of(&ctx, src_obj) else {
+                    return Err(throw_type_error(&ctx, "drawImage: the source is not an image or canvas"));
+                };
+                let Some(src_key) = b.borrow().wrapper_keys.get(&wid).copied() else {
+                    return Err(throw_type_error(&ctx, "drawImage: the source is not an image or canvas"));
+                };
+                let host = host_of(&b).map_err(|e| throw_type_error(&ctx, &e))?;
+                let tag = host.borrow().tag_name(src_key);
+                let (sw, sh) = match tag.as_deref() {
+                    Some("canvas") => match host
+                        .borrow_mut()
+                        .canvas_call(src_key, CanvasCall::Ensure)
+                    {
+                        CanvasOutcome::Size(w, h) => (w as f64, h as f64),
+                        _ => (0.0, 0.0),
+                    },
+                    Some("img") => {
+                        let s = b.borrow();
+                        match s.image_states.get(&src_key) {
+                            Some(st) if st.complete => (st.width as f64, st.height as f64),
+                            _ => (0.0, 0.0),
+                        }
+                    }
+                    _ => {
+                        return Err(throw_type_error(
+                            &ctx,
+                            "drawImage: the source is not an image or canvas",
+                        ));
+                    }
+                };
+                drop(host);
+                if sw == 0.0 || sh == 0.0 {
+                    return Ok(false);
+                }
+                let (sx, sy, s_w, s_h, dx, dy, d_w, d_h) = match a.len() {
+                    3 => (0.0, 0.0, sw, sh, carg(&ctx, a, 1), carg(&ctx, a, 2), sw, sh),
+                    5 => (
+                        0.0,
+                        0.0,
+                        sw,
+                        sh,
+                        carg(&ctx, a, 1),
+                        carg(&ctx, a, 2),
+                        carg(&ctx, a, 3),
+                        carg(&ctx, a, 4),
+                    ),
+                    _ => (
+                        carg(&ctx, a, 1),
+                        carg(&ctx, a, 2),
+                        carg(&ctx, a, 3),
+                        carg(&ctx, a, 4),
+                        carg(&ctx, a, 5),
+                        carg(&ctx, a, 6),
+                        carg(&ctx, a, 7),
+                        carg(&ctx, a, 8),
+                    ),
+                };
+                let call = match tag.as_deref() {
+                    Some("canvas") => CanvasCall::DrawImageCanvas {
+                        src: src_key,
+                        sx,
+                        sy,
+                        sw: s_w,
+                        sh: s_h,
+                        dx,
+                        dy,
+                        dw: d_w,
+                        dh: d_h,
+                    },
+                    _ => CanvasCall::DrawImageElement {
+                        src: src_key,
+                        sx,
+                        sy,
+                        sw: s_w,
+                        sh: s_h,
+                        dx,
+                        dy,
+                        dw: d_w,
+                        dh: d_h,
+                    },
+                };
+                match call_canvas(&ctx, &b, key, call)? {
+                    CanvasOutcome::Bool(drawn) => Ok(drawn),
+                    _ => Ok(false),
+                }
+            },
+        )
+        .map_err(|e| format!("drawImage: {e}"))?;
+        obj.set("drawImage", f).map_err(|e| format!("drawImage: {e}"))?;
+    }
+
+    // getImageData(x, y, w, h) — SecurityError when tainted.
+    {
+        let b = Rc::clone(bindings);
+        let f = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, args: Rest<Value<'js>>| -> rquickjs::Result<Object<'js>> {
+                let a = &args.0;
+                let img = match call_canvas(
+                    &ctx,
+                    &b,
+                    key,
+                    CanvasCall::GetImageData(
+                        carg(&ctx, a, 0),
+                        carg(&ctx, a, 1),
+                        carg(&ctx, a, 2),
+                        carg(&ctx, a, 3),
+                    ),
+                )? {
+                    CanvasOutcome::ImageData(img) => img,
+                    CanvasOutcome::Tainted => {
+                        return Err(throw_dom(
+                            &ctx,
+                            "SecurityError",
+                            "getImageData: the canvas is tainted by cross-origin data",
+                        ));
+                    }
+                    _ => {
+                        return Err(throw_type_error(
+                            &ctx,
+                            "getImageData: the canvas has no pixel support",
+                        ));
+                    }
+                };
+                let o = Object::new(ctx.clone())?;
+                o.set("width", img.width as f64)?;
+                o.set("height", img.height as f64)?;
+                // A real `Uint8ClampedArray` (clamped values, the
+                // `.length` JS reads, indexed access): built via
+                // rquickjs's `TypedArray`, not by calling the
+                // constructor (a class constructor called without
+                // `new` throws "must be called with new").
+                let clamped: Vec<rquickjs::U8Clamped> =
+                    img.data.into_iter().map(rquickjs::U8Clamped).collect();
+                let arr = rquickjs::TypedArray::<rquickjs::U8Clamped>::new_copy(
+                    ctx.clone(),
+                    clamped.as_slice(),
+                )?;
+                o.set("data", arr.into_value())?;
+                Ok(o)
+            },
+        )
+        .map_err(|e| format!("getImageData: {e}"))?;
+        obj.set("getImageData", f)
+            .map_err(|e| format!("getImageData: {e}"))?;
+    }
+
+    // putImageData(imageData, dx, dy) — allowed on a tainted
+    // canvas (it exposes nothing); the dirty rect is ignored
+    // (see the header note).
+    {
+        let b = Rc::clone(bindings);
+        let f = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, args: Rest<Value<'js>>| -> rquickjs::Result<()> {
+                let a = &args.0;
+                let Some(data_obj) = a.first().and_then(|v| v.as_object()) else {
+                    return Err(throw_type_error(&ctx, "putImageData: expected ImageData"));
+                };
+                let width = data_obj.get::<_, f64>("width").unwrap_or(0.0) as u32;
+                let height = data_obj.get::<_, f64>("height").unwrap_or(0.0) as u32;
+                let data_value: Value = data_obj.get("data")?;
+                let mut data = Vec::with_capacity((width as usize) * (height as usize) * 4);
+                if let Some(data_obj) = data_value.as_object() {
+                    let len = data_obj.get::<_, f64>("length").unwrap_or(0.0) as usize;
+                    for i in 0..len {
+                        let v: Value = data_obj.get(i as i32)?;
+                        data.push(f64::from_js(&ctx, v).unwrap_or(0.0) as u8);
+                    }
+                }
+                let _ = call_canvas(
+                    &ctx,
+                    &b,
+                    key,
+                    CanvasCall::PutImageData {
+                        width,
+                        height,
+                        data,
+                        dx: carg(&ctx, a, 1),
+                        dy: carg(&ctx, a, 2),
+                    },
+                )?;
+                Ok(())
+            },
+        )
+        .map_err(|e| format!("putImageData: {e}"))?;
+        obj.set("putImageData", f)
+            .map_err(|e| format!("putImageData: {e}"))?;
+    }
+
+    // --- accessors: fillStyle / strokeStyle / lineWidth /
+    // lineCap / lineJoin / font / textAlign / textBaseline ---
+
+    // fillStyle / strokeStyle (colour string or gradient object).
+    for (name, is_fill) in [("fillStyle", true), ("strokeStyle", false)] {
+        let b = Rc::clone(bindings);
+        let get = move |ctx: Ctx<'js>, This(_this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+            let call = if is_fill {
+                CanvasCall::FillStyle
+            } else {
+                CanvasCall::StrokeStyle
+            };
+            match call_canvas(&ctx, &b, key, call)? {
+                CanvasOutcome::Paint(p) => paint_to_js(&ctx, &b, &p),
+                _ => Ok(js(&ctx, "#000000")),
+            }
+        };
+        let b = Rc::clone(bindings);
+        let set = move |ctx: Ctx<'js>, This(_this): This<Object<'js>>, value: Value<'js>| -> rquickjs::Result<()> {
+            if let Some(obj) = value.as_object()
+                && let Some(id) = gradient_id_of(&ctx, obj)?
+            {
+                let call = if is_fill {
+                    CanvasCall::SetFill(CanvasPaintSpec::Gradient(id))
+                } else {
+                    CanvasCall::SetStroke(CanvasPaintSpec::Gradient(id))
+                };
+                let _ = call_canvas(&ctx, &b, key, call)?;
+                return Ok(());
+            }
+            let text = to_dom_string(&ctx, &value)?;
+            let call = if is_fill {
+                CanvasCall::SetFillText(text)
+            } else {
+                CanvasCall::SetStrokeText(text)
+            };
+            let _ = call_canvas(&ctx, &b, key, call)?;
+            Ok(())
+        };
+        def_accessor(ctx, obj, name, get, set)?;
+    }
+
+    // lineWidth (number).
+    {
+        let b = Rc::clone(bindings);
+        let get = move |ctx: Ctx<'js>, This(_this): This<Object<'js>>| -> rquickjs::Result<f64> {
+            match call_canvas(&ctx, &b, key, CanvasCall::LineWidth)? {
+                CanvasOutcome::Number(w) => Ok(w),
+                _ => Ok(1.0),
+            }
+        };
+        let b = Rc::clone(bindings);
+        let set = move |ctx: Ctx<'js>, This(_this): This<Object<'js>>, value: Value<'js>| -> rquickjs::Result<()> {
+            let w = f64::from_js(&ctx, value).unwrap_or(1.0);
+            let _ = call_canvas(&ctx, &b, key, CanvasCall::SetLineWidth(w))?;
+            Ok(())
+        };
+        def_accessor(ctx, obj, "lineWidth", get, set)?;
+    }
+
+    // lineCap / lineJoin / font / textAlign / textBaseline
+    // (string accessors, one shape each).
+    for (name, get_call, set_call) in [
+        (
+            "lineCap",
+            CanvasCall::LineCap,
+            (|s: String| CanvasCall::SetLineCap(s)) as fn(String) -> CanvasCall,
+        ),
+        (
+            "lineJoin",
+            CanvasCall::LineJoin,
+            (|s: String| CanvasCall::SetLineJoin(s)) as fn(String) -> CanvasCall,
+        ),
+        (
+            "font",
+            CanvasCall::Font,
+            (|s: String| CanvasCall::SetFont(s)) as fn(String) -> CanvasCall,
+        ),
+        (
+            "textAlign",
+            CanvasCall::TextAlign,
+            (|s: String| CanvasCall::SetTextAlign(s)) as fn(String) -> CanvasCall,
+        ),
+        (
+            "textBaseline",
+            CanvasCall::TextBaseline,
+            (|s: String| CanvasCall::SetTextBaseline(s)) as fn(String) -> CanvasCall,
+        ),
+    ] {
+        let b = Rc::clone(bindings);
+        let get = move |ctx: Ctx<'js>, This(_this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+            match call_canvas(&ctx, &b, key, get_call.clone())? {
+                CanvasOutcome::Text(t) => Ok(js(&ctx, t)),
+                _ => Ok(js(&ctx, "")),
+            }
+        };
+        let b = Rc::clone(bindings);
+        let set = move |ctx: Ctx<'js>, This(_this): This<Object<'js>>, value: Value<'js>| -> rquickjs::Result<()> {
+            let text = to_dom_string(&ctx, &value)?;
+            let _ = call_canvas(&ctx, &b, key, set_call(text))?;
+            Ok(())
+        };
+        def_accessor(ctx, obj, name, get, set)?;
+    }
+    Ok(())
+}
+
 /// Install the `dataset` helpers: Rust functions in the registry
 /// plus a JS factory that builds a `Proxy` over them. The `dataset`
 /// getter on `Element.prototype` calls the factory once per
@@ -2628,6 +3638,54 @@ fn install_document_methods<'js>(
     )
     .map_err(|e| format!("createElement: {e}"))?;
     def_method(ctx, document, "createElement", create_el)?;
+
+    // createElementNS (Stage 15, M7 Phase 1, Rec 1): like
+    // `createElement`, but the element is created in the given
+    // namespace. `null` / `undefined` namespace means "no
+    // namespace" (the HTML namespace here). The qualified name
+    // is lowercased only for the HTML namespace — a foreign
+    // `foreignObject` keeps its case — and may carry one `:` for
+    // a `prefix:local` name.
+    let b = Rc::clone(bindings);
+    let create_el_ns = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>,
+              This(this): This<Object<'js>>,
+              namespace: Value<'js>,
+              tag: Coerced<String>|
+              -> rquickjs::Result<Value<'js>> {
+            let _ = dom_key_of_this(&ctx, &b, &this)?;
+            let ns = if namespace.is_null() || namespace.is_undefined() {
+                String::new()
+            } else {
+                to_dom_string(&ctx, &namespace)?
+            };
+            let mut tag = tag.to_string();
+            if tag.is_empty()
+                || !tag
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == ':')
+                || tag.starts_with(':')
+                || tag.ends_with(':')
+            {
+                return Err(throw_dom(
+                    &ctx,
+                    "InvalidCharacterError",
+                    "the qualified name contains an invalid character",
+                ));
+            }
+            if ns.is_empty() {
+                tag = tag.to_ascii_lowercase();
+            }
+            let host = host_of(&b).map_err(|e| throw_type_error(&ctx, &e))?;
+            let Some(key) = host.borrow_mut().create_element_ns(&ns, &tag) else {
+                return Err(throw_type_error(&ctx, "could not create element"));
+            };
+            wrap_node(&ctx, &b, key).map(Value::from)
+        },
+    )
+    .map_err(|e| format!("createElementNS: {e}"))?;
+    def_method(ctx, document, "createElementNS", create_el_ns)?;
 
     let b = Rc::clone(bindings);
     let create_text = Function::new(

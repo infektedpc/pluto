@@ -62,8 +62,8 @@ use cosmic::iced::futures::SinkExt;
 use cosmic::iced::futures::channel::mpsc;
 use pluto_html::NodeId;
 use pluto_ipc::{
-    BrowserToRenderer, CommandReceiver, DeltaMode, InputEvent, PointerKind, RendererToBrowser,
-    WheelPhase, origin_of,
+    BrowserToRenderer, CommandReceiver, DeltaMode, InputEvent, Origin, PointerKind,
+    RendererToBrowser, WheelPhase, origin_of,
 };
 use pluto_ipc::transport::{recv_browser_message, Transport};
 use pluto_js::DomHost;
@@ -79,7 +79,10 @@ use pluto_layout::{
     Theme,
 };
 use pluto_net::{ResourceLoader, SharedLoader};
-use pluto_paint::{CompositedUpdate, DisplayList, Resource, ResourceId, ResourceTable, perf};
+use pluto_paint::{
+    CompositedUpdate, DisplayList, Resource, ResourceId, ResourceTable, perf,
+    svg::SvgRasterCache,
+};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -488,9 +491,23 @@ pub(crate) enum LayoutJob {
         reply: oneshot::Sender<Vec<CompositedUpdate>>,
     },
     /// Build the display list from the actor's retained tree
-    /// (after the ResizeObserver step has run).
+    /// (after the ResizeObserver step has run). The reply also
+    /// carries the fresh raster Blobs (`build_with_svg_and_canvas`,
+    /// Stage 15 Rec 5/8): `(ResourceId, Resource)` pairs the tab
+    /// thread inserts into its image cache and announces with
+    /// `ResourceReady` before submitting the list. Empty when
+    /// the list has no new raster content (a scroll re-collect
+    /// names the cached ids again, so nothing is returned twice).
+    /// `canvas_live` names every live canvas element (its Blob
+    /// item is emitted whenever it is live); `canvas_new` carries
+    /// the bitmaps that changed since the last announcement;
+    /// `svg_images` maps `<svg><image>` nodes to their decoded
+    /// resource ids (from the last image map).
     CollectDisplayList {
-        reply: oneshot::Sender<Arc<DisplayList>>,
+        canvas_live: Vec<NodeId>,
+        canvas_new: Vec<(NodeId, Resource)>,
+        svg_images: HashMap<NodeId, ResourceId>,
+        reply: oneshot::Sender<(Arc<DisplayList>, Vec<(ResourceId, Resource)>)>,
     },
     /// Sizes + DOM depths for observed targets, from the retained
     /// tree + document (Stage 8 Rec 8). `None` size = unrendered.
@@ -523,10 +540,19 @@ pub(crate) enum LayoutJob {
     /// Scroll several containers at once: apply all offsets, then
     /// re-collect ONE display list (Stage 8 Rec 9 — a wheel that
     /// crosses two containers in one gesture must not submit
-    /// twice). `None` when the actor holds no tree.
+    /// twice). `None` when the actor holds no tree. The `Some`
+    /// payload also carries the fresh raster Blobs (see
+    /// [`LayoutJob::CollectDisplayList`]) — empty on a pure
+    /// scroll, since sizes never change and the raster cache hits.
+    /// The canvas / svg-image payload is the same as
+    /// `CollectDisplayList`'s: a scroll re-collect must still
+    /// name live canvases, or they would vanish on scroll.
     ScrollMany {
         scrolls: Vec<(NodeId, f32, f32)>,
-        reply: oneshot::Sender<Option<Arc<DisplayList>>>,
+        canvas_live: Vec<NodeId>,
+        canvas_new: Vec<(NodeId, Resource)>,
+        svg_images: HashMap<NodeId, ResourceId>,
+        reply: oneshot::Sender<Option<(Arc<DisplayList>, Vec<(ResourceId, Resource)>)>>,
     },
     /// Hit-test a click (page coordinates) and resolve the nearest
     /// enclosing `<a href>` against the document base URL. `None`
@@ -596,11 +622,19 @@ pub(crate) enum LayoutJob {
     /// so the worker skips the submit (the shell scrolls its
     /// cached list) and the event stream stays clean — a spurious
     /// submit here used to poison the wheel/resize tests' event
-    /// order. `None` when the actor holds no tree.
+    /// order. `None` when the actor holds no tree. The third
+    /// payload element is the fresh raster Blobs (see
+    /// [`LayoutJob::CollectDisplayList`]). The canvas / svg-image
+    /// payload is the same as `CollectDisplayList`'s (a viewport
+    /// scroll that moves a sticky box submits the re-collected
+    /// list, which must still name live canvases).
     SetViewportScroll {
         x: f32,
         y: f32,
-        reply: oneshot::Sender<Option<(Arc<DisplayList>, bool)>>,
+        canvas_live: Vec<NodeId>,
+        canvas_new: Vec<(NodeId, Resource)>,
+        svg_images: HashMap<NodeId, ResourceId>,
+        reply: oneshot::Sender<Option<(Arc<DisplayList>, bool, Vec<(ResourceId, Resource)>)>>,
     },
 }
 
@@ -763,6 +797,14 @@ fn build_full_tree(
 pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
     let mut tree: Option<LayoutTree> = None;
     let mut document: Option<Document> = None;
+    // Stage 15 Rec 5: the worker-side raster cache for inline
+    // SVGs and radial CSS gradient backgrounds (`build_with_svg`).
+    // Keyed by element id + bitmap size + content fingerprint —
+    // a new document means new node ids, so the cache clears
+    // whenever a document is installed (slot ids can be reused
+    // by a fresh `Dom`, and a stale bitmap would paint the wrong
+    // svg).
+    let mut svg_cache = SvgRasterCache::new();
     while let Ok(job) = jobs.recv() {
         match job {
             LayoutJob::LayoutTree {
@@ -781,6 +823,7 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
             } => {
                 if let Some(doc) = *new_document {
                     document = Some(doc);
+                    svg_cache.clear();
                 }
                 let Some(doc) = document.as_ref() else {
                     let _ = reply.send(RelayoutOutcome {
@@ -976,12 +1019,31 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                     .unwrap_or_default();
                 let _ = reply.send(updates);
             }
-            LayoutJob::CollectDisplayList { reply } => {
-                let display = tree
-                    .as_ref()
-                    .map(|tree| Arc::new(DisplayList::build(tree)))
-                    .unwrap_or_else(|| Arc::new(DisplayList::new()));
-                let _ = reply.send(display);
+            LayoutJob::CollectDisplayList {
+                canvas_live,
+                canvas_new,
+                svg_images,
+                reply,
+            } => {
+                let (display, blobs) = match tree.as_ref() {
+                    Some(tree) => match document.as_ref() {
+                        Some(doc) => {
+                            let (list, blobs) =
+                                DisplayList::build_with_svg_and_canvas(
+                                    tree,
+                                    doc.dom(),
+                                    &mut svg_cache,
+                                    &svg_images,
+                                    &canvas_live,
+                                    &canvas_new,
+                                );
+                            (Arc::new(list), blobs)
+                        }
+                        None => (Arc::new(DisplayList::build(tree)), Vec::new()),
+                    },
+                    None => (Arc::new(DisplayList::new()), Vec::new()),
+                };
+                let _ = reply.send((display, blobs));
             }
             LayoutJob::ResizeSizes { ids, reply } => {
                 let rows = match (tree.as_ref(), document.as_ref()) {
@@ -1013,12 +1075,29 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                 };
                 let _ = reply.send(chain);
             }
-            LayoutJob::ScrollMany { scrolls, reply } => {
+            LayoutJob::ScrollMany {
+                scrolls,
+                canvas_live,
+                canvas_new,
+                svg_images,
+                reply,
+            } => {
                 let display = tree.as_mut().map(|tree| {
                     for (id, x, y) in scrolls {
                         tree.set_scroll_offset(id, x, y);
                     }
-                    Arc::new(DisplayList::build(tree))
+                    let (list, blobs) = match document.as_ref() {
+                        Some(doc) => DisplayList::build_with_svg_and_canvas(
+                            tree,
+                            doc.dom(),
+                            &mut svg_cache,
+                            &svg_images,
+                            &canvas_live,
+                            &canvas_new,
+                        ),
+                        None => (DisplayList::build(tree), Vec::new()),
+                    };
+                    (Arc::new(list), blobs)
                 });
                 let _ = reply.send(display);
             }
@@ -1077,6 +1156,7 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                 reply,
             } => {
                 document = Some(*new_document);
+                svg_cache.clear();
                 let doc = document.as_ref().unwrap();
                 // A forced flush rebuilds the tree: keep the
                 // retained tree's images (Stage 11 Rec 1) — a
@@ -1103,7 +1183,14 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                 let target = tree.as_ref().and_then(|tree| tree.hit_test(x, y));
                 let _ = reply.send(target);
             }
-            LayoutJob::SetViewportScroll { x, y, reply } => {
+            LayoutJob::SetViewportScroll {
+                x,
+                y,
+                canvas_live,
+                canvas_new,
+                svg_images,
+                reply,
+            } => {
                 // M6 Phase 3 (Rec 1/3): the tree learns the
                 // viewport scroll — sticky offsets are
                 // scroll-derived, fixed boxes hit-test in viewport
@@ -1114,7 +1201,18 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                 // `ScrollMany`.
                 let display = tree.as_mut().map(|tree| {
                     let sticky_moved = tree.set_viewport_scroll(x, y);
-                    (Arc::new(DisplayList::build(tree)), sticky_moved)
+                    let (list, blobs) = match document.as_ref() {
+                        Some(doc) => DisplayList::build_with_svg_and_canvas(
+                            tree,
+                            doc.dom(),
+                            &mut svg_cache,
+                            &svg_images,
+                            &canvas_live,
+                            &canvas_new,
+                        ),
+                        None => (DisplayList::build(tree), Vec::new()),
+                    };
+                    (Arc::new(list), sticky_moved, blobs)
                 });
                 let _ = reply.send(display);
             }
@@ -1519,6 +1617,13 @@ struct TabState {
     /// Rec 11): the animation visibility check walks it for
     /// animated nodes.
     last_image_map: ImageMap,
+    /// Hash of the last announced canvas bitmap per canvas
+    /// element (Stage 15, M7 Phase 3, Rec 8):
+    /// `relayout_and_submit` only re-announces a canvas whose
+    /// bitmap changed since its last announcement — an unchanged
+    /// canvas is not re-sent at 60 fps. Cleared on navigation (a
+    /// new document's keys are a fresh arena).
+    last_canvas_announced: HashMap<NodeId, u64>,
     /// Animated resource ids currently on-screen (Stage 11 Rec
     /// 11): refreshed by a `Geometry` job every ~30 ticks; the
     /// advance step only runs for ids in this set.
@@ -1779,6 +1884,7 @@ impl TabState {
             progress_tx,
             progress_rx: Some(progress_rx),
             last_image_map: ImageMap::new(),
+            last_canvas_announced: HashMap::new(),
             animation_visible: HashSet::new(),
             animation_geometry_pending: Vec::new(),
             last_animation_check_tick: 0,
@@ -2362,15 +2468,31 @@ fn handle_exec(state: &mut TabState, msg: crate::js_host::ExecMsg) {
     let Some(js) = state.tab_js.as_mut() else {
         return;
     };
-    let mut exec = crate::js_host::ScriptExecutor::new(Rc::clone(&state.host));
+    // Stage 15 (M7 Phase 1, Rec 11): the CSP gate for inline
+    // scripts — the CURRENT document's policies, stashed on the
+    // shared host by the load task from the document response's
+    // headers, plus the document origin (the host's base URL is
+    // the in-flight navigation's URL, which is the right origin
+    // while the parse is still running and `state.document` is the
+    // old page). The host copy — not the loader's — is the source
+    // of truth here: in Broker mode the worker-side loader never
+    // sees the document response.
+    let csp = {
+        let policies = state.host.lock().unwrap().csp_policies();
+        let origin = Origin::from_url(state.host.lock().unwrap().base_url());
+        Some((policies, origin))
+    };
+    let mut exec = crate::js_host::ScriptExecutor::new(Rc::clone(&state.host), csp);
     match msg {
         ExecMsg::Classic {
+            node,
+            inline,
             source,
             url,
             reply,
             ..
         } => {
-            exec.exec_classic(js, &source, &url);
+            exec.exec_classic(js, node, &source, &url, inline);
             let _ = reply.send(());
         }
         ExecMsg::Queued {
@@ -3561,6 +3683,7 @@ fn start_navigation_with_body(
     state.last_title = String::new();
     state.last_display = None;
     state.last_image_map = ImageMap::new();
+    state.last_canvas_announced.clear();
     state.animation_visible.clear();
     state.animation_geometry_pending.clear();
     // The shell resets its scroll on commit; mirror it here (the
@@ -3943,16 +4066,51 @@ fn handle_js_image_request(state: &mut TabState, req: ImageRequest) {
     }
 }
 
+/// Whether an image URL is origin-clean for canvas tainting
+/// (Stage 15, M7 Phase 3, Rec 9): `data:` URLs never taint,
+/// and a URL is clean when its origin equals the document base
+/// URL's origin. Cross-origin images taint — the pipeline
+/// records no CORS approval for `<img>`, so there is no clean
+/// cross-origin case.
+fn image_origin_clean(base_url: &str, url: &str) -> bool {
+    if url.starts_with("data:") {
+        return true;
+    }
+    Origin::from_url(url) == Origin::from_url(base_url)
+}
+
 /// Report one image outcome to JS (Stage 12 Rec 7): every `<img>`
 /// whose current `src` resolves to `url` gets a `load` (with the
 /// intrinsic size) or `error` event, via `TabJs`. A favicon never
 /// reaches here (it has no element). Elements whose `src` moved
 /// on since the fetch started do not match, so they hear nothing
 /// about the stale load.
+///
+/// A decoded load also feeds the pixels to the JS host (Stage 15,
+/// M7 Phase 3, Rec 8): a later `drawImage(img)` then has the
+/// bitmap synchronously, with the origin-clean flag Rec 9
+/// requires. The host keeps its own copy of the bytes (see
+/// `ImageStore::ready_pixels` for the bound).
 fn notify_image_targets(state: &mut TabState, url: &str, outcome: Option<(u32, u32)>) {
     let targets = state.host.lock().unwrap().image_targets(url);
     if targets.is_empty() {
         return;
+    }
+    if outcome.is_some() {
+        let base_url = state.host.lock().unwrap().base_url().to_string();
+        let clean = image_origin_clean(&base_url, url);
+        if let Some(pixels) = state.images.ready_pixels(url) {
+            let mut host = state.host.lock().unwrap();
+            for target in &targets {
+                host.set_image_pixels(
+                    *target,
+                    pixels.width,
+                    pixels.height,
+                    pixels.rgba.clone(),
+                    clean,
+                );
+            }
+        }
     }
     let Some(js) = state.tab_js.as_mut() else {
         return;
@@ -4076,6 +4234,102 @@ async fn emit(
         .send(crate::Message::RendererEvent(tab_id, event))
         .await
         .is_ok()
+}
+
+/// Insert fresh raster Blobs (Stage 15, M7 Phase 2, Rec 5)
+/// into the tab's image cache and announce each with
+/// `ResourceReady` BEFORE the display list that names them
+/// submits — the shell validates the list against its per-tab
+/// table, so a Blob id without pixels would fail validation and
+/// drop the frame. Entries the cache already holds (same id,
+/// same pixels — the deterministic ids make a scroll re-collect
+/// name the same id) are skipped: the shell already has them.
+/// An entry under the same id with different pixels (a
+/// re-raster after a content change or resize) replaces the
+/// cached pixels and re-announces, like the animated-frame
+/// precedent above. Oversize-for-frame resources are skipped —
+/// they cannot cross IPC (the raster cap in `pluto_paint::svg`
+/// is set so this never happens in practice; the check is the
+/// belt to that suspender). Returns false when the shell is gone.
+/// Drain the host's canvas state for one collect (Stage 15, M7
+/// Phase 3, Rec 8): every live canvas element, the bitmaps that
+/// changed since the last announcement (as `Resource::Image`s),
+/// and the svg-image resource map from the last image map. A
+/// bitmap whose hash matches the last announced one is not
+/// re-sent — the shell already has those pixels, so an unchanged
+/// canvas costs nothing per frame. The drain clears the hosts'
+/// dirty flags, so a second call in the same tick finds nothing
+/// new.
+fn collect_canvas_state(
+    state: &mut TabState,
+) -> (
+    Vec<NodeId>,
+    Vec<(NodeId, Resource)>,
+    HashMap<NodeId, ResourceId>,
+) {
+    let (live, dirty) = {
+        let mut host = state.host.lock().unwrap();
+        (host.canvas_live_keys(), host.canvas_take_dirty())
+    };
+    let mut fresh = Vec::new();
+    for (key, width, height, rgba) in dirty {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        rgba.hash(&mut hasher);
+        let hash = hasher.finish();
+        if state.last_canvas_announced.get(&key).copied() != Some(hash) {
+            state.last_canvas_announced.insert(key, hash);
+            fresh.push((
+                key,
+                Resource::Image {
+                    width,
+                    height,
+                    rgba,
+                },
+            ));
+        }
+    }
+    let svg_images: HashMap<NodeId, ResourceId> = state
+        .last_image_map
+        .by_node
+        .iter()
+        .map(|(id, info)| (*id, ResourceId(info.resource)))
+        .collect();
+    (live, fresh, svg_images)
+}
+
+async fn announce_blobs(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+    blobs: Vec<(ResourceId, Resource)>,
+) -> bool {
+    for (id, resource) in blobs {
+        if state.images.cache.get(id) == Some(&resource) {
+            continue;
+        }
+        let fits = match &resource {
+            Resource::Image { rgba, .. } => ImageStore::resource_fits_frame(rgba.len()),
+        };
+        if !fits {
+            continue;
+        }
+        if !state.images.cache.insert_with_id(id, resource.clone()) {
+            continue;
+        }
+        if !emit_tab(
+            events,
+            RendererToBrowser::ResourceReady {
+                epoch: state.nav_epoch,
+                resource_id: id,
+                resource,
+            },
+        )
+        .await
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Submit a display list to the shell, stamping the next epoch.
@@ -4474,11 +4728,26 @@ async fn layout_and_submit(
             .send(LayoutJob::SetViewportScroll {
                 x: clamped.0,
                 y: clamped.1,
+                // The list is discarded (the collect step below
+                // rebuilds it), so the canvas drain stays with
+                // the collect — passing live keys here would only
+                // name Blobs in a list nobody submits.
+                canvas_live: Vec::new(),
+                canvas_new: Vec::new(),
+                svg_images: HashMap::new(),
                 reply: reply_tx,
             })
             .is_ok()
         {
-            let _ = reply_rx.await;
+            // The list is discarded (the collect step below
+            // rebuilds it from the synced tree) — but a fresh
+            // Blob in the reply must still be announced, or the
+            // re-collect names an id the shell never received.
+            if let Ok(Some((_, _, blobs))) = reply_rx.await
+                && !announce_blobs(state, events, blobs).await
+            {
+                return false;
+            }
         }
     }
     // Stage 10 Rec 7: the layout phase ends when the tree reply
@@ -4491,11 +4760,20 @@ async fn layout_and_submit(
     // list: the geometry is computed here, but the callbacks are a
     // queued task — they run after the submit, on a later turn.
     run_intersection_observer_step(state).await;
-    // (3) Display list from the retained tree.
+    // (3) Display list from the retained tree. The canvas drain
+    // runs first: the list names canvas Blobs, so fresh bitmaps
+    // must be announced (below, via `announce_blobs`) before the
+    // list that names them is submitted.
+    let (canvas_live, canvas_new, svg_images) = collect_canvas_state(state);
     let (list_tx, list_rx) = oneshot::channel();
     if state
         .layout_tx
-        .send(LayoutJob::CollectDisplayList { reply: list_tx })
+        .send(LayoutJob::CollectDisplayList {
+            canvas_live,
+            canvas_new,
+            svg_images,
+            reply: list_tx,
+        })
         .is_err()
     {
         return emit_tab(
@@ -4507,7 +4785,7 @@ async fn layout_and_submit(
         .await;
     }
     match list_rx.await {
-        Ok(display) => {
+        Ok((display, blobs)) => {
             // Stage 10 Rec 7: the collect phase ends when the
             // list lands (it covers the observer steps above
             // plus the collect round trip).
@@ -4526,6 +4804,13 @@ async fn layout_and_submit(
             // blink tick re-derives it from the caret-free base.
             let display = with_caret(state, display);
             state.caret_blink_on = caret_blink_on(state);
+            // Stage 15 Rec 5: the fresh raster Blobs travel in
+            // their own `ResourceReady` frames before the list
+            // that names them — otherwise the shell's validation
+            // would reject the submit for a missing resource.
+            if !announce_blobs(state, events, blobs).await {
+                return false;
+            }
             let submit_started = std::time::Instant::now();
             let submitted = submit(state, events, display).await;
             // Stage 11 Rec 8: the title is emitted here, after
@@ -5273,12 +5558,16 @@ async fn apply_viewport_scroll(
     events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
 ) -> bool {
     let started = std::time::Instant::now();
+    let (canvas_live, canvas_new, svg_images) = collect_canvas_state(state);
     let (reply_tx, reply_rx) = oneshot::channel();
     if state
         .layout_tx
         .send(LayoutJob::SetViewportScroll {
             x: state.viewport_scroll.0,
             y: state.viewport_scroll.1,
+            canvas_live,
+            canvas_new,
+            svg_images,
             reply: reply_tx,
         })
         .is_err()
@@ -5286,17 +5575,27 @@ async fn apply_viewport_scroll(
         return false;
     }
     match reply_rx.await {
-        Ok(Some((display, sticky_moved))) => {
+        Ok(Some((display, sticky_moved, blobs))) => {
             // The tree is synced either way — but the list only
             // submits when a sticky box actually moved. Otherwise
             // the list is byte-identical to the cached one and a
             // submit would be a spurious event in the stream (the
             // shell scrolls its cached list on `ScrollViewport`).
+            // The fresh Blobs are still announced: the drain
+            // already consumed them, and the list names the
+            // canvas Blob ids — skipping the announcement would
+            // leave the shell without pixels the next list names.
+            // (A canvas pixel change does not alter the list
+            // bytes — only the resource — so skipping the submit
+            // stays correct.)
             if !sticky_moved {
-                return true;
+                return announce_blobs(state, events, blobs).await;
             }
             let collect_ms = started.elapsed().as_secs_f32() * 1000.0;
             state.last_display = Some(Arc::clone(&display));
+            if !announce_blobs(state, events, blobs).await {
+                return false;
+            }
             let submit_started = std::time::Instant::now();
             let submitted = submit(state, events, display).await;
             state.frame_times.record(FrameSample {
@@ -5324,11 +5623,15 @@ async fn apply_scrolls(
     // re-laying out, so its cost is the ScrollMany round trip
     // (collect) plus the submit — no layout phase.
     let started = std::time::Instant::now();
+    let (canvas_live, canvas_new, svg_images) = collect_canvas_state(state);
     let (reply_tx, reply_rx) = oneshot::channel();
     if state
         .layout_tx
         .send(LayoutJob::ScrollMany {
             scrolls: scrolls.clone(),
+            canvas_live,
+            canvas_new,
+            svg_images,
             reply: reply_tx,
         })
         .is_err()
@@ -5336,10 +5639,13 @@ async fn apply_scrolls(
         return false;
     }
     match reply_rx.await {
-        Ok(Some(display)) => {
+        Ok(Some((display, blobs))) => {
             let collect_ms = started.elapsed().as_secs_f32() * 1000.0;
             for (id, x, y) in scrolls {
                 state.scroll_offsets.insert(id, (x, y));
+            }
+            if !announce_blobs(state, events, blobs).await {
+                return false;
             }
             let submit_started = std::time::Instant::now();
             let submitted = submit(state, events, display).await;
@@ -5841,6 +6147,18 @@ mod tests {
 </body>
 </html>"#;
 
+    /// A page with one radial-gradient inline SVG (Stage 15,
+    /// M7 Phase 2, Rec 5): the worker must rasterise it and
+    /// announce the Blob's pixels before the submit that names
+    /// them. Served at `/svg` by the test server below.
+    const SVG_PAGE: &str = r#"<!doctype html>
+<html>
+<head><title>SVG</title></head>
+<body>
+<svg width="100" height="100" viewBox="0 0 100 100"><defs><radialGradient id="rg"><stop offset="0" stop-color="red"/><stop offset="1" stop-color="white"/></radialGradient></defs><rect x="0" y="0" width="100" height="100" fill="url(#rg)"/></svg>
+</body>
+</html>"#;
+
     /// Local server returning the example document, same pattern as
     /// pluto-net's and page's tests. No internet needed (hyper has
     /// no proxy support). `/slow` answers after 500 ms, so a
@@ -5866,7 +6184,7 @@ mod tests {
                 if path == "/slow" {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
-                let body = EXAMPLE_COM;
+                let body = if path == "/svg" { SVG_PAGE } else { EXAMPLE_COM };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -6409,6 +6727,98 @@ mod tests {
                 ..
             }
         ));
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Stage 15 (M7 Phase 2, Rec 5): a page with a
+    /// radial-gradient inline SVG produces a `ResourceReady`
+    /// BEFORE the `SubmitDisplayList` that names the Blob — the
+    /// shell validates the list against its per-tab table, so a
+    /// Blob without pixels would fail validation and drop the
+    /// frame. Mirrors
+    /// `worker_loads_a_page_and_submits_its_display_list`, with
+    /// the `/svg` page. (`next_event` skips `ResourceReady`, so
+    /// this test reads the channel raw until the submit lands.)
+    #[tokio::test]
+    async fn worker_announces_svg_blob_before_submit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/svg", addr.port());
+        cmd_tx
+            .send(BrowserToRenderer::CommitNavigation { url: url.clone() })
+            .expect("worker takes the command");
+        assert!(matches!(
+            next_event(&mut event_rx).await,
+            RendererToBrowser::DidCommit { .. }
+        ));
+        let mut ready: Vec<(ResourceId, Resource)> = Vec::new();
+        let (epoch, bytes) = loop {
+            let msg = tokio::time::timeout(Duration::from_secs(20), event_rx.recv())
+                .await
+                .expect("an event arrives in time")
+                .expect("worker emits an event");
+            let event = match msg {
+                crate::Message::RendererEvent(_, event) => event,
+                other => panic!("expected a RendererEvent, got {other:?}"),
+            };
+            match event {
+                RendererToBrowser::ResourceReady {
+                    resource_id,
+                    resource,
+                    ..
+                } => {
+                    ready.push((resource_id, resource));
+                }
+                RendererToBrowser::SubmitDisplayList {
+                    epoch,
+                    bytes,
+                    resources,
+                } => {
+                    assert!(resources.is_empty(), "resources travel out-of-band");
+                    break (epoch, bytes);
+                }
+                // LoadProgress / TitleChanged / FaviconChanged /
+                // Heartbeat / SandboxReport interleave freely.
+                _ => {}
+            }
+        };
+        assert_eq!(epoch, 1, "first frame is epoch 1");
+        let list = DisplayList::from_bytes(&bytes).expect("list bytes decode");
+        let blob_ids: Vec<ResourceId> = list
+            .0
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::Blob { resource, .. } => Some(*resource),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(blob_ids.len(), 1, "one radial svg = one Blob");
+        let (_, ready_resource) = ready
+            .iter()
+            .find(|(id, _)| blob_ids.contains(id))
+            .expect("the Blob's pixels arrived in a ResourceReady before the submit");
+        assert!(
+            matches!(
+                ready_resource,
+                Resource::Image {
+                    width: 100,
+                    height: 100,
+                    rgba,
+                } if !rgba.is_empty()
+            ),
+            "the announced resource is the 100x100 raster"
+        );
+        let mut table = ResourceTable::new();
+        for (id, resource) in &ready {
+            table.insert(*id, resource.clone());
+        }
+        list.validate(&table)
+            .expect("the submitted list validates against the announced resources");
         cmd_tx
             .send(BrowserToRenderer::Shutdown)
             .expect("worker takes Shutdown");

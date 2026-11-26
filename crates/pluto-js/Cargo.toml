@@ -14,3 +14,13 @@ pluto-ipc.workspace = true
 sha2.workspace = true
 url.workspace = true
 regex = "1"
+
+[dev-dependencies]
+# Stage 15 (M7 Phase 3, Rec 8/9): the test host implements the
+# canvas calls against the real `pluto-paint` rasteriser, so
+# binding tests exercise the production drawing code (not a
+# second rasteriser). Test-only: the library never imports paint.
+# `pluto-css` is for `Affine`, the type `Canvas2d::set_transform`
+# takes.
+pluto-paint.workspace = true
+pluto-css.workspace = true

@@ -71,6 +71,8 @@ pub mod storage;
 pub mod test_host;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_canvas;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -110,6 +112,10 @@ pub const ABORT_SIGNAL_SYMBOL: &str = "pluto.abortSignal";
 
 /// `Symbol.for("pluto.url")` — the per-URL / per-URLSearchParams id property.
 pub const URL_SYMBOL: &str = "pluto.url";
+
+/// `Symbol.for("pluto.canvasGradient")` — the host gradient id on
+/// a `CanvasGradient` object (Stage 15, M7 Phase 3, Rec 8).
+pub const CANVAS_GRADIENT_SYMBOL: &str = "pluto.canvasGradient";
 
 /// `window`'s target id in the listener registry (the window has no
 /// `DomKey`).
@@ -336,6 +342,12 @@ pub fn registry<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
         "resizeObserverInstances",
         "intersectionObservers",
         "intersectionObserverInstances",
+        // Stage 15 (M7 Phase 3, Rec 8/9): cached 2D context
+        // objects, by wrapper id (like `classLists` / `styles`
+        // above — `getContext('2d')` is `===`-stable), and live
+        // `CanvasGradient` objects, by host gradient id.
+        "canvasContexts",
+        "canvasGradients",
         // Stage 9 Rec 11: live `PermissionStatus` objects, by id,
         // so a state change can dispatch `onchange` to them.
         "permissionStatuses",

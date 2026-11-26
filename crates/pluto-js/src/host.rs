@@ -247,6 +247,14 @@ pub trait DomHost {
         None
     }
 
+    /// DOM `namespaceURI` as stored (Stage 15, M7 Phase 1, Rec 1):
+    /// the element's namespace URI, `""` for the HTML namespace
+    /// (the parser's convention — the binding maps it to the HTML
+    /// namespace URI). `None` for non-elements / stale keys.
+    fn namespace_uri(&self, _key: DomKey) -> Option<String> {
+        None
+    }
+
     /// The document title (text of the first `<title>` in `<head>`),
     /// or `None` if there is none.
     fn title(&self) -> Option<String> {
@@ -263,6 +271,29 @@ pub trait DomHost {
     /// failure (never in practice); the tag is stored as given.
     fn create_element(&mut self, _tag: &str) -> Option<DomKey> {
         None
+    }
+
+    /// Create a detached element node in namespace `namespace`
+    /// (`document.createElementNS`, Stage 15, M7 Phase 1, Rec 1):
+    /// `""` (or null from JS) is the HTML namespace; the SVG
+    /// namespace URI makes an SVG element. Plain `createElement`
+    /// always creates an HTML-namespace element. The default impl
+    /// is "not present" — hosts that own a `Dom` override it.
+    fn create_element_ns(&mut self, _namespace: &str, _tag: &str) -> Option<DomKey> {
+        None
+    }
+
+    /// Whether `eval()` / the `Function` constructor may run under
+    /// the document's CSP (Stage 15, M7 Phase 1, Rec 11): the seam
+    /// for the later phase that installs a CSP-aware eval override
+    /// in `install_globals`. Default `true` — a host with no
+    /// policies known allows eval, as before. rquickjs's built-in
+    /// `eval` has no host hook, so this is not yet wired to
+    /// execution; replacing the global would turn direct eval into
+    /// global-scope eval and break `eval("localVar")` inside
+    /// functions on allowed pages.
+    fn eval_allowed(&self) -> bool {
+        true
     }
 
     /// Create a detached text node.
@@ -721,4 +752,238 @@ pub trait DomHost {
     /// boundary): pending requests, known animations, CSS names.
     /// The tab thread also clears its engine.
     fn clear_animations(&mut self) {}
+
+    // --- Stage 15 (M7 Phase 3, Rec 8/9): 2D canvas ---
+
+    /// One canvas operation, as plain data across the host
+    /// boundary (the binding never touches the bitmap — the host
+    /// owns the `Canvas2d` in `pluto-paint`, the binding only
+    /// forwards calls and formats results). The `key` argument
+    /// of [`DomHost::canvas_call`] is the `<canvas>` element;
+    /// `DrawImage*` names the source element separately.
+    /// Coordinates are user-space (the CTM applies inside the
+    /// host's canvas); `GetImageData` / `PutImageData` pixel
+    /// coordinates are device pixels (bitmap space).
+    fn canvas_call(&mut self, _key: DomKey, _call: CanvasCall) -> CanvasOutcome {
+        CanvasOutcome::Unsupported
+    }
+
+    /// Every `<canvas>` element with a live bitmap, in document
+    /// order (the tab thread's display-list pass names these, so
+    /// a static canvas keeps painting its Blob). Default: none.
+    fn canvas_live_keys(&self) -> Vec<DomKey> {
+        Vec::new()
+    }
+
+    /// Drain every dirty canvas bitmap since the last call, as
+    /// `(element, width, height, rgba)` — the tab thread
+    /// announces each as a `ResourceReady` before the submit
+    /// that names it. A canvas whose bitmap did not change is
+    /// not returned (no 60 fps re-send — Rec 8). Default: none.
+    fn canvas_take_dirty(&mut self) -> Vec<(DomKey, u32, u32, Vec<u8>)> {
+        Vec::new()
+    }
+}
+
+/// A canvas paint as plain data (Stage 15, M7 Phase 3, Rec 8):
+/// a solid colour (straight-alpha RGBA bytes) or a gradient id
+/// allocated by [`CanvasCall::CreateGradient`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum CanvasPaintSpec {
+    Color([u8; 4]),
+    Gradient(u64),
+}
+
+/// A canvas gradient's geometry, as plain data: linear (two
+/// points) or radial (two circles). Stops ride the spec
+/// (added out of order, they sort at paint time).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CanvasGradientKindSpec {
+    Linear(f64, f64, f64, f64),
+    Radial(f64, f64, f64, f64, f64, f64),
+}
+
+/// One `createLinearGradient` / `createRadialGradient` value:
+/// geometry + stops (`offset` in 0..=1, colour RGBA bytes).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanvasGradientSpec {
+    pub kind: CanvasGradientKindSpec,
+    pub stops: Vec<(f32, [u8; 4])>,
+}
+
+/// `getImageData` pixels: `width` × `height` RGBA bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanvasImageData {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}
+
+/// One canvas operation (see [`DomHost::canvas_call`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CanvasCall {
+    /// Ensure the backing store exists (sized from the
+    /// `width` / `height` attributes, 300×150 default).
+    /// → [`CanvasOutcome::Size`].
+    Ensure,
+    /// Resize + reset (spec: setting `width` / `height` clears
+    /// the bitmap and the whole context state). → `Bool`
+    /// (false = refused: zero or over the raster cap).
+    Resize(u32, u32),
+    /// Set / read the fill paint. → `None` / `Paint`.
+    SetFill(CanvasPaintSpec),
+    FillStyle,
+    /// Set the fill paint from a CSS colour string (`"red"`,
+    /// `"#ff0000"`, `"rgb(…)"` — parsed by the host, which owns
+    /// the colour parser). An unparseable string leaves the
+    /// paint unchanged. → `Paint` (the effective paint).
+    SetFillText(String),
+    /// Set / read the stroke paint. → `None` / `Paint`.
+    SetStroke(CanvasPaintSpec),
+    StrokeStyle,
+    /// Set the stroke paint from a CSS colour string.
+    /// → `Paint` (the effective paint).
+    SetStrokeText(String),
+    /// `lineWidth` (ignored when ≤ 0 or non-finite). → `None` /
+    /// `Number`.
+    SetLineWidth(f64),
+    LineWidth,
+    /// `lineCap` (`"butt"` / `"round"` / `"square"`). → `None` /
+    /// `Text`.
+    SetLineCap(String),
+    LineCap,
+    /// `lineJoin` (`"miter"` / `"round"` / `"bevel"`). → `None` /
+    /// `Text`.
+    SetLineJoin(String),
+    LineJoin,
+    /// `font` (the size is parsed; the family is not honoured —
+    /// system font). → `None` / `Text`.
+    SetFont(String),
+    Font,
+    /// `textAlign`. → `None` / `Text`.
+    SetTextAlign(String),
+    TextAlign,
+    /// `textBaseline`. → `None` / `Text`.
+    SetTextBaseline(String),
+    TextBaseline,
+    FillRect(f64, f64, f64, f64),
+    ClearRect(f64, f64, f64, f64),
+    StrokeRect(f64, f64, f64, f64),
+    BeginPath,
+    MoveTo(f64, f64),
+    LineTo(f64, f64),
+    ClosePath,
+    RectPath(f64, f64, f64, f64),
+    Arc(f64, f64, f64, f64, f64, bool),
+    QuadraticCurveTo(f64, f64, f64, f64),
+    BezierCurveTo(f64, f64, f64, f64, f64, f64),
+    /// Fill the current path (`true` = evenodd rule). → `None`.
+    Fill(bool),
+    Stroke,
+    Clip,
+    Save,
+    Restore,
+    Translate(f64, f64),
+    Scale(f64, f64),
+    /// `rotate` in radians. → `None`.
+    Rotate(f64),
+    /// `setTransform(a, b, c, d, e, f)`. → `None`.
+    SetTransform([f64; 6]),
+    ResetTransform,
+    /// The current transform as `[a, b, c, d, e, f]`.
+    /// → `Transform`.
+    GetTransform,
+    /// Allocate a gradient (empty stops; `AddColorStop` fills
+    /// them). → `GradientId`.
+    CreateGradient(CanvasGradientSpec),
+    /// Add a stop to a gradient id (the colour is a CSS string,
+    /// parsed by the host). → `Bool` (parsed; an invalid colour
+    /// throws `SyntaxError` in the binding, per spec).
+    AddColorStop(u64, f32, String),
+    FillText(String, f64, f64, Option<f64>),
+    StrokeText(String, f64, f64, Option<f64>),
+    /// The advance width of `text` at the current font.
+    /// → `Number`.
+    MeasureText(String),
+    /// `drawImage` from another canvas: `(src, sx, sy, sw, sh,
+    /// dx, dy, dw, dh)` in user space. Taint propagates from a
+    /// tainted source. → `Bool` (drawn).
+    DrawImageCanvas {
+        src: DomKey,
+        sx: f64,
+        sy: f64,
+        sw: f64,
+        sh: f64,
+        dx: f64,
+        dy: f64,
+        dw: f64,
+        dh: f64,
+    },
+    /// `drawImage` from an `<img>` / `Image()` element (the
+    /// host looks the decoded pixels up in its image-pixel
+    /// store). A cross-origin source without CORS approval
+    /// taints the canvas (Rec 9). → `Bool` (drawn).
+    DrawImageElement {
+        src: DomKey,
+        sx: f64,
+        sy: f64,
+        sw: f64,
+        sh: f64,
+        dx: f64,
+        dy: f64,
+        dw: f64,
+        dh: f64,
+    },
+    /// `getImageData(x, y, w, h)`. → `ImageData`, or `Tainted`
+    /// when the canvas is tainted (Rec 9 — the binding raises
+    /// `SecurityError`).
+    GetImageData(f64, f64, f64, f64),
+    /// `putImageData(data, dx, dy)`: writes pixels ignoring the
+    /// CTM; allowed on a tainted canvas (it exposes nothing).
+    PutImageData {
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+        dx: f64,
+        dy: f64,
+    },
+    /// `toDataURL()`. → `Text`, or `Tainted`.
+    ToDataUrl,
+    /// The Rec 9 origin-clean flag. → `Bool`.
+    OriginClean,
+    /// Peek at the bitmap without clearing the dirty flag.
+    /// → `Bitmap`.
+    Bitmap,
+    /// Record decoded pixels for an `<img>` element (called by
+    /// the tab thread when an image loads, so `drawImage` can
+    /// read them; the host copies the bytes — see the
+    /// production host). `origin_clean` is whether the image's
+    /// origin is clean for this document (same-origin / `data:`).
+    SetImagePixels {
+        key: DomKey,
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+        origin_clean: bool,
+    },
+}
+
+/// The result of a [`CanvasCall`]. `Unsupported` is the default
+/// host's answer to every call (a host with no canvas support:
+/// `getContext('2d')` then returns `null`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CanvasOutcome {
+    Unsupported,
+    None,
+    Bool(bool),
+    Size(u32, u32),
+    Number(f64),
+    Text(String),
+    Paint(CanvasPaintSpec),
+    GradientId(u64),
+    ImageData(CanvasImageData),
+    Bitmap(Option<(u32, u32, Vec<u8>)>),
+    Transform([f64; 6]),
+    /// The canvas is tainted: pixel readback is refused (Rec 9).
+    Tainted,
 }

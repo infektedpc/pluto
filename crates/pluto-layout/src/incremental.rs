@@ -387,7 +387,17 @@ pub fn unsafe_layout_root_reason(
     let definite_width = matches!(style.width, Some(Dim::Px(_)));
     let definite_size =
         definite_width && matches!(style.height, Some(Dim::Px(_)));
-    let replaced = matches!(dom.tag(root), Some("img"));
+    // Stage 15 (M7 Phase 1, Rec 2): `<svg>` / `<canvas>` are
+    // replaced-element leaves like `<img>` — their size does not
+    // come from their subtree (which builds no boxes at all), so a
+    // subtree rooted at one is size-independent. The predicate and
+    // the cold build change together here (Stage 14 trap class):
+    // cold used to drop SVG children entirely, so the
+    // incremental==cold tripwire could not have caught a predicate
+    // that treated them as ordinary containers.
+    let replaced = matches!(dom.tag(root), Some("img"))
+        || is_svg_element(dom, root)
+        || is_canvas_element(dom, root);
     // A leaf with a definite size: the fourth alternative, listed
     // separately for the report even though it is subsumed by
     // `definite_size` (a leaf has no contents to size from).

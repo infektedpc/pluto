@@ -56,6 +56,7 @@
 //! renderer's `FontSystem` to layout instead of building a second one.)
 
 use crate::glyph_key::font_id_map;
+use crate::path::VectorVertex;
 use crate::image::{IMAGE_CACHE_BYTE_CAP, build_mip_chain, mip_chain_bytes, mip_level_for_scale};
 use crate::perf::{self, SpanKind};
 use crate::{
@@ -187,6 +188,57 @@ fn rect_vs(v: RectVertex) -> RectOut {
 
 @fragment
 fn rect_fs(in: RectOut) -> @location(0) vec4<f32> {
+    let cov = clip_coverage(in.page);
+    if (cov <= 0.0) { discard; }
+    return vec4<f32>(in.color.rgb, in.color.a * cov);
+}
+"#;
+
+const VECTOR_WGSL_BODY: &str = r#"
+@group(0) @binding(1)
+var<uniform> clip: ClipUniform;
+
+struct Uniforms {
+    viewport: vec2<f32>,
+    scroll: vec2<f32>,
+}
+
+@group(0) @binding(0)
+var<uniform> uniforms: Uniforms;
+
+// The vector pipeline (Stage 15, M7 Phase 2, Rec 4) is the rect
+// pipeline with its own entry points: the same vertex layout
+// (position + colour), the same group-0-only uniforms (viewport/
+// scroll + clip coverage), the same clip SDF. A `VectorPath` is
+// pre-tessellated triangles, so the shader does no more work
+// than the rect shader — the tessellator did it on the CPU.
+struct VectorVertex {
+    @location(0) position: vec2<f32>,
+    @location(1) color: vec4<f32>,
+}
+
+struct VectorOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) page: vec2<f32>,
+}
+
+@vertex
+fn vector_vs(v: VectorVertex) -> VectorOut {
+    var out: VectorOut;
+    let p = v.position - uniforms.scroll;
+    let clip = vec2<f32>(
+        p.x / uniforms.viewport.x * 2.0 - 1.0,
+        1.0 - p.y / uniforms.viewport.y * 2.0,
+    );
+    out.pos = vec4<f32>(clip, 0.0, 1.0);
+    out.color = v.color;
+    out.page = v.position;
+    return out;
+}
+
+@fragment
+fn vector_fs(in: VectorOut) -> @location(0) vec4<f32> {
     let cov = clip_coverage(in.page);
     if (cov <= 0.0) { discard; }
     return vec4<f32>(in.color.rgb, in.color.a * cov);
@@ -977,6 +1029,10 @@ fn shadow_vertices_for(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunKind {
     Rect,
+    /// Tessellated vector triangles (Stage 15, M7 Phase 2, Rec 4):
+    /// `DisplayItem::VectorPath`, drawn by the vector pipeline
+    /// (same vertex layout and group-0-only bind groups as Rect).
+    Vector,
     Glyph,
     /// Colour glyphs (emoji): same vertex layout as `Glyph`, but
     /// the colour-glyph pipeline sampling the colour atlas.
@@ -1771,6 +1827,27 @@ fn rect_vertices_for(item: &DisplayItem, transform: &Affine, opacity: f32) -> Ve
     ]
 }
 
+/// Map a `VectorPath`'s triangles through the current page
+/// transform and scale their alpha by the effective group
+/// opacity (Stage 15, M7 Phase 2, Rec 4): the vertices are
+/// already in layout space, so this is the same `xform` + `dim`
+/// the rect path applies — the vector pipeline shares the rect
+/// vertex layout (`RectVertex`: pos + colour). Pure:
+/// unit-tested.
+fn vector_vertices_for(
+    vertices: &[VectorVertex],
+    transform: &Affine,
+    opacity: f32,
+) -> Vec<RectVertex> {
+    vertices
+        .iter()
+        .map(|v| RectVertex {
+            pos: xform(v.position, transform),
+            color: dim(v.color, opacity),
+        })
+        .collect()
+}
+
 /// Six vertices (two triangles) for one image/blob item, with UVs
 /// spanning the whole texture. Pure: unit-tested. UV (0,0) is the
 /// texture's first texel (top-left as uploaded), and it lands on the
@@ -2042,6 +2119,10 @@ fn glyph_quad(glyph: &PaintGlyph, placement: cosmic_text::Placement) -> (f32, f3
 
 pub struct PaintRenderer {
     rect_pipeline: wgpu::RenderPipeline,
+    /// Vector-triangle pipeline (Stage 15, M7 Phase 2, Rec 4):
+    /// the 7th pipeline, a sibling of the rect pipeline (same
+    /// vertex layout, same group-0-only layout).
+    vector_pipeline: wgpu::RenderPipeline,
     glyph_pipeline: wgpu::RenderPipeline,
     /// Colour-glyph pipeline (Stage 8 Rec 11): same vertex layout
     /// as the mask glyph pipeline, sampling the colour atlas.
@@ -2084,6 +2165,7 @@ pub struct PaintRenderer {
     font_ids: HashMap<u64, fontdb::ID>,
     swash: SwashCache,
     rect_buffer: Option<wgpu::Buffer>,
+    vector_buffer: Option<wgpu::Buffer>,
     glyph_buffer: Option<wgpu::Buffer>,
     image_buffer: Option<wgpu::Buffer>,
     rounded_buffer: Option<wgpu::Buffer>,
@@ -2351,6 +2433,61 @@ impl PaintRenderer {
                     // opaque content (alpha 1) reproduces the old
                     // `blend: None` exactly, and a translucent
                     // group now composites instead of overwriting.
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        // The vector pipeline (Stage 15, M7 Phase 2, Rec 4): a
+        // sibling of the rect pipeline — same layout (group 0
+        // only: uniform + clip, so it fits the 2-bind-group cap),
+        // same vertex layout, same alpha blend for group
+        // opacity. Its shader is the rect shader with its own
+        // entry points.
+        let vector_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("pluto vector shader"),
+            source: wgpu::ShaderSource::Wgsl(format!("{CLIP_WGSL}{VECTOR_WGSL_BODY}").into()),
+        });
+        let vector_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pluto vector pipeline"),
+            layout: Some(&rect_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &vector_shader,
+                entry_point: Some("vector_vs"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<RectVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 8,
+                            shader_location: 1,
+                        },
+                    ],
+                }],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &vector_shader,
+                entry_point: Some("vector_fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -2685,6 +2822,7 @@ impl PaintRenderer {
 
         Self {
             rect_pipeline,
+            vector_pipeline,
             glyph_pipeline,
             colour_glyph_pipeline,
             image_pipeline,
@@ -2704,6 +2842,7 @@ impl PaintRenderer {
             font_ids,
             swash: SwashCache::new(),
             rect_buffer: None,
+            vector_buffer: None,
             glyph_buffer: None,
             image_buffer: None,
             rounded_buffer: None,
@@ -2791,6 +2930,7 @@ impl PaintRenderer {
             self.last_prepared = Some(identity);
             self.runs.clear();
             self.rect_buffer = None;
+            self.vector_buffer = None;
             self.glyph_buffer = None;
             self.image_buffer = None;
             self.rounded_buffer = None;
@@ -2820,6 +2960,7 @@ impl PaintRenderer {
             list.1.map(|d| [d.x, d.y, d.width, d.height]);
 
         let mut rect_vertices: Vec<RectVertex> = Vec::new();
+        let mut vector_vertices: Vec<RectVertex> = Vec::new();
         let mut glyph_vertices: Vec<GlyphVertex> = Vec::new();
         let mut image_vertices: Vec<ImageVertex> = Vec::new();
         let mut rounded_vertices: Vec<RoundedVertex> = Vec::new();
@@ -3181,6 +3322,23 @@ impl PaintRenderer {
                     extend_run(
                         &mut runs,
                         RunKind::Shadow,
+                        clip_index,
+                        scissor,
+                        first,
+                        count,
+                        None,
+                    );
+                }
+                DisplayItem::VectorPath { vertices, .. } => {
+                    has_content = true;
+                    let first = vector_vertices.len() as u32;
+                    let verts =
+                        vector_vertices_for(vertices, &effective_transform, effective_opacity);
+                    let count = verts.len() as u32;
+                    vector_vertices.extend(verts);
+                    extend_run(
+                        &mut runs,
+                        RunKind::Vector,
                         clip_index,
                         scissor,
                         first,
@@ -3557,6 +3715,8 @@ impl PaintRenderer {
         self.clip_groups = clip_groups;
         self.items_culled = culled;
         self.rect_buffer = make_buffer(device, "pluto rect vertices", &rect_vertices);
+        self.vector_buffer =
+            make_buffer(device, "pluto vector vertices", &vector_vertices);
         self.glyph_buffer = make_buffer(device, "pluto glyph vertices", &glyph_vertices);
         self.image_buffer = make_buffer(device, "pluto image vertices", &image_vertices);
         self.rounded_buffer =
@@ -3629,6 +3789,15 @@ impl PaintRenderer {
                         continue;
                     };
                     pass.set_pipeline(&self.rect_pipeline);
+                    pass.set_bind_group(0, &self.clip_groups[run.clip], &[]);
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw(range, 0..1);
+                }
+                RunKind::Vector => {
+                    let Some(buffer) = &self.vector_buffer else {
+                        continue;
+                    };
+                    pass.set_pipeline(&self.vector_pipeline);
                     pass.set_bind_group(0, &self.clip_groups[run.clip], &[]);
                     pass.set_vertex_buffer(0, buffer.slice(..));
                     pass.draw(range, 0..1);
@@ -4330,6 +4499,36 @@ mod tests {
         }
     }
 
+    /// Vector vertex emission (Stage 15, M7 Phase 2, Rec 4):
+    /// a `VectorPath`'s triangles map through the page
+    /// transform and their alpha scales by the group opacity —
+    /// no GPU needed (this is the CPU half of the pipeline).
+    #[test]
+    fn vector_vertices_apply_transform_and_opacity() {
+        let verts = vec![
+            VectorVertex {
+                position: [10.0, 20.0],
+                color: [1.0, 0.0, 0.0, 1.0],
+            },
+            VectorVertex {
+                position: [30.0, 20.0],
+                color: [0.0, 1.0, 0.0, 0.5],
+            },
+            VectorVertex {
+                position: [10.0, 40.0],
+                color: [0.0, 0.0, 1.0, 0.25],
+            },
+        ];
+        let out = vector_vertices_for(&verts, &Affine::translate(5.0, 5.0), 0.5);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].pos, [15.0, 25.0]);
+        assert_eq!(out[0].color, [1.0, 0.0, 0.0, 0.5]);
+        assert_eq!(out[1].pos, [35.0, 25.0]);
+        assert_eq!(out[1].color, [0.0, 1.0, 0.0, 0.25]);
+        assert_eq!(out[2].pos, [15.0, 45.0]);
+        assert_eq!(out[2].color, [0.0, 0.0, 1.0, 0.125]);
+    }
+
     /// Regression test for the Haswell crash (2026-11-24): the
     /// glyph pipeline's three-group layout ([uniform, atlas, clip])
     /// panicked at creation with "Bind group layout count 3 exceeds
@@ -4350,6 +4549,7 @@ mod tests {
             ("image", format!("{CLIP_WGSL}{IMAGE_WGSL_BODY}")),
             ("rounded", format!("{CLIP_WGSL}{ROUNDED_WGSL_BODY}")),
             ("shadow", format!("{CLIP_WGSL}{SHADOW_WGSL_BODY}")),
+            ("vector", format!("{CLIP_WGSL}{VECTOR_WGSL_BODY}")),
         ];
         for (name, src) in sources {
             let module = naga::front::wgsl::parse_str(&src)

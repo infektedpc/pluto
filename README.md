@@ -119,6 +119,13 @@ during bootstrap, verified against the actual sources:
   engine, `var()`/`calc()`/`clamp()`, `prefers-color-scheme`,
   `@font-face`; IPC protocol 7 → 9; CI sandbox race fixed
   (compromised-renderer poison flag).
+- **M7 — done.** Inline SVG & 2D canvas: SVG namespace threaded
+  downstream, replaced-element layout for `<svg>`/`<canvas>`,
+  path model + lyon tessellation with a 7th wgpu pipeline,
+  raster-first SVG slice, gradients in CSS and SVG, full
+  CanvasRenderingContext2D with tainting policy, `<use>`/`<image>`/
+  `<foreignObject>`, external `<img src=*.svg>` decode; IPC
+  protocol 9 → 10.
 
-Full workspace suite: 928 tests, all passing. See `ARCHITECTURE.md`
+Full workspace suite: 1029 tests, all passing. See `ARCHITECTURE.md`
 for the full M1–M12 roadmap.

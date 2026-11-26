@@ -105,10 +105,10 @@
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, Weight};
 use pluto_css::{
     Affine, AnPlusB, Animation, AnimationDirection, AttrOp, BorderRadius, BoxShadow, CalcCtx,
-    CalcExpr, CalcNumber, CascadeKey, Combinator, Easing, FillMode, IterationCount, Keyframes,
-    Origin, PlayState, PseudoClass, ResolvedCorners, Rule, Selector, SimpleSelector, Stylesheet,
-    SupportsCondition, TransformList, TransformListExt, Transition,
-    Value, parse_value,
+    CalcExpr, CalcNumber, CascadeKey, Combinator, Easing, FillMode, Gradient, IterationCount,
+    Keyframes, Origin, PlayState, PseudoClass, ResolvedCorners, Rule, Selector, SimpleSelector,
+    Stylesheet, SupportsCondition, TransformList, TransformListExt, Transition, Value,
+    parse_value,
 };
 use pluto_html::{Dom, NodeId as DomId};
 use rayon::prelude::*;
@@ -327,6 +327,24 @@ pub enum GridPlace {
 /// The computed style of one element: the cascade winner for every
 /// property, with relative units resolved as far as style resolution
 /// can take them — `em` against the element's own computed font size,
+/// A paint server for SVG `fill` / `stroke` (Stage 15, M7 Phase 1,
+/// Rec 6): a solid colour, none, a `url(...)` reference to a
+/// `<linearGradient>` / `<radialGradient>` / `<pattern>` (paint
+/// resolves the reference in a later phase — gradients are Rec 7),
+/// or `currentColor`, resolved against the element's computed `color`
+/// after the cascade (see `resolve_style`'s post-pass).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Paint {
+    /// No paint (`fill: none` / `stroke: none`).
+    None,
+    /// A solid RGB colour.
+    Color([u8; 3]),
+    /// A `url(...)` paint-server reference, as written.
+    Url(String),
+    /// `currentColor` — resolved post-cascade.
+    CurrentColor,
+}
+
 /// `rem` against the root font size, `vh`/`vw` left as used values for
 /// layout. `%`/`auto` are likewise left for layout. This is the
 /// computed/used split (R8): nothing here depends on layout geometry.
@@ -351,6 +369,19 @@ pub struct ComputedStyle {
     pub font_style: FontStyle,
     pub color: [u8; 3],
     pub background: Option<[u8; 3]>,
+    /// SVG `fill` (Stage 15, M7 Phase 1, Rec 6): inherited,
+    /// initial black. Paint reads it; layout only carries it.
+    pub fill: Paint,
+    /// SVG `stroke` (Rec 6): inherited, initial none.
+    pub stroke: Paint,
+    /// SVG `stroke-width` in px (Rec 6): inherited, initial 1.0.
+    /// Percentages (relative to the viewport diagonal) are not
+    /// resolved here — they keep the previous value.
+    pub stroke_width: f32,
+    /// SVG `stop-color` (Rec 6): inherited, initial black. Used
+    /// by gradient stops (Rec 7); stored now so the cascade and
+    /// presentation attributes have somewhere to land.
+    pub stop_color: [u8; 3],
     pub bold: bool,
     pub text_align: TextAlign,
     pub white_space: WhiteSpace,
@@ -392,6 +423,12 @@ pub struct ComputedStyle {
     /// resolves it against the document base and looks the decoded
     /// resource up in the [`ImageMap`].
     pub background_image: Option<String>,
+    /// A CSS gradient `background-image` (Stage 15, M7 Phase 2,
+    /// Rec 7): the parsed gradient. `background-image` is one
+    /// property, so this and `background_image` are mutually
+    /// exclusive — each arm that sets one clears the other (see
+    /// `apply_decl`).
+    pub background_gradient: Option<Gradient>,
     /// `background-size` (Stage 11 Rec 3).
     pub background_size: BackgroundSize,
     /// `background-repeat` (Stage 11 Rec 3; two-value form M6).
@@ -447,6 +484,10 @@ impl ComputedStyle {
             font_style: FontStyle::Normal,
             color: [0, 0, 0],
             background: None,
+            fill: Paint::Color([0, 0, 0]),
+            stroke: Paint::None,
+            stroke_width: 1.0,
+            stop_color: [0, 0, 0],
             bold: false,
             text_align: TextAlign::Left,
             white_space: WhiteSpace::Normal,
@@ -471,6 +512,7 @@ impl ComputedStyle {
             grid_auto_flow: GridAutoFlow::Row,
             contain_layout: false,
             background_image: None,
+            background_gradient: None,
             background_size: BackgroundSize::Auto,
             background_repeat: BackgroundRepeat::Repeat,
             background_position: (BackgroundPosition::Start, BackgroundPosition::Start),
@@ -829,6 +871,22 @@ pub struct ShapedGlyph {
     pub color: [u8; 3],
 }
 
+/// What kind of replaced-element content a [`LayoutBox`] carries
+/// (Stage 15, M7 Phase 1, Rec 2). Deliberately separate from
+/// [`LayoutBox::image`]: `image` is a decoded-image resource id the
+/// paint phase looks up, while this only marks "this box is an
+/// `<svg>` / `<canvas>` leaf" so paint (a later phase) can find the
+/// boxes whose content it must rasterise — reusing `image` would
+/// conflate the two and send paint looking up a resource id that
+/// does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SvgCanvasKind {
+    /// An `<svg>` element (SVG namespace).
+    Svg,
+    /// A `<canvas>` element (HTML namespace).
+    Canvas,
+}
+
 /// One laid-out box: an element or a text leaf, in page coordinates.
 #[derive(Debug, Clone)]
 pub struct LayoutBox {
@@ -880,6 +938,12 @@ pub struct LayoutBox {
     /// element has no background image or it has not arrived yet.
     pub background_image: Option<u32>,
     pub background_image_size: Option<(u32, u32)>,
+    /// `<svg>` / `<canvas>` content marker (Stage 15, M7 Phase 1,
+    /// Rec 2): `Some(Svg)` / `Some(Canvas)` exactly when this box
+    /// is such an element's atomic leaf, `None` otherwise. Paint
+    /// reads this to find the boxes whose vector / bitmap content
+    /// it must produce; layout sizes the leaf, it does not draw it.
+    pub svg_canvas: Option<SvgCanvasKind>,
     /// The DOM id of the nearest ancestor box (`None` for the
     /// root box).
     pub parent: Option<DomId>,
@@ -912,6 +976,9 @@ struct BoxMeta {
     style: ComputedStyle,
     children: Vec<TaffyId>,
     text: Option<LeafText>,
+    /// `<svg>` / `<canvas>` marker, copied onto the [`LayoutBox`]
+    /// in `collect_boxes` (Stage 15, M7 Phase 1, Rec 2).
+    svg_canvas: Option<SvgCanvasKind>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -939,6 +1006,93 @@ pub fn is_bfc_root(style: &ComputedStyle, is_root: bool) -> bool {
         )
         || style.overflow_x.is_scroll_container()
         || style.overflow_y.is_scroll_container()
+}
+
+/// True when `id` is an `<svg>` element in the SVG namespace
+/// (Stage 15, M7 Phase 1, Rec 2): tag spelling alone is not enough —
+/// an unknown HTML `<svg>` (no namespace) is not an SVG element.
+pub fn is_svg_element(dom: &Dom, id: DomId) -> bool {
+    dom.tag(id) == Some("svg")
+        && dom.namespace(id).is_some_and(|ns| ns == pluto_html::NS_SVG)
+}
+
+/// True when `id` is a `<canvas>` element in the HTML namespace
+/// (Stage 15, M7 Phase 1, Rec 2).
+pub fn is_canvas_element(dom: &Dom, id: DomId) -> bool {
+    dom.tag(id) == Some("canvas")
+        && dom
+            .namespace(id)
+            .is_some_and(|ns| ns.is_empty() || ns == pluto_html::NS_HTML)
+}
+
+/// Parse an SVG `width` / `height` / `canvas` attribute: a bare
+/// number, or a number with a `px` suffix. Percentages are NOT a
+/// fixed size (they resolve against the containing block, which
+/// layout does not know here) — they return `None` so the caller
+/// falls back to the intrinsic default. Non-positive values are
+/// invalid per spec and also return `None`.
+fn parse_svg_attr_length(value: Option<&str>) -> Option<f32> {
+    let v = value?.trim();
+    let v = v.strip_suffix("px").unwrap_or(v).trim();
+    if v.ends_with('%') {
+        return None;
+    }
+    v.parse::<f32>().ok().filter(|n| *n > 0.0)
+}
+
+/// Parse an SVG `viewBox` attribute (`min-x min-y width height`,
+/// whitespace- and/or comma-separated) into its width and height.
+/// `None` when absent, malformed, or with a non-positive width or
+/// height (an invalid viewBox is ignored per spec, not an error).
+fn parse_view_box(value: Option<&str>) -> Option<(f32, f32)> {
+    let v = value?;
+    let mut nums = v
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<f32>());
+    let _min_x = nums.next()?.ok()?;
+    let _min_y = nums.next()?.ok()?;
+    let w = nums.next()?.ok()?;
+    let h = nums.next()?.ok()?;
+    if w > 0.0 && h > 0.0 { Some((w, h)) } else { None }
+}
+
+/// Intrinsic size for an `<svg>` element (Stage 15, M7 Phase 1,
+/// Rec 2): `(width, height, aspect_ratio)`.
+///
+/// * `width`/`height` attributes win per axis; the other axis
+///   follows the `viewBox` ratio when one is present, else the
+///   300×150 replaced-element default on that axis.
+/// * No attributes but a `viewBox`: the 300×150 default size, with
+///   the viewBox ratio so a CSS-constrained axis keeps it.
+/// * Neither: 300×150, no ratio.
+/// * `preserveAspectRatio="none"` disables the ratio (the viewport
+///   stretches); any other value — including absent — keeps it.
+///   `meet` vs `slice` only changes how the viewBox maps into the
+///   viewport at paint time, not the box size.
+fn svg_intrinsic_size(dom: &Dom, id: DomId) -> (f32, f32, Option<f32>) {
+    let attr_w = parse_svg_attr_length(dom.attr(id, "width"));
+    let attr_h = parse_svg_attr_length(dom.attr(id, "height"));
+    let view_box = parse_view_box(dom.attr(id, "viewBox"));
+    let ratio = view_box.map(|(w, h)| w / h);
+    let ratio = match dom.attr(id, "preserveAspectRatio") {
+        Some(v) if v.split_whitespace().next() == Some("none") => None,
+        _ => ratio,
+    };
+    let (w, h) = match (attr_w, attr_h) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => (w, ratio.map_or(150.0, |r| w / r)),
+        (None, Some(h)) => (ratio.map_or(300.0, |r| h * r), h),
+        (None, None) => (300.0, 150.0),
+    };
+    // With both attributes the ratio is the attributes' own, not
+    // the viewBox's — but `preserveAspectRatio="none"` still
+    // disables it (`ratio` is already `None` then).
+    let ratio = match (attr_w, attr_h) {
+        (Some(_), Some(_)) => ratio.map(|_| w / h),
+        _ => ratio,
+    };
+    (w, h, ratio)
 }
 
 /// Owns the Taffy layout tree and the cosmic-text font system for one
@@ -1238,6 +1392,7 @@ impl LayoutTree {
                         style: default_style,
                         children,
                         text: None,
+                        svg_canvas: None,
                     },
                 );
                 node
@@ -2164,6 +2319,14 @@ impl<'a, 't> Builder<'a, 't> {
         id: DomId,
         parent_style: &ComputedStyle,
     ) -> Option<TaffyId> {
+        // Stage 15 (M7 Phase 1, Rec 2): an `<svg>` / `<canvas>` with
+        // an author `display: block` is still a replaced-element
+        // leaf — its children must never build (no boxes, no leaked
+        // SVG `<text>`).
+        if is_svg_element(self.dom, id) || is_canvas_element(self.dom, id) {
+            let style = self.style_for(id, parent_style);
+            return self.build_atomic(id, &style);
+        }
         let style = self.style_for(id, parent_style);
         match style.display {
             DisplayKind::None | DisplayKind::Inline | DisplayKind::InlineBlock => None,
@@ -2184,6 +2347,7 @@ impl<'a, 't> Builder<'a, 't> {
                         style,
                         children,
                         text: None,
+                        svg_canvas: None,
                     },
                 );
                 Some(node)
@@ -2276,12 +2440,20 @@ impl<'a, 't> Builder<'a, 't> {
             }
             return;
         }
-        if self.dom.tag(id) == Some("img") {
-            // Replaced element (Stage 11 Rec 2): an `<img>` is
+        if self.dom.tag(id) == Some("img")
+            || is_svg_element(self.dom, id)
+            || is_canvas_element(self.dom, id)
+        {
+            // Replaced element (Stage 11 Rec 2 for `<img>`, Stage
+            // 15 Rec 2 for `<svg>` / `<canvas>`): an `<img>` is
             // atomic even though the UA sheet says `display:
             // inline` — called here as the inline element itself,
             // it has no text children to collect, so it becomes
-            // its own leaf instead of vanishing.
+            // its own leaf instead of vanishing. Same for SVG /
+            // canvas, whose children must never contribute inline
+            // text (an author `display: inline` on an `<svg>` must
+            // not re-open the leak the UA `inline-block` rule
+            // closes).
             self.flush_spans(spans, parent_style, out);
             if let Some(node) = self.build_atomic(id, style) {
                 out.push(node);
@@ -2314,12 +2486,18 @@ impl<'a, 't> Builder<'a, 't> {
             match child_style.display {
                 DisplayKind::None => {}
                 DisplayKind::Inline => {
-                    if tag == "img" {
-                        // Replaced element (Stage 11 Rec 2): an
-                        // `<img>` is atomic even though the UA sheet
-                        // says `display: inline` — it never
-                        // contributes inline text, so recursing into
-                        // it (as for a span) would drop it entirely.
+                    if tag == "img"
+                        || is_svg_element(self.dom, child)
+                        || is_canvas_element(self.dom, child)
+                    {
+                        // Replaced element (Stage 11 Rec 2 for
+                        // `<img>`, Stage 15 Rec 2 for `<svg>` /
+                        // `<canvas>`): an `<img>` is atomic even
+                        // though the UA sheet says `display: inline`
+                        // — it never contributes inline text, so
+                        // recursing into it (as for a span) would
+                        // drop it entirely. Same for SVG / canvas,
+                        // whose children must never leak text.
                         self.flush_spans(spans, parent_style, out);
                         if let Some(node) = self.build_atomic(child, &child_style) {
                             out.push(node);
@@ -2373,6 +2551,178 @@ impl<'a, 't> Builder<'a, 't> {
                 style: style.clone(),
                 children,
                 text: None,
+                svg_canvas: None,
+            },
+        );
+        Some(node)
+    }
+
+    /// An atomic leaf for an `<svg>` / `<canvas>` replaced element
+    /// (Stage 15, M7 Phase 1, Rec 2): a taffy leaf sized by the
+    /// intrinsic dimensions — SVG from `width` / `height` /
+    /// `viewBox` (+ `preserveAspectRatio`), canvas from its
+    /// `width` / `height` attributes with the 300×150 default —
+    /// with CSS `width` / `height` winning over both, exactly like
+    /// the `<img>` branch. The `aspect_ratio` lets taffy derive
+    /// the auto axis from the set one instead of collapsing it.
+    /// The leaf carries `svg_canvas` in its `BoxMeta` so
+    /// `collect_boxes` can mark the `LayoutBox`; it draws nothing
+    /// yet (paint is a later phase), and its children never build.
+    fn replaced_svg_canvas_leaf(
+        &mut self,
+        id: DomId,
+        style: &ComputedStyle,
+        kind: SvgCanvasKind,
+    ) -> Option<TaffyId> {
+        let (w, h, ratio) = match kind {
+            SvgCanvasKind::Svg => svg_intrinsic_size(self.dom, id),
+            SvgCanvasKind::Canvas => {
+                let w = parse_svg_attr_length(self.dom.attr(id, "width")).unwrap_or(300.0);
+                let h = parse_svg_attr_length(self.dom.attr(id, "height")).unwrap_or(150.0);
+                (w, h, Some(w / h))
+            }
+        };
+        let mut taffy_style = to_taffy_style(style, self.viewport);
+        if w > 0.0 && h > 0.0 {
+            if let Some(r) = ratio {
+                taffy_style.aspect_ratio = Some(r);
+            }
+        }
+        if style.width.is_none() && style.height.is_none() {
+            taffy_style.size.width = Dimension::length(w);
+            taffy_style.size.height = Dimension::length(h);
+        }
+        // Stage 15 (M7 Phase 3, Rec 10): `<foreignObject>` children
+        // get real boxes (see `build_foreign_object_children`); the
+        // svg node becomes a taffy parent (position relative) so
+        // its absolute foreignObject children anchor to it. An svg
+        // without foreignObjects stays a leaf, exactly as before.
+        let fo_children = if kind == SvgCanvasKind::Svg {
+            self.build_foreign_object_children(id, style, (w, h))
+        } else {
+            Vec::new()
+        };
+        let node = if fo_children.is_empty() {
+            self.taffy
+                .new_leaf_with_context(taffy_style, None)
+                .ok()?
+        } else {
+            taffy_style.position = Position::Relative;
+            self.taffy
+                .new_with_children(taffy_style, &fo_children)
+                .ok()?
+        };
+        self.meta.insert(
+            node,
+            BoxMeta {
+                dom: Some(id),
+                style: style.clone(),
+                children: fo_children,
+                text: None,
+                svg_canvas: Some(kind),
+            },
+        );
+        Some(node)
+    }
+
+    /// Stage 15 (M7 Phase 3, Rec 10): the `<foreignObject>`
+    /// elements of an `<svg>` (top-level only — not nested inside
+    /// another foreignObject) as taffy nodes, each a real viewport
+    /// for its HTML children: sized/positioned by its `x` / `y` /
+    /// `width` / `height` attributes, `overflow: clip` so its
+    /// children paint inside the rect and never outside it (the
+    /// clip rides `collect_boxes` like any overflow clip). `%`
+    /// lengths resolve against the svg's intrinsic size — the
+    /// used size is not known at build time (documented
+    /// approximation; px values are exact). A foreignObject
+    /// nested inside HTML content is out of scope.
+    fn build_foreign_object_children(
+        &mut self,
+        svg_id: DomId,
+        svg_style: &ComputedStyle,
+        intrinsic: (f32, f32),
+    ) -> Vec<TaffyId> {
+        let mut fos = Vec::new();
+        self.collect_foreign_objects(svg_id, &mut fos);
+        fos.into_iter()
+            .filter_map(|fo| self.build_foreign_object(fo, svg_style, intrinsic))
+            .collect()
+    }
+
+    /// Collect top-level `<foreignObject>` descendants of `id`
+    /// (recursing into SVG grouping elements only).
+    fn collect_foreign_objects(&self, id: DomId, out: &mut Vec<DomId>) {
+        for &child in self.dom.children(id) {
+            if self.dom.tag(child) == Some("foreignObject") {
+                out.push(child);
+                continue;
+            }
+            if matches!(
+                self.dom.tag(child),
+                Some("g" | "svg" | "a" | "switch")
+            ) {
+                self.collect_foreign_objects(child, out);
+            }
+        }
+    }
+
+    /// One `<foreignObject>` as an absolute taffy node inside its
+    /// `<svg>`: its HTML children build inside it (via
+    /// `build_children`, so text, divs, and nested replaced
+    /// elements all lay out normally, at the foreignObject's
+    /// origin).
+    fn build_foreign_object(
+        &mut self,
+        id: DomId,
+        parent_style: &ComputedStyle,
+        intrinsic: (f32, f32),
+    ) -> Option<TaffyId> {
+        let mut style = self.style_for(id, parent_style);
+        style.overflow_x = OverflowKind::Clip;
+        style.overflow_y = OverflowKind::Clip;
+        let len = |dom: &Dom, name: &str, basis: f32, default: f32| -> f32 {
+            dom.attr(id, name)
+                .and_then(|v| {
+                    let s = v.trim();
+                    if let Some(num) = s.strip_suffix('%') {
+                        num.trim().parse::<f32>().ok().map(|n| n / 100.0 * basis)
+                    } else {
+                        parse_svg_attr_length(Some(s))
+                    }
+                })
+                .unwrap_or(default)
+        };
+        let x = len(self.dom, "x", intrinsic.0, 0.0);
+        let y = len(self.dom, "y", intrinsic.1, 0.0);
+        let w = len(self.dom, "width", intrinsic.0, 0.0);
+        let h = len(self.dom, "height", intrinsic.1, 0.0);
+        if w <= 0.0 || h <= 0.0 {
+            return None;
+        }
+        let children = self.build_children(id, &style);
+        let mut taffy_style = to_taffy_style(&style, self.viewport);
+        taffy_style.position = Position::Absolute;
+        taffy_style.inset.left = LengthPercentageAuto::length(x);
+        taffy_style.inset.top = LengthPercentageAuto::length(y);
+        taffy_style.size.width = Dimension::length(w);
+        taffy_style.size.height = Dimension::length(h);
+        let node = if children.is_empty() {
+            self.taffy
+                .new_leaf_with_context(taffy_style, None)
+                .ok()?
+        } else {
+            self.taffy
+                .new_with_children(taffy_style, &children)
+                .ok()?
+        };
+        self.meta.insert(
+            node,
+            BoxMeta {
+                dom: Some(id),
+                style,
+                children,
+                text: None,
+                svg_canvas: None,
             },
         );
         Some(node)
@@ -2386,6 +2736,18 @@ impl<'a, 't> Builder<'a, 't> {
     /// size it (image decoding itself is M3).
     fn build_atomic(&mut self, id: DomId, style: &ComputedStyle) -> Option<TaffyId> {
         let tag = self.dom.tag(id).unwrap_or("");
+        // Stage 15 (M7 Phase 1, Rec 2): `<svg>` and `<canvas>` are
+        // replaced elements — atomic leaves, sized by their intrinsic
+        // dimensions. Their children NEVER build: SVG shapes get no
+        // boxes, and `<svg><text>` must not leak its text into the
+        // parent's anonymous text leaf (the generic tail below would
+        // recurse into the children through `append_inline`).
+        if is_svg_element(self.dom, id) {
+            return self.replaced_svg_canvas_leaf(id, style, SvgCanvasKind::Svg);
+        }
+        if is_canvas_element(self.dom, id) {
+            return self.replaced_svg_canvas_leaf(id, style, SvgCanvasKind::Canvas);
+        }
         if tag == "img" {
             // Stage 11 Rec 2: HTML sizing rules. A broken image
             // with alt text renders as a text leaf (the alt text,
@@ -2414,6 +2776,7 @@ impl<'a, 't> Builder<'a, 't> {
                             style: style.clone(),
                             children: Vec::new(),
                             text: Some(leaf),
+                            svg_canvas: None,
                         },
                     );
                     self.leaves.push(node);
@@ -2487,6 +2850,7 @@ impl<'a, 't> Builder<'a, 't> {
                     style: style.clone(),
                     children: Vec::new(),
                     text: None,
+                    svg_canvas: None,
                 },
             );
             return Some(node);
@@ -2563,6 +2927,7 @@ impl<'a, 't> Builder<'a, 't> {
                     style: style.clone(),
                     children: Vec::new(),
                     text: None,
+                    svg_canvas: None,
                 },
             );
             return Some(node);
@@ -2584,6 +2949,7 @@ impl<'a, 't> Builder<'a, 't> {
                 style: style.clone(),
                 children: Vec::new(),
                 text: Some(leaf),
+                svg_canvas: None,
             },
         );
         self.leaves.push(node);
@@ -2628,6 +2994,7 @@ impl<'a, 't> Builder<'a, 't> {
                 style: style.clone(),
                 children: Vec::new(),
                 text: leaf,
+                svg_canvas: None,
             },
         );
         if has_text {
@@ -2664,6 +3031,7 @@ impl<'a, 't> Builder<'a, 't> {
                 style: parent_style.clone(),
                 children: Vec::new(),
                 text: Some(leaf),
+                svg_canvas: None,
             },
         );
         self.leaves.push(node);
@@ -3304,6 +3672,7 @@ fn collect_boxes(
         image,
         background_image,
         background_image_size,
+        svg_canvas: m.svg_canvas,
         parent: parent_dom,
         matrix,
         is_stacking_context: stacking,
@@ -3791,6 +4160,25 @@ fn nth_matches(n: i32, ab: AnPlusB) -> bool {
     d % ab.a == 0 && d / ab.a >= 0
 }
 
+/// True when `id` is a link anchor for `:link` / `:any-link`:
+/// an HTML `<a>` / `<area>` / `<link>` with `href`, or an SVG
+/// `<a>` with `href` (SVG2) or the legacy `xlink:href` (Stage 15,
+/// M7 Phase 1, Rec 1 — namespace-aware; a same-spelled `<a>` in
+/// any other namespace is not a link).
+fn is_link_anchor(dom: &Dom, id: DomId) -> bool {
+    match dom.tag(id) {
+        Some("a") => {
+            if dom.attr(id, "href").is_some() {
+                return true;
+            }
+            dom.namespace(id).is_some_and(|ns| ns == pluto_html::NS_SVG)
+                && dom.attr(id, "xlink:href").is_some()
+        }
+        Some("area" | "link") => dom.attr(id, "href").is_some(),
+        _ => false,
+    }
+}
+
 /// Right-to-left complex-selector matching: test the key (rightmost)
 /// compound first, then walk ancestors / siblings per combinator.
 /// A selector with a pseudo-element never matches a real element
@@ -4037,16 +4425,13 @@ fn match_pseudo_class(
         // `:link` = an anchor with an `href` that has NOT been
         // visited — `:link` and `:visited` are exclusive per spec.
         // `:any-link` is the union: any anchor with an `href`,
-        // visited or not.
+        // visited or not. Namespace-aware (Stage 15, M7 Phase 1,
+        // Rec 1): an SVG `<a>` also links through the legacy
+        // `xlink:href`.
         PseudoClass::Link => {
-            matches!(dom.tag(id), Some("a" | "area" | "link"))
-                && dom.attr(id, "href").is_some()
-                && !state.visited.contains(&id)
+            is_link_anchor(dom, id) && !state.visited.contains(&id)
         }
-        PseudoClass::AnyLink => {
-            matches!(dom.tag(id), Some("a" | "area" | "link"))
-                && dom.attr(id, "href").is_some()
-        }
+        PseudoClass::AnyLink => is_link_anchor(dom, id),
         // `:visited` = an anchor the worker's visited projection
         // flagged (see `ElementState::visited`): the link's
         // resolved href is in the session's committed-URL set.
@@ -4269,6 +4654,43 @@ fn resolve_style(
             }
         }
     }
+    // Presentation attributes (Stage 15, M7 Phase 1, Rec 6): an
+    // SVG element's `fill` / `stroke` / `stroke-width` /
+    // `stop-color` attributes are author-level declarations with
+    // specificity 0 (SVG2 §6.5 / CSS Cascade 5 §6.1) — below every
+    // author rule, above the UA sheet. They sort there via the
+    // lowest author key: author origin, non-important, the lowest
+    // layer order (layered and unlayered rules all sort above),
+    // non-inline, zero specificity, first source order. Only SVG
+    // elements have presentation attributes — an HTML element's
+    // `fill` attribute must NOT leak into the cascade (namespace
+    // threaded by Rec 1). Values are parsed as single CSS values
+    // (`parse_value`), never embedded in a stylesheet string, so a
+    // hostile `fill="red; background: blue"` cannot inject a
+    // second declaration.
+    if dom
+        .namespace(id)
+        .is_some_and(|ns| ns == pluto_html::NS_SVG)
+    {
+        for property in ["fill", "stroke", "stroke-width", "stop-color"] {
+            if let Some(attr) = dom.attr(id, property)
+                && !attr.trim().is_empty()
+            {
+                decls.push((
+                    CascadeKey {
+                        origin_rank: Origin::Author.rank(false),
+                        important: false,
+                        layer_order: i32::MIN,
+                        inline: false,
+                        specificity: (0, 0, 0),
+                        source_order: 0,
+                    },
+                    property.to_string(),
+                    parse_value(attr),
+                ));
+            }
+        }
+    }
     decls.sort_by_key(|(key, _, _)| *key);
 
     // M6 Rec 12: custom properties first. The element's own `--*`
@@ -4344,6 +4766,17 @@ fn resolve_style(
             root_font_size,
             viewport,
         );
+    }
+    // `currentColor` post-pass (Stage 15, M7 Phase 1, Rec 6):
+    // `fill` / `stroke` may have resolved to `Paint::CurrentColor`
+    // in either pass, but `color` applies in cascade order too, so
+    // resolving at `apply_decl` time could read a stale `color`.
+    // Resolve now, against the final computed `color`.
+    if style.fill == Paint::CurrentColor {
+        style.fill = Paint::Color(style.color);
+    }
+    if style.stroke == Paint::CurrentColor {
+        style.stroke = Paint::Color(style.color);
     }
     (style, flags)
 }
@@ -4662,26 +5095,88 @@ fn apply_decl(
             Value::ColorA(r, g, b, _) => style.color = [*r, *g, *b],
             _ => {}
         },
+        // Stage 15 (M7 Phase 1, Rec 6): SVG paint properties.
+        // `fill` / `stroke` accept a colour, `none`, a `url(...)`
+        // paint-server reference, or `currentColor` (resolved
+        // against the computed `color` in `resolve_style`'s
+        // post-pass, because `color` may apply after `fill` in
+        // cascade order). `stroke-width` accepts a length or a
+        // bare number (`Raw`, from `parse_value`); a percentage
+        // is relative to the viewport diagonal and is left for a
+        // later phase. `stop-color` accepts a colour or
+        // `currentColor` (resolved here against the inherited
+        // `color` — the post-pass only rewrites `fill`/`stroke`).
+        "fill" => {
+            if let Some(paint) = paint_value(value) {
+                style.fill = paint;
+            }
+        }
+        "stroke" => {
+            if let Some(paint) = paint_value(value) {
+                style.stroke = paint;
+            }
+        }
+        "stroke-width" => match value {
+            Value::Length(v) => style.stroke_width = v.max(0.0),
+            Value::Em(v) => style.stroke_width = (v * style.font_size).max(0.0),
+            Value::Raw(raw) => {
+                if let Ok(v) = raw.trim().parse::<f32>() {
+                    style.stroke_width = v.max(0.0);
+                }
+            }
+            _ => {}
+        },
+        "stop-color" => match value {
+            Value::Color(r, g, b) => style.stop_color = [*r, *g, *b],
+            Value::ColorA(r, g, b, _) => style.stop_color = [*r, *g, *b],
+            Value::Keyword(k) if k.eq_ignore_ascii_case("currentcolor") => {
+                style.stop_color = style.color;
+            }
+            _ => {}
+        },
         "background-color" | "background" => match value {
             Value::Color(r, g, b) => style.background = Some([*r, *g, *b]),
             Value::ColorA(r, g, b, _) => style.background = Some([*r, *g, *b]),
             // Stage 11 Rec 3: `background: url(...)` is a
             // shorthand — the image rides the same property.
-            Value::Url(url) => style.background_image = Some(url.clone()),
+            // A shorthand resets the whole background-image, so
+            // it clears a gradient too (Stage 15 Rec 7).
+            Value::Url(url) => {
+                style.background_image = Some(url.clone());
+                style.background_gradient = None;
+            }
+            Value::Gradient(g) => {
+                style.background_gradient = Some(g.clone());
+                style.background_image = None;
+            }
             Value::Raw(raw) => {
                 if let Some(url) = pluto_css::extract_css_urls(raw).into_iter().next() {
                     style.background_image = Some(url);
+                    style.background_gradient = None;
                 }
             }
             _ => {}
         },
         // Stage 11 Rec 3: background-image properties.
         "background-image" => match value {
-            Value::Url(url) => style.background_image = Some(url.clone()),
-            Value::Keyword(k) if k == "none" => style.background_image = None,
+            Value::Url(url) => {
+                style.background_image = Some(url.clone());
+                style.background_gradient = None;
+            }
+            // Stage 15 (M7 Phase 2, Rec 7): a gradient
+            // background-image replaces a URL one (one property).
+            Value::Gradient(g) => {
+                style.background_gradient = Some(g.clone());
+                style.background_image = None;
+            }
+            Value::Keyword(k) if k == "none" => {
+                style.background_image = None;
+                style.background_gradient = None;
+            }
             Value::Raw(raw) => {
                 if let Some(url) = pluto_css::extract_css_urls(raw).into_iter().next() {
                     style.background_image = Some(url);
+                    style.background_gradient = None;
                 }
             }
             _ => {}
@@ -5480,6 +5975,24 @@ fn number_value(value: &Value) -> Option<f32> {
 /// here; a `%` inside them has no containing-block basis at style
 /// time, so a mixed calc is unresolvable and yields `None` (the
 /// declaration falls back to `auto` / initial).
+/// Map a parsed CSS value to an SVG [`Paint`] (Stage 15, M7 Phase 1,
+/// Rec 6): a colour, `none`, a `url(...)` paint-server reference, or
+/// `currentColor`. Anything else (e.g. a gradient function, which is
+/// Rec 7) returns `None` and the declaration is dropped.
+fn paint_value(value: &Value) -> Option<Paint> {
+    match value {
+        Value::Color(r, g, b) => Some(Paint::Color([*r, *g, *b])),
+        // Alpha is dropped: paint has no alpha channel yet.
+        Value::ColorA(r, g, b, _) => Some(Paint::Color([*r, *g, *b])),
+        Value::Keyword(k) if k == "none" => Some(Paint::None),
+        Value::Keyword(k) if k.eq_ignore_ascii_case("currentcolor") => {
+            Some(Paint::CurrentColor)
+        }
+        Value::Url(url) => Some(Paint::Url(url.clone())),
+        _ => None,
+    }
+}
+
 fn dim_value(
     value: &Value,
     font_size: f32,
@@ -5923,6 +6436,7 @@ fn to_taffy_style(style: &ComputedStyle, viewport: (f32, f32)) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pluto_css::GradientKind;
     use pluto_css::TransformFunction;
     use pluto_html::parse as parse_html;
 
@@ -8130,6 +8644,76 @@ mod tests {
     }
 
     #[test]
+    fn background_gradient_lands_on_box_and_url_clears_it() {
+        // Stage 15 Rec 7: a `linear-gradient()` background-image
+        // lands in the computed style, and the url/gradient
+        // slots are one property — setting one clears the other.
+        let dom = parse_html("<html><body><div></div></body></html>");
+        let sheet = Stylesheet::parse(
+            "div { width: 100px; height: 100px; background-image: linear-gradient(to right, red, blue); }",
+        );
+        let tree = LayoutTree::build_with_state_and_images(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            &ImageMap::default(),
+            Theme::Light,
+        )
+        .expect("layout builds");
+        let div = box_for(&tree, &dom, "div");
+        let gradient = div
+            .style
+            .background_gradient
+            .as_ref()
+            .expect("gradient lands in the computed style");
+        assert_eq!(gradient.stops.len(), 2);
+        assert!(matches!(gradient.kind, GradientKind::Linear { .. }));
+        assert_eq!(div.style.background_image, None);
+
+        // A later url() rule wins and clears the gradient.
+        let sheet = Stylesheet::parse(
+            "div { width: 100px; height: 100px; background-image: linear-gradient(to right, red, blue); } div { background-image: url(bg.png); }",
+        );
+        let tree = LayoutTree::build_with_state_and_images(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            &ImageMap::default(),
+            Theme::Light,
+        )
+        .expect("layout builds");
+        let div = box_for(&tree, &dom, "div");
+        assert_eq!(div.style.background_gradient, None);
+        assert_eq!(div.style.background_image.as_deref(), Some("bg.png"));
+
+        // And the other way round: a gradient after a url clears it.
+        let sheet = Stylesheet::parse(
+            "div { width: 100px; height: 100px; background-image: url(bg.png); } div { background-image: radial-gradient(circle, white, black); }",
+        );
+        let tree = LayoutTree::build_with_state_and_images(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            &ImageMap::default(),
+            Theme::Light,
+        )
+        .expect("layout builds");
+        let div = box_for(&tree, &dom, "div");
+        assert!(div.style.background_gradient.is_some());
+        assert!(matches!(
+            div.style.background_gradient.as_ref().unwrap().kind,
+            GradientKind::Radial { .. }
+        ));
+        assert_eq!(div.style.background_image, None);
+    }
+
+    #[test]
     fn background_position_and_repeat_parse() {
         let dom = parse_html("<html><body><div></div></body></html>");
         let div_id = find_element(&dom, dom.root().unwrap(), "div").expect("div in dom");
@@ -8455,5 +9039,287 @@ mod tests {
         style.transform = Vec::new();
         style.will_change_transform = true;
         assert!(!is_stacking_context(&style, false));
+    }
+
+    // ---- Stage 15 (M7 Phase 1, Rec 2): <svg> / <canvas> replaced elements ----
+
+    /// Build `html` with author `css` and return the tree + dom.
+    fn svg_tree(html: &str, css: &str) -> (Dom, LayoutTree) {
+        let dom = parse_html(html);
+        let sheet = Stylesheet::parse(css);
+        let tree = LayoutTree::build(&dom, &sheet, 1024.0, 768.0, Theme::Light)
+            .expect("layout builds");
+        (dom, tree)
+    }
+
+    #[test]
+    fn svg_intrinsic_size_from_width_height_attributes() {
+        let (dom, tree) = svg_tree(
+            r#"<svg width="100" height="50"><rect width="10" height="10"/></svg>"#,
+            "",
+        );
+        let svg = box_for(&tree, &dom, "svg");
+        assert_eq!((svg.width, svg.height), (100.0, 50.0));
+        assert_eq!(svg.svg_canvas, Some(SvgCanvasKind::Svg));
+        // The <rect> child builds no box.
+        assert!(
+            tree.boxes
+                .iter()
+                .all(|b| b.dom.is_none_or(|id| dom.tag(id) != Some("rect"))),
+            "SVG children must not get boxes"
+        );
+    }
+
+    #[test]
+    fn svg_view_box_only_defaults_to_300x150() {
+        let (dom, tree) = svg_tree(r#"<svg viewBox="0 0 100 50"></svg>"#, "");
+        let svg = box_for(&tree, &dom, "svg");
+        assert_eq!((svg.width, svg.height), (300.0, 150.0));
+        assert_eq!(svg.svg_canvas, Some(SvgCanvasKind::Svg));
+    }
+
+    #[test]
+    fn svg_view_box_ratio_derives_the_missing_axis() {
+        let (dom, tree) = svg_tree(r#"<svg width="200" viewBox="0 0 100 50"></svg>"#, "");
+        assert_eq!((box_for(&tree, &dom, "svg").width, box_for(&tree, &dom, "svg").height), (200.0, 100.0));
+        let (dom, tree) = svg_tree(r#"<svg height="100" viewBox="0 0 100 50"></svg>"#, "");
+        assert_eq!((box_for(&tree, &dom, "svg").width, box_for(&tree, &dom, "svg").height), (200.0, 100.0));
+        // One attribute, no viewBox: the other axis is the default.
+        let (dom, tree) = svg_tree(r#"<svg width="200"></svg>"#, "");
+        assert_eq!((box_for(&tree, &dom, "svg").width, box_for(&tree, &dom, "svg").height), (200.0, 150.0));
+    }
+
+    #[test]
+    fn foreign_object_gets_a_viewport_box_and_clip() {
+        // Stage 15 (M7 Phase 3, Rec 10): <foreignObject> is a
+        // real viewport — its HTML children lay out inside its
+        // rect, clipped to it — while the svg's shape children
+        // still build no boxes.
+        let (dom, tree) = svg_tree(
+            r#"<svg width="200" height="100"><foreignObject x="10" y="20" width="100" height="50"><div style="width: 80px; height: 40px;">hi</div></foreignObject><rect width="10" height="10"/></svg>"#,
+            "",
+        );
+        let fo = box_for(&tree, &dom, "foreignObject");
+        assert_eq!((fo.x, fo.y, fo.width, fo.height), (18.0, 28.0, 100.0, 50.0));
+        assert!(fo.clip.is_some(), "foreignObject clips its content");
+        let clip = fo.clip.unwrap();
+        assert_eq!((clip[0], clip[1], clip[2], clip[3]), (18.0, 28.0, 100.0, 50.0));
+        let div = box_for(&tree, &dom, "div");
+        assert_eq!((div.x, div.y), (18.0, 28.0), "div lays out at the foreignObject origin");
+        assert!(
+            tree.boxes
+                .iter()
+                .all(|b| b.dom.is_none_or(|id| dom.tag(id) != Some("rect"))),
+            "SVG shape children still build no boxes"
+        );
+    }
+
+    #[test]
+    fn foreign_object_text_lays_out_inside_the_svg() {
+        let (dom, tree) = svg_tree(
+            r#"<svg width="200" height="100"><foreignObject x="0" y="0" width="200" height="100"><p>hello</p></foreignObject></svg>"#,
+            "",
+        );
+        assert!(
+            tree.boxes.iter().any(|b| b.text.as_ref().is_some_and(|t| t
+                .spans
+                .iter()
+                .any(|s| s.text.contains("hello")))),
+            "foreignObject text lays out as HTML"
+        );
+        assert_eq!(box_for(&tree, &dom, "svg").svg_canvas, Some(SvgCanvasKind::Svg));
+    }
+
+    #[test]
+    fn svg_css_size_wins_over_attributes() {
+        let (dom, tree) = svg_tree(
+            r#"<svg width="100" height="50"></svg>"#,
+            "svg { width: 400px; height: 300px; }",
+        );
+        let svg = box_for(&tree, &dom, "svg");
+        assert_eq!((svg.width, svg.height), (400.0, 300.0));
+    }
+
+    #[test]
+    fn svg_text_does_not_leak_into_flow() {
+        let (dom, tree) = svg_tree(
+            r#"<p>before<svg viewBox="0 0 10 10"><text>hello</text></svg>after</p>"#,
+            "",
+        );
+        assert!(
+            tree.boxes.iter().all(|b| !b.text.as_ref().is_some_and(|t| t
+                .spans
+                .iter()
+                .any(|s| s.text.contains("hello")))),
+            "SVG <text> must not leak as HTML text"
+        );
+        assert!(
+            tree.boxes.iter().any(|b| b.text.as_ref().is_some_and(|t| t
+                .spans
+                .iter()
+                .any(|s| s.text.contains("before")))),
+            "surrounding text still lays out"
+        );
+        assert_eq!(box_for(&tree, &dom, "svg").svg_canvas, Some(SvgCanvasKind::Svg));
+    }
+
+    #[test]
+    fn svg_stays_atomic_under_author_display() {
+        // Author `display: inline` must not re-open the leak the
+        // UA `inline-block` rule closes; `display: block` must not
+        // build the children either.
+        let (dom, tree) = svg_tree(
+            r#"<svg style="display: inline" width="50" height="40"><text>leak</text></svg>"#,
+            "",
+        );
+        assert_eq!((box_for(&tree, &dom, "svg").width, box_for(&tree, &dom, "svg").height), (50.0, 40.0));
+        assert!(
+            tree.boxes.iter().all(|b| !b.text.as_ref().is_some_and(|t| t
+                .spans
+                .iter()
+                .any(|s| s.text.contains("leak")))),
+            "inline SVG <text> must not leak"
+        );
+        let (dom, tree) = svg_tree(
+            r#"<svg style="display: block" width="50" height="40"><circle r="5"/></svg>"#,
+            "",
+        );
+        assert_eq!((box_for(&tree, &dom, "svg").width, box_for(&tree, &dom, "svg").height), (50.0, 40.0));
+        assert!(
+            tree.boxes
+                .iter()
+                .all(|b| b.dom.is_none_or(|id| dom.tag(id) != Some("circle"))),
+            "block SVG children must not get boxes"
+        );
+    }
+
+    #[test]
+    fn canvas_default_and_attribute_sizes() {
+        let (dom, tree) = svg_tree(r#"<canvas></canvas>"#, "");
+        let canvas = box_for(&tree, &dom, "canvas");
+        assert_eq!((canvas.width, canvas.height), (300.0, 150.0));
+        assert_eq!(canvas.svg_canvas, Some(SvgCanvasKind::Canvas));
+        let (dom, tree) = svg_tree(r#"<canvas width="640" height="480"></canvas>"#, "");
+        assert_eq!(
+            (box_for(&tree, &dom, "canvas").width, box_for(&tree, &dom, "canvas").height),
+            (640.0, 480.0)
+        );
+        let (dom, tree) = svg_tree(
+            r#"<canvas width="640" height="480"></canvas>"#,
+            "canvas { width: 100px; }",
+        );
+        // CSS width wins; the height follows the attribute ratio.
+        let canvas = box_for(&tree, &dom, "canvas");
+        assert_eq!(canvas.width, 100.0);
+        assert_eq!(canvas.height, 75.0);
+    }
+
+    // ---- Stage 15 (M7 Phase 1, Rec 6): fill / stroke / presentation attributes ----
+
+    #[test]
+    fn fill_stroke_from_css() {
+        let (dom, tree) = svg_tree(
+            r#"<svg><path d="M0 0h10"/></svg>"#,
+            "svg { fill: red; stroke: #0000ff; stroke-width: 2px; stop-color: green; }",
+        );
+        let style = &box_for(&tree, &dom, "svg").style;
+        assert_eq!(style.fill, Paint::Color([255, 0, 0]));
+        assert_eq!(style.stroke, Paint::Color([0, 0, 255]));
+        assert_eq!(style.stroke_width, 2.0);
+        assert_eq!(style.stop_color, [0, 128, 0]);
+    }
+
+    #[test]
+    fn fill_none_and_url_and_current_color() {
+        let (dom, tree) = svg_tree(r#"<svg></svg>"#, "svg { fill: none; }");
+        assert_eq!(box_for(&tree, &dom, "svg").style.fill, Paint::None);
+        let (dom, tree) = svg_tree(r#"<svg></svg>"#, "svg { fill: url(#grad); }");
+        assert_eq!(
+            box_for(&tree, &dom, "svg").style.fill,
+            Paint::Url("#grad".to_string())
+        );
+        let (dom, tree) = svg_tree(
+            r#"<svg style="color: blue" fill="currentColor"></svg>"#,
+            "svg { fill: currentColor; stroke: currentColor; }",
+        );
+        // The presentation attribute and the CSS rule both say
+        // currentColor; the post-pass resolves both against the
+        // element's own computed color.
+        let style = &box_for(&tree, &dom, "svg").style;
+        assert_eq!(style.fill, Paint::Color([0, 0, 255]));
+        assert_eq!(style.stroke, Paint::Color([0, 0, 255]));
+    }
+
+    #[test]
+    fn presentation_attributes_lose_to_author_rules() {
+        // Author `fill: red` beats the `fill="green"` presentation
+        // attribute (specificity 0, below author rules).
+        let (dom, tree) = svg_tree(
+            r#"<svg fill="green" stroke="blue" stroke-width="3" stop-color="blue"></svg>"#,
+            "svg { fill: red; }",
+        );
+        let style = &box_for(&tree, &dom, "svg").style;
+        assert_eq!(style.fill, Paint::Color([255, 0, 0]));
+        assert_eq!(style.stroke, Paint::Color([0, 0, 255]));
+        assert_eq!(style.stroke_width, 3.0);
+        assert_eq!(style.stop_color, [0, 0, 255]);
+        // With no author rule the presentation attributes apply.
+        let (dom, tree) = svg_tree(r#"<svg fill="green"></svg>"#, "");
+        assert_eq!(
+            box_for(&tree, &dom, "svg").style.fill,
+            Paint::Color([0, 128, 0])
+        );
+    }
+
+    #[test]
+    fn presentation_attributes_do_not_leak_into_html() {
+        // An HTML element's `fill` / `stroke` attributes are not
+        // presentation attributes — they must not reach the cascade.
+        let (dom, tree) = svg_tree(r#"<div fill="red" stroke="blue">x</div>"#, "");
+        let style = &box_for(&tree, &dom, "div").style;
+        assert_eq!(style.fill, Paint::Color([0, 0, 0]));
+        assert_eq!(style.stroke, Paint::None);
+    }
+
+    #[test]
+    fn fill_inherits_into_svg_children() {
+        // `fill` is inherited: a <path> inside a fill="red" <svg>
+        // resolves to red even though it never gets a box.
+        let dom = parse_html(r#"<svg fill="red"><path d="M0 0h10"/></svg>"#);
+        let sheet = Stylesheet::parse("");
+        let ua = Stylesheet::ua();
+        let (styles, _) = resolve_document_styles(
+            &dom,
+            &ua,
+            &sheet,
+            false,
+            (1024.0, 768.0),
+            &ElementState::default(),
+            Theme::Light,
+        );
+        let path = find_element(&dom, dom.root().unwrap(), "path").unwrap();
+        assert_eq!(styles[&path].fill, Paint::Color([255, 0, 0]));
+    }
+
+    #[test]
+    fn svg_anchor_with_xlink_href_matches_any_link() {
+        // Stage 15 (M7 Phase 1, Rec 1): an SVG <a> links through
+        // the legacy xlink:href too, so :any-link matches it.
+        let dom = parse_html(
+            r#"<svg><a xlink:href="https://example.com"><text>t</text></a></svg>"#,
+        );
+        let sheet = Stylesheet::parse("a:any-link { color: #123456; }");
+        let ua = Stylesheet::ua();
+        let (styles, _) = resolve_document_styles(
+            &dom,
+            &ua,
+            &sheet,
+            false,
+            (1024.0, 768.0),
+            &ElementState::default(),
+            Theme::Light,
+        );
+        let a = find_element(&dom, dom.root().unwrap(), "a").unwrap();
+        assert_eq!(styles[&a].color, [0x12, 0x34, 0x56]);
     }
 }

@@ -77,7 +77,9 @@ use std::collections::{HashMap, HashSet};
 use builder::ParseOutput;
 use slotmap::{SlotMap, new_key_type};
 
-pub use builder::{DomEvent, QName, SinkStats};
+pub use builder::{
+    DomEvent, NS_HTML, NS_MATHML, NS_SVG, NS_XLINK, NS_XML, NS_XMLNS, QName, SinkStats,
+};
 pub use observers::{
     MutationObserverOptions, MutationObserverRegistry, ObserverMutationRecord, ObserverRecordKind,
 };
@@ -148,6 +150,16 @@ pub struct DirtyFlags {
 /// small on purpose: auxiliary per-node data (computed style, selector
 /// flags, …) belongs in a `SparseSecondaryMap` owned by the consumer,
 /// not here.
+///
+/// `ns` is the element's namespace URI (Stage 15, M7 Phase 1, Rec 1):
+/// `""` for the HTML namespace (the [`QName`] convention — HTML
+/// elements carry an empty namespace), `"http://www.w3.org/2000/svg"`
+/// for SVG, `"http://www.w3.org/1998/Math/MathML"` for MathML. The
+/// parser sets it from tree construction (`builder::NS_SVG`, …);
+/// `createElement` leaves it `""`, `createElementNS` sets it to the
+/// namespace it was created with. Downstream (layout, paint, JS, the
+/// preload scanner) must read this, never the tag spelling alone, to
+/// tell `<svg><path>` from an unknown HTML `<path>`.
 #[derive(Debug, Clone)]
 pub struct Node {
     pub kind: NodeKind,
@@ -156,6 +168,8 @@ pub struct Node {
     /// Attributes in source order; duplicate names keep the first value
     /// (a *parse* rule — see [`Dom::set_attribute`], which replaces).
     pub attrs: Vec<(String, String)>,
+    /// Namespace URI; `""` = HTML namespace.
+    pub ns: String,
     pub dirty: DirtyFlags,
 }
 
@@ -172,6 +186,15 @@ impl Node {
     pub fn tag(&self) -> Option<&str> {
         match &self.kind {
             NodeKind::Element { tag } => Some(tag.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Namespace URI of an element (`""` = HTML namespace), or
+    /// `None` for document/text nodes.
+    pub fn namespace(&self) -> Option<&str> {
+        match &self.kind {
+            NodeKind::Element { .. } => Some(self.ns.as_str()),
             _ => None,
         }
     }
@@ -336,6 +359,7 @@ impl Dom {
             parent: None,
             children: Vec::new(),
             attrs: Vec::new(),
+            ns: String::new(),
             dirty: DirtyFlags::default(),
         });
         dom.root = Some(root);
@@ -369,6 +393,20 @@ impl Dom {
     /// Tag name of an element node, or `None`.
     pub fn tag(&self, id: NodeId) -> Option<&str> {
         self.arena.get(id).and_then(Node::tag)
+    }
+
+    /// Namespace URI of an element node (`""` = HTML namespace),
+    /// or `None` for non-elements. The parser fills this from tree
+    /// construction; `createElement` leaves it `""`,
+    /// `createElementNS` sets it (Stage 15, M7 Phase 1, Rec 1).
+    pub fn namespace(&self, id: NodeId) -> Option<&str> {
+        self.arena.get(id).and_then(Node::namespace)
+    }
+
+    /// True when `id` is an element in the SVG namespace.
+    pub fn is_svg(&self, id: NodeId) -> bool {
+        self.namespace(id)
+            .is_some_and(|ns| ns == crate::builder::NS_SVG)
     }
 
     /// Text of a text node, or `None`.
@@ -583,10 +621,31 @@ impl Dom {
         self.create_element_with_attrs(tag, Vec::new())
     }
 
+    /// Like [`create_element`](Self::create_element), but the
+    /// element is created in namespace `ns` — the
+    /// `document.createElementNS(namespace, tag)` seam (Stage 15,
+    /// M7 Phase 1, Rec 1). `""` is the HTML namespace, matching
+    /// the parser's [`QName`] convention.
+    pub fn create_element_ns(&mut self, ns: &str, tag: &str) -> NodeId {
+        self.create_element_with_attrs_ns(tag, Vec::new(), ns)
+    }
+
     pub fn create_element_with_attrs(
         &mut self,
         tag: &str,
         attrs: Vec<(String, String)>,
+    ) -> NodeId {
+        self.create_element_with_attrs_ns(tag, attrs, "")
+    }
+
+    /// Like [`create_element_with_attrs`](Self::create_element_with_attrs),
+    /// with an explicit namespace (the builder's path: the parser
+    /// records the namespace tree construction assigned).
+    pub fn create_element_with_attrs_ns(
+        &mut self,
+        tag: &str,
+        attrs: Vec<(String, String)>,
+        ns: &str,
     ) -> NodeId {
         self.arena.insert(Node {
             kind: NodeKind::Element {
@@ -595,6 +654,7 @@ impl Dom {
             parent: None,
             children: Vec::new(),
             attrs,
+            ns: ns.to_string(),
             dirty: DirtyFlags::default(),
         })
     }
@@ -605,6 +665,7 @@ impl Dom {
             parent: None,
             children: Vec::new(),
             attrs: Vec::new(),
+            ns: String::new(),
             dirty: DirtyFlags::default(),
         })
     }
@@ -615,6 +676,7 @@ impl Dom {
             parent: None,
             children: Vec::new(),
             attrs: Vec::new(),
+            ns: String::new(),
             dirty: DirtyFlags::default(),
         })
     }
@@ -629,6 +691,7 @@ impl Dom {
             parent: None,
             children: Vec::new(),
             attrs: Vec::new(),
+            ns: String::new(),
             dirty: DirtyFlags::default(),
         })
     }
@@ -642,6 +705,7 @@ impl Dom {
             parent: None,
             children: Vec::new(),
             attrs: Vec::new(),
+            ns: String::new(),
             dirty: DirtyFlags::default(),
         })
     }
@@ -654,6 +718,7 @@ impl Dom {
             parent: None,
             children: Vec::new(),
             attrs: Vec::new(),
+            ns: String::new(),
             dirty: DirtyFlags::default(),
         })
     }
@@ -1705,7 +1770,51 @@ mod tests {
     }
 
 
-    // ---- Stage 13 Rec 1: form-control state ----
+    // ---- Stage 15 (M7 Phase 1, Rec 1): namespace threading ----
+
+    #[test]
+    fn parse_threads_svg_namespace_onto_arena_nodes() {
+        let dom = parse(
+            r#"<svg viewBox="0 0 10 10"><path d="M0 0h10"/><foreignObject><div>hi</div></foreignObject></svg>"#,
+        );
+        let root = dom.root().unwrap();
+        let svg = find_tag(&dom, root, "svg").unwrap();
+        assert_eq!(dom.namespace(svg), Some(NS_SVG));
+        assert!(dom.is_svg(svg));
+        let path = find_tag(&dom, root, "path").unwrap();
+        assert_eq!(dom.namespace(path), Some(NS_SVG));
+        // Inside <foreignObject> content is HTML again.
+        let div = find_tag(&dom, root, "div").unwrap();
+        assert_eq!(dom.namespace(div), Some(""));
+        assert!(!dom.is_svg(div));
+        // A plain HTML element is HTML-namespaced.
+        let body = find_tag(&dom, root, "body").unwrap();
+        assert_eq!(dom.namespace(body), Some(""));
+    }
+
+    #[test]
+    fn parse_threads_mathml_namespace() {
+        let dom = parse(r#"<math><mi>x</mi></math>"#);
+        let root = dom.root().unwrap();
+        let math = find_tag(&dom, root, "math").unwrap();
+        assert_eq!(dom.namespace(math), Some(NS_MATHML));
+        let mi = find_tag(&dom, root, "mi").unwrap();
+        assert_eq!(dom.namespace(mi), Some(NS_MATHML));
+    }
+
+    #[test]
+    fn create_element_ns_sets_namespace_and_create_element_does_not() {
+        let mut dom = Dom::new();
+        let svg = dom.create_element_ns(NS_SVG, "svg");
+        assert_eq!(dom.namespace(svg), Some(NS_SVG));
+        assert!(dom.is_svg(svg));
+        let div = dom.create_element("div");
+        assert_eq!(dom.namespace(div), Some(""));
+        // Arbitrary namespaces round-trip (createElementNS accepts
+        // any URI, not just the known three).
+        let custom = dom.create_element_ns("https://example.com/ns", "x-thing");
+        assert_eq!(dom.namespace(custom), Some("https://example.com/ns"));
+    }
 
     #[test]
     fn form_state_seeded_from_attributes() {

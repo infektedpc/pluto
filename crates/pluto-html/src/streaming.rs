@@ -637,8 +637,17 @@ impl Parser {
                         }));
                     }
                 } else {
+                    // Stage 15 (M7 Phase 1, Rec 11): classify with
+                    // the element's real namespace from the `Dom` —
+                    // an SVG `<script src>` must not be fetched.
+                    let namespace = {
+                        let dom = self.shared_dom();
+                        let dom = dom.lock().unwrap();
+                        dom.namespace(node).unwrap_or("").to_string()
+                    };
                     for raw in classify_element(
                         tag,
+                        &namespace,
                         &attrs,
                         in_picture,
                         in_media,
@@ -959,6 +968,24 @@ mod tests {
         let dom = p.shared_dom();
         let dom = dom.lock().unwrap();
         assert!(find_tag(&dom, dom.root().unwrap(), "p").is_some());
+    }
+
+    #[test]
+    fn svg_script_never_pauses_the_parser() {
+        // Stage 15 (M7 Phase 1, Rec 11): an SVG <script> is inert
+        // by rule — no ScriptPaused event — unlike an HTML <script>.
+        let mut p = Parser::new();
+        let events = p.feed(b"<svg><script>alert(1)</script></svg><p>after");
+        assert!(
+            events.iter().all(|e| !matches!(e, DomEvent::ScriptPaused(_))),
+            "SVG script must not pause the parser: {events:?}"
+        );
+        let mut p = Parser::new();
+        let events = p.feed(b"<script>alert(1)</script>");
+        assert!(
+            events.iter().any(|e| matches!(e, DomEvent::ScriptPaused(_))),
+            "HTML script must pause the parser"
+        );
     }
 
     #[test]

@@ -246,6 +246,32 @@ impl ImageStore {
         }
     }
 
+    /// Decoded pixels of an already-decoded URL, if its pixels
+    /// are still cached (a CLONE of the cached bytes — the cache
+    /// keeps its own copy). The tab thread uses this when an
+    /// image load lands: it feeds the pixels to the JS host so a
+    /// later `drawImage(img)` has the bitmap synchronously
+    /// (Stage 15, M7 Phase 3, Rec 8). Bounded by the 64 MiB
+    /// cache cap, so the host copy is at most another 64 MiB in
+    /// the pathological all-images-drawn case.
+    pub fn ready_pixels(&self, url: &str) -> Option<pluto_paint::DecodedImage> {
+        match self.by_url.get(url) {
+            Some(ImageState::Ready { id, .. }) => match self.cache.get(*id) {
+                Some(Resource::Image {
+                    width,
+                    height,
+                    rgba,
+                }) => Some(pluto_paint::DecodedImage {
+                    width: *width,
+                    height: *height,
+                    rgba: rgba.clone(),
+                }),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// True when this URL already failed (fetch, decode, or
     /// cache insert): a JS request for it reports `error`
     /// straight away instead of re-fetching.
@@ -532,6 +558,38 @@ impl ImageStore {
                     // so a srcless <img> renders its alt text
                     // instead of a 300x150 hole.
                     map.broken.insert(id);
+                }
+            }
+        } else if dom.tag(id) == Some("image") {
+            // Stage 15 (M7 Phase 3, Rec 10): an SVG `<image>`
+            // resolves its `href` (plain wins, `xlink:href`
+            // fallback — the same spelling `svg_href` uses)
+            // through the same image pipeline as `<img>`, so the
+            // CollectDisplayList `svg_images` map can name its
+            // resource. Fragment-only and `data:` hrefs are
+            // excluded by the scanner, so they never reach the
+            // store — here an unresolvable href simply maps
+            // nothing (the rasteriser draws nothing for it).
+            if let Some(href) = dom
+                .attr(id, "href")
+                .or_else(|| dom.attr(id, "xlink:href"))
+            {
+                let resolved = pluto_html::resolve_url(base_url, href);
+                match self.by_url.get(&resolved) {
+                    Some(ImageState::Ready { id: rid, width, height }) => {
+                        map.by_node.insert(
+                            id,
+                            ImageInfo {
+                                resource: rid.0,
+                                width: *width,
+                                height: *height,
+                            },
+                        );
+                    }
+                    Some(ImageState::Broken) => {
+                        map.broken.insert(id);
+                    }
+                    _ => {}
                 }
             }
         }

@@ -87,9 +87,13 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// pixel hash, so two images with the same bytes at different sizes
 /// never collide.
 fn pixel_hash(image: &DecodedImage) -> u64 {
-    let mut hash = fnv1a(&image.width.to_le_bytes());
-    hash ^= fnv1a(&image.height.to_le_bytes()).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    hash ^= fnv1a(&image.rgba);
+    pixel_hash_parts(image.width, image.height, &image.rgba)
+}
+
+fn pixel_hash_parts(width: u32, height: u32, rgba: &[u8]) -> u64 {
+    let mut hash = fnv1a(&width.to_le_bytes());
+    hash ^= fnv1a(&height.to_le_bytes()).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    hash ^= fnv1a(rgba);
     // Mix once more so a hash of only the dimensions cannot equal
     // a hash of only pixels.
     hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
@@ -141,6 +145,16 @@ pub enum ImageError {
 /// than [`MAX_IMAGE_DIMENSION`] px on a side, or an allocation
 /// past the cache cap, is rejected before pixels are allocated.
 pub fn decode_image(bytes: &[u8]) -> Result<DecodedImage, ImageError> {
+    // Stage 15 (M7 Phase 3, Rec 12): SVG bytes rasterise
+    // through the M7 rasteriser — the `image` crate has no SVG
+    // decoder, so without this sniff an `<img src=*.svg>` lands
+    // in the broken-image set. The sniff is structural (first
+    // element `<svg>`), never a content-type trust: a PNG that
+    // happens to contain the string is still a PNG (its first
+    // bytes are the PNG magic, not `<svg`).
+    if crate::svg::looks_like_svg(bytes) {
+        return crate::svg::decode_svg_image(bytes);
+    }
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(image::ImageError::IoError)?;
@@ -642,6 +656,45 @@ impl ImageCache {
         Ok(id)
     }
 
+    /// Store a resource under a caller-chosen id (Stage 15, M7
+    /// Phase 2, Rec 5): the worker's rasteriser names its Blobs
+    /// with deterministic ids (`svg_blob_id` /
+    /// `bg_gradient_blob_id`), so the tab thread inserts them
+    /// under that id instead of the sequential `next_id`.
+    /// Replacing an existing entry keeps the byte accounting,
+    /// LRU order, and hash maps correct: the old entry's
+    /// bookkeeping is removed first (not counted as an eviction),
+    /// then room is made — the id being inserted is already out
+    /// of the LRU, so `evict_until_fits` can never evict it.
+    /// The pixels are registered in the dedup map like any
+    /// insert. `false` when the id is 0 or the resource exceeds
+    /// the cap (refused, like `insert_decoded`); the sequential
+    /// `next_id` is untouched — the deterministic ids live in
+    /// the 0x4000_0000+ range, far above any sequential id in
+    /// practice, so the two namespaces never collide.
+    pub fn insert_with_id(&mut self, id: ResourceId, resource: Resource) -> bool {
+        let Resource::Image {
+            width,
+            height,
+            rgba,
+        } = &resource;
+        let size = rgba.len();
+        if id == ResourceId(0) || size > self.cap_bytes {
+            return false;
+        }
+        if self.table.get(id).is_some() {
+            self.remove_entry(id);
+        }
+        self.evict_until_fits(size);
+        let phash = pixel_hash_parts(*width, *height, rgba);
+        self.table.insert(id, resource);
+        self.bytes_used += size;
+        self.lru.push_front(id);
+        self.by_pixels.insert(phash, id);
+        self.pixel_hash.insert(id, phash);
+        true
+    }
+
     /// Store an animated image: frame 0 lands in the table under
     /// the returned id, the rest are held for
     /// [`advance_animated`]. `None` when there are no frames, the
@@ -777,6 +830,15 @@ impl ImageCache {
     }
 
     fn evict(&mut self, id: ResourceId) {
+        self.remove_entry(id);
+        self.evictions += 1;
+    }
+
+    /// Drop one entry's table row and all its bookkeeping (LRU,
+    /// hashes, animation, bytes) without counting an eviction —
+    /// the shared removal behind [`Self::evict`] and the replace
+    /// path of [`Self::insert_with_id`].
+    fn remove_entry(&mut self, id: ResourceId) {
         if let Some(pos) = self.lru.iter().position(|&x| x == id) {
             self.lru.remove(pos);
         }
@@ -795,7 +857,6 @@ impl ImageCache {
         }
         self.animated.remove(&id);
         self.frame_dirty.remove(&id);
-        self.evictions += 1;
     }
 }
 
@@ -1172,6 +1233,101 @@ mod tests {
             Err(ImageError::TooLarge(256))
         ));
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn insert_with_id_stores_replaces_and_refuses() {
+        // Stage 15 Rec 5: the worker's rasteriser names its Blobs
+        // with deterministic ids, so the tab thread inserts them
+        // under that id instead of the sequential counter.
+        let mut cache = ImageCache::with_cap(1024);
+        let id = ResourceId(0x4000_0001);
+        let red = solid(2, [255, 0, 0, 255]);
+        assert!(cache.insert_with_id(
+            id,
+            Resource::Image {
+                width: red.width,
+                height: red.height,
+                rgba: red.rgba.clone(),
+            }
+        ));
+        assert_eq!(cache.get(id), Some(&Resource::Image {
+            width: 2,
+            height: 2,
+            rgba: red.rgba.clone(),
+        }));
+        assert_eq!(cache.bytes_used(), 16);
+        assert_eq!(cache.evictions(), 0);
+        // Replace with different pixels under the same id: one
+        // entry, bytes re-accounted, no eviction counted.
+        let green = solid(1, [0, 255, 0, 255]);
+        assert!(cache.insert_with_id(
+            id,
+            Resource::Image {
+                width: green.width,
+                height: green.height,
+                rgba: green.rgba.clone(),
+            }
+        ));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.bytes_used(), 4);
+        assert_eq!(cache.evictions(), 0);
+        assert_eq!(cache.get(id), Some(&Resource::Image {
+            width: 1,
+            height: 1,
+            rgba: green.rgba,
+        }));
+        // Oversize is refused; id 0 is refused.
+        let big = Resource::Image {
+            width: 100,
+            height: 100,
+            rgba: vec![0u8; 40_000],
+        };
+        assert!(!cache.insert_with_id(ResourceId(0x4000_0002), big));
+        assert!(!cache.insert_with_id(
+            ResourceId(0),
+            Resource::Image {
+                width: 1,
+                height: 1,
+                rgba: vec![0, 0, 0, 255],
+            }
+        ));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn insert_with_id_evicts_lru_but_never_itself() {
+        // A 64-byte cap: two 16-byte sequential images fill half
+        // the cap; a 64-byte Blob must evict both and land — and
+        // replacing that Blob afterwards must not evict itself.
+        let mut cache = ImageCache::with_cap(64);
+        let a = cache.insert_decoded(solid(2, [1, 0, 0, 255])).unwrap();
+        let b = cache.insert_decoded(solid(2, [2, 0, 0, 255])).unwrap();
+        assert_eq!(cache.bytes_used(), 32);
+        let blob = ResourceId(0x4000_0001);
+        assert!(cache.insert_with_id(
+            blob,
+            Resource::Image {
+                width: 8,
+                height: 2,
+                rgba: vec![9u8; 64],
+            }
+        ));
+        assert_eq!(cache.bytes_used(), 64);
+        assert!(cache.get(blob).is_some());
+        assert!(cache.get(a).is_none());
+        assert!(cache.get(b).is_none());
+        // Replace the Blob with a smaller one: it stays.
+        assert!(cache.insert_with_id(
+            blob,
+            Resource::Image {
+                width: 2,
+                height: 2,
+                rgba: vec![9u8; 16],
+            }
+        ));
+        assert_eq!(cache.bytes_used(), 16);
+        assert!(cache.get(blob).is_some());
     }
 
     #[test]

@@ -17,46 +17,46 @@ use crate::bindings::fetch::{
     FetchBackend, FetchCompletion, FetchError, FetchRequest, FetchResponse, ResponseType,
 };
 use crate::bindings::events::TypedEventKind;
-use crate::host::DomHost;
+use crate::host::{CanvasCall, DomHost};
 use crate::bindings::test_host::{TestHost, TestHostLog};
 use crate::engine::JsValue;
 use crate::observers::ComputedIntersection;
 use crate::realm::RealmConfig;
 use crate::tab::TabJs;
 
-const DOC: &str = r#"<!doctype html>
+pub(crate) const DOC: &str = r#"<!doctype html>
 <html><head><title>Test Page</title></head><body>
 <div id="app" class="root"><p id="para">Hello</p><button id="btn">Click</button></div>
 <ul id="list"><li class="item">one</li><li class="item">two</li><li class="item">three</li></ul>
 </body></html>"#;
 
-fn test_tab() -> TabJs {
+pub(crate) fn test_tab() -> TabJs {
     let mut tab = TabJs::new(&RealmConfig::default()).unwrap();
     tab.set_dom_host(Box::new(TestHost::from_html(DOC)));
     tab
 }
 
 /// Run `source` as a script task, then drive the loop to idle.
-fn run(tab: &mut TabJs, source: &str) {
+pub(crate) fn run(tab: &mut TabJs, source: &str) {
     tab.eval_script(source, "test.js").unwrap();
     tab.run_until_idle().unwrap();
 }
 
-fn read_str(tab: &mut TabJs, source: &str) -> String {
+pub(crate) fn read_str(tab: &mut TabJs, source: &str) -> String {
     match tab.eval_value(source).unwrap() {
         JsValue::String(s) => s,
         other => panic!("expected a string from `{source}`, got {other:?}"),
     }
 }
 
-fn read_num(tab: &mut TabJs, source: &str) -> f64 {
+pub(crate) fn read_num(tab: &mut TabJs, source: &str) -> f64 {
     match tab.eval_value(source).unwrap() {
         JsValue::Number(n) => n,
         other => panic!("expected a number from `{source}`, got {other:?}"),
     }
 }
 
-fn read_bool(tab: &mut TabJs, source: &str) -> bool {
+pub(crate) fn read_bool(tab: &mut TabJs, source: &str) -> bool {
     match tab.eval_value(source).unwrap() {
         JsValue::Bool(b) => b,
         other => panic!("expected a bool from `{source}`, got {other:?}"),
@@ -256,6 +256,42 @@ fn create_element_and_append() {
     );
     assert_eq!(read_str(&mut tab, "__r"), "made");
     assert_eq!(read_num(&mut tab, "document.getElementById('app').childNodes.length"), 3.0);
+}
+
+#[test]
+fn create_element_ns_carries_namespace_and_create_element_does_not() {
+    // Stage 15 (M7 Phase 1, Rec 1): createElementNS creates the
+    // element in the given namespace; plain createElement always
+    // creates an HTML-namespace element. namespaceURI reports the
+    // HTML namespace URI for HTML elements, per DOM.
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); \
+         const path = document.createElementNS('http://www.w3.org/2000/svg', 'path'); \
+         const fo = document.createElementNS('http://www.w3.org/2000/svg', 'foreignObject'); \
+         const div = document.createElement('div'); \
+         const nul = document.createElementNS(null, 'span'); \
+         globalThis.__r = [svg.namespaceURI, path.namespaceURI, fo.namespaceURI, fo.nodeName, fo.tagName, div.namespaceURI, nul.namespaceURI].join('|');",
+    );
+    assert_eq!(
+        read_str(&mut tab, "__r"),
+        "http://www.w3.org/2000/svg|http://www.w3.org/2000/svg|http://www.w3.org/2000/svg|foreignObject|foreignObject|http://www.w3.org/1999/xhtml|http://www.w3.org/1999/xhtml"
+    );
+}
+
+#[test]
+fn clone_node_preserves_namespace() {
+    // Stage 15 (M7 Phase 1, Rec 1): cloneNode keeps the namespace
+    // — a cloned <svg> stays SVG.
+    let mut tab = test_tab();
+    run(
+        &mut tab,
+        "const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); \
+         const c = svg.cloneNode(false); \
+         globalThis.__r = c.namespaceURI;",
+    );
+    assert_eq!(read_str(&mut tab, "__r"), "http://www.w3.org/2000/svg");
 }
 
 #[test]

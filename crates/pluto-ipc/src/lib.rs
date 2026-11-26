@@ -58,6 +58,13 @@ pub mod transport;
 /// The protocol version every encoded message carries. Bump on any
 /// breaking change to the enums below.
 ///
+/// v10 (Stage 15 Phase 2, M7 Rec 4) appends one display-list
+/// variant at the end so existing variants keep their postcard
+/// discriminants: [`DisplayItem::VectorPath`] (tessellated vector
+/// triangles for inline SVG shapes and CSS linear-gradient
+/// backgrounds). The bump is the shape change; v9 bytes are
+/// rejected by [`decode_message`].
+///
 /// v9 (Stage 14 Phase 3, M6 Rec 12) adds one browser message,
 /// appended at the end so existing variants keep their postcard
 /// discriminants: [`BrowserToRenderer::SetTheme`] (the OS / desktop
@@ -89,7 +96,7 @@ pub mod transport;
 /// `SetFocused` and `ScrollViewport`. v2 bytes are rejected by
 /// [`decode_message`] — Pluto ships one binary, so a bump is a
 /// clean break, not a migration.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// What went wrong decoding a versioned message.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -796,7 +803,7 @@ mod tests {
         // POSTs), 6 -> 7 (Stage 13 Rec 12: SandboxReport +
         // Heartbeat), 7 -> 8 (Stage 14 Rec 9: CompositingUpdate),
         // and 8 -> 9 (Stage 14 Phase 3, Rec 12: SetTheme).
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 10);
     }
 
     #[test]

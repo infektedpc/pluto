@@ -80,11 +80,12 @@ use pluto_html::{
 };
 use pluto_html::{Destination as HtmlDestination, Priority as HtmlPriority};
 use pluto_ipc::{
-    CredentialsMode, Destination, Priority, RequestMode, ResourceRequest, origin_of,
+    CredentialsMode, Destination, Origin, Priority, RequestMode, ResourceRequest, origin_of,
 };
 use pluto_js::ModuleSources;
 use pluto_layout::{ElementState, LayoutTree, Theme};
 use pluto_net::ResourceLoader;
+use pluto_net::csp::{PolicySet, inline_style_allowed};
 use pluto_paint::DisplayList;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -479,6 +480,14 @@ pub trait ScriptHooks {
     /// would be fed nothing and its `Dom` would stay empty).
     fn parser_created(&mut self, _parser: &std::rc::Rc<std::cell::RefCell<Parser>>) {}
 
+    /// The document response's CSP policies (Stage 15, M7 Phase 1,
+    /// Rec 11): the load calls this with the policies built from
+    /// the response's `content-security-policy` headers, before
+    /// the first chunk is fed — the runner stashes them where the
+    /// tab thread's script gate can read them. Default no-op: a
+    /// runner with no execution path has nothing to gate.
+    fn set_document_csp(&mut self, _policies: PolicySet) {}
+
     /// An encoding restart replaced the parser (and its arena) with
     /// a fresh one: the runner must re-point the host at it.
     fn parser_restarted(&mut self, parser: &std::rc::Rc<std::cell::RefCell<Parser>>);
@@ -598,6 +607,35 @@ pub async fn load_page_cancellable_with_hooks(
         final_url,
         response.body.len()
     );
+    // Stage 15 (M7 Phase 1, Rec 11): the document's CSP, built
+    // from its response headers (same extraction as the fetch-side
+    // gate in `pluto-net`). It is stashed on the shared host
+    // BEFORE the first chunk is fed — so a parser-blocking inline
+    // script is gated under the CURRENT document's policies — and
+    // carried into the streaming load for the inline-`<style>`
+    // gate at `finish_document`. Replaced unconditionally: a
+    // document with no CSP headers clears the previous
+    // document's policies. This is the execution-time source of
+    // truth in both fetch modes (in Broker mode the worker-side
+    // loader never sees the document response).
+    let csp = {
+        let enforce: Vec<&str> = response
+            .headers
+            .get_all("content-security-policy")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        let report_only: Vec<&str> = response
+            .headers
+            .get_all("content-security-policy-report-only")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        PolicySet::from_headers(&enforce, &report_only)
+    };
+    if let Some(hooks) = hooks.as_mut() {
+        hooks.set_document_csp(csp.clone());
+    }
     // Stage 9 Rec 13 (downloads): decide render-vs-download
     // BEFORE parsing — a response that says "download" must
     // never render as a page (an attachment served as text/html
@@ -708,6 +746,7 @@ pub async fn load_page_cancellable_with_hooks(
         sinks,
         tab_id,
         epoch,
+        csp,
     );
     for chunk in response.body.chunks(FEED_CHUNK_BYTES) {
         if cancel.is_cancelled() {
@@ -874,6 +913,12 @@ struct StreamingLoad<'h> {
     sheet_attempted: HashSet<String>,
     /// Fetched script bytes by resolved `src`.
     script_bytes: HashMap<String, Vec<u8>>,
+    /// The document's CSP policies (Stage 15, M7 Phase 1, Rec 11),
+    /// built from the document response's headers at the load site:
+    /// `finish_document` gates inline `<style>` blocks against
+    /// them. Carried here (not read back from the host) because
+    /// the load owns the parse.
+    csp: PolicySet,
     /// Module import URLs already attempted (loaded or failed),
     /// keyed by absolute URL (Stage 12 Rec 1): the same module
     /// imported from several spellings / several parents is
@@ -899,6 +944,7 @@ impl<'h> StreamingLoad<'h> {
         sinks: LoadSinks,
         tab_id: u64,
         epoch: u64,
+        csp: PolicySet,
     ) -> Self {
         Self {
             fetch,
@@ -912,6 +958,7 @@ impl<'h> StreamingLoad<'h> {
             sheet_cache: HashMap::new(),
             sheet_attempted: HashSet::new(),
             script_bytes: HashMap::new(),
+            csp,
             module_attempted: HashSet::new(),
             paused_scripts: Vec::new(),
             blocking_deadline: tokio::time::Instant::now() + RENDER_BLOCKING_TIMEOUT,
@@ -1353,7 +1400,15 @@ impl<'h> StreamingLoad<'h> {
         );
         let parsed = parser.finish();
         let dom = parsed.output.dom;
-        let sources = collect_style_sources(&dom);
+        // Stage 15 (M7 Phase 1, Rec 11): inline `<style>` blocks
+        // are gated by the document's CSP (`style-src-elem` →
+        // `style-src` → `default-src`) at collection time — a
+        // blocked block never reaches the merged sheet. The
+        // policies are the load's own (built from the document
+        // response's headers at the load site), so the gate holds
+        // in both fetch modes.
+        let origin = Origin::from_url(&self.base_url);
+        let sources = collect_style_sources(&dom, Some((&self.csp, &origin)));
         let sheet = merge_sources(&sources, &self.sheet_cache, &self.base_url);
         let held_scripts = held_scripts(
             &dom,
@@ -1437,7 +1492,9 @@ pub fn parse_document(html: &str) -> Document {
 /// against (the document's final URL after redirects).
 pub fn parse_document_with_base(html: &str, base_url: &str) -> Document {
     let dom = pluto_html::parse(html);
-    let sources = collect_style_sources(&dom);
+    // No policies known on this path (see `collect_style_sources`):
+    // inline `<style>` blocks are allowed, as before.
+    let sources = collect_style_sources(&dom, None);
     let sheet = merge_sources(&sources, &HashMap::new(), base_url);
     Document {
         dom,
@@ -1489,10 +1546,22 @@ pub fn layout_document_with_state(
 /// the worker's hit-test hands back is usually the link itself, but a
 /// click on a child (an `<img>` or `<span>` inside the link) must
 /// still navigate — hence the ancestor walk.
+///
+/// Namespace-aware (Stage 15, M7 Phase 1, Rec 1): an HTML `<a>`
+/// links through `href` only; an SVG `<a>` links through `href`
+/// (SVG2) or the legacy `xlink:href`. A same-spelled `<a>` in any
+/// other namespace links through neither.
 pub fn find_link_href(doc: &Document, mut id: NodeId) -> Option<String> {
     loop {
         if doc.dom.tag(id) == Some("a") {
-            if let Some(href) = doc.dom.attr(id, "href")
+            let href = match doc.dom.namespace(id) {
+                Some(ns) if ns == pluto_html::NS_SVG => doc
+                    .dom
+                    .attr(id, "href")
+                    .or_else(|| doc.dom.attr(id, "xlink:href")),
+                _ => doc.dom.attr(id, "href"),
+            };
+            if let Some(href) = href
                 && !href.trim().is_empty()
             {
                 return Some(resolve_url(&doc.base_url, href));
@@ -1508,15 +1577,28 @@ pub fn find_link_href(doc: &Document, mut id: NodeId) -> Option<String> {
 /// `<style>` text (with its `media` attribute, if any) and external
 /// `<link rel="stylesheet">` (href + media). `data:` hrefs and links
 /// without an href contribute nothing.
-fn collect_style_sources(dom: &Dom) -> Vec<StyleSource> {
+///
+/// `csp` gates inline `<style>` blocks (Stage 15, M7 Phase 1,
+/// Rec 11): `Some((policies, origin))` drops a block the document's
+/// CSP forbids; `None` (no policies known — the `parse_document*`
+/// paths) allows everything, preserving the old behaviour.
+fn collect_style_sources(
+    dom: &Dom,
+    csp: Option<(&PolicySet, &Origin)>,
+) -> Vec<StyleSource> {
     let mut sources = Vec::new();
     if let Some(root) = dom.root() {
-        collect_style_sources_from(dom, root, &mut sources);
+        collect_style_sources_from(dom, root, csp, &mut sources);
     }
     sources
 }
 
-fn collect_style_sources_from(dom: &Dom, id: NodeId, out: &mut Vec<StyleSource>) {
+fn collect_style_sources_from(
+    dom: &Dom,
+    id: NodeId,
+    csp: Option<(&PolicySet, &Origin)>,
+    out: &mut Vec<StyleSource>,
+) {
     if dom.tag(id) == Some("style") {
         let mut css = String::new();
         for &child in dom.children(id) {
@@ -1524,6 +1606,20 @@ fn collect_style_sources_from(dom: &Dom, id: NodeId, out: &mut Vec<StyleSource>)
                 css.push_str(text);
                 css.push('\n');
             }
+        }
+        // Stage 15 (M7 Phase 1, Rec 11): a CSP-blocked inline
+        // `<style>` contributes nothing — it never reaches the
+        // merged sheet. The nonce rides the element, the content
+        // is the exact block bytes (tags excluded).
+        if let Some((policies, origin)) = csp
+            && !inline_style_allowed(
+                policies,
+                origin,
+                dom.attr(id, "nonce"),
+                css.as_bytes(),
+            )
+        {
+            return;
         }
         let media = dom.attr(id, "media").map(str::to_string);
         out.push(StyleSource::Inline { css, media });
@@ -1549,7 +1645,7 @@ fn collect_style_sources_from(dom: &Dom, id: NodeId, out: &mut Vec<StyleSource>)
         // siblings do — fall through to the child walk below.
     }
     for &child in dom.children(id) {
-        collect_style_sources_from(dom, child, out);
+        collect_style_sources_from(dom, child, csp, out);
     }
 }
 
@@ -2513,5 +2609,75 @@ mod tests {
             display.0[0],
             DisplayItem::FillRect { color, .. } if fill_near(color, (0x00, 0xff, 0x00))
         ));
+    }
+
+    /// Walk the DOM for the first node matching `pred` (test helper).
+    fn find_node(doc: &Document, pred: impl Fn(&Dom, NodeId) -> bool) -> Option<NodeId> {
+        let mut stack = vec![doc.dom.root()?];
+        while let Some(id) = stack.pop() {
+            if pred(&doc.dom, id) {
+                return Some(id);
+            }
+            stack.extend(doc.dom.children(id).iter().rev());
+        }
+        None
+    }
+
+    /// Stage 15 (M7 Phase 1, Rec 1): `find_link_href` reads an SVG
+    /// `<a>`'s `href`, falling back to the legacy `xlink:href` —
+    /// and an HTML `<a>` never falls back to `xlink:href`.
+    #[test]
+    fn find_link_href_svg_anchor_uses_xlink_href() {
+        let doc = parse_document_with_base(
+            "<svg><a xlink:href=\"/svg-page\"><text>link</text></a></svg>",
+            "https://example.com/",
+        );
+        let text = find_node(&doc, |dom, id| dom.tag(id) == Some("text")).expect("svg text");
+        assert_eq!(
+            find_link_href(&doc, text).as_deref(),
+            Some("https://example.com/svg-page")
+        );
+        // Plain href wins over xlink:href on an SVG anchor.
+        let doc = parse_document_with_base(
+            "<svg><a href=\"/plain\" xlink:href=\"/legacy\">x</a></svg>",
+            "https://example.com/",
+        );
+        let a = find_node(&doc, |dom, id| dom.tag(id) == Some("a")).expect("svg a");
+        assert_eq!(
+            find_link_href(&doc, a).as_deref(),
+            Some("https://example.com/plain")
+        );
+        // An HTML <a> with only xlink:href is not a link.
+        let doc = parse_document_with_base(
+            "<a xlink:href=\"/legacy\">x</a>",
+            "https://example.com/",
+        );
+        let a = find_node(&doc, |dom, id| dom.tag(id) == Some("a")).expect("html a");
+        assert_eq!(find_link_href(&doc, a), None);
+    }
+
+    /// Stage 15 (M7 Phase 1, Rec 11): `collect_style_sources`
+    /// drops an inline `<style>` the document's CSP forbids, keeps
+    /// one its nonce allows, and keeps everything when no policies
+    /// are known.
+    #[test]
+    fn collect_style_sources_csp_blocks_inline_style() {
+        let dom = pluto_html::parse(
+            "<html><head><style>div { color: red; }</style><style nonce=\"abc\">p { color: blue; }</style></head><body></body></html>",
+        );
+        let origin = Origin::from_url("https://example.com/");
+        let blocked = PolicySet::from_headers(&["style-src 'none'"], &[]);
+        assert!(collect_style_sources(&dom, Some((&blocked, &origin))).is_empty());
+        let nonce_ok = PolicySet::from_headers(&["style-src 'nonce-abc'"], &[]);
+        assert_eq!(
+            collect_style_sources(&dom, Some((&nonce_ok, &origin))).len(),
+            1
+        );
+        let empty = PolicySet::from_headers(&[], &[]);
+        assert_eq!(
+            collect_style_sources(&dom, Some((&empty, &origin))).len(),
+            2
+        );
+        assert_eq!(collect_style_sources(&dom, None).len(), 2);
     }
 }

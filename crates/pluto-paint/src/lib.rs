@@ -21,17 +21,32 @@
 //! vocabulary + renderer support for M3; no borders or color glyphs
 //! (emoji) yet.
 
-use pluto_css::{Affine, MAX_BOX_SHADOW_BLUR, ResolvedCorners, ResolvedShadow};
+use pluto_css::{Affine, GradientKind, MAX_BOX_SHADOW_BLUR, ResolvedCorners, ResolvedShadow};
+use pluto_html::Dom;
 use pluto_layout::{
     BackgroundPosition, BackgroundRepeat, BackgroundSize, Dim, LayoutBox, LayoutTree,
+    SvgCanvasKind,
+};
+
+use crate::canvas::canvas_blob_id;
+use crate::path::{VectorVertex, clip_colored_triangles, linear_gradient_quad};
+use crate::raster::rasterize_gradient_rect;
+use crate::svg::{
+    MAX_RASTER_PIXELS, SvgContent, SvgRasterCache, bg_gradient_blob_id, collect_svg_content,
+    gradient_fingerprint, parse_view_box, rasterize_svg_content, svg_blob_id, svg_fingerprint,
+    svg_needs_raster, tessellate_svg_shape, view_box_transform,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub mod canvas;
 pub mod glyph_key;
 pub mod image;
+pub mod path;
 pub mod perf;
+pub mod raster;
 pub mod raster_spike;
+pub mod svg;
 pub mod renderer;
 
 pub use glyph_key::GlyphKey;
@@ -198,6 +213,19 @@ pub enum DisplayItem {
     PushFixed,
     /// Pop the most recent `PushFixed`.
     PopFixed,
+    /// A tessellated vector path (Stage 15, M7 Phase 2, Rec 4):
+    /// flat coloured triangles in layout space, one item per
+    /// shape of an inline `<svg>` (solid fills, two-stop linear
+    /// gradients) or per CSS linear-gradient background.
+    /// Vertices come in triples; `bounds` is the item's rect
+    /// (the svg box, or the background box) for damage and CPU
+    /// culling. Appended last, so the earlier postcard
+    /// discriminants never move — the wire bump is
+    /// `PROTOCOL_VERSION` 9→10.
+    VectorPath {
+        vertices: Vec<VectorVertex>,
+        bounds: [f32; 4],
+    },
 }
 
 /// One element's compositing state (M6 Phase 2, Rec 9): the
@@ -266,6 +294,7 @@ impl DisplayItem {
                 ..
             } => Some([*x, *y, *width, *height]),
             DisplayItem::Caret { x, y, height, .. } => Some([*x, *y, 2.0, *height]),
+            DisplayItem::VectorPath { bounds, .. } => Some(*bounds),
             DisplayItem::BoxShadow {
                 x,
                 y,
@@ -434,6 +463,11 @@ impl ResourceTable {
 /// generous for real pages and tight enough to bound the work.
 pub const MAX_DISPLAY_ITEMS: usize = 100_000;
 pub const MAX_GLYPHS_TOTAL: usize = 1_000_000;
+/// Cap on the vertices of one `VectorPath` item (Stage 15):
+/// ~2.6 MB of vertex data, far above any real svg shape (the
+/// tessellator's own cap is 65_536) and far below anything that
+/// would let a hostile renderer blow the browser's memory.
+pub const MAX_VECTOR_VERTICES: usize = 262_144;
 pub const MAX_COORDINATE: f32 = 100_000.0;
 pub const MAX_RESOURCE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -444,6 +478,10 @@ pub enum ValidationError {
     TooManyItems(usize),
     #[error("display list has {0} glyphs, over the limit of {MAX_GLYPHS_TOTAL}")]
     TooManyGlyphs(usize),
+    #[error("vector path has {0} vertices, over the limit of {MAX_VECTOR_VERTICES}")]
+    TooManyVectorVertices(usize),
+    #[error("vector path has {0} vertices, not a multiple of 3")]
+    VectorPathNotTriangles(usize),
     #[error("non-finite or out-of-range coordinate {0}")]
     BadCoordinate(f32),
     #[error("negative or out-of-range size {0}")]
@@ -772,6 +810,27 @@ impl DisplayList {
                 }
                 DisplayItem::PopOpacity => {}
                 DisplayItem::PushFixed | DisplayItem::PopFixed => {}
+                DisplayItem::VectorPath { vertices, bounds } => {
+                    check_coord(bounds[0])?;
+                    check_coord(bounds[1])?;
+                    check_size(bounds[2])?;
+                    check_size(bounds[3])?;
+                    if vertices.len() > MAX_VECTOR_VERTICES {
+                        return Err(ValidationError::TooManyVectorVertices(vertices.len()));
+                    }
+                    if !vertices.len().is_multiple_of(3) {
+                        return Err(ValidationError::VectorPathNotTriangles(vertices.len()));
+                    }
+                    for v in vertices {
+                        check_coord(v.position[0])?;
+                        check_coord(v.position[1])?;
+                        for c in v.color {
+                            if !c.is_finite() || !(0.0..=1.0).contains(&c) {
+                                return Err(ValidationError::BadColor(c));
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -806,8 +865,72 @@ impl DisplayList {
     /// transformed bounds, and every item's transformed bounds (a
     /// shadow's falloff can leave its box), so a rotated item is
     /// never damage-culled.
+    /// Build the paint operations for one laid-out document (see
+    /// [`DisplayList::build_inner`]). Inline `<svg>` elements and
+    /// radial CSS gradient backgrounds paint nothing here — use
+    /// [`DisplayList::build_with_svg`] for those.
     pub fn build(layout: &LayoutTree) -> Self {
+        Self::build_inner(layout, None, &HashMap::new(), &[], &[]).0
+    }
+
+    /// Like [`DisplayList::build`], but inline `<svg>` elements
+    /// and radial CSS gradient backgrounds also paint (vector
+    /// triangles or raster Blobs — see `build_inner`). Returns
+    /// the list plus the new raster resources: each is a
+    /// `(ResourceId, Resource)` the tab thread must insert into
+    /// its image cache and announce with `ResourceReady` before
+    /// submitting the list. The ids are deterministic (see
+    /// [`svg_blob_id`]), so a scroll rebuild names the id the
+    /// shell already holds and no entry is returned twice.
+    pub fn build_with_svg(
+        layout: &LayoutTree,
+        dom: &Dom,
+        cache: &mut SvgRasterCache,
+    ) -> (Self, Vec<(ResourceId, Resource)>) {
+        Self::build_inner(layout, Some((dom, cache)), &HashMap::new(), &[], &[])
+    }
+
+    /// Like [`DisplayList::build_with_svg`], plus the Phase 3
+    /// producers (Stage 15, M7 Phase 3, Rec 8/10): `svg_images`
+    /// resolves `<svg><image>` elements (by DOM id) to the
+    /// resource ids the tab thread's image map already holds;
+    /// `canvas_live` names every `<canvas>` with a bitmap (its
+    /// Blob is emitted even when the bitmap is unchanged);
+    /// `canvas_new` carries the fresh bitmaps (id + `Resource`)
+    /// the tab thread must announce — only dirty canvases ride
+    /// here, so a static canvas costs one `ResourceReady` frame,
+    /// not one per tick. Canvas blob ids are deterministic
+    /// ([`canvas_blob_id`]).
+    pub fn build_with_svg_and_canvas(
+        layout: &LayoutTree,
+        dom: &Dom,
+        cache: &mut SvgRasterCache,
+        svg_images: &HashMap<pluto_html::NodeId, ResourceId>,
+        canvas_live: &[pluto_html::NodeId],
+        canvas_new: &[(pluto_html::NodeId, Resource)],
+    ) -> (Self, Vec<(ResourceId, Resource)>) {
+        Self::build_inner(
+            layout,
+            Some((dom, cache)),
+            svg_images,
+            canvas_live,
+            canvas_new,
+        )
+    }
+
+    /// The shared builder: `svg` carries the DOM + raster cache
+    /// for the SVG/gradient routes (`None` in plain `build()` —
+    /// radial backgrounds and inline SVGs then paint nothing,
+    /// and the box keeps its background fill).
+    fn build_inner(
+        layout: &LayoutTree,
+        mut svg: Option<(&Dom, &mut SvgRasterCache)>,
+        svg_images: &HashMap<pluto_html::NodeId, ResourceId>,
+        canvas_live: &[pluto_html::NodeId],
+        canvas_new: &[(pluto_html::NodeId, Resource)],
+    ) -> (Self, Vec<(ResourceId, Resource)>) {
         let mut list = Self::new();
+        let mut new_blobs: Vec<(ResourceId, Resource)> = Vec::new();
         let bg = layout.canvas_background;
         list.0.push(DisplayItem::FillRect {
             x: 0.0,
@@ -1063,6 +1186,72 @@ impl DisplayList {
                     list.0.push(DisplayItem::PopClip);
                 }
             }
+            // Stage 15 Rec 7: CSS gradient backgrounds. A linear
+            // gradient is a vector quad subdivided per stop segment
+            // (exact for any stop count — see
+            // `path::linear_gradient_quad`); a radial gradient
+            // rasterises to a Blob (per-pixel evaluation, like an
+            // inline SVG's radial fill). The radial route needs
+            // the DOM + raster cache, so plain `build()` paints
+            // nothing for a radial background — the box keeps its
+            // background fill. `background-image` and
+            // `background_gradient` are mutually exclusive in the
+            // cascade (setting one clears the other), and a text
+            // leaf's style is its parent's clone, so this is
+            // guarded by `bx.dom.is_some()` — the parent's own
+            // box already paints its gradient. Rounded boxes clip
+            // the gradient to the padding box, like the
+            // background-image tiles above.
+            if bx.dom.is_some() {
+                if let Some(gradient) = &bx.style.background_gradient {
+                    let needs_clip = !bx.radii.is_zero();
+                    if needs_clip {
+                        let clip_rect =
+                            transform_rect([bx.x, bx.y, bx.width, bx.height], &page_t);
+                        list.0.push(DisplayItem::PushClip {
+                            x: clip_rect[0],
+                            y: clip_rect[1],
+                            width: clip_rect[2],
+                            height: clip_rect[3],
+                            radii: Some(scale_radii(bx.radii, &page_t)),
+                        });
+                    }
+                    match &gradient.kind {
+                        GradientKind::Linear { .. } => {
+                            let verts = linear_gradient_quad(
+                                bx.x,
+                                bx.y,
+                                bx.width,
+                                bx.height,
+                                gradient,
+                            );
+                            if !verts.is_empty() {
+                                list.0.push(DisplayItem::VectorPath {
+                                    vertices: verts,
+                                    bounds: [bx.x, bx.y, bx.width, bx.height],
+                                });
+                            }
+                        }
+                        GradientKind::Radial { .. } => {
+                            if let (Some(dom_id), Some((_, cache))) =
+                                (bx.dom, svg.as_mut())
+                            {
+                                Self::emit_radial_background(
+                                    &mut list,
+                                    &mut new_blobs,
+                                    &mut **cache,
+                                    dom_id,
+                                    bx,
+                                    gradient,
+                                );
+                            }
+                        }
+                    }
+                    if needs_clip {
+                        list.0.push(DisplayItem::PopClip);
+                    }
+                }
+            }
             if let Some(resource) = bx.image {
                 list.0.push(DisplayItem::Image {
                     resource: ResourceId(resource),
@@ -1071,6 +1260,53 @@ impl DisplayList {
                     width: bx.width,
                     height: bx.height,
                 });
+            }
+            // Stage 15 Rec 3/5: inline `<svg>` content. The box
+            // is the svg's viewport; its children paint as
+            // vector triangles (solid + two-stop linear fills)
+            // or as one raster Blob (radial / multi-stop
+            // gradients), clipped to the box. Needs the DOM +
+            // raster cache, so plain `build()` paints nothing
+            // for an svg box (its background still paints).
+            if bx.svg_canvas == Some(SvgCanvasKind::Svg) {
+                if let (Some(svg_id), Some((dom, cache))) = (bx.dom, svg.as_mut()) {
+                    Self::emit_svg(
+                        &mut list,
+                        &mut new_blobs,
+                        layout,
+                        *dom,
+                        &mut **cache,
+                        svg_id,
+                        bx,
+                        svg_images,
+                    );
+                }
+            }
+            // Stage 15 (M7 Phase 3, Rec 8): a `<canvas>` with a
+            // live bitmap paints it as a Blob at the box's rect.
+            // The Blob is emitted whenever the canvas is live
+            // (even unchanged — the id is deterministic, so the
+            // shell already holds the pixels); a fresh bitmap
+            // rides `new_blobs` only when it is in `canvas_new`
+            // (dirty canvases only — see `build_with_svg_and_canvas`).
+            if bx.svg_canvas == Some(SvgCanvasKind::Canvas) {
+                if let Some(canvas_id) = bx.dom
+                    && canvas_live.contains(&canvas_id)
+                {
+                    let id = canvas_blob_id(canvas_id);
+                    if let Some((_, resource)) =
+                        canvas_new.iter().find(|(d, _)| *d == canvas_id)
+                    {
+                        new_blobs.push((id, resource.clone()));
+                    }
+                    list.0.push(DisplayItem::Blob {
+                        resource: id,
+                        x: bx.x,
+                        y: bx.y,
+                        width: bx.width,
+                        height: bx.height,
+                    });
+                }
             }
             if !bx.glyphs.is_empty() {
                 // Group consecutive glyphs of the same color into one item.
@@ -1168,7 +1404,228 @@ impl DisplayList {
             }
         }
         list.1 = Some(damage);
-        list
+        (list, new_blobs)
+    }
+
+    /// Paint one inline `<svg>` box (Stage 15, M7 Phase 2): the
+    /// box is the svg's viewport. Vector-first: solid shapes and
+    /// two-stop linear gradients tessellate to `VectorPath`
+    /// items, clipped to the box; a radial or multi-stop
+    /// gradient forces the raster route (one Blob, cached by
+    /// content fingerprint + bitmap size). A raster refusal
+    /// (oversize bitmap, tessellation failure) falls through to
+    /// the vector route, which paints the shapes it can express
+    /// and skips the rest — a shape whose tessellation fails is
+    /// skipped individually, never the whole svg.
+    fn emit_svg(
+        list: &mut DisplayList,
+        new_blobs: &mut Vec<(ResourceId, Resource)>,
+        layout: &LayoutTree,
+        dom: &Dom,
+        cache: &mut SvgRasterCache,
+        svg_id: pluto_html::NodeId,
+        bx: &LayoutBox,
+        svg_images: &HashMap<pluto_html::NodeId, ResourceId>,
+    ) {
+        if bx.width <= 0.0 || bx.height <= 0.0 {
+            return;
+        }
+        let content = collect_svg_content(
+            dom,
+            svg_id,
+            &layout.node_styles,
+            (bx.width, bx.height),
+        );
+        if content.shapes.is_empty() && content.images.is_empty() {
+            return;
+        }
+        let view = view_box_transform(
+            bx.width,
+            bx.height,
+            dom.attr(svg_id, "viewBox").and_then(parse_view_box),
+            dom.attr(svg_id, "preserveAspectRatio"),
+        );
+        if !content.shapes.is_empty() {
+            // A raster refusal (oversize bitmap, tessellation
+            // failure) falls through to the vector route, which
+            // paints the shapes it can express and skips the rest.
+            let rastered = if svg_needs_raster(&content) {
+                Self::emit_svg_raster(list, new_blobs, dom, cache, svg_id, &content, view, bx)
+            } else {
+                false
+            };
+            if !rastered {
+                Self::emit_svg_vector(list, &content, view, bx);
+            }
+        }
+        // Stage 15 (M7 Phase 3, Rec 10): `<svg><image>` elements
+        // paint as `Image` items at their (viewBox-mapped) rects,
+        // above the shapes — only when the tab thread resolved
+        // the href to a resource id (an unfetched / broken image
+        // paints nothing, like a broken `<img>`).
+        for img in &content.images {
+            let Some(resource) = svg_images.get(&img.dom) else {
+                continue;
+            };
+            let (x0, y0) = view.apply(img.x, img.y);
+            let (x1, y1) = view.apply(img.x + img.width, img.y + img.height);
+            list.0.push(DisplayItem::Image {
+                resource: *resource,
+                x: bx.x + x0,
+                y: bx.y + y0,
+                width: (x1 - x0).abs(),
+                height: (y1 - y0).abs(),
+            });
+        }
+    }
+
+    /// Raster route for one svg box: one Blob for the whole svg,
+    /// at the box's used size. Returns true when a Blob was
+    /// emitted (cache hit or fresh raster); false when the
+    /// rasteriser refused (oversize/empty/tessellation failure).
+    /// The Blob id is deterministic (`svg_blob_id`), so a scroll
+    /// rebuild names the id the shell already holds and no
+    /// `ResourceReady` is sent twice — a fresh bitmap is
+    /// returned in `new_blobs` only on a cache miss.
+    fn emit_svg_raster(
+        list: &mut DisplayList,
+        new_blobs: &mut Vec<(ResourceId, Resource)>,
+        dom: &Dom,
+        cache: &mut SvgRasterCache,
+        svg_id: pluto_html::NodeId,
+        content: &SvgContent,
+        view: Affine,
+        bx: &LayoutBox,
+    ) -> bool {
+        let w = bx.width.round().max(0.0) as u32;
+        let h = bx.height.round().max(0.0) as u32;
+        if w == 0 || h == 0 {
+            return false;
+        }
+        let id = svg_blob_id(svg_id);
+        let fingerprint = svg_fingerprint(dom, svg_id);
+        if cache.get(svg_id, w, h, fingerprint).is_some() {
+            list.0.push(DisplayItem::Blob {
+                resource: id,
+                x: bx.x,
+                y: bx.y,
+                width: bx.width,
+                height: bx.height,
+            });
+            return true;
+        }
+        let Some(img) = rasterize_svg_content(content, view, w, h) else {
+            return false;
+        };
+        let resource = Resource::Image {
+            width: img.width,
+            height: img.height,
+            rgba: img.rgba,
+        };
+        cache.insert(svg_id, w, h, fingerprint, id, resource.clone());
+        new_blobs.push((id, resource));
+        list.0.push(DisplayItem::Blob {
+            resource: id,
+            x: bx.x,
+            y: bx.y,
+            width: bx.width,
+            height: bx.height,
+        });
+        true
+    }
+
+    /// Vector route for one svg box: one `VectorPath` item per
+    /// shape (fill + stroke tessellated together), its vertices
+    /// mapped by the viewBox transform, clipped to the box
+    /// (Sutherland–Hodgman, colours interpolated — the
+    /// spec-correct viewport clip, including `slice` overflow),
+    /// then translated to the box's page position. A shape whose
+    /// tessellation fails is skipped, never the whole svg.
+    fn emit_svg_vector(
+        list: &mut DisplayList,
+        content: &SvgContent,
+        view: Affine,
+        bx: &LayoutBox,
+    ) {
+        let clip = [0.0, 0.0, bx.width, bx.height];
+        for shape in &content.shapes {
+            let Ok(mut verts) = tessellate_svg_shape(shape, content.viewport) else {
+                continue;
+            };
+            if verts.is_empty() {
+                continue;
+            }
+            for v in &mut verts {
+                let (x, y) = view.apply(v.position[0], v.position[1]);
+                v.position = [x, y];
+            }
+            let verts = clip_colored_triangles(&verts, clip);
+            if verts.is_empty() {
+                continue;
+            }
+            let verts = verts
+                .into_iter()
+                .map(|mut v| {
+                    v.position[0] += bx.x;
+                    v.position[1] += bx.y;
+                    v
+                })
+                .collect();
+            list.0.push(DisplayItem::VectorPath {
+                vertices: verts,
+                bounds: [bx.x, bx.y, bx.width, bx.height],
+            });
+        }
+    }
+
+    /// Raster route for one radial CSS gradient background: one
+    /// Blob at the box's used size, cached by element id + size
+    /// + gradient fingerprint (see `emit_svg_raster` for the
+    /// deterministic-id contract). Oversize bitmaps paint
+    /// nothing — the box keeps its background fill.
+    fn emit_radial_background(
+        list: &mut DisplayList,
+        new_blobs: &mut Vec<(ResourceId, Resource)>,
+        cache: &mut SvgRasterCache,
+        dom_id: pluto_html::NodeId,
+        bx: &LayoutBox,
+        gradient: &pluto_css::Gradient,
+    ) {
+        let w = bx.width.round().max(0.0) as u32;
+        let h = bx.height.round().max(0.0) as u32;
+        if w == 0
+            || h == 0
+            || (w as usize).checked_mul(h as usize).unwrap_or(usize::MAX) > MAX_RASTER_PIXELS
+        {
+            return;
+        }
+        let id = bg_gradient_blob_id(dom_id);
+        let fingerprint = gradient_fingerprint(gradient);
+        if cache.get(dom_id, w, h, fingerprint).is_some() {
+            list.0.push(DisplayItem::Blob {
+                resource: id,
+                x: bx.x,
+                y: bx.y,
+                width: bx.width,
+                height: bx.height,
+            });
+            return;
+        }
+        let img = rasterize_gradient_rect(gradient, w, h);
+        let resource = Resource::Image {
+            width: img.width,
+            height: img.height,
+            rgba: img.rgba,
+        };
+        cache.insert(dom_id, w, h, fingerprint, id, resource.clone());
+        new_blobs.push((id, resource));
+        list.0.push(DisplayItem::Blob {
+            resource: id,
+            x: bx.x,
+            y: bx.y,
+            width: bx.width,
+            height: bx.height,
+        });
     }
 
     /// Patch this list in place with a compositing update (M6
@@ -1532,7 +1989,7 @@ mod tests {
     use super::*;
     use pluto_css::Stylesheet;
     use pluto_html::parse as parse_html;
-    use pluto_layout::{LayoutTree, Theme};
+    use pluto_layout::{ElementState, LayoutTree, Theme};
 
     const EXAMPLE_COM: &str = r#"<!doctype html>
 <html>
@@ -2117,6 +2574,279 @@ mod tests {
         assert_eq!(back, list, "round-trip must be lossless");
         back.validate(&ResourceTable::new())
             .expect("decoded list validates");
+    }
+
+    #[test]
+    fn build_with_svg_emits_vector_path_for_linear_gradient_background() {
+        // Stage 15 Rec 7: a linear-gradient background is a
+        // `VectorPath` (one strip per stop segment — exact), with
+        // no raster resource attached.
+        let dom = parse_html("<html><body><div></div></body></html>");
+        let sheet = Stylesheet::parse(
+            "div { width: 100px; height: 100px; background-image: linear-gradient(to right, red, blue); }",
+        );
+        let tree = LayoutTree::build_with_state(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            Theme::Light,
+        )
+        .expect("layout builds");
+        let mut cache = SvgRasterCache::new();
+        let (list, blobs) = DisplayList::build_with_svg(&tree, &dom, &mut cache);
+        assert!(blobs.is_empty(), "linear backgrounds rasterise nothing");
+        let vectors: Vec<_> = list
+            .0
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::VectorPath { .. }))
+            .collect();
+        assert_eq!(vectors.len(), 1, "one gradient background = one VectorPath");
+        if let DisplayItem::VectorPath { vertices, bounds } = vectors[0] {
+            assert!(!vertices.is_empty());
+            assert_eq!(vertices.len() % 3, 0, "vertices come in triples");
+            assert_eq!(bounds[2], 100.0);
+            assert_eq!(bounds[3], 100.0);
+        }
+        list.validate(&ResourceTable::new())
+            .expect("list validates with no resources");
+    }
+
+    #[test]
+    fn build_with_svg_emits_blob_for_radial_gradient_background() {
+        // Stage 15 Rec 7: a radial-gradient background is one
+        // Blob (per-pixel evaluation) plus one fresh resource —
+        // and a second build with the same cache reuses it (same
+        // Blob, no new resource: the id is deterministic).
+        let dom = parse_html("<html><body><div></div></body></html>");
+        let sheet = Stylesheet::parse(
+            "div { width: 100px; height: 100px; background-image: radial-gradient(circle, white, black); }",
+        );
+        let tree = LayoutTree::build_with_state(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            Theme::Light,
+        )
+        .expect("layout builds");
+        let mut cache = SvgRasterCache::new();
+        let (list, blobs) = DisplayList::build_with_svg(&tree, &dom, &mut cache);
+        assert_eq!(blobs.len(), 1, "one fresh raster");
+        let (id, resource) = &blobs[0];
+        assert!(matches!(
+            resource,
+            Resource::Image {
+                width: 100,
+                height: 100,
+                ..
+            }
+        ));
+        assert!(
+            list.0.iter().any(|i| matches!(
+                i,
+                DisplayItem::Blob { resource, .. } if resource == id
+            )),
+            "the Blob names the fresh resource"
+        );
+        assert!(
+            !list.0.iter().any(|i| matches!(i, DisplayItem::VectorPath { .. })),
+            "radial backgrounds never take the vector route"
+        );
+        let mut table = ResourceTable::new();
+        table.insert(*id, resource.clone());
+        list.validate(&table).expect("list validates");
+        let (list2, blobs2) = DisplayList::build_with_svg(&tree, &dom, &mut cache);
+        assert!(blobs2.is_empty(), "cache hit returns nothing new");
+        assert!(
+            list2.0.iter().any(|i| matches!(
+                i,
+                DisplayItem::Blob { resource, .. } if resource == id
+            )),
+            "the second build names the same Blob id"
+        );
+    }
+
+    #[test]
+    fn build_with_svg_emits_vector_paths_for_inline_svg() {
+        // Stage 15 Rec 3/4: a solid inline SVG is `VectorPath`
+        // items (one per shape), clipped to the svg box, with no
+        // raster resource attached.
+        let dom = parse_html(
+            "<html><body><svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\"><rect x=\"10\" y=\"10\" width=\"80\" height=\"80\" fill=\"red\"/></svg></body></html>",
+        );
+        let sheet = Stylesheet::parse("");
+        let tree = LayoutTree::build_with_state(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            Theme::Light,
+        )
+        .expect("layout builds");
+        let mut cache = SvgRasterCache::new();
+        let (list, blobs) = DisplayList::build_with_svg(&tree, &dom, &mut cache);
+        assert!(blobs.is_empty(), "solid SVGs rasterise nothing");
+        let vectors: Vec<_> = list
+            .0
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::VectorPath { .. }))
+            .collect();
+        assert_eq!(vectors.len(), 1, "one rect shape = one VectorPath");
+        if let DisplayItem::VectorPath { vertices, bounds } = vectors[0] {
+            assert!(!vertices.is_empty());
+            assert_eq!(vertices.len() % 3, 0, "vertices come in triples");
+            assert_eq!(bounds[2], 100.0, "bounds are the svg box");
+            assert_eq!(bounds[3], 100.0);
+        }
+        // Plain build() paints nothing for the svg (no DOM/cache).
+        let plain = DisplayList::build(&tree);
+        assert!(
+            !plain.0.iter().any(|i| matches!(i, DisplayItem::VectorPath { .. })),
+            "plain build() has no vector items"
+        );
+        list.validate(&ResourceTable::new())
+            .expect("list validates with no resources");
+    }
+
+    #[test]
+    fn build_with_svg_emits_blob_for_radial_gradient_svg() {
+        // Stage 15 Rec 5: an inline SVG whose fill is a radial
+        // gradient is one Blob plus one fresh resource — the
+        // vector route cannot express it.
+        let dom = parse_html(
+            "<html><body><svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\"><defs><radialGradient id=\"rg\"><stop offset=\"0\" stop-color=\"red\"/><stop offset=\"1\" stop-color=\"white\"/></radialGradient></defs><rect x=\"0\" y=\"0\" width=\"100\" height=\"100\" fill=\"url(#rg)\"/></svg></body></html>",
+        );
+        let sheet = Stylesheet::parse("");
+        let tree = LayoutTree::build_with_state(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            Theme::Light,
+        )
+        .expect("layout builds");
+        let mut cache = SvgRasterCache::new();
+        let (list, blobs) = DisplayList::build_with_svg(&tree, &dom, &mut cache);
+        assert_eq!(blobs.len(), 1, "one fresh raster");
+        let (id, resource) = &blobs[0];
+        assert!(matches!(
+            resource,
+            Resource::Image {
+                width: 100,
+                height: 100,
+                ..
+            }
+        ));
+        assert!(
+            list.0.iter().any(|i| matches!(
+                i,
+                DisplayItem::Blob { resource, .. } if resource == id
+            )),
+            "the Blob names the fresh resource"
+        );
+        assert!(
+            !list.0.iter().any(|i| matches!(i, DisplayItem::VectorPath { .. })),
+            "a radial svg is raster-only"
+        );
+        let mut table = ResourceTable::new();
+        table.insert(*id, resource.clone());
+        list.validate(&table).expect("list validates");
+        let (list2, blobs2) = DisplayList::build_with_svg(&tree, &dom, &mut cache);
+        assert!(blobs2.is_empty(), "cache hit returns nothing new");
+        assert!(
+            list2.0.iter().any(|i| matches!(
+                i,
+                DisplayItem::Blob { resource, .. } if resource == id
+            )),
+            "the second build names the same Blob id"
+        );
+    }
+
+    #[test]
+    fn build_with_svg_and_canvas_emits_canvas_blob_and_svg_image() {
+        // Stage 15 (M7 Phase 3, Rec 8/10): a live canvas paints
+        // its bitmap as a Blob (fresh pixels ride `new_blobs`
+        // once), and a resolved `<svg><image>` paints as an
+        // `Image` item at its rect.
+        let dom = parse_html(
+            "<html><body><svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\"><image href=\"photo.png\" x=\"10\" y=\"10\" width=\"20\" height=\"20\"/></svg><canvas width=\"4\" height=\"4\"></canvas></body></html>",
+        );
+        let sheet = Stylesheet::parse("");
+        let tree = LayoutTree::build_with_state(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            Theme::Light,
+        )
+        .expect("layout builds");
+        let canvas_id = dom
+            .all_node_ids()
+            .into_iter()
+            .find(|&id| dom.tag(id) == Some("canvas"))
+            .expect("canvas in DOM");
+        let image_id = dom
+            .all_node_ids()
+            .into_iter()
+            .find(|&id| dom.tag(id) == Some("image"))
+            .expect("svg image in DOM");
+        let mut svg_images = HashMap::new();
+        svg_images.insert(image_id, ResourceId(7));
+        let fresh = Resource::Image {
+            width: 4,
+            height: 4,
+            rgba: vec![255u8; 64],
+        };
+        let mut cache = SvgRasterCache::new();
+        let (list, blobs) = DisplayList::build_with_svg_and_canvas(
+            &tree,
+            &dom,
+            &mut cache,
+            &svg_images,
+            &[canvas_id],
+            &[(canvas_id, fresh.clone())],
+        );
+        assert_eq!(blobs.len(), 1, "one fresh canvas bitmap");
+        assert_eq!(blobs[0].0, crate::canvas::canvas_blob_id(canvas_id));
+        assert!(
+            list.0.iter().any(|i| matches!(
+                i,
+                DisplayItem::Blob { resource, .. } if *resource == crate::canvas::canvas_blob_id(canvas_id)
+            )),
+            "canvas Blob names the fresh bitmap"
+        );
+        assert!(
+            list.0.iter().any(|i| matches!(
+                i,
+                DisplayItem::Image { resource, x, y, width, height }
+                    if *resource == ResourceId(7) && (*x, *y, *width, *height) == (18.0, 18.0, 20.0, 20.0)
+            )),
+            "svg image paints at its rect (svg at 8,8 + image at 10,10)"
+        );
+        // A second build with the same live canvas but no fresh
+        // bitmap still names the Blob, and announces nothing.
+        let (list2, blobs2) = DisplayList::build_with_svg_and_canvas(
+            &tree,
+            &dom,
+            &mut cache,
+            &svg_images,
+            &[canvas_id],
+            &[],
+        );
+        assert!(blobs2.is_empty(), "unchanged canvas re-sends nothing");
+        assert!(
+            list2.0.iter().any(|i| matches!(
+                i,
+                DisplayItem::Blob { resource, .. } if *resource == crate::canvas::canvas_blob_id(canvas_id)
+            )),
+            "unchanged canvas still paints its Blob"
+        );
     }
 
     #[test]

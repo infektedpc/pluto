@@ -57,6 +57,7 @@
 //!   treats noscript content as raw text while the scanner may
 //!   over-fetch from it. Wasted bandwidth, not a correctness bug.
 
+use crate::builder::{NS_HTML, NS_MATHML, NS_SVG};
 use crate::tokenizer::{Token, Tokenizer};
 
 /// What kind of resource a discovery is asking for.
@@ -448,8 +449,10 @@ pub struct PictureSource {
 }
 
 /// Whether a `<source type>` is a format Pluto decodes (Stage 11
-/// Rec 10): the `image` crate's formats. Parameters (`;...`) are
-/// stripped; an empty type always applies.
+/// Rec 10): the `image` crate's formats, plus SVG (Stage 15, M7
+/// Phase 3, Rec 12 — SVG bytes rasterise through the M7
+/// rasteriser, so an SVG `<source>` is now a real candidate).
+/// Parameters (`;...`) are stripped; an empty type always applies.
 pub fn source_type_supported(type_: Option<&str>) -> bool {
     let Some(type_) = type_.filter(|t| !t.trim().is_empty()) else {
         return true;
@@ -457,7 +460,7 @@ pub fn source_type_supported(type_: Option<&str>) -> bool {
     let mime = type_.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
     matches!(
         mime.as_str(),
-        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/svg+xml"
     )
 }
 
@@ -596,10 +599,16 @@ pub fn scan_hints(bytes: &[u8], document_url: &str) -> Vec<ConnectionHint> {
 /// ([`select_img_url`] / [`select_img_url_from_dom`]) and emits the
 /// one selected URL itself.
 ///
+/// `namespace` is the element's namespace URI (`""` = HTML; Stage 15,
+/// M7 Phase 1, Rec 11): an SVG `<script src>` is never fetched — SVG
+/// script is inert, so fetching it would only let a page make the
+/// browser request a URL that can never execute.
+///
 /// Returns raw (unresolved) URLs; the caller resolves them against the
 /// document base with [`resolve_url`].
 pub fn classify_element(
     tag: &str,
+    namespace: &str,
     attrs: &[(String, String)],
     in_picture: bool,
     in_media: bool,
@@ -619,8 +628,16 @@ pub fn classify_element(
     };
     match tag {
         "script" => {
-            if let Some(src) = attr(attrs, "src") {
-                if !src.trim().is_empty() && !src.trim_start().starts_with("data:") {
+            // Stage 15 (M7 Phase 1, Rec 11): only an HTML
+            // `<script>` fetches. An SVG (or MathML) `<script>` is
+            // inert — its `src` must never become a `Script`
+            // discovery, or the page could make the browser request
+            // a URL that can never execute.
+            if namespace.is_empty() || namespace == NS_HTML {
+                if let Some(src) = attr(attrs, "src")
+                    && !src.trim().is_empty()
+                    && !src.trim_start().starts_with("data:")
+                {
                     let is_module = attr(attrs, "type")
                         .is_some_and(|t| t.eq_ignore_ascii_case("module"));
                     let blocking = !has("async") && !has("defer") && !is_module;
@@ -634,6 +651,31 @@ pub fn classify_element(
                         from: "script[src]",
                         integrity: integrity.clone(),
                         is_module,
+                    });
+                }
+            }
+        }
+        "image" => {
+            // Stage 15 (M7 Phase 3, Rec 10): `<svg><image>` fetches
+            // like an `<img>` (same Stage 9 gates — the loader
+            // treats a `Destination::Image` discovery the same way
+            // regardless of which element made it). `href` is the
+            // SVG2 spelling, `xlink:href` the legacy one; a
+            // fragment-only href (`#id`) is not a fetch.
+            if namespace == NS_SVG {
+                if let Some(href) = attr(attrs, "href")
+                    .or_else(|| attr(attrs, "xlink:href"))
+                    && !href.trim().is_empty()
+                    && !href.trim_start().starts_with('#')
+                    && !href.trim_start().starts_with("data:")
+                {
+                    out.push(RawDiscovery {
+                        url: href.to_string(),
+                        destination: Destination::Image,
+                        priority: fetch_priority(attrs, Priority::Low),
+                        from: "svg:image[href]",
+                        integrity: None,
+                        is_module: false,
                     });
                 }
             }
@@ -979,6 +1021,16 @@ pub fn scan_with_viewport(
     let mut template_depth: usize = 0;
     let mut picture_depth: usize = 0;
     let mut media_depth: usize = 0;
+    // Foreign-content tracking (Stage 15, M7 Phase 1, Rec 11): the
+    // raw tokenizer has no tree, so the scanner tracks `<svg>`
+    // depth itself to know when a `<script>` is foreign (inert —
+    // never fetched). `<foreignObject>` re-enters HTML content,
+    // so a script inside it IS an HTML script again. A
+    // self-closing `<svg/>` opens nothing, so it does not count.
+    // This is a heuristic pre-scan, not tree construction: the
+    // streaming parser classifies from the real `Dom` namespace.
+    let mut svg_depth: usize = 0;
+    let mut foreign_object_depth: usize = 0;
     // The current <picture>'s <source> elements, in document
     // order (Stage 11 Rec 10): an <img> inside the picture
     // selects from these, so they are tracked, not emitted.
@@ -998,6 +1050,12 @@ pub fn scan_with_viewport(
                         picture_sources.clear();
                     }
                     "video" | "audio" => media_depth += 1,
+                    "svg" if !tag.self_closing => svg_depth += 1,
+                    // Tag names arrive lowercased from the tokenizer
+                    // (`foreignObject` -> `foreignobject`).
+                    "foreignobject" if svg_depth > 0 && !tag.self_closing => {
+                        foreign_object_depth += 1
+                    }
                     _ => {}
                 }
                 if name == "base" {
@@ -1054,6 +1112,13 @@ pub fn scan_with_viewport(
                     }
                     for raw in classify_element(
                         &name,
+                        // Foreign content (see the depth tracking
+                        // above): an SVG `<script>` is inert.
+                        if svg_depth > 0 && foreign_object_depth == 0 {
+                            NS_SVG
+                        } else {
+                            ""
+                        },
                         &tag.attrs,
                         in_picture,
                         in_media,
@@ -1080,6 +1145,10 @@ pub fn scan_with_viewport(
                     }
                 }
                 "video" | "audio" => media_depth = media_depth.saturating_sub(1),
+                "svg" => svg_depth = svg_depth.saturating_sub(1),
+                "foreignobject" => {
+                    foreign_object_depth = foreign_object_depth.saturating_sub(1)
+                }
                 _ => {}
             },
             _ => {}
@@ -1117,6 +1186,62 @@ mod tests {
         assert_eq!(found[1].destination, Destination::Script);
         assert_eq!(found[2].destination, Destination::Image);
         assert_eq!(found[2].priority, Priority::Low);
+    }
+
+    #[test]
+    fn svg_script_src_is_not_discovered_but_html_script_is() {
+        // Stage 15 (M7 Phase 1, Rec 11): an SVG <script> is inert
+        // — its src must never become a Script discovery — while a
+        // following HTML <script> still fetches.
+        let found = scan(
+            br#"<svg><script src="/svg.js"></script></svg><script src="/html.js"></script>"#,
+            DOC,
+        );
+        assert_eq!(urls(&found), vec!["https://example.com/html.js"]);
+        assert_eq!(found[0].destination, Destination::Script);
+    }
+
+    #[test]
+    fn svg_image_href_is_discovered_as_image() {
+        // Stage 15 (M7 Phase 3, Rec 10): `<svg><image href>` is
+        // preloaded like an <img> (Destination::Image, same
+        // gates); a fragment-only href is not a fetch, and
+        // `xlink:href` works too.
+        let found = scan(
+            br##"<svg><image href="/a.png"/><image xlink:href="/b.png"/><image href="#frag"/></svg>"##,
+            DOC,
+        );
+        assert_eq!(
+            urls(&found),
+            vec!["https://example.com/a.png", "https://example.com/b.png"]
+        );
+        assert!(found.iter().all(|d| d.destination == Destination::Image));
+    }
+
+    #[test]
+    fn svg_script_in_foreign_object_is_discovered() {
+        // Inside <foreignObject> content is HTML again, so a
+        // <script> there IS an HTML script and fetches.
+        let found = scan(
+            br#"<svg><foreignObject><script src="/fo.js"></script></foreignObject></svg>"#,
+            DOC,
+        );
+        assert_eq!(urls(&found), vec!["https://example.com/fo.js"]);
+        assert_eq!(found[0].destination, Destination::Script);
+    }
+
+    #[test]
+    fn classify_element_script_namespace_gate() {
+        // Direct unit check of the classifier: same tag + attrs,
+        // different namespace.
+        let attrs = vec![("src".to_string(), "/s.js".to_string())];
+        let svg = classify_element("script", NS_SVG, &attrs, false, false, 1024.0, 1.0);
+        assert!(svg.is_empty(), "SVG script must classify to nothing");
+        let html = classify_element("script", "", &attrs, false, false, 1024.0, 1.0);
+        assert_eq!(html.len(), 1);
+        assert_eq!(html[0].destination, Destination::Script);
+        let mathml = classify_element("script", NS_MATHML, &attrs, false, false, 1024.0, 1.0);
+        assert!(mathml.is_empty(), "MathML script must classify to nothing");
     }
 
     #[test]
@@ -1389,8 +1514,9 @@ mod tests {
     #[test]
     fn picture_source_media_and_type_matching() {
         // The first source whose media matches AND whose type is
-        // supported wins; a WebP source is picked on this build,
-        // an SVG source is skipped for the img fallback.
+        // supported wins; a WebP source is picked on this build.
+        // (Stage 15, M7 Phase 3, Rec 12: an SVG source is a
+        // candidate too — see the tail of this test.)
         let found = scan_with_viewport(
             br#"<picture><source media="(max-width: 600px)" srcset="small.webp" type="image/webp"><source srcset="big.png"><img src="fallback.png"></picture>"#,
             DOC,
@@ -1409,12 +1535,24 @@ mod tests {
         assert_eq!(urls(&found), vec!["https://example.com/dir/big.png"]);
         // An unsupported type is skipped even when its media holds.
         let found = scan_with_viewport(
-            br#"<picture><source srcset="vector.svg" type="image/svg+xml"><img src="fallback.png"></picture>"#,
+            br#"<picture><source srcset="vector.bmp" type="image/bmp"><img src="fallback.png"></picture>"#,
             DOC,
             1024.0,
             1.0,
         );
         assert_eq!(urls(&found), vec!["https://example.com/dir/fallback.png"]);
+        // Stage 15 (M7 Phase 3, Rec 12): an SVG <source> IS a
+        // candidate now (the M7 rasteriser decodes it) — with no
+        // media gate it wins over the img fallback.
+        let found = scan_with_viewport(
+            br#"<picture><source srcset="vector.svg" type="image/svg+xml"><img src="fallback.png"></picture>"#,
+            DOC,
+            1024.0,
+            1.0,
+        );
+        assert_eq!(urls(&found), vec!["https://example.com/dir/vector.svg"]);
+        assert!(source_type_supported(Some("image/svg+xml")));
+        assert!(!source_type_supported(Some("image/bmp")));
     }
 
     #[test]

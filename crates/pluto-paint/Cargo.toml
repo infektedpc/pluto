@@ -16,6 +16,9 @@ rayon.workspace = true
 image.workspace = true
 pluto-layout.workspace = true
 pluto-css.workspace = true
+pluto-html.workspace = true
+lyon.workspace = true
+slotmap.workspace = true
 
 # Only the tests build example documents, so these stay dev-only.
 [dev-dependencies]

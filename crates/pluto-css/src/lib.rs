@@ -83,8 +83,244 @@ pub enum Value {
         val: Box<CalcExpr>,
         max: Box<CalcExpr>,
     },
+    /// A CSS gradient (`linear-gradient()` / `radial-gradient()`),
+    /// parsed to stops + geometry (Stage 15, M7 Phase 2, Rec 7).
+    /// Stop offsets are resolved 0..=1 at parse time (missing
+    /// offsets are distributed evenly, per CSS); `px` stop offsets
+    /// are not supported and fail the parse (the value falls back
+    /// to `Raw`). Shared by CSS `background-image` and, through
+    /// the paint layer, SVG `<linearGradient>` /
+    /// `<radialGradient>` (whose own defs live in pluto-paint and
+    /// convert to this type).
+    Gradient(Gradient),
     /// Anything not modelled yet (font stacks, ...), kept verbatim.
     Raw(String),
+}
+
+/// One gradient color stop: `offset` is a fraction along the
+/// gradient line / radius (0..=1, resolved at parse time), `color`
+/// is RGBA (alpha 255 when the stop had no alpha).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GradientStop {
+    pub offset: f32,
+    pub color: [u8; 4],
+}
+
+/// The shape of a radial gradient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RadialShape {
+    Circle,
+    Ellipse,
+}
+
+/// The sizing keyword of a radial gradient (default
+/// `FarthestCorner`, per CSS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RadialExtent {
+    ClosestSide,
+    FarthestSide,
+    ClosestCorner,
+    FarthestCorner,
+}
+
+/// A parsed gradient: its geometry plus its stops.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gradient {
+    pub kind: GradientKind,
+    pub stops: Vec<GradientStop>,
+}
+
+/// The geometry of a gradient. A linear gradient's angle is in
+/// degrees, clockwise from "to top" (0deg = to top, 90deg = to
+/// right, 180deg = to bottom — the CSS default). A radial
+/// gradient's center is fractions of the box (0.5, 0.5 = center);
+/// its radii are derived from `shape` + `extent` against the box
+/// at paint time, so the value stays box-independent.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GradientKind {
+    Linear { angle_deg: f32 },
+    Radial {
+        center: (f32, f32),
+        shape: RadialShape,
+        extent: RadialExtent,
+    },
+}
+
+impl Gradient {
+    /// The colour at `t` (0..=1 along the gradient line / radius),
+    /// as premultiplied-by-nothing RGBA floats. Stops are clamped
+    /// to the ends outside 0..=1; between stops the colour
+    /// interpolates linearly (per channel, alpha included). Pure.
+    pub fn color_at(&self, t: f32) -> [f32; 4] {
+        let t = t.clamp(0.0, 1.0);
+        if self.stops.is_empty() {
+            return [0.0, 0.0, 0.0, 0.0];
+        }
+        if self.stops.len() == 1 || t <= self.stops[0].offset {
+            return stop_rgba(self.stops[0]);
+        }
+        let last = self.stops.len() - 1;
+        if t >= self.stops[last].offset {
+            return stop_rgba(self.stops[last]);
+        }
+        for w in self.stops.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if t >= a.offset && t <= b.offset {
+                let span = (b.offset - a.offset).max(f32::EPSILON);
+                let f = (t - a.offset) / span;
+                let ca = stop_rgba(a);
+                let cb = stop_rgba(b);
+                return [
+                    ca[0] + (cb[0] - ca[0]) * f,
+                    ca[1] + (cb[1] - ca[1]) * f,
+                    ca[2] + (cb[2] - ca[2]) * f,
+                    ca[3] + (cb[3] - ca[3]) * f,
+                ];
+            }
+        }
+        stop_rgba(self.stops[last])
+    }
+
+    /// The parameter `t` of a point `p` on a linear gradient over
+    /// the box `[x, y, w, h]`: the projection of `p` onto the
+    /// gradient axis (the line through the box center at
+    /// `angle_deg`, from the "start" corner to the "end" corner),
+    /// normalised so the axis spans 0..=1 across the box. Pure.
+    /// For a radial gradient this is meaningless — use
+    /// [`Gradient::radial_t`] instead.
+    pub fn linear_t(&self, p: (f32, f32), rect: (f32, f32, f32, f32)) -> f32 {
+        let GradientKind::Linear { angle_deg } = self.kind else {
+            return 0.0;
+        };
+        let (x, y, w, h) = rect;
+        let rad = angle_deg.to_radians();
+        // CSS angles are clockwise from "to top": the axis
+        // direction is (sin, -cos).
+        let dx = rad.sin();
+        let dy = -rad.cos();
+        let cx = x + w / 2.0;
+        let cy = y + h / 2.0;
+        // Half the axis length across the box: the projection of
+        // the half-diagonal onto the axis.
+        let half = (w * dx.abs() + h * dy.abs()) / 2.0;
+        if half <= 0.0 {
+            return 0.0;
+        }
+        ((p.0 - cx) * dx + (p.1 - cy) * dy) / (2.0 * half) + 0.5
+    }
+
+    /// The parameter `t` of a point `p` on a radial gradient over
+    /// the box `[x, y, w, h]`: the distance from the center,
+    /// normalised by the radius in `p`'s direction (elliptical
+    /// when the shape is an ellipse). Pure.
+    pub fn radial_t(&self, p: (f32, f32), rect: (f32, f32, f32, f32)) -> f32 {
+        let GradientKind::Radial {
+            center,
+            shape,
+            extent,
+        } = self.kind
+        else {
+            return 0.0;
+        };
+        let (x, y, w, h) = rect;
+        let cx = x + center.0 * w;
+        let cy = y + center.1 * h;
+        let (rx, ry) = radial_radii(shape, extent, center, w, h);
+        if rx <= 0.0 || ry <= 0.0 {
+            return 0.0;
+        }
+        let dx = (p.0 - cx) / rx;
+        let dy = (p.1 - cy) / ry;
+        (dx * dx + dy * dy).sqrt()
+    }
+}
+
+fn stop_rgba(stop: GradientStop) -> [f32; 4] {
+    [
+        stop.color[0] as f32 / 255.0,
+        stop.color[1] as f32 / 255.0,
+        stop.color[2] as f32 / 255.0,
+        stop.color[3] as f32 / 255.0,
+    ]
+}
+
+/// The (rx, ry) radii of a radial gradient over a `w`×`h` box
+/// with center `center` (fractions of the box), from its shape +
+/// extent keyword. Pure. Follows CSS Images 4: the circle radius
+/// is the distance to the relevant side/corner; an ellipse through
+/// a corner has radii `sqrt(2)` × the corner's axis distances.
+pub fn radial_radii(
+    shape: RadialShape,
+    extent: RadialExtent,
+    center: (f32, f32),
+    w: f32,
+    h: f32,
+) -> (f32, f32) {
+    let cx = center.0 * w;
+    let cy = center.1 * h;
+    // Distances from the center to each side.
+    let (left, right, top, bottom) = (cx, w - cx, cy, h - cy);
+    // Distances from the center to each corner (axis components).
+    let corners = [
+        (left, top),
+        (right, top),
+        (left, bottom),
+        (right, bottom),
+    ];
+    let corner_dist = |dx: f32, dy: f32| (dx * dx + dy * dy).sqrt();
+    match shape {
+        RadialShape::Circle => {
+            let r = match extent {
+                RadialExtent::ClosestSide => left.min(right).min(top).min(bottom),
+                RadialExtent::FarthestSide => left.max(right).max(top).max(bottom),
+                RadialExtent::ClosestCorner => corners
+                    .iter()
+                    .map(|&(dx, dy)| corner_dist(dx, dy))
+                    .fold(f32::INFINITY, f32::min),
+                RadialExtent::FarthestCorner => corners
+                    .iter()
+                    .map(|&(dx, dy)| corner_dist(dx, dy))
+                    .fold(0.0f32, f32::max),
+            };
+            (r, r)
+        }
+        RadialShape::Ellipse => {
+            let (rx, ry) = match extent {
+                RadialExtent::ClosestSide => (left.min(right), top.min(bottom)),
+                RadialExtent::FarthestSide => (left.max(right), top.max(bottom)),
+                RadialExtent::ClosestCorner | RadialExtent::FarthestCorner => {
+                    let pick = if extent == RadialExtent::ClosestCorner {
+                        corners
+                            .iter()
+                            .min_by(|a, b| {
+                                corner_dist(a.0, a.1)
+                                    .partial_cmp(&corner_dist(b.0, b.1))
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .copied()
+                            .unwrap_or((left, top))
+                    } else {
+                        corners
+                            .iter()
+                            .max_by(|a, b| {
+                                corner_dist(a.0, a.1)
+                                    .partial_cmp(&corner_dist(b.0, b.1))
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .copied()
+                            .unwrap_or((left, top))
+                    };
+                    // The ellipse through the corner, radii
+                    // proportional to the corner's axis distances:
+                    // (dx/rx)^2 + (dy/ry)^2 = 1 with rx = dx*s,
+                    // ry = dy*s gives s = sqrt(2).
+                    let s = std::f32::consts::SQRT_2;
+                    (pick.0 * s, pick.1 * s)
+                }
+            };
+            (rx, ry)
+        }
+    }
 }
 
 /// Light/dark colour-scheme theme, for `prefers-color-scheme`
@@ -2589,6 +2825,14 @@ input { min-width: 150px; }
 textarea { white-space: pre; }
 input[type="checkbox"], input[type="radio"] { min-width: 0; }
 img { display: inline; }
+/* Stage 15 (M7 Phase 1, Rec 2): `<svg>` and `<canvas>` are replaced
+   elements — atomic leaves sized by their intrinsic dimensions, never
+   inline containers whose children would leak text into flow. The
+   `inline-block` display routes them through `build_atomic` (the same
+   leaf the `img` branch builds); layout also special-cases the tags
+   by namespace, so an author `display: inline` cannot re-open the
+   leak. */
+svg, canvas { display: inline-block; }
 "#;
 
 // ---- top-level parsing ----
@@ -4385,6 +4629,20 @@ pub fn parse_value(raw: &str) -> Value {
             }
         }
     }
+    // CSS gradients (Stage 15, M7 Phase 2, Rec 7): parse before
+    // the generic function branch below — `linear-gradient(`
+    // contains a paren, so `parse_transform_list` would claim it
+    // first. An unparseable gradient falls through to `Raw`.
+    if lower.starts_with("linear-gradient(") && lower.ends_with(')') {
+        if let Some(g) = parse_gradient(&s[16..s.len() - 1], true) {
+            return Value::Gradient(g);
+        }
+    }
+    if lower.starts_with("radial-gradient(") && lower.ends_with(')') {
+        if let Some(g) = parse_gradient(&s[16..s.len() - 1], false) {
+            return Value::Gradient(g);
+        }
+    }
     if s.contains('(') {
         if let Some(list) = parse_transform_list(s) {
             return Value::Transform(list);
@@ -4422,6 +4680,247 @@ fn parse_angle_value(tok: &str) -> Option<f32> {
         Value::Angle(a) => Some(a),
         _ => None,
     }
+}
+
+/// Parse the inside of `linear-gradient(...)` /
+/// `radial-gradient(...)` (without the parens) into a
+/// [`Gradient`]. `linear` selects the linear form. Missing stop
+/// offsets are distributed evenly (first 0, last 1); offsets may
+/// be `%` or a bare number (read as a fraction); `px` offsets are
+/// not supported and fail the parse. A gradient with fewer than
+/// two stops fails the parse.
+fn parse_gradient(inner: &str, linear: bool) -> Option<Gradient> {
+    let parts = split_top_level(inner, ',');
+    if parts.len() < 2 {
+        return None;
+    }
+    let mut rest: &[&str] = &parts;
+    let mut kind = if linear {
+        GradientKind::Linear { angle_deg: 180.0 }
+    } else {
+        GradientKind::Radial {
+            center: (0.5, 0.5),
+            shape: RadialShape::Ellipse,
+            extent: RadialExtent::FarthestCorner,
+        }
+    };
+    // The first part may be geometry, not a stop: an angle / `to
+    // ...` direction (linear), or a shape / extent / `at ...`
+    // position (radial). A part whose first token parses as a
+    // colour is a stop, not geometry.
+    let first = parts[0].trim();
+    let first_is_stop = parse_gradient_stop(first).is_some();
+    if !first_is_stop {
+        if linear {
+            if let Some(angle) = parse_angle_value(first) {
+                kind = GradientKind::Linear { angle_deg: angle };
+                rest = &parts[1..];
+            } else if let Some(angle) = parse_to_direction(first) {
+                kind = GradientKind::Linear { angle_deg: angle };
+                rest = &parts[1..];
+            } else {
+                // Unrecognised first part: not a gradient we
+                // understand — fail rather than paint wrong.
+                return None;
+            }
+        } else {
+            let lower = first.to_ascii_lowercase();
+            if lower.contains("circle")
+                || lower.contains("ellipse")
+                || lower.contains("closest")
+                || lower.contains("farthest")
+                || lower.contains(" at ")
+                || lower.ends_with(" at")
+                || lower.starts_with("at ")
+            {
+                kind = parse_radial_prelude(first)?;
+                rest = &parts[1..];
+            } else {
+                return None;
+            }
+        }
+    }
+    let mut stops: Vec<(Option<f32>, [u8; 4])> =
+        Vec::with_capacity(rest.len());
+    for part in rest {
+        let (offset, color) = parse_gradient_stop(part.trim())?;
+        stops.push((offset, color));
+    }
+    if stops.len() < 2 {
+        return None;
+    }
+    // Distribute missing offsets, per CSS: the first stop
+    // defaults to 0, the last to 1, and runs between known
+    // offsets interpolate evenly.
+    if stops[0].0.is_none() {
+        stops[0].0 = Some(0.0);
+    }
+    let last = stops.len() - 1;
+    if stops[last].0.is_none() {
+        stops[last].0 = Some(1.0);
+    }
+    let mut resolved: Vec<GradientStop> = Vec::with_capacity(stops.len());
+    let mut i = 0;
+    while i < stops.len() {
+        if stops[i].0.is_some() {
+            resolved.push(GradientStop {
+                offset: stops[i].0.unwrap(),
+                color: stops[i].1,
+            });
+            i += 1;
+            continue;
+        }
+        // A run of missing offsets starting at i, ending at the
+        // next known offset (both ends are known now: the first
+        // and last stops were pinned above).
+        let mut j = i;
+        while j < stops.len() && stops[j].0.is_none() {
+            j += 1;
+        }
+        let start = stops[i - 1].0.unwrap();
+        let end = stops[j].0.unwrap();
+        let run = j - i;
+        for k in 0..run {
+            let f = (k + 1) as f32 / (run + 1) as f32;
+            resolved.push(GradientStop {
+                offset: start + (end - start) * f,
+                color: stops[i + k].1,
+            });
+        }
+        i = j;
+    }
+    // Offsets must be non-decreasing (a stop behind the previous
+    // one clamps to it, per CSS).
+    let mut prev = f32::NEG_INFINITY;
+    for stop in &mut resolved {
+        if stop.offset < prev {
+            stop.offset = prev;
+        }
+        prev = stop.offset;
+    }
+    Some(Gradient {
+        kind,
+        stops: resolved,
+    })
+}
+
+/// Parse one gradient stop (`red`, `red 50%`, `#fff 0.2`): the
+/// colour plus an optional offset (fraction). `None` when the
+/// first token is not a colour.
+fn parse_gradient_stop(part: &str) -> Option<(Option<f32>, [u8; 4])> {
+    let mut toks = part.split_whitespace();
+    let color_tok = toks.next()?;
+    let color = match parse_value(color_tok) {
+        Value::Color(r, g, b) => [r, g, b, 255],
+        Value::ColorA(r, g, b, a) => [r, g, b, (a.clamp(0.0, 1.0) * 255.0) as u8],
+        _ => return None,
+    };
+    let offset = match toks.next() {
+        None => None,
+        Some(tok) => {
+            let tok = tok.trim();
+            if let Some(num) = tok.strip_suffix('%')
+                && let Ok(v) = num.trim().parse::<f32>()
+            {
+                Some(v / 100.0)
+            } else if let Ok(v) = tok.parse::<f32>() {
+                Some(v)
+            } else {
+                // A second token that is neither % nor a bare
+                // number (e.g. `10px`) — unsupported.
+                return None;
+            }
+        }
+    };
+    if toks.next().is_some() {
+        return None;
+    }
+    Some((offset, color))
+}
+
+/// Parse a `to <side>` direction (`to top`, `to bottom right`,
+/// ...) to degrees (0 = to top, 90 = to right, 180 = to bottom,
+/// 270 = to left).
+fn parse_to_direction(s: &str) -> Option<f32> {
+    let lower = s.trim().to_ascii_lowercase();
+    let rest = lower.strip_prefix("to ")?.trim();
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    let (mut vertical, mut horizontal): (Option<f32>, Option<f32>) = (None, None);
+    for w in words {
+        match w {
+            "top" => vertical = Some(-1.0),
+            "bottom" => vertical = Some(1.0),
+            "left" => horizontal = Some(-1.0),
+            "right" => horizontal = Some(1.0),
+            _ => return None,
+        }
+    }
+    let (v, h) = (vertical.unwrap_or(0.0), horizontal.unwrap_or(0.0));
+    if v == 0.0 && h == 0.0 {
+        return None;
+    }
+    // atan2 of (horizontal, -vertical): CSS 0deg is "to top".
+    Some(h.atan2(-v).to_degrees().rem_euclid(360.0))
+}
+
+/// Parse a radial prelude (`circle`, `ellipse at 20% 30%`,
+/// `farthest-side`, `circle closest-corner at left top`, ...).
+fn parse_radial_prelude(s: &str) -> Option<GradientKind> {
+    let lower = s.trim().to_ascii_lowercase();
+    let mut shape = RadialShape::Ellipse;
+    let mut extent = RadialExtent::FarthestCorner;
+    let mut center = (0.5f32, 0.5f32);
+    // Split off an `at <position>` tail first.
+    let (head, at) = match lower.split_once(" at ") {
+        Some((h, a)) => (h, Some(a)),
+        None => (lower.as_str(), None),
+    };
+    for tok in head.split_whitespace() {
+        match tok {
+            "circle" => shape = RadialShape::Circle,
+            "ellipse" => shape = RadialShape::Ellipse,
+            "closest-side" => extent = RadialExtent::ClosestSide,
+            "farthest-side" => extent = RadialExtent::FarthestSide,
+            "closest-corner" => extent = RadialExtent::ClosestCorner,
+            "farthest-corner" => extent = RadialExtent::FarthestCorner,
+            "" => {}
+            _ => return None,
+        }
+    }
+    if let Some(pos) = at {
+        let toks: Vec<&str> = pos.split_whitespace().collect();
+        if toks.is_empty() || toks.len() > 2 {
+            return None;
+        }
+        let parse_pos = |t: &str| -> Option<f32> {
+            match t {
+                "left" | "top" => Some(0.0),
+                "center" => Some(0.5),
+                "right" | "bottom" => Some(1.0),
+                _ => {
+                    if let Some(num) = t.strip_suffix('%')
+                        && let Ok(v) = num.parse::<f32>()
+                    {
+                        Some(v / 100.0)
+                    } else {
+                        None
+                    }
+                }
+            }
+        };
+        let x = parse_pos(toks[0])?;
+        let y = if toks.len() == 2 {
+            parse_pos(toks[1])?
+        } else {
+            0.5
+        };
+        center = (x, y);
+    }
+    Some(GradientKind::Radial {
+        center,
+        shape,
+        extent,
+    })
 }
 
 /// Parse a `transform` function list: `translate(...) scale(...)
@@ -5182,6 +5681,40 @@ impl fmt::Display for Value {
             },
             Value::Calc(e) => write!(f, "calc({e})"),
             Value::Clamp { min, val, max } => write!(f, "clamp({min}, {val}, {max})"),
+            Value::Gradient(g) => {
+                let stops: Vec<String> = g
+                    .stops
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "rgba({}, {}, {}, {}) {}%",
+                            s.color[0],
+                            s.color[1],
+                            s.color[2],
+                            s.color[3] as f32 / 255.0,
+                            s.offset * 100.0
+                        )
+                    })
+                    .collect();
+                match &g.kind {
+                    GradientKind::Linear { angle_deg } => {
+                        write!(f, "linear-gradient({angle_deg}deg, {})", stops.join(", "))
+                    }
+                    GradientKind::Radial {
+                        center,
+                        shape,
+                        extent,
+                    } => write!(
+                        f,
+                        "radial-gradient({:?} {:?} at {}% {}%, {})",
+                        shape,
+                        extent,
+                        center.0 * 100.0,
+                        center.1 * 100.0,
+                        stops.join(", ")
+                    ),
+                }
+            }
             Value::Raw(r) => write!(f, "{r}"),
         }
     }
@@ -6770,5 +7303,90 @@ mod tests {
         );
         let plain = Stylesheet::parse("p { color: red; }");
         assert!(plain.background_image_urls().is_empty());
+    }
+
+    // Stage 15 (M7 Phase 2, Rec 7): CSS gradient values.
+    fn gradient_value(s: &str) -> Gradient {
+        match parse_value(s) {
+            Value::Gradient(g) => g,
+            other => panic!("{s} should parse as a gradient, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn linear_gradient_angle_and_stops_parse() {
+        let g = gradient_value("linear-gradient(45deg, red, blue)");
+        assert_eq!(g.kind, GradientKind::Linear { angle_deg: 45.0 });
+        assert_eq!(g.stops.len(), 2);
+        assert_eq!(g.stops[0], GradientStop { offset: 0.0, color: [255, 0, 0, 255] });
+        assert_eq!(g.stops[1], GradientStop { offset: 1.0, color: [0, 0, 255, 255] });
+        // Default direction is `to bottom` (180deg).
+        let d = gradient_value("linear-gradient(red, blue)");
+        assert_eq!(d.kind, GradientKind::Linear { angle_deg: 180.0 });
+        // `to ...` directions.
+        assert_eq!(
+            gradient_value("linear-gradient(to top right, red, blue)").kind,
+            GradientKind::Linear { angle_deg: 45.0 }
+        );
+        assert_eq!(
+            gradient_value("linear-gradient(to left, red, blue)").kind,
+            GradientKind::Linear { angle_deg: 270.0 }
+        );
+        // Explicit offsets + a middle stop without one (distributed).
+        let m = gradient_value("linear-gradient(90deg, red 0%, green, blue 100%)");
+        assert_eq!(m.stops[0].offset, 0.0);
+        assert_eq!(m.stops[1].offset, 0.5);
+        assert_eq!(m.stops[2].offset, 1.0);
+        assert_eq!(m.stops[1].color, [0, 128, 0, 255]);
+    }
+
+    #[test]
+    fn radial_gradient_shape_position_and_extent_parse() {
+        let g = gradient_value("radial-gradient(circle at 20% 30%, red, blue)");
+        assert_eq!(
+            g.kind,
+            GradientKind::Radial {
+                center: (0.2, 0.3),
+                shape: RadialShape::Circle,
+                extent: RadialExtent::FarthestCorner,
+            }
+        );
+        let e = gradient_value("radial-gradient(closest-side, red, blue)");
+        assert_eq!(
+            e.kind,
+            GradientKind::Radial {
+                center: (0.5, 0.5),
+                shape: RadialShape::Ellipse,
+                extent: RadialExtent::ClosestSide,
+            }
+        );
+        // One stop, px offsets, and unknown directions are not
+        // gradients — they fall back to Raw, never an error.
+        assert!(matches!(parse_value("linear-gradient(red)"), Value::Raw(_)));
+        assert!(matches!(
+            parse_value("linear-gradient(red 10px, blue)"),
+            Value::Raw(_)
+        ));
+    }
+
+    #[test]
+    fn gradient_color_at_and_linear_t_are_exact() {
+        let g = gradient_value("linear-gradient(90deg, red, blue)");
+        // 90deg = to the right: t runs left (0) to right (1).
+        // (Float noise: 90deg in f32 radians is a hair off pi/2,
+        // so compare approximately.)
+        let approx = |a: f32, b: f32| (a - b).abs() < 1e-5;
+        assert!(approx(g.linear_t((0.0, 50.0), (0.0, 0.0, 100.0, 100.0)), 0.0));
+        assert!(approx(g.linear_t((100.0, 50.0), (0.0, 0.0, 100.0, 100.0)), 1.0));
+        assert!(approx(g.linear_t((50.0, 50.0), (0.0, 0.0, 100.0, 100.0)), 0.5));
+        assert_eq!(g.color_at(0.0), [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(g.color_at(1.0), [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(g.color_at(0.5), [0.5, 0.0, 0.5, 1.0]);
+        // Radial: center is t = 0, the farthest corner is t = 1
+        // for the default (ellipse, farthest-corner) gradient.
+        let r = gradient_value("radial-gradient(red, blue)");
+        assert_eq!(r.radial_t((50.0, 50.0), (0.0, 0.0, 100.0, 100.0)), 0.0);
+        let corner = r.radial_t((100.0, 100.0), (0.0, 0.0, 100.0, 100.0));
+        assert!((corner - 1.0).abs() < 1e-5, "corner t = {corner}");
     }
 }

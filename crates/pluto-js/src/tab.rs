@@ -186,6 +186,14 @@ impl TabJs {
         self.bindings.borrow_mut().host = Some(shared);
     }
 
+    /// The attached host, if any (tests only: inject canvas image
+    /// pixels, inspect host state — the production tab thread
+    /// holds its own `BrowserDomHost` directly).
+    #[cfg(test)]
+    pub fn dom_host(&self) -> Option<Rc<RefCell<Box<dyn DomHost>>>> {
+        self.host.clone()
+    }
+
     /// Attach the `fetch()` backend (the integration wave's
     /// `pluto-net` backend). Until it is attached, `fetch()` rejects.
     pub fn set_fetch_backend(&mut self, backend: std::sync::Arc<dyn FetchBackend>) {
