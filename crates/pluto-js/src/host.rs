@@ -60,6 +60,67 @@ pub enum DomHostError {
     InvalidState,
 }
 
+// --- M6 Phase 3 (Rec 11): Web Animations API surface ---
+//
+// pluto-js does not depend on pluto-css, so the animate request is
+// plain data: keyframe steps are (offset, declarations) with the
+// declarations as (property, css-text) pairs, parsed browser-side
+// into `AnimatedValue`s. Only `Element.animate` / `getAnimations`
+// are in scope (report §12 boundary).
+
+/// One `Element.animate` keyframe step: an offset in 0..=1 and the
+/// declarations at that offset, as (property, css-text) pairs.
+pub type WaapiStep = (f32, Vec<(String, String)>);
+
+/// Options for `Element.animate`, as plain data.
+#[derive(Debug, Clone)]
+pub struct AnimateSpec {
+    /// Keyframe steps, in author order (offsets need not be sorted;
+    /// the tab thread normalises them like CSS `@keyframes`).
+    pub steps: Vec<WaapiStep>,
+    /// Duration in milliseconds (0 = instant).
+    pub duration_ms: f32,
+    /// Delay in milliseconds before the first iteration.
+    pub delay_ms: f32,
+    /// Timing function name (`"linear"`, `"ease"`, … — parsed
+    /// browser-side with the CSS `Easing` parser).
+    pub easing: String,
+    /// Iteration count; `None` = infinite.
+    pub iterations: Option<f32>,
+    /// `"normal"` | `"reverse"` | `"alternate"` | `"alternate-reverse"`.
+    pub direction: String,
+    /// `"none"` | `"forwards"` | `"backwards"` | `"both"`.
+    pub fill: String,
+}
+
+/// A play-state control for a running WAAPI animation (or, with a
+/// name instead of an id, a CSS animation — see
+/// [`DomHost::css_animation_control`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaapiOp {
+    /// Freeze at the current progress.
+    Pause,
+    /// Resume a paused animation.
+    Play,
+    /// Remove the animation; the element returns to its underlying
+    /// values (fill `none` semantics).
+    Cancel,
+    /// Jump to the end of the active interval; the next tick emits
+    /// the final values and the finish event.
+    Finish,
+}
+
+/// One running animation as `getAnimations()` reports it.
+#[derive(Debug, Clone)]
+pub struct AnimationInfo {
+    /// `Some(id)` for a WAAPI animation, `None` for a CSS one.
+    pub id: Option<u64>,
+    /// The CSS animation name (WAAPI animations have none).
+    pub name: Option<String>,
+    /// True once the engine has reported this animation finished.
+    pub finished: bool,
+}
+
 /// What the JS engine needs from the host document. Implemented in wave
 /// 2 by the per-tab worker (which owns the `Dom` and talks to the
 /// layout actor). All methods are synchronous and run on the tab's
@@ -612,4 +673,52 @@ pub trait DomHost {
     fn depth(&self, _key: DomKey) -> Option<usize> {
         None
     }
+
+    // --- M6 Phase 3 (Rec 11): computed style + WAAPI ---
+
+    /// The computed value of one property for `key`, reflecting
+    /// in-flight animated values (the tab thread's style cache,
+    /// which the animation engine updates every tick). `None`
+    /// when the key is stale or the property is not cached —
+    /// `getComputedStyle` then has no value for it (only
+    /// animatable properties the engine has sampled are in the
+    /// cache; non-animatable properties are not yet covered).
+    fn computed_style(&self, _key: DomKey, _property: &str) -> Option<String> {
+        None
+    }
+
+    /// All cached computed (property, value) pairs for `key`
+    /// (the animatable properties the engine has sampled).
+    fn computed_styles(&self, _key: DomKey) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// Queue a WAAPI animation on `key` and return its id (the
+    /// tab thread drains the queue each tick and starts it in
+    /// the animation engine). `None` when the host cannot start
+    /// animations (the binding then returns a stillborn
+    /// Animation whose `playState` is `"idle"`).
+    fn request_animate(&mut self, _key: DomKey, _spec: AnimateSpec) -> Option<u64> {
+        None
+    }
+
+    /// The animations currently running on `key`: WAAPI ones by
+    /// id, CSS ones by name. `finished` is set once the engine
+    /// has reported the animation finished.
+    fn get_animations(&self, _key: DomKey) -> Vec<AnimationInfo> {
+        Vec::new()
+    }
+
+    /// Apply a play-state control to a WAAPI animation (queued
+    /// for the tab thread, like `request_animate`).
+    fn waapi_control(&mut self, _key: DomKey, _anim_id: u64, _op: WaapiOp) {}
+
+    /// Apply a play-state control to a CSS animation by name
+    /// (queued for the tab thread).
+    fn css_animation_control(&mut self, _key: DomKey, _name: &str, _op: WaapiOp) {}
+
+    /// Drop all animation state for this document (navigation
+    /// boundary): pending requests, known animations, CSS names.
+    /// The tab thread also clears its engine.
+    fn clear_animations(&mut self) {}
 }

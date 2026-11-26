@@ -4,7 +4,7 @@
 //! structural/link/dynamic/logical pseudo-classes, pseudo-elements),
 //! specificity, cascade data (origin / `!important` / layers / source
 //! order), conditional group rules (`@media` / `@supports`), `@import`,
-//! `@font-face`, `@layer`, `@keyframes` (stored), and a real UA
+//! `@font-face`, `@layer`, `@keyframes` (structured steps), and a real UA
 //! stylesheet ([`UA_CSS`]) parsed by this same parser.
 //!
 //! The parser is fault-tolerant per CSS Syntax L3: a bad declaration is
@@ -58,9 +58,687 @@ pub enum Value {
     /// `background-image`). The URL is stored verbatim; resolution
     /// against the document base is the caller's job.
     Url(String),
-    /// Anything not modelled yet (`calc(...)`, font stacks, ...),
-    /// kept verbatim.
+    /// A time duration in seconds (`0.3s` / `300ms`). Negative
+    /// durations are invalid and stay `Raw`.
+    Time(f32),
+    /// An angle in degrees (`45deg` / `0.5turn` / `1rad`).
+    Angle(f32),
+    /// A `transform` function list (`none` is the empty list).
+    Transform(TransformList),
+    /// A parsed `transition` shorthand / longhand list.
+    Transitions(Vec<Transition>),
+    /// A parsed `animation` shorthand / longhand list.
+    Animations(Vec<Animation>),
+    /// `var(--name)` / `var(--name, <fallback>)`. Resolved at
+    /// style time by the layout pass, not here.
+    Var {
+        name: String,
+        fallback: Option<Box<Value>>,
+    },
+    /// `calc(...)`.
+    Calc(CalcExpr),
+    /// `clamp(min, val, max)`.
+    Clamp {
+        min: Box<CalcExpr>,
+        val: Box<CalcExpr>,
+        max: Box<CalcExpr>,
+    },
+    /// Anything not modelled yet (font stacks, ...), kept verbatim.
     Raw(String),
+}
+
+/// Light/dark colour-scheme theme, for `prefers-color-scheme`
+/// media evaluation (M6 Rec 12). The shell owns the theme signal;
+/// the layout entry points default to [`Theme::Light`] until it is
+/// threaded through (a later phase).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Theme {
+    #[default]
+    Light,
+    Dark,
+}
+
+/// An angle in degrees.
+pub type Angle = f32;
+
+/// A 2D affine transform, row-major `matrix(a, b, c, d, e, f)`:
+/// `x' = a*x + c*y + e`, `y' = b*x + d*y + f`. One shared type
+/// for the value model (pluto-css), the layout model
+/// (pluto-layout) and — later — the display list (pluto-paint).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Affine {
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+    pub d: f32,
+    pub e: f32,
+    pub f: f32,
+}
+
+impl Affine {
+    /// The identity transform.
+    pub fn identity() -> Self {
+        Affine {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    /// A translation by `(x, y)`.
+    pub fn translate(x: f32, y: f32) -> Self {
+        Affine {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: x,
+            f: y,
+        }
+    }
+
+    /// A scale by `(sx, sy)`.
+    pub fn scale(sx: f32, sy: f32) -> Self {
+        Affine {
+            a: sx,
+            b: 0.0,
+            c: 0.0,
+            d: sy,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    /// A rotation by `degrees` (clockwise, CSS convention).
+    pub fn rotate(degrees: f32) -> Self {
+        let r = degrees.to_radians();
+        let (s, c) = r.sin_cos();
+        Affine {
+            a: c,
+            b: s,
+            c: -s,
+            d: c,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    /// A skew along the x axis by `degrees`.
+    pub fn skew_x(degrees: f32) -> Self {
+        Affine {
+            a: 1.0,
+            b: 0.0,
+            c: degrees.to_radians().tan(),
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    /// A skew along the y axis by `degrees`.
+    pub fn skew_y(degrees: f32) -> Self {
+        Affine {
+            a: 1.0,
+            b: degrees.to_radians().tan(),
+            c: 0.0,
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    /// Compose: `self.then(other)` applies `self` first, then
+    /// `other` (the matrix product `other * self`).
+    pub fn then(self, other: Affine) -> Self {
+        Affine {
+            a: other.a * self.a + other.c * self.b,
+            b: other.b * self.a + other.d * self.b,
+            c: other.a * self.c + other.c * self.d,
+            d: other.b * self.c + other.d * self.d,
+            e: other.a * self.e + other.c * self.f + other.e,
+            f: other.b * self.e + other.d * self.f + other.f,
+        }
+    }
+
+    /// Apply the transform to a point.
+    pub fn apply(self, x: f32, y: f32) -> (f32, f32) {
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
+    }
+
+    /// The inverse transform, or `None` when the matrix is
+    /// singular (determinant ~0).
+    pub fn invert(self) -> Option<Affine> {
+        let det = self.a * self.d - self.b * self.c;
+        if det.abs() < 1e-12 {
+            return None;
+        }
+        Some(Affine {
+            a: self.d / det,
+            b: -self.b / det,
+            c: -self.c / det,
+            d: self.a / det,
+            e: (self.c * self.f - self.d * self.e) / det,
+            f: (self.b * self.e - self.a * self.f) / det,
+        })
+    }
+}
+
+/// One `transform` function. Lengths are [`CssLength`] (the
+/// pluto-css length type — layout's `Dim` is the same shape one
+/// crate up); angles are degrees.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TransformFunction {
+    Translate(CssLength, CssLength),
+    TranslateX(CssLength),
+    TranslateY(CssLength),
+    Scale(f32, f32),
+    ScaleX(f32),
+    ScaleY(f32),
+    Rotate(Angle),
+    SkewX(Angle),
+    SkewY(Angle),
+    Matrix([f32; 6]),
+}
+
+/// A `transform` value: the function list, in author order
+/// (`none` is the empty list). Serializable (via
+/// [`TransformFunction`]) so it can ride a computed style or a
+/// display item.
+pub type TransformList = Vec<TransformFunction>;
+
+impl TransformFunction {
+    /// The affine matrix for one function. Percentage translates
+    /// resolve against `basis` (`(width, height)` of the border
+    /// box); `em`/`rem` against the font sizes, `vh`/`vw` against
+    /// the viewport.
+    fn to_affine(
+        &self,
+        basis: (f32, f32),
+        font_size: f32,
+        root_font_size: f32,
+        viewport: (f32, f32),
+    ) -> Affine {
+        let len = |l: CssLength, axis_basis: f32| match l {
+            CssLength::Px(v) => v,
+            CssLength::Percentage(v) => v / 100.0 * axis_basis,
+            CssLength::Em(v) => v * font_size,
+            CssLength::Rem(v) => v * root_font_size,
+            CssLength::Vh(v) => v / 100.0 * viewport.1,
+            CssLength::Vw(v) => v / 100.0 * viewport.0,
+        };
+        match *self {
+            TransformFunction::Translate(x, y) => {
+                Affine::translate(len(x, basis.0), len(y, basis.1))
+            }
+            TransformFunction::TranslateX(x) => Affine::translate(len(x, basis.0), 0.0),
+            TransformFunction::TranslateY(y) => Affine::translate(0.0, len(y, basis.1)),
+            TransformFunction::Scale(sx, sy) => Affine::scale(sx, sy),
+            TransformFunction::ScaleX(sx) => Affine::scale(sx, 1.0),
+            TransformFunction::ScaleY(sy) => Affine::scale(1.0, sy),
+            TransformFunction::Rotate(a) => Affine::rotate(a),
+            TransformFunction::SkewX(a) => Affine::skew_x(a),
+            TransformFunction::SkewY(a) => Affine::skew_y(a),
+            TransformFunction::Matrix(m) => Affine {
+                a: m[0],
+                b: m[1],
+                c: m[2],
+                d: m[3],
+                e: m[4],
+                f: m[5],
+            },
+        }
+    }
+}
+
+/// Helpers on a transform list.
+pub trait TransformListExt {
+    /// Compose the functions in author order, wrapped around
+    /// `origin`: `T(origin) * M * T(-origin)`. Lengths resolve
+    /// with the 16px / zero-basis defaults — percentages and
+    /// viewport units resolve to 0; layout's
+    /// [`TransformListExt::to_affine_in`] is the resolving form.
+    fn to_affine(&self, origin: (f32, f32)) -> Affine;
+    /// Like [`TransformListExt::to_affine`], but percentage
+    /// translates resolve against `basis` (`(width, height)` of
+    /// the border box), `em`/`rem` against the font sizes and
+    /// `vh`/`vw` against the viewport.
+    fn to_affine_in(
+        &self,
+        origin: (f32, f32),
+        basis: (f32, f32),
+        font_size: f32,
+        root_font_size: f32,
+        viewport: (f32, f32),
+    ) -> Affine;
+}
+
+impl TransformListExt for TransformList {
+    fn to_affine(&self, origin: (f32, f32)) -> Affine {
+        self.to_affine_in(origin, (0.0, 0.0), 16.0, 16.0, (0.0, 0.0))
+    }
+
+    fn to_affine_in(
+        &self,
+        origin: (f32, f32),
+        basis: (f32, f32),
+        font_size: f32,
+        root_font_size: f32,
+        viewport: (f32, f32),
+    ) -> Affine {
+        let mut m = Affine::identity();
+        for f in self {
+            m = m.then(f.to_affine(basis, font_size, root_font_size, viewport));
+        }
+        // `T(origin) * M * T(-origin)` in matrix order: the
+        // -origin translation is applied first, then `M`, then
+        // +origin.
+        Affine::translate(-origin.0, -origin.1)
+            .then(m)
+            .then(Affine::translate(origin.0, origin.1))
+    }
+}
+
+/// Where a `steps()` jump lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepPosition {
+    Start,
+    End,
+}
+
+/// A timing function for transitions and animations.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Easing {
+    Linear,
+    Ease,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+    CubicBezier(f32, f32, f32, f32),
+    Steps(u32, StepPosition),
+}
+
+impl Easing {
+    /// Parse a timing-function token: a keyword, `cubic-bezier()`
+    /// or `steps()`.
+    pub fn parse(raw: &str) -> Option<Easing> {
+        let s = raw.trim();
+        let lower = s.to_ascii_lowercase();
+        match lower.as_str() {
+            "linear" => return Some(Easing::Linear),
+            "ease" => return Some(Easing::Ease),
+            "ease-in" => return Some(Easing::EaseIn),
+            "ease-out" => return Some(Easing::EaseOut),
+            "ease-in-out" => return Some(Easing::EaseInOut),
+            _ => {}
+        }
+        if lower.starts_with("cubic-bezier(") && lower.ends_with(')') {
+            let inner = &s[13..s.len() - 1];
+            let parts: Vec<&str> = inner.split(',').collect();
+            if parts.len() == 4 {
+                let nums: Option<Vec<f32>> =
+                    parts.iter().map(|p| p.trim().parse::<f32>().ok()).collect();
+                if let Some(n) = nums {
+                    return Some(Easing::CubicBezier(n[0], n[1], n[2], n[3]));
+                }
+            }
+            return None;
+        }
+        if lower.starts_with("steps(") && lower.ends_with(')') {
+            let inner = &s[6..s.len() - 1];
+            let parts: Vec<&str> = inner.split(',').collect();
+            if parts.is_empty() || parts.len() > 2 {
+                return None;
+            }
+            let n: u32 = parts[0].trim().parse().ok()?;
+            if n == 0 {
+                return None;
+            }
+            let pos = match parts.get(1).map(|p| p.trim().to_ascii_lowercase()) {
+                None => StepPosition::End,
+                Some(p) if p == "start" || p == "jump-start" => StepPosition::Start,
+                Some(p) if p == "end" || p == "jump-end" => StepPosition::End,
+                Some(_) => return None,
+            };
+            return Some(Easing::Steps(n, pos));
+        }
+        None
+    }
+
+    /// Sample the easing at progress `t` in `[0, 1]`.
+    pub fn sample(&self, t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        match *self {
+            Easing::Linear => t,
+            Easing::Ease => Easing::CubicBezier(0.25, 0.1, 0.25, 1.0).sample(t),
+            Easing::EaseIn => Easing::CubicBezier(0.42, 0.0, 1.0, 1.0).sample(t),
+            Easing::EaseOut => Easing::CubicBezier(0.0, 0.0, 0.58, 1.0).sample(t),
+            Easing::EaseInOut => Easing::CubicBezier(0.42, 0.0, 0.58, 1.0).sample(t),
+            Easing::CubicBezier(x1, y1, x2, y2) => cubic_bezier_sample(x1, y1, x2, y2, t),
+            Easing::Steps(n, pos) => {
+                let n = n as f32;
+                match pos {
+                    // Jumps at the end of each interval.
+                    StepPosition::End => ((t * n).floor() / n).clamp(0.0, 1.0),
+                    // Jumps at the start of each interval: progress
+                    // 0 already shows the first step.
+                    StepPosition::Start => {
+                        if t <= 0.0 {
+                            (1.0 / n).clamp(0.0, 1.0)
+                        } else {
+                            ((t * n).ceil() / n).clamp(0.0, 1.0)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Display for Easing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Easing::Linear => write!(f, "linear"),
+            Easing::Ease => write!(f, "ease"),
+            Easing::EaseIn => write!(f, "ease-in"),
+            Easing::EaseOut => write!(f, "ease-out"),
+            Easing::EaseInOut => write!(f, "ease-in-out"),
+            Easing::CubicBezier(x1, y1, x2, y2) => {
+                write!(f, "cubic-bezier({x1}, {y1}, {x2}, {y2})")
+            }
+            Easing::Steps(n, StepPosition::Start) => write!(f, "steps({n}, start)"),
+            Easing::Steps(n, StepPosition::End) => write!(f, "steps({n}, end)"),
+        }
+    }
+}
+
+/// Sample a cubic-bezier easing at input progress `x`: solve for
+/// the curve parameter `u` with `bezier_x(u) = x` (Newton, with a
+/// bisection fallback when the derivative vanishes), then return
+/// `bezier_y(u)`.
+fn cubic_bezier_sample(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    // Polynomial coefficients for one axis: P(u) =
+    // ((a*u + b)*u + c)*u.
+    let (ax, bx, cx) = (1.0 - 3.0 * x2 + 3.0 * x1, 3.0 * x2 - 6.0 * x1, 3.0 * x1);
+    let (ay, by, cy) = (1.0 - 3.0 * y2 + 3.0 * y1, 3.0 * y2 - 6.0 * y1, 3.0 * y1);
+    let sample_x = |u: f32| ((ax * u + bx) * u + cx) * u;
+    let sample_y = |u: f32| ((ay * u + by) * u + cy) * u;
+    let sample_dx = |u: f32| (3.0 * ax * u + 2.0 * bx) * u + cx;
+    // Newton from u = x; fall back to bisection on failure.
+    let mut u = x;
+    let mut solved = false;
+    for _ in 0..8 {
+        let err = sample_x(u) - x;
+        if err.abs() < 1e-6 {
+            solved = true;
+            break;
+        }
+        let d = sample_dx(u);
+        if d.abs() < 1e-6 {
+            break;
+        }
+        let next = u - err / d;
+        if !(0.0..=1.0).contains(&next) {
+            break;
+        }
+        u = next;
+    }
+    if !solved {
+        let mut lo = 0.0f32;
+        let mut hi = 1.0f32;
+        u = x;
+        for _ in 0..20 {
+            if sample_x(u) < x {
+                lo = u;
+            } else {
+                hi = u;
+            }
+            u = (lo + hi) / 2.0;
+        }
+    }
+    sample_y(u).clamp(0.0, 1.0)
+}
+
+/// One `transition` entry: which property, how long, with what
+/// easing, after what delay. Durations/delays are seconds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Transition {
+    pub property: String,
+    pub duration: f32,
+    pub timing: Easing,
+    pub delay: f32,
+}
+
+impl Default for Transition {
+    fn default() -> Self {
+        Transition {
+            property: "all".to_string(),
+            duration: 0.0,
+            timing: Easing::Ease,
+            delay: 0.0,
+        }
+    }
+}
+
+/// How many times an animation repeats.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IterationCount {
+    Finite(f32),
+    Infinite,
+}
+
+/// Which way an animation runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimationDirection {
+    Normal,
+    Reverse,
+    Alternate,
+    AlternateReverse,
+}
+
+/// What an animation applies outside its active interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillMode {
+    None,
+    Forwards,
+    Backwards,
+    Both,
+}
+
+/// Whether an animation is running or paused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayState {
+    Running,
+    Paused,
+}
+
+/// One `animation` entry. Durations/delays are seconds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Animation {
+    pub name: String,
+    pub duration: f32,
+    pub timing: Easing,
+    pub delay: f32,
+    pub iteration_count: IterationCount,
+    pub direction: AnimationDirection,
+    pub fill_mode: FillMode,
+    pub play_state: PlayState,
+}
+
+impl Default for Animation {
+    fn default() -> Self {
+        Animation {
+            name: "none".to_string(),
+            duration: 0.0,
+            timing: Easing::Ease,
+            delay: 0.0,
+            iteration_count: IterationCount::Finite(1.0),
+            direction: AnimationDirection::Normal,
+            fill_mode: FillMode::None,
+            play_state: PlayState::Running,
+        }
+    }
+}
+
+/// One keyframe step: its selectors plus the declarations that
+/// apply at those offsets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyframeStep {
+    pub selectors: Vec<KeyframeSelector>,
+    pub declarations: Vec<Declaration>,
+}
+
+/// A keyframe selector: `from` / `to` / `50%`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyframeSelector {
+    From,
+    To,
+    Percentage(f32),
+}
+
+/// A `calc()` / `clamp()` expression tree. `Var` carries its
+/// fallback expression, if any; `Mul`/`Div` only ever scale by a
+/// plain number (anything else is unparseable and the whole value
+/// falls back to `Raw`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CalcExpr {
+    Len(CssLength),
+    Pct(f32),
+    Num(f32),
+    Var(String, Option<Box<CalcExpr>>),
+    Add(Box<CalcExpr>, Box<CalcExpr>),
+    Sub(Box<CalcExpr>, Box<CalcExpr>),
+    Mul(Box<CalcExpr>, f32),
+    Div(Box<CalcExpr>, f32),
+}
+
+/// The context a `calc()` evaluates against.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CalcCtx {
+    pub font_size: f32,
+    pub root_font_size: f32,
+    pub viewport: (f32, f32),
+    /// What a percentage resolves against (`None` = unresolvable
+    /// here — the caller has no basis, so the expression yields
+    /// `Pct` and the declaration falls back).
+    pub pct_basis: Option<f32>,
+}
+
+/// The result of evaluating a [`CalcExpr`]: used pixels, or an
+/// unresolved percentage (only when no basis was available).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CalcNumber {
+    Px(f32),
+    Pct(f32),
+}
+
+impl CalcExpr {
+    /// Evaluate against `ctx`. `None` means unresolvable (a `%`
+    /// with no basis, a bare number where a length is needed, a
+    /// `var()` with no fallback, mixed px/% arithmetic, division
+    /// by zero) — the declaration falls back to its initial value.
+    pub fn eval(&self, ctx: &CalcCtx) -> Option<CalcNumber> {
+        match self {
+            CalcExpr::Len(l) => Some(match *l {
+                CssLength::Px(v) => CalcNumber::Px(v),
+                CssLength::Em(v) => CalcNumber::Px(v * ctx.font_size),
+                CssLength::Rem(v) => CalcNumber::Px(v * ctx.root_font_size),
+                CssLength::Vh(v) => CalcNumber::Px(v / 100.0 * ctx.viewport.1),
+                CssLength::Vw(v) => CalcNumber::Px(v / 100.0 * ctx.viewport.0),
+                CssLength::Percentage(p) => return CalcExpr::Pct(p).eval(ctx),
+            }),
+            CalcExpr::Pct(p) => Some(match ctx.pct_basis {
+                Some(b) => CalcNumber::Px(p / 100.0 * b),
+                None => CalcNumber::Pct(*p),
+            }),
+            CalcExpr::Num(_) => None,
+            CalcExpr::Var(_, fallback) => {
+                fallback.as_ref().and_then(|f| f.eval(ctx))
+            }
+            CalcExpr::Add(a, b) => {
+                let (x, y) = (a.eval(ctx)?, b.eval(ctx)?);
+                match (x, y) {
+                    (CalcNumber::Px(u), CalcNumber::Px(v)) => Some(CalcNumber::Px(u + v)),
+                    (CalcNumber::Pct(u), CalcNumber::Pct(v)) => Some(CalcNumber::Pct(u + v)),
+                    _ => None,
+                }
+            }
+            CalcExpr::Sub(a, b) => {
+                let (x, y) = (a.eval(ctx)?, b.eval(ctx)?);
+                match (x, y) {
+                    (CalcNumber::Px(u), CalcNumber::Px(v)) => Some(CalcNumber::Px(u - v)),
+                    (CalcNumber::Pct(u), CalcNumber::Pct(v)) => Some(CalcNumber::Pct(u - v)),
+                    _ => None,
+                }
+            }
+            CalcExpr::Mul(e, n) => match e.eval(ctx)? {
+                CalcNumber::Px(v) => Some(CalcNumber::Px(v * n)),
+                CalcNumber::Pct(p) => Some(CalcNumber::Pct(p * n)),
+            },
+            CalcExpr::Div(e, n) => {
+                if *n == 0.0 {
+                    return None;
+                }
+                match e.eval(ctx)? {
+                    CalcNumber::Px(v) => Some(CalcNumber::Px(v / n)),
+                    CalcNumber::Pct(p) => Some(CalcNumber::Pct(p / n)),
+                }
+            }
+        }
+    }
+
+    /// Convert a plain [`Value`] to a [`CalcExpr`], for `var()`
+    /// substitution inside a `calc()`: lengths/percentages/
+    /// numbers map directly, a nested `calc()` unwraps, a `var()`
+    /// maps to its node (resolved by the caller first); anything
+    /// else (colours, keywords, ...) is not a length and yields
+    /// `None`.
+    pub fn from_value(value: &Value) -> Option<CalcExpr> {
+        Some(match value {
+            Value::Length(v) => CalcExpr::Len(CssLength::Px(*v)),
+            Value::Percentage(p) => CalcExpr::Pct(*p),
+            Value::Em(v) => CalcExpr::Len(CssLength::Em(*v)),
+            Value::Rem(v) => CalcExpr::Len(CssLength::Rem(*v)),
+            Value::Vh(v) => CalcExpr::Len(CssLength::Vh(*v)),
+            Value::Vw(v) => CalcExpr::Len(CssLength::Vw(*v)),
+            Value::Calc(e) => e.clone(),
+            Value::Var { name, fallback } => CalcExpr::Var(
+                name.clone(),
+                fallback
+                    .as_ref()
+                    .and_then(|f| CalcExpr::from_value(f))
+                    .map(Box::new),
+            ),
+            _ => return None,
+        })
+    }
+}
+
+impl fmt::Display for CalcExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CalcExpr::Len(l) => write!(f, "{l}"),
+            CalcExpr::Pct(p) => write!(f, "{p}%"),
+            CalcExpr::Num(n) => write!(f, "{n}"),
+            CalcExpr::Var(name, None) => write!(f, "var({name})"),
+            CalcExpr::Var(name, Some(fb)) => write!(f, "var({name}, {fb})"),
+            CalcExpr::Add(a, b) => write!(f, "({a} + {b})"),
+            CalcExpr::Sub(a, b) => write!(f, "({a} - {b})"),
+            CalcExpr::Mul(e, n) => write!(f, "({e} * {n})"),
+            CalcExpr::Div(e, n) => write!(f, "({e} / {n})"),
+        }
+    }
 }
 
 /// Every `url(...)` reference in a raw CSS value, in order
@@ -96,8 +774,8 @@ pub fn extract_css_urls(raw: &str) -> Vec<String> {
 }
 
 /// One length that can appear inside a structured value
-/// ([`BorderRadius`], [`BoxShadow`]).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// ([`BorderRadius`], [`BoxShadow`], [`TransformFunction`]).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum CssLength {
     Px(f32),
     Percentage(f32),
@@ -720,10 +1398,18 @@ impl MediaCondition {
         MediaCondition::Unknown(text.to_string())
     }
 
-    /// Evaluate against a viewport. `None` means "cannot tell"
-    /// (unknown feature or type); `em` in a feature resolves against
-    /// the initial 16px font size.
-    pub fn eval(&self, viewport_width: f32, viewport_height: f32) -> Option<bool> {
+    /// Evaluate against a viewport and a theme. `None` means
+    /// "cannot tell" (unknown feature or type); `em` in a feature
+    /// resolves against the initial 16px font size.
+    /// `prefers-color-scheme: dark` / `: light` compare against
+    /// `theme`; a bare `(prefers-color-scheme)` (no value) is
+    /// `None`.
+    pub fn eval(
+        &self,
+        viewport_width: f32,
+        viewport_height: f32,
+        theme: Theme,
+    ) -> Option<bool> {
         match self {
             MediaCondition::MediaType(t) => match t.as_str() {
                 "screen" | "all" => Some(true),
@@ -731,6 +1417,18 @@ impl MediaCondition {
                 _ => None,
             },
             MediaCondition::Feature { name, value } => {
+                if name == "prefers-color-scheme" {
+                    return match value {
+                        None => None,
+                        Some(Value::Keyword(k)) if k == "dark" => {
+                            Some(theme == Theme::Dark)
+                        }
+                        Some(Value::Keyword(k)) if k == "light" => {
+                            Some(theme == Theme::Light)
+                        }
+                        Some(_) => None,
+                    };
+                }
                 let px = |v: &Value| -> Option<f32> {
                     match v {
                         Value::Length(x) => Some(*x),
@@ -754,7 +1452,7 @@ impl MediaCondition {
             MediaCondition::And(parts) => {
                 let mut unknown = false;
                 for p in parts {
-                    match p.eval(viewport_width, viewport_height) {
+                    match p.eval(viewport_width, viewport_height, theme) {
                         Some(false) => return Some(false),
                         None => unknown = true,
                         Some(true) => {}
@@ -769,7 +1467,7 @@ impl MediaCondition {
             MediaCondition::Or(parts) => {
                 let mut unknown = false;
                 for p in parts {
-                    match p.eval(viewport_width, viewport_height) {
+                    match p.eval(viewport_width, viewport_height, theme) {
                         Some(true) => return Some(true),
                         None => unknown = true,
                         Some(false) => {}
@@ -781,9 +1479,9 @@ impl MediaCondition {
                     Some(false)
                 }
             }
-            MediaCondition::Not(inner) => {
-                inner.eval(viewport_width, viewport_height).map(|b| !b)
-            }
+            MediaCondition::Not(inner) => inner
+                .eval(viewport_width, viewport_height, theme)
+                .map(|b| !b),
             MediaCondition::Unknown(_) => None,
         }
     }
@@ -901,7 +1599,24 @@ pub const KNOWN_PROPERTIES: &[&str] = &[
     "z-index",
     "cursor",
     "transform",
+    "transform-origin",
+    "transform-box",
+    "will-change",
     "transition",
+    "transition-property",
+    "transition-duration",
+    "transition-timing-function",
+    "transition-delay",
+    "animation",
+    "animation-name",
+    "animation-duration",
+    "animation-timing-function",
+    "animation-delay",
+    "animation-iteration-count",
+    "animation-direction",
+    "animation-fill-mode",
+    "animation-play-state",
+    "inset",
     "content",
 ];
 
@@ -1004,12 +1719,14 @@ pub struct FontFace {
     pub style: Option<String>,
 }
 
-/// One `@keyframes` rule: name plus the raw block text (steps are
-/// parsed when animations land, not here).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One `@keyframes` rule: name plus its parsed steps (M6 Rec 10:
+/// the raw blob is gone — steps carry selectors + declarations).
+/// No consumer runs animations yet (the engine is a later phase),
+/// but the structure is what it will read.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Keyframes {
     pub name: String,
-    pub raw: String,
+    pub steps: Vec<KeyframeStep>,
 }
 
 /// One `selector, selector { declarations }` rule, with its cascade
@@ -1127,7 +1844,7 @@ pub struct Stylesheet {
     pub imports: Vec<Import>,
     /// `@font-face` descriptor blocks, in document order.
     pub font_faces: Vec<FontFace>,
-    /// `@keyframes` rules, in document order (name + raw block text).
+    /// `@keyframes` rules, in document order (name + parsed steps).
     pub keyframes: Vec<Keyframes>,
 }
 
@@ -2094,10 +2811,9 @@ fn handle_at_rule(
                         .next()
                         .unwrap_or("")
                         .to_string();
-                    sheet.keyframes.push(Keyframes {
-                        name: kf_name,
-                        raw: block.to_string(),
-                    });
+                    sheet
+                        .keyframes
+                        .push(parse_keyframes_block(&kf_name, block));
                 }
                 _ => {
                     *seen_rule = true;
@@ -2200,6 +2916,74 @@ fn parse_import(prelude: &str) -> Option<Import> {
         import.media = Some(rest.to_string());
     }
     Some(import)
+}
+
+/// Parse an `@keyframes` block into structured steps: each
+/// `from` / `to` / `50%` selector group (comma-separated) with
+/// the declarations inside its braces. A step with no parseable
+/// selector or no declarations is dropped; an unclosed step ends
+/// the block.
+fn parse_keyframes_block(name: &str, block: &str) -> Keyframes {
+    let mut steps = Vec::new();
+    let mut rest = block;
+    loop {
+        let rest_trimmed = rest.trim_start();
+        if rest_trimmed.is_empty() {
+            break;
+        }
+        rest = rest_trimmed;
+        let Some(open) = rest.find('{') else {
+            break;
+        };
+        let sel_text = &rest[..open];
+        let mut depth = 0i32;
+        let mut close = None;
+        for (i, c) in rest[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            break;
+        };
+        let decl_block = &rest[open + 1..close];
+        let selectors: Vec<KeyframeSelector> = sel_text
+            .split(',')
+            .filter_map(|t| {
+                let t = t.trim().to_ascii_lowercase();
+                match t.as_str() {
+                    "from" => Some(KeyframeSelector::From),
+                    "to" => Some(KeyframeSelector::To),
+                    _ => t
+                        .strip_suffix('%')
+                        .and_then(|n| n.trim().parse::<f32>().ok())
+                        .map(KeyframeSelector::Percentage),
+                }
+            })
+            .collect();
+        let mut rule = Rule::default();
+        let mut errors = Vec::new();
+        parse_declarations(decl_block, &mut rule, &mut errors);
+        if !selectors.is_empty() && !rule.declarations.is_empty() {
+            steps.push(KeyframeStep {
+                selectors,
+                declarations: rule.declarations,
+            });
+        }
+        rest = &rest[close + 1..];
+    }
+    Keyframes {
+        name: name.to_string(),
+        steps,
+    }
 }
 
 /// Parse a `@font-face` descriptor block into a [`FontFace`].
@@ -3138,6 +3922,26 @@ fn parse_declarations(block: &str, rule: &mut Rule, errors: &mut Vec<String>) {
                     .declarations
                     .push(decl(prop, Value::Raw(raw.to_string()), important)),
             },
+            // M6 Rec 10: transition / animation shorthands expand
+            // to structured values; the longhands keep their
+            // parsed single values and are zipped by the layout
+            // pass (`apply_decl`).
+            "transition" => match parse_transition_shorthand(raw) {
+                Some(list) => rule
+                    .declarations
+                    .push(decl(prop, Value::Transitions(list), important)),
+                None => rule
+                    .declarations
+                    .push(decl(prop, Value::Raw(raw.to_string()), important)),
+            },
+            "animation" => match parse_animation_shorthand(raw) {
+                Some(list) => rule
+                    .declarations
+                    .push(decl(prop, Value::Animations(list), important)),
+                None => rule
+                    .declarations
+                    .push(decl(prop, Value::Raw(raw.to_string()), important)),
+            },
             _ => rule
                 .declarations
                 .push(decl(prop, parse_value(raw), important)),
@@ -3471,6 +4275,36 @@ pub fn parse_value(raw: &str) -> Value {
     {
         return Value::Percentage(v);
     }
+    // Time: `ms` before `s` ("300ms" ends in "s" too). A negative
+    // duration is not a valid duration — it falls through to `Raw`.
+    if let Some(num) = lower.strip_suffix("ms")
+        && let Ok(v) = num.trim().parse::<f32>()
+        && v >= 0.0
+    {
+        return Value::Time(v / 1000.0);
+    }
+    if let Some(num) = lower.strip_suffix('s')
+        && let Ok(v) = num.trim().parse::<f32>()
+        && v >= 0.0
+    {
+        return Value::Time(v);
+    }
+    // Angles, in degrees: `deg` / `turn` / `rad`.
+    if let Some(num) = lower.strip_suffix("deg")
+        && let Ok(v) = num.trim().parse::<f32>()
+    {
+        return Value::Angle(v);
+    }
+    if let Some(num) = lower.strip_suffix("turn")
+        && let Ok(v) = num.trim().parse::<f32>()
+    {
+        return Value::Angle(v * 360.0);
+    }
+    if let Some(num) = lower.strip_suffix("rad")
+        && let Ok(v) = num.trim().parse::<f32>()
+    {
+        return Value::Angle(v * 180.0 / std::f32::consts::PI);
+    }
     if let Ok(v) = s.parse::<f32>() {
         return Value::Length(v); // bare number: unitless zero, e.g. `margin: 0`
     }
@@ -3521,12 +4355,539 @@ pub fn parse_value(raw: &str) -> Value {
             return Value::Url(inner.to_string());
         }
     }
+    // `var()` / `calc()` / `clamp()` / transform functions, before
+    // the keyword fallthrough (they all contain parens, so the
+    // keyword arm below would never claim them — but `Raw` would).
+    if lower.starts_with("var(") && lower.ends_with(')') {
+        if let Some(v) = parse_var_value(&s[4..s.len() - 1]) {
+            return v;
+        }
+    }
+    if lower.starts_with("calc(") && lower.ends_with(')') {
+        if let Some(e) = parse_calc_str(&s[5..s.len() - 1]) {
+            return Value::Calc(e);
+        }
+    }
+    if lower.starts_with("clamp(") && lower.ends_with(')') {
+        let inner = &s[6..s.len() - 1];
+        let parts = split_top_level(inner, ',');
+        if parts.len() == 3 {
+            if let (Some(min), Some(val), Some(max)) = (
+                parse_calc_str(parts[0]),
+                parse_calc_str(parts[1]),
+                parse_calc_str(parts[2]),
+            ) {
+                return Value::Clamp {
+                    min: Box::new(min),
+                    val: Box::new(val),
+                    max: Box::new(max),
+                };
+            }
+        }
+    }
+    if s.contains('(') {
+        if let Some(list) = parse_transform_list(s) {
+            return Value::Transform(list);
+        }
+    }
     if s.split_whitespace().count() == 1
         && s.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
     {
         return Value::Keyword(lower);
     }
     Value::Raw(s.to_string())
+}
+
+/// Parse the inside of `var(...)`: `--name` plus an optional
+/// fallback (itself a parsed [`Value`]; a nested `var()` in the
+/// fallback is allowed — `parse_value` recurses for it).
+fn parse_var_value(inner: &str) -> Option<Value> {
+    let (name, fallback) = match split_top_level_once(inner, ',') {
+        Some((n, f)) => (n.trim(), Some(f.trim())),
+        None => (inner.trim(), None),
+    };
+    if !name.starts_with("--") || name.len() < 3 {
+        return None;
+    }
+    Some(Value::Var {
+        name: name.to_string(),
+        fallback: fallback.map(|f| Box::new(parse_value(f))),
+    })
+}
+
+/// Parse one angle token (`45deg` / `0.5turn` / `1rad`) to
+/// degrees, or `None` when it is not an angle.
+fn parse_angle_value(tok: &str) -> Option<f32> {
+    match parse_value(tok) {
+        Value::Angle(a) => Some(a),
+        _ => None,
+    }
+}
+
+/// Parse a `transform` function list: `translate(...) scale(...)
+/// rotate(...) skew(...) matrix(...)` (comma- or space-separated
+/// arguments), `none` → the empty list. Returns `None` when the
+/// text is not a transform list at all (so `parse_value` falls
+/// through to `Raw`).
+fn parse_transform_list(s: &str) -> Option<TransformList> {
+    let lower = s.trim().to_ascii_lowercase();
+    if lower == "none" {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let len = |tok: &str| -> Option<CssLength> {
+        CssLength::from_value(&parse_value(tok))
+    };
+    let num = |tok: &str| -> Option<f32> { tok.trim().parse::<f32>().ok() };
+    loop {
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        // Function name, up to '('.
+        let name_start = i;
+        while i < bytes.len() && (bytes[i] as char).is_ascii_alphabetic() {
+            i += 1;
+        }
+        if i == name_start || i >= bytes.len() || bytes[i] != b'(' {
+            return None;
+        }
+        let name = s[name_start..i].to_ascii_lowercase();
+        // Balanced args up to the matching ')'.
+        let mut depth = 0i32;
+        let mut end = None;
+        let mut j = i;
+        while j < bytes.len() {
+            match bytes[j] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let Some(end) = end else {
+            return None;
+        };
+        let args_raw = &s[i + 1..end];
+        let args: Vec<&str> = args_raw
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let f = match name.as_str() {
+            "translate" => {
+                if args.is_empty() || args.len() > 2 {
+                    return None;
+                }
+                let x = len(args[0])?;
+                let y = if args.len() == 2 {
+                    len(args[1])?
+                } else {
+                    CssLength::Px(0.0)
+                };
+                TransformFunction::Translate(x, y)
+            }
+            "translatex" => {
+                if args.len() != 1 {
+                    return None;
+                }
+                TransformFunction::TranslateX(len(args[0])?)
+            }
+            "translatey" => {
+                if args.len() != 1 {
+                    return None;
+                }
+                TransformFunction::TranslateY(len(args[0])?)
+            }
+            "scale" => {
+                if args.is_empty() || args.len() > 2 {
+                    return None;
+                }
+                let sx = num(args[0])?;
+                let sy = if args.len() == 2 { num(args[1])? } else { sx };
+                TransformFunction::Scale(sx, sy)
+            }
+            "scalex" => {
+                if args.len() != 1 {
+                    return None;
+                }
+                TransformFunction::ScaleX(num(args[0])?)
+            }
+            "scaley" => {
+                if args.len() != 1 {
+                    return None;
+                }
+                TransformFunction::ScaleY(num(args[0])?)
+            }
+            "rotate" => {
+                if args.len() != 1 {
+                    return None;
+                }
+                TransformFunction::Rotate(parse_angle_value(args[0])?)
+            }
+            "skew" => {
+                if args.is_empty() || args.len() > 2 {
+                    return None;
+                }
+                out.push(TransformFunction::SkewX(parse_angle_value(args[0])?));
+                if args.len() == 2 {
+                    out.push(TransformFunction::SkewY(parse_angle_value(args[1])?));
+                }
+                i = end + 1;
+                continue;
+            }
+            "skewx" => {
+                if args.len() != 1 {
+                    return None;
+                }
+                TransformFunction::SkewX(parse_angle_value(args[0])?)
+            }
+            "skewy" => {
+                if args.len() != 1 {
+                    return None;
+                }
+                TransformFunction::SkewY(parse_angle_value(args[0])?)
+            }
+            "matrix" => {
+                if args.len() != 6 {
+                    return None;
+                }
+                let mut m = [0.0f32; 6];
+                for (k, t) in args.iter().enumerate() {
+                    m[k] = num(t)?;
+                }
+                TransformFunction::Matrix(m)
+            }
+            _ => return None,
+        };
+        out.push(f);
+        i = end + 1;
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Parse a `transition` shorthand value (comma-separated list of
+/// `property duration timing delay` items, in any order per item)
+/// into structured [`Transition`]s.
+fn parse_transition_shorthand(raw: &str) -> Option<Vec<Transition>> {
+    let mut out = Vec::new();
+    for item in split_top_level(raw, ',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let mut t = Transition::default();
+        let mut seen_time = false;
+        let mut seen_property = false;
+        for tok in split_top_level_ws(item) {
+            match parse_value(tok) {
+                Value::Time(d) => {
+                    if !seen_time {
+                        t.duration = d;
+                        seen_time = true;
+                    } else {
+                        t.delay = d;
+                    }
+                }
+                _ => {
+                    if let Some(e) = Easing::parse(tok) {
+                        t.timing = e;
+                    } else if !seen_property {
+                        t.property = tok.to_ascii_lowercase();
+                        seen_property = true;
+                    }
+                }
+            }
+        }
+        out.push(t);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Parse an `animation` shorthand value (comma-separated list) into
+/// structured [`Animation`]s. Tokens are classified by shape: a
+/// time is duration (first) then delay, an easing keyword /
+/// function is the timing, `infinite` / a bare number is the
+/// iteration count, the direction / fill / play-state keywords
+/// name themselves, and the first remaining token is the name.
+fn parse_animation_shorthand(raw: &str) -> Option<Vec<Animation>> {
+    let mut out = Vec::new();
+    for item in split_top_level(raw, ',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let mut a = Animation::default();
+        let mut seen_time = false;
+        let mut seen_name = false;
+        for tok in split_top_level_ws(item) {
+            let lower = tok.to_ascii_lowercase();
+            match parse_value(tok) {
+                Value::Time(d) => {
+                    if !seen_time {
+                        a.duration = d;
+                        seen_time = true;
+                    } else {
+                        a.delay = d;
+                    }
+                }
+                _ => {
+                    if let Some(e) = Easing::parse(tok) {
+                        a.timing = e;
+                        continue;
+                    }
+                    match lower.as_str() {
+                        "infinite" => a.iteration_count = IterationCount::Infinite,
+                        "normal" => a.direction = AnimationDirection::Normal,
+                        "reverse" => a.direction = AnimationDirection::Reverse,
+                        "alternate" => a.direction = AnimationDirection::Alternate,
+                        "alternate-reverse" => {
+                            a.direction = AnimationDirection::AlternateReverse
+                        }
+                        "none" if !seen_name => {
+                            // `none` as a fill keyword only when a
+                            // name was already seen; as the first
+                            // bare token it is the animation name.
+                            a.name = "none".to_string();
+                            seen_name = true;
+                        }
+                        "forwards" => a.fill_mode = FillMode::Forwards,
+                        "backwards" => a.fill_mode = FillMode::Backwards,
+                        "both" => a.fill_mode = FillMode::Both,
+                        "running" => a.play_state = PlayState::Running,
+                        "paused" => a.play_state = PlayState::Paused,
+                        _ => {
+                            if let Ok(n) = tok.parse::<f32>() {
+                                a.iteration_count = IterationCount::Finite(n);
+                            } else if !seen_name {
+                                a.name = tok.to_string();
+                                seen_name = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out.push(a);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Parse a `calc(...)` inner expression into a [`CalcExpr`].
+/// Grammar: `expr := term (('+'|'-') term)*`,
+/// `term := factor (('*'|'/') factor)*`,
+/// `factor := number[unit] | '(' expr ')' | var(...)`.
+/// `*` / `/` only scale by a plain number (a length on either
+/// side of a number is folded into `Mul`/`Div`); anything else
+/// fails the whole parse (`None` → the value stays `Raw`).
+fn parse_calc_str(s: &str) -> Option<CalcExpr> {
+    let mut p = CalcParser {
+        bytes: s.as_bytes(),
+        pos: 0,
+    };
+    let expr = p.parse_expr()?;
+    p.skip_ws();
+    if p.pos != p.bytes.len() {
+        return None;
+    }
+    Some(expr)
+}
+
+struct CalcParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> CalcParser<'a> {
+    fn skip_ws(&mut self) {
+        while self.pos < self.bytes.len() && (self.bytes[self.pos] as char).is_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn parse_expr(&mut self) -> Option<CalcExpr> {
+        let mut lhs = self.parse_term()?;
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some(b'+') => {
+                    self.pos += 1;
+                    let rhs = self.parse_term()?;
+                    lhs = CalcExpr::Add(Box::new(lhs), Box::new(rhs));
+                }
+                Some(b'-') => {
+                    self.pos += 1;
+                    let rhs = self.parse_term()?;
+                    lhs = CalcExpr::Sub(Box::new(lhs), Box::new(rhs));
+                }
+                _ => break,
+            }
+        }
+        Some(lhs)
+    }
+
+    fn parse_term(&mut self) -> Option<CalcExpr> {
+        let mut lhs = self.parse_factor()?;
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some(b'*') => {
+                    self.pos += 1;
+                    let rhs = self.parse_factor()?;
+                    match (lhs, rhs) {
+                        (CalcExpr::Num(n), e) => lhs = CalcExpr::Mul(Box::new(e), n),
+                        (e, CalcExpr::Num(n)) => lhs = CalcExpr::Mul(Box::new(e), n),
+                        _ => return None,
+                    }
+                }
+                Some(b'/') => {
+                    self.pos += 1;
+                    let rhs = self.parse_factor()?;
+                    match rhs {
+                        CalcExpr::Num(n) => lhs = CalcExpr::Div(Box::new(lhs), n),
+                        _ => return None,
+                    }
+                }
+                _ => break,
+            }
+        }
+        Some(lhs)
+    }
+
+    fn parse_factor(&mut self) -> Option<CalcExpr> {
+        self.skip_ws();
+        match self.peek()? {
+            b'(' => {
+                self.pos += 1;
+                let e = self.parse_expr()?;
+                self.skip_ws();
+                if self.peek() != Some(b')') {
+                    return None;
+                }
+                self.pos += 1;
+                Some(e)
+            }
+            b'v' | b'V' => {
+                // `var(--name)` / `var(--name, <fallback expr>)`.
+                let rest = &self.bytes[self.pos..];
+                let lower: String = rest
+                    .iter()
+                    .take(4)
+                    .map(|b| (*b as char).to_ascii_lowercase())
+                    .collect();
+                if lower != "var(" {
+                    return None;
+                }
+                self.pos += 4;
+                self.skip_ws();
+                let name_start = self.pos;
+                while let Some(c) = self.peek() {
+                    if c == b',' || c == b')' {
+                        break;
+                    }
+                    self.pos += 1;
+                }
+                let name = std::str::from_utf8(&self.bytes[name_start..self.pos])
+                    .ok()?
+                    .trim()
+                    .to_string();
+                if !name.starts_with("--") {
+                    return None;
+                }
+                self.skip_ws();
+                let fallback = if self.peek() == Some(b',') {
+                    self.pos += 1;
+                    Some(Box::new(self.parse_expr()?))
+                } else {
+                    None
+                };
+                self.skip_ws();
+                if self.peek() != Some(b')') {
+                    return None;
+                }
+                self.pos += 1;
+                Some(CalcExpr::Var(name, fallback))
+            }
+            _ => self.parse_number(),
+        }
+    }
+
+    /// A number with an optional length unit: `10px`, `50%`,
+    /// `2em`, `1.5` (bare number). A leading `+`/`-` is part of
+    /// the number when it directly precedes digits.
+    fn parse_number(&mut self) -> Option<CalcExpr> {
+        self.skip_ws();
+        let start = self.pos;
+        if matches!(self.peek(), Some(b'+') | Some(b'-')) {
+            self.pos += 1;
+        }
+        let mut seen_digit = false;
+        let mut seen_dot = false;
+        while let Some(c) = self.peek() {
+            match c {
+                b'0'..=b'9' => {
+                    seen_digit = true;
+                    self.pos += 1;
+                }
+                b'.' if !seen_dot => {
+                    seen_dot = true;
+                    self.pos += 1;
+                }
+                _ => break,
+            }
+        }
+        if !seen_digit {
+            self.pos = start;
+            return None;
+        }
+        let num_str = std::str::from_utf8(&self.bytes[start..self.pos]).ok()?;
+        let v: f32 = num_str.parse().ok()?;
+        let unit_start = self.pos;
+        while let Some(c) = self.peek() {
+            if (c as char).is_ascii_alphabetic() || c == b'%' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        let unit = std::str::from_utf8(&self.bytes[unit_start..self.pos])
+            .ok()?
+            .to_ascii_lowercase();
+        Some(match unit.as_str() {
+            "" => CalcExpr::Num(v),
+            "px" => CalcExpr::Len(CssLength::Px(v)),
+            "%" => CalcExpr::Pct(v),
+            "em" => CalcExpr::Len(CssLength::Em(v)),
+            "rem" => CalcExpr::Len(CssLength::Rem(v)),
+            "vh" => CalcExpr::Len(CssLength::Vh(v)),
+            "vw" => CalcExpr::Len(CssLength::Vw(v)),
+            _ => return None,
+        })
+    }
 }
 
 /// `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`. Alpha is 1.0 unless the
@@ -3752,6 +5113,75 @@ impl fmt::Display for Value {
                 Ok(())
             }
             Value::Url(url) => write!(f, "url({url})"),
+            Value::Time(v) => write!(f, "{v}s"),
+            Value::Angle(v) => write!(f, "{v}deg"),
+            Value::Transform(list) => {
+                if list.is_empty() {
+                    return write!(f, "none");
+                }
+                let mut first = true;
+                for func in list {
+                    if !first {
+                        write!(f, " ")?;
+                    }
+                    first = false;
+                    match func {
+                        TransformFunction::Translate(x, y) => {
+                            write!(f, "translate({x}, {y})")?
+                        }
+                        TransformFunction::TranslateX(x) => write!(f, "translateX({x})")?,
+                        TransformFunction::TranslateY(y) => write!(f, "translateY({y})")?,
+                        TransformFunction::Scale(sx, sy) => write!(f, "scale({sx}, {sy})")?,
+                        TransformFunction::ScaleX(sx) => write!(f, "scaleX({sx})")?,
+                        TransformFunction::ScaleY(sy) => write!(f, "scaleY({sy})")?,
+                        TransformFunction::Rotate(a) => write!(f, "rotate({a}deg)")?,
+                        TransformFunction::SkewX(a) => write!(f, "skewX({a}deg)")?,
+                        TransformFunction::SkewY(a) => write!(f, "skewY({a}deg)")?,
+                        TransformFunction::Matrix(m) => write!(
+                            f,
+                            "matrix({}, {}, {}, {}, {}, {})",
+                            m[0], m[1], m[2], m[3], m[4], m[5]
+                        )?,
+                    }
+                }
+                Ok(())
+            }
+            Value::Transitions(list) => {
+                let mut first = true;
+                for t in list {
+                    if !first {
+                        write!(f, ", ")?;
+                    }
+                    first = false;
+                    write!(
+                        f,
+                        "{} {}s {} {}s",
+                        t.property, t.duration, t.timing, t.delay
+                    )?;
+                }
+                Ok(())
+            }
+            Value::Animations(list) => {
+                let mut first = true;
+                for a in list {
+                    if !first {
+                        write!(f, ", ")?;
+                    }
+                    first = false;
+                    write!(
+                        f,
+                        "{} {}s {} {}s",
+                        a.name, a.duration, a.timing, a.delay
+                    )?;
+                }
+                Ok(())
+            }
+            Value::Var { name, fallback } => match fallback {
+                Some(fb) => write!(f, "var({name}, {fb})"),
+                None => write!(f, "var({name})"),
+            },
+            Value::Calc(e) => write!(f, "calc({e})"),
+            Value::Clamp { min, val, max } => write!(f, "clamp({min}, {val}, {max})"),
             Value::Raw(r) => write!(f, "{r}"),
         }
     }
@@ -3873,11 +5303,11 @@ mod tests {
             })
         );
         assert_eq!(
-            media_div.media.as_ref().unwrap().eval(600.0, 800.0),
+            media_div.media.as_ref().unwrap().eval(600.0, 800.0, Theme::Light),
             Some(true)
         );
         assert_eq!(
-            media_div.media.as_ref().unwrap().eval(800.0, 800.0),
+            media_div.media.as_ref().unwrap().eval(800.0, 800.0, Theme::Light),
             Some(false)
         );
         assert_eq!(decl(media_div, "width"), Some(&Value::Keyword("auto".into())));
@@ -4233,24 +5663,24 @@ mod tests {
         assert_eq!(sheet.rules.len(), 2);
         let and = sheet.rules[0].media.as_ref().unwrap();
         assert!(matches!(and, MediaCondition::And(_)));
-        assert_eq!(and.eval(50.0, 800.0), Some(false));
-        assert_eq!(and.eval(200.0, 800.0), Some(true));
+        assert_eq!(and.eval(50.0, 800.0, Theme::Light), Some(false));
+        assert_eq!(and.eval(200.0, 800.0, Theme::Light), Some(true));
         let or = sheet.rules[1].media.as_ref().unwrap();
         assert!(matches!(or, MediaCondition::Or(_)));
-        assert_eq!(or.eval(600.0, 800.0), Some(true));
-        assert_eq!(or.eval(800.0, 800.0), Some(false));
-        assert_eq!(or.eval(1300.0, 800.0), Some(true));
+        assert_eq!(or.eval(600.0, 800.0, Theme::Light), Some(true));
+        assert_eq!(or.eval(800.0, 800.0, Theme::Light), Some(false));
+        assert_eq!(or.eval(1300.0, 800.0, Theme::Light), Some(true));
         // `em` in a media feature resolves against 16px.
         let em = MediaCondition::parse("(max-width: 40em)");
-        assert_eq!(em.eval(640.0, 800.0), Some(true));
-        assert_eq!(em.eval(641.0, 800.0), Some(false));
+        assert_eq!(em.eval(640.0, 800.0, Theme::Light), Some(true));
+        assert_eq!(em.eval(641.0, 800.0, Theme::Light), Some(false));
         // Unknown features evaluate to None, never true/false.
         assert_eq!(
-            MediaCondition::parse("(pointer: fine)").eval(800.0, 600.0),
+            MediaCondition::parse("(pointer: fine)").eval(800.0, 600.0, Theme::Light),
             None
         );
         assert_eq!(
-            MediaCondition::parse("print").eval(800.0, 600.0),
+            MediaCondition::parse("print").eval(800.0, 600.0, Theme::Light),
             Some(false)
         );
     }
@@ -4306,8 +5736,383 @@ mod tests {
         assert_eq!(sheet.font_faces[0].weight, Some("400".to_string()));
         assert_eq!(sheet.keyframes.len(), 1);
         assert_eq!(sheet.keyframes[0].name, "spin");
-        assert!(sheet.keyframes[0].raw.contains("from"));
+        assert_eq!(sheet.keyframes[0].steps.len(), 2);
+        assert_eq!(
+            sheet.keyframes[0].steps[0].selectors,
+            vec![KeyframeSelector::From]
+        );
+        assert_eq!(
+            sheet.keyframes[0].steps[1].selectors,
+            vec![KeyframeSelector::To]
+        );
+        assert_eq!(
+            sheet.keyframes[0].steps[0].declarations[0].property,
+            "transform"
+        );
+        assert_eq!(
+            sheet.keyframes[0].steps[1].declarations[0].value,
+            Value::Transform(vec![TransformFunction::Rotate(360.0)])
+        );
         assert_eq!(sheet.rules.len(), 1);
+    }
+
+    #[test]
+    fn time_and_angle_values_parse() {
+        assert_eq!(parse_value("0.3s"), Value::Time(0.3));
+        assert_eq!(parse_value("300ms"), Value::Time(0.3));
+        assert_eq!(parse_value("0s"), Value::Time(0.0));
+        assert_eq!(parse_value("2s"), Value::Time(2.0));
+        // A negative duration is not valid: it stays Raw.
+        assert_eq!(parse_value("-0.3s"), Value::Raw("-0.3s".to_string()));
+        assert_eq!(parse_value("45deg"), Value::Angle(45.0));
+        assert_eq!(parse_value("0.5turn"), Value::Angle(180.0));
+        assert!((match parse_value("1rad") {
+            Value::Angle(a) => a,
+            _ => panic!("expected Angle"),
+        } - 57.29578)
+            .abs()
+            < 1e-4);
+    }
+
+    #[test]
+    fn transform_functions_parse_and_compose() {
+        // Each function parses to its typed form.
+        assert_eq!(
+            parse_value("translate(10px, 20px)"),
+            Value::Transform(vec![TransformFunction::Translate(
+                CssLength::Px(10.0),
+                CssLength::Px(20.0),
+            )])
+        );
+        assert_eq!(
+            parse_value("translateX(5%)"),
+            Value::Transform(vec![TransformFunction::TranslateX(
+                CssLength::Percentage(5.0),
+            )])
+        );
+        assert_eq!(
+            parse_value("scale(2, 3)"),
+            Value::Transform(vec![TransformFunction::Scale(2.0, 3.0)])
+        );
+        assert_eq!(
+            parse_value("scale(2)"),
+            Value::Transform(vec![TransformFunction::Scale(2.0, 2.0)])
+        );
+        assert_eq!(
+            parse_value("rotate(90deg)"),
+            Value::Transform(vec![TransformFunction::Rotate(90.0)])
+        );
+        assert_eq!(
+            parse_value("skewX(45deg)"),
+            Value::Transform(vec![TransformFunction::SkewX(45.0)])
+        );
+        assert_eq!(
+            parse_value("matrix(1, 2, 3, 4, 5, 6)"),
+            Value::Transform(vec![TransformFunction::Matrix([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])])
+        );
+        assert_eq!(parse_value("none"), Value::Keyword("none".to_string()));
+        // Composition: rotate(90deg) maps (1, 0) to (0, 1).
+        let list = match parse_value("rotate(90deg)") {
+            Value::Transform(l) => l,
+            _ => panic!("expected Transform"),
+        };
+        let (x, y) = list.to_affine((0.0, 0.0)).apply(1.0, 0.0);
+        assert!(x.abs() < 1e-5, "x={x}");
+        assert!((y - 1.0).abs() < 1e-5, "y={y}");
+        // Order: translate then scale applies the translate first.
+        let list = match parse_value("translate(10px, 0px) scale(2)") {
+            Value::Transform(l) => l,
+            _ => panic!("expected Transform"),
+        };
+        let (x, y) = list.to_affine((0.0, 0.0)).apply(1.0, 0.0);
+        assert!((x - 22.0).abs() < 1e-5, "x={x}");
+        assert!(y.abs() < 1e-5, "y={y}");
+        // Origin wrapping: rotate(90deg) about (10, 0) leaves the
+        // origin point itself fixed.
+        let rot = match parse_value("rotate(90deg)") {
+            Value::Transform(l) => l,
+            _ => panic!("expected Transform"),
+        };
+        let (x, y) = rot.to_affine((10.0, 0.0)).apply(10.0, 0.0);
+        assert!((x - 10.0).abs() < 1e-4, "x={x}");
+        assert!(y.abs() < 1e-4, "y={y}");
+        // ...and maps a point 10px to the right of the origin to
+        // 10px below it.
+        let (x, y) = rot.to_affine((10.0, 0.0)).apply(20.0, 0.0);
+        assert!((x - 10.0).abs() < 1e-4, "x={x}");
+        assert!((y - 10.0).abs() < 1e-4, "y={y}");
+        // `invert` round-trips.
+        let m = Affine::translate(3.0, 4.0).then(Affine::rotate(30.0));
+        let inv = m.invert().expect("invertible");
+        let (x, y) = inv.apply(m.apply(7.0, -2.0).0, m.apply(7.0, -2.0).1);
+        assert!((x - 7.0).abs() < 1e-4, "x={x}");
+        assert!((y + 2.0).abs() < 1e-4, "y={y}");
+        assert!(Affine::scale(0.0, 1.0).invert().is_none());
+    }
+
+    #[test]
+    fn easing_samples() {
+        assert_eq!(Easing::Linear.sample(0.5), 0.5);
+        assert_eq!(Easing::Ease.sample(0.0), 0.0);
+        assert_eq!(Easing::Ease.sample(1.0), 1.0);
+        // `cubic-bezier(0, 0, 1, 1)` is the identity.
+        assert!((Easing::CubicBezier(0.0, 0.0, 1.0, 1.0).sample(0.37) - 0.37).abs() < 1e-4);
+        // `ease` runs fast through the middle (above the diagonal),
+        // slow at both ends.
+        assert!(Easing::Ease.sample(0.5) > 0.5);
+        assert!(Easing::EaseIn.sample(0.5) < 0.5);
+        assert!(Easing::EaseOut.sample(0.5) > 0.5);
+        // Steps: end jumps at interval ends, start at interval starts.
+        assert_eq!(Easing::Steps(4, StepPosition::End).sample(0.0), 0.0);
+        assert_eq!(Easing::Steps(4, StepPosition::End).sample(0.3), 0.25);
+        assert_eq!(Easing::Steps(4, StepPosition::Start).sample(0.0), 0.25);
+        assert_eq!(Easing::Steps(4, StepPosition::Start).sample(0.3), 0.5);
+        assert_eq!(Easing::parse("linear"), Some(Easing::Linear));
+        assert_eq!(Easing::parse("ease-in"), Some(Easing::EaseIn));
+        assert_eq!(
+            Easing::parse("cubic-bezier(0.1, 0.2, 0.3, 0.4)"),
+            Some(Easing::CubicBezier(0.1, 0.2, 0.3, 0.4))
+        );
+        assert_eq!(
+            Easing::parse("steps(4, start)"),
+            Some(Easing::Steps(4, StepPosition::Start))
+        );
+        assert_eq!(Easing::parse("bounce"), None);
+    }
+
+    #[test]
+    fn transition_shorthand_parses() {
+        let sheet = Stylesheet::parse("div { transition: opacity .3s ease-in .1s; }");
+        assert!(sheet.errors.is_empty(), "errors: {:?}", sheet.errors);
+        let v = sheet.rules[0]
+            .declarations
+            .iter()
+            .find(|d| d.property == "transition")
+            .map(|d| &d.value)
+            .expect("transition decl");
+        assert_eq!(
+            v,
+            &Value::Transitions(vec![Transition {
+                property: "opacity".to_string(),
+                duration: 0.3,
+                timing: Easing::EaseIn,
+                delay: 0.1,
+            }])
+        );
+        // Comma-separated lists, and `ms` durations.
+        let sheet = Stylesheet::parse(
+            "div { transition: opacity 300ms, transform 1s linear; }",
+        );
+        let v = sheet.rules[0]
+            .declarations
+            .iter()
+            .find(|d| d.property == "transition")
+            .map(|d| &d.value)
+            .expect("transition decl");
+        assert_eq!(
+            v,
+            &Value::Transitions(vec![
+                Transition {
+                    property: "opacity".to_string(),
+                    duration: 0.3,
+                    timing: Easing::Ease,
+                    delay: 0.0,
+                },
+                Transition {
+                    property: "transform".to_string(),
+                    duration: 1.0,
+                    timing: Easing::Linear,
+                    delay: 0.0,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn animation_shorthand_parses() {
+        let sheet = Stylesheet::parse(
+            "div { animation: spin 2s linear infinite alternate both running; }",
+        );
+        assert!(sheet.errors.is_empty(), "errors: {:?}", sheet.errors);
+        let v = sheet.rules[0]
+            .declarations
+            .iter()
+            .find(|d| d.property == "animation")
+            .map(|d| &d.value)
+            .expect("animation decl");
+        assert_eq!(
+            v,
+            &Value::Animations(vec![Animation {
+                name: "spin".to_string(),
+                duration: 2.0,
+                timing: Easing::Linear,
+                delay: 0.0,
+                iteration_count: IterationCount::Infinite,
+                direction: AnimationDirection::Alternate,
+                fill_mode: FillMode::Both,
+                play_state: PlayState::Running,
+            }])
+        );
+        let sheet = Stylesheet::parse("div { animation: fade 0.5s ease-in-out 0.2s 3 reverse; }");
+        let v = sheet.rules[0]
+            .declarations
+            .iter()
+            .find(|d| d.property == "animation")
+            .map(|d| &d.value)
+            .expect("animation decl");
+        assert_eq!(
+            v,
+            &Value::Animations(vec![Animation {
+                name: "fade".to_string(),
+                duration: 0.5,
+                timing: Easing::EaseInOut,
+                delay: 0.2,
+                iteration_count: IterationCount::Finite(3.0),
+                direction: AnimationDirection::Reverse,
+                fill_mode: FillMode::None,
+                play_state: PlayState::Running,
+            }])
+        );
+    }
+
+    #[test]
+    fn keyframes_percentage_and_multi_selectors_parse() {
+        let sheet = Stylesheet::parse(
+            "@keyframes bounce { 0%, 100% { transform: translateY(0px); } 50% { transform: translateY(-10px); } }",
+        );
+        assert!(sheet.errors.is_empty(), "errors: {:?}", sheet.errors);
+        assert_eq!(sheet.keyframes.len(), 1);
+        assert_eq!(sheet.keyframes[0].steps.len(), 2);
+        assert_eq!(
+            sheet.keyframes[0].steps[0].selectors,
+            vec![
+                KeyframeSelector::Percentage(0.0),
+                KeyframeSelector::Percentage(100.0),
+            ]
+        );
+        assert_eq!(
+            sheet.keyframes[0].steps[1].selectors,
+            vec![KeyframeSelector::Percentage(50.0)]
+        );
+        assert_eq!(
+            sheet.keyframes[0].steps[1].declarations[0].value,
+            Value::Transform(vec![TransformFunction::TranslateY(CssLength::Px(-10.0))])
+        );
+    }
+
+    #[test]
+    fn var_and_calc_parse_and_eval() {
+        assert_eq!(
+            parse_value("var(--x)"),
+            Value::Var {
+                name: "--x".to_string(),
+                fallback: None,
+            }
+        );
+        assert_eq!(
+            parse_value("var(--x, 10px)"),
+            Value::Var {
+                name: "--x".to_string(),
+                fallback: Some(Box::new(Value::Length(10.0))),
+            }
+        );
+        assert_eq!(
+            parse_value("var(--x, var(--y, 5px))"),
+            Value::Var {
+                name: "--x".to_string(),
+                fallback: Some(Box::new(Value::Var {
+                    name: "--y".to_string(),
+                    fallback: Some(Box::new(Value::Length(5.0))),
+                })),
+            }
+        );
+        assert_eq!(
+            parse_value("calc(100% - 20px)"),
+            Value::Calc(CalcExpr::Sub(
+                Box::new(CalcExpr::Pct(100.0)),
+                Box::new(CalcExpr::Len(CssLength::Px(20.0))),
+            ))
+        );
+        // `calc(100% - 20px)` evaluates where a basis exists.
+        let ctx = CalcCtx {
+            font_size: 16.0,
+            root_font_size: 16.0,
+            viewport: (800.0, 600.0),
+            pct_basis: Some(200.0),
+        };
+        assert_eq!(
+            match parse_value("calc(100% - 20px)") {
+                Value::Calc(e) => e.eval(&ctx),
+                _ => panic!("expected Calc"),
+            },
+            Some(CalcNumber::Px(180.0))
+        );
+        // ...and stays an unresolved percentage without one.
+        let no_basis = CalcCtx {
+            pct_basis: None,
+            ..ctx
+        };
+        assert_eq!(
+            match parse_value("calc(100% - 20px)") {
+                Value::Calc(e) => e.eval(&no_basis),
+                _ => panic!("expected Calc"),
+            },
+            None
+        );
+        // Pure-px calc, `*` / `/` by plain numbers, `em`.
+        let px = |s: &str| match parse_value(s) {
+            Value::Calc(e) => e.eval(&ctx),
+            _ => panic!("expected Calc"),
+        };
+        assert_eq!(px("calc(100px + 20px)"), Some(CalcNumber::Px(120.0)));
+        assert_eq!(px("calc(10px * 2)"), Some(CalcNumber::Px(20.0)));
+        assert_eq!(px("calc(2 * 10px)"), Some(CalcNumber::Px(20.0)));
+        assert_eq!(px("calc(100px / 4)"), Some(CalcNumber::Px(25.0)));
+        assert_eq!(px("calc(2em + 8px)"), Some(CalcNumber::Px(40.0)));
+        assert_eq!(px("calc((10px + 5px) * 2)"), Some(CalcNumber::Px(30.0)));
+        // `*` by a length is unparseable → Raw.
+        assert_eq!(
+            parse_value("calc(10px * 2px)"),
+            Value::Raw("calc(10px * 2px)".to_string())
+        );
+        // `clamp()` clamps the value between min and max.
+        let clamp = match parse_value("clamp(10px, 50px, 20px)") {
+            Value::Clamp { min, val, max } => {
+                let lo = min.eval(&ctx).unwrap();
+                let v = val.eval(&ctx).unwrap();
+                let hi = max.eval(&ctx).unwrap();
+                match (lo, v, hi) {
+                    (CalcNumber::Px(a), CalcNumber::Px(b), CalcNumber::Px(c)) => {
+                        b.clamp(a, c)
+                    }
+                    _ => panic!("expected px"),
+                }
+            }
+            _ => panic!("expected Clamp"),
+        };
+        assert_eq!(clamp, 20.0);
+    }
+
+    #[test]
+    fn prefers_color_scheme_media_eval() {
+        let dark = MediaCondition::parse("(prefers-color-scheme: dark)");
+        assert_eq!(dark.eval(800.0, 600.0, Theme::Dark), Some(true));
+        assert_eq!(dark.eval(800.0, 600.0, Theme::Light), Some(false));
+        let light = MediaCondition::parse("(prefers-color-scheme: light)");
+        assert_eq!(light.eval(800.0, 600.0, Theme::Dark), Some(false));
+        assert_eq!(light.eval(800.0, 600.0, Theme::Light), Some(true));
+        // Bare `(prefers-color-scheme)` (no value) is unknown.
+        assert_eq!(
+            MediaCondition::parse("(prefers-color-scheme)").eval(800.0, 600.0, Theme::Dark),
+            None
+        );
+        // Combined with a width feature, both must hold.
+        let combo = MediaCondition::parse(
+            "screen and (max-width: 700px) and (prefers-color-scheme: dark)",
+        );
+        assert_eq!(combo.eval(600.0, 800.0, Theme::Dark), Some(true));
+        assert_eq!(combo.eval(600.0, 800.0, Theme::Light), Some(false));
+        assert_eq!(combo.eval(800.0, 800.0, Theme::Dark), Some(false));
     }
 
     // ---- R7: UA stylesheet ----

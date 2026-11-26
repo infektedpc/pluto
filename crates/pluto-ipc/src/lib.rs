@@ -48,7 +48,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pluto_paint::ResourceTable;
+use pluto_paint::{CompositedUpdate, ResourceTable};
 use serde::{Deserialize, Serialize};
 
 /// The transport layer: in-process channels and cross-process Unix
@@ -58,7 +58,20 @@ pub mod transport;
 /// The protocol version every encoded message carries. Bump on any
 /// breaking change to the enums below.
 ///
-/// v5 (Stage 11, M3) adds three renderer messages, appended at
+/// v9 (Stage 14 Phase 3, M6 Rec 12) adds one browser message,
+/// appended at the end so existing variants keep their postcard
+/// discriminants: [`BrowserToRenderer::SetTheme`] (the OS / desktop
+/// theme changed — the worker restyles, never refetches). The bump
+/// is the shape change; v8 bytes are rejected by
+/// [`decode_message`].
+///
+/// v8 (Stage 14, M6) adds one renderer message, appended at the
+/// end so existing variants keep their postcard discriminants:
+/// [`RendererToBrowser::CompositingUpdate`] (the changed
+/// transform/opacity state of a few elements, out-of-band — a
+/// transform-only frame never rebuilds or resubmits the display
+/// list). The bump is the shape change; v7 bytes are rejected by
+/// [`decode_message`]. v5 (Stage 11, M3) adds three renderer messages, appended at
 /// the end so existing variants keep their postcard discriminants:
 /// [`RendererToBrowser::ResourceReady`] (one decoded resource per
 /// frame, out-of-band — see the module docs), `LoadProgress`
@@ -76,7 +89,7 @@ pub mod transport;
 /// `SetFocused` and `ScrollViewport`. v2 bytes are rejected by
 /// [`decode_message`] — Pluto ships one binary, so a bump is a
 /// clean break, not a migration.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// What went wrong decoding a versioned message.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -147,6 +160,11 @@ pub enum BrowserToRenderer {
     /// loses focus). Same single-window signal as `SetVisible` in
     /// practice — the shell sends both on focus change.
     SetFocused { focused: bool },
+    /// The OS / desktop theme changed (M6 Phase 3, Rec 12, v9):
+    /// the worker restyles against the new theme (a full rebuild
+    /// — never a refetch). Appended at the end so existing variants
+    /// keep their postcard discriminants.
+    SetTheme { dark: bool },
 }
 
 /// Messages from the renderer worker to the browser (shell).
@@ -249,6 +267,22 @@ pub enum RendererToBrowser {
     /// browser-side watchdog can tell a hung renderer (no
     /// heartbeat, no progress) from a merely slow one.
     Heartbeat,
+    /// A transform/opacity-only change (M6, Stage 14 Rec 9):
+    /// the new compositing state of the elements whose transform
+    /// or opacity changed — and their descendants, whose page
+    /// transforms move with them — keyed by the same ids the
+    /// display list's `PushTransform`/`PushOpacity` items carry.
+    /// Out-of-band like `ResourceReady`: the message carries
+    /// only the changed elements, never a rebuilt list, so a
+    /// transform-only frame costs a few dozen bytes per element
+    /// and stays far under the 64 MiB frame cap. The shell
+    /// patches its active list in place (and only when `epoch`
+    /// matches the active list's epoch — a pending newer list
+    /// already carries the new values).
+    CompositingUpdate {
+        epoch: u64,
+        updates: Vec<CompositedUpdate>,
+    },
 }
 
 /// A resource ask, frozen as v1 in Stage 5. This is the payload of
@@ -745,23 +779,58 @@ mod tests {
     use super::*;
     use pluto_css::Stylesheet;
     use pluto_html::parse as parse_html;
-    use pluto_layout::LayoutTree;
+    use pluto_layout::{LayoutTree, Theme};
     use pluto_paint::{DisplayItem, DisplayList, Resource, ResourceId};
 
     fn example_list() -> DisplayList {
         let html = "<html><head><style>body { background-color: #f0f0f2; }</style></head><body><p>Hello</p></body></html>";
         let dom = parse_html(html);
         let sheet = Stylesheet::parse("body { background-color: #f0f0f2; }");
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         DisplayList::build(&tree)
     }
 
     #[test]
-    fn protocol_version_is_seven() {
+    fn protocol_version_is_nine() {
         // Bumped 5 -> 6 (Stage 13: ResourceRequest.body for form
-        // POSTs) and 6 -> 7 (Stage 13 Rec 12: SandboxReport +
-        // Heartbeat).
-        assert_eq!(PROTOCOL_VERSION, 7);
+        // POSTs), 6 -> 7 (Stage 13 Rec 12: SandboxReport +
+        // Heartbeat), 7 -> 8 (Stage 14 Rec 9: CompositingUpdate),
+        // and 8 -> 9 (Stage 14 Phase 3, Rec 12: SetTheme).
+        assert_eq!(PROTOCOL_VERSION, 9);
+    }
+
+    #[test]
+    fn compositing_update_round_trips_through_versioned_bytes() {
+        // M6 Stage 14 (Rec 9): the out-of-band compositing
+        // update survives the versioned envelope, including an
+        // empty update list (a no-op frame) and several elements.
+        use pluto_css::Affine;
+        let msg = RendererToBrowser::CompositingUpdate {
+            epoch: 42,
+            updates: vec![
+                CompositedUpdate {
+                    id: 7,
+                    matrix: Affine::translate(30.0, 0.0),
+                    opacity: 1.0,
+                },
+                CompositedUpdate {
+                    id: 9,
+                    matrix: Affine::rotate(45.0),
+                    opacity: 0.5,
+                },
+            ],
+        };
+        let bytes = encode_message(&msg);
+        let back: RendererToBrowser =
+            decode_message(&bytes).expect("message decodes");
+        assert_eq!(back, msg);
+        let empty = RendererToBrowser::CompositingUpdate {
+            epoch: 43,
+            updates: vec![],
+        };
+        let back: RendererToBrowser =
+            decode_message(&encode_message(&empty)).expect("empty update decodes");
+        assert_eq!(back, empty);
     }
 
     #[test]

@@ -83,7 +83,7 @@ use pluto_ipc::{
     CredentialsMode, Destination, Priority, RequestMode, ResourceRequest, origin_of,
 };
 use pluto_js::ModuleSources;
-use pluto_layout::{ElementState, LayoutTree};
+use pluto_layout::{ElementState, LayoutTree, Theme};
 use pluto_net::ResourceLoader;
 use pluto_paint::DisplayList;
 use std::collections::{HashMap, HashSet};
@@ -365,6 +365,30 @@ fn subresource_request(
         // Stage 13 Rec 6: subresources never carry a body.
         body: None,
     }
+}
+
+/// A `@font-face` fetch request (M6 Phase 3, Rec 12): the same
+/// loader, the same Stage 9 gates (CSP / referrer / HTTPS-only /
+/// caps) as any other subresource — `Destination::Font`, low
+/// priority, `NoCors` / `SameOrigin` like the other
+/// [`subresource_request`] callers. Fonts are never fetched any
+/// other way.
+pub fn font_resource_request(
+    url: &str,
+    base_url: &str,
+    tab_id: u64,
+    epoch: u64,
+) -> ResourceRequest {
+    subresource_request(
+        url,
+        Destination::Font,
+        Priority::Low,
+        base_url,
+        false,
+        None,
+        tab_id,
+        epoch,
+    )
 }
 
 fn map_html_destination(d: HtmlDestination) -> Destination {
@@ -1439,7 +1463,7 @@ pub fn layout_document_with_state(
     viewport: (f32, f32),
     state: &ElementState,
 ) -> (Arc<DisplayList>, LayoutTree) {
-    match LayoutTree::build_with_state(&doc.dom, &doc.sheet, viewport.0, viewport.1, state) {
+    match LayoutTree::build_with_state(&doc.dom, &doc.sheet, viewport.0, viewport.1, state, Theme::Light) {
         Ok(tree) => (Arc::new(DisplayList::build(&tree)), tree),
         Err(e) => {
             let err_doc = parse_document(&error_document(
@@ -1452,6 +1476,7 @@ pub fn layout_document_with_state(
                 viewport.0,
                 viewport.1,
                 state,
+                Theme::Light,
             )
             .unwrap_or_default();
             (Arc::new(DisplayList::build(&tree)), tree)

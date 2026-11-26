@@ -34,7 +34,7 @@ use crate::bindings::{
     format_console_arg, js, js_null, map_delete, map_get, map_set, registry, registry_map,
     throw_dom, throw_host_error, throw_named, throw_type_error, to_dom_string, wrapper_id_of,
 };
-use crate::host::{DomHost, DomKey};
+use crate::host::{AnimateSpec, AnimationInfo, DomHost, DomKey, WaapiOp, WaapiStep};
 
 /// One `URL` / `URLSearchParams` value, by id.
 ///
@@ -61,6 +61,78 @@ pub struct ImageLoadState {
     /// Intrinsic width / height from the decoded image (0 until loaded).
     pub width: u32,
     pub height: u32,
+}
+
+/// Local play-state + clock for one `Animation` object (M6 Phase 3,
+/// Rec 11). The animation engine is the authority for sampled
+/// values; this is only the JS-visible `playState` / `currentTime`
+/// bookkeeping, kept in [`BindingState::animation_locals`].
+#[derive(Debug, Clone)]
+pub struct AnimationLocal {
+    /// `"running"` | `"paused"` | `"finished"` | `"idle"`.
+    pub play_state: String,
+    /// When the animation started (binding-side clock).
+    pub started: Instant,
+    /// Duration in ms (`f32::INFINITY` for infinite / CSS).
+    pub duration_ms: f32,
+    /// When the current pause began (`None` while running).
+    pub paused_at: Option<Instant>,
+    /// Total time spent paused so far.
+    pub paused_total: std::time::Duration,
+    /// True for CSS animations (`currentTime` reads `null`).
+    pub is_css: bool,
+}
+
+impl AnimationLocal {
+    /// `currentTime` in ms, or `None` for CSS / idle animations.
+    /// Clamped to `[0, duration]` for finite durations.
+    pub fn current_time_ms(&self) -> Option<f64> {
+        if self.is_css || self.play_state == "idle" {
+            return None;
+        }
+        let end = self.paused_at.unwrap_or_else(Instant::now);
+        let elapsed = end
+            .duration_since(self.started)
+            .saturating_sub(self.paused_total);
+        let ms = elapsed.as_secs_f64() * 1000.0;
+        if self.duration_ms.is_finite() {
+            Some(ms.min(self.duration_ms as f64))
+        } else {
+            Some(ms)
+        }
+    }
+}
+
+/// `camelCase` → `kebab-case` (JS keyframe / style property names
+/// arrive camelCased; the CSS side wants kebab-case).
+fn camel_to_kebab(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for c in name.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('-');
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `kebab-case` → `camelCase` (for `getComputedStyle` aliases).
+fn kebab_to_camel(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut upper = false;
+    for c in name.chars() {
+        if c == '-' {
+            upper = true;
+        } else if upper {
+            out.push(c.to_ascii_uppercase());
+            upper = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// The host document for a binding call, or a `TypeError`-style
@@ -605,6 +677,378 @@ fn dataset_attr_from_key(prop: &str) -> String {
     out
 }
 
+// ---------------------------------------------------------------- Animations
+//
+// M6 Phase 3 (Rec 11): `Element.animate` / `getAnimations` /
+// `window.getComputedStyle`. Only the array-of-objects keyframe
+// form is supported (the property-indexed form throws
+// `TypeError`); per-step `easing` / `composite` are ignored.
+// The host owns the ids and the engine; the binding owns the
+// JS-visible `Animation` objects (identity via the registry's
+// `animations` Map) and their local `playState` / `currentTime`.
+
+/// Parse a duration value: a number (ms) or a `"1s"` / `"500ms"` string.
+fn parse_duration_ms(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Result<f32> {
+    if let Some(n) = value.as_number() {
+        return Ok(n as f32);
+    }
+    if let Some(s) = value.as_string() {
+        let text = s.to_string().map_err(|e| {
+            rquickjs::Error::new_from_js_message("TypeError", "duration", e.to_string())
+        })?;
+        let text = text.trim();
+        if let Some(ms) = text.strip_suffix("ms") {
+            return ms
+                .trim()
+                .parse::<f32>()
+                .map_err(|_| throw_type_error(ctx, "invalid duration"));
+        }
+        if let Some(sec) = text.strip_suffix('s') {
+            return sec
+                .trim()
+                .parse::<f32>()
+                .map(|v| v * 1000.0)
+                .map_err(|_| throw_type_error(ctx, "invalid duration"));
+        }
+    }
+    Err(throw_type_error(ctx, "invalid duration"))
+}
+
+/// Parse `Element.animate` keyframes (array of objects) into
+/// (offset, declarations) steps. Missing offsets are distributed
+/// linearly between the surrounding explicit ones (0 at the start,
+/// 1 at the end), per the Web Animations spec.
+fn parse_keyframes(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Result<Vec<WaapiStep>> {
+    let Some(arr) = value.as_object() else {
+        return Err(throw_type_error(ctx, "keyframes must be an array of objects"));
+    };
+    let len: u32 = arr
+        .get("length")
+        .map_err(|_| throw_type_error(ctx, "keyframes must be an array of objects"))?;
+    let mut steps: Vec<(Option<f32>, Vec<(String, String)>)> = Vec::new();
+    for i in 0..len {
+        let item: Value = arr
+            .get(i.to_string())
+            .map_err(|_| throw_type_error(ctx, "keyframes must be an array of objects"))?;
+        let Some(step_obj) = item.as_object() else {
+            return Err(throw_type_error(ctx, "each keyframe must be an object"));
+        };
+        let offset: Option<f64> = step_obj.get("offset")?;
+        let mut decls = Vec::new();
+        for key in step_obj.keys::<String>().flatten() {
+            if key == "offset" || key == "easing" || key == "composite" {
+                continue;
+            }
+            let v: Coerced<String> = step_obj.get(key.as_str())?;
+            decls.push((camel_to_kebab(&key), v.to_string()));
+        }
+        steps.push((offset.map(|o| o as f32), decls));
+    }
+    if steps.is_empty() {
+        return Err(throw_type_error(ctx, "no keyframes"));
+    }
+    // Distribute missing offsets.
+    let n = steps.len();
+    let mut filled: Vec<f32> = vec![0.0; n];
+    let mut prev_idx: Option<usize> = None;
+    for i in 0..n {
+        if let Some(o) = steps[i].0 {
+            filled[i] = o.clamp(0.0, 1.0);
+            if let Some(p) = prev_idx {
+                // Fill the gap between p and i linearly.
+                let gap = i - p;
+                let start = filled[p];
+                let end = filled[i];
+                for j in (p + 1)..i {
+                    filled[j] = start + (end - start) * ((j - p) as f32 / gap as f32);
+                }
+            }
+            prev_idx = Some(i);
+        }
+    }
+    match prev_idx {
+        None => {
+            // No explicit offset at all: spread evenly (a single
+            // step sits at 0 — the engine holds it for the duration).
+            for i in 0..n {
+                filled[i] = if n == 1 { 0.0 } else { i as f32 / (n - 1) as f32 };
+            }
+        }
+        Some(last) => {
+            for i in 0..last {
+                if steps[i].0.is_none() && i == 0 {
+                    filled[i] = 0.0;
+                }
+            }
+            for i in (last + 1)..n {
+                filled[i] = 1.0;
+            }
+        }
+    }
+    Ok(steps
+        .into_iter()
+        .enumerate()
+        .map(|(i, (_, decls))| (filled[i], decls))
+        .collect())
+}
+
+/// Parse the `Element.animate` options argument: a number (duration
+/// in ms) or an object. Defaults: duration 0, delay 0, easing
+/// `"linear"`, iterations 1, direction `"normal"`, fill `"none"`.
+fn parse_animate_options(
+    ctx: &Ctx<'_>,
+    value: &Option<Value<'_>>,
+) -> rquickjs::Result<AnimateSpec> {
+    let mut spec = AnimateSpec {
+        steps: Vec::new(),
+        duration_ms: 0.0,
+        delay_ms: 0.0,
+        easing: "linear".to_string(),
+        iterations: Some(1.0),
+        direction: "normal".to_string(),
+        fill: "none".to_string(),
+    };
+    let Some(value) = value else {
+        return Ok(spec);
+    };
+    if value.is_number() {
+        spec.duration_ms = parse_duration_ms(ctx, value)?;
+        return Ok(spec);
+    }
+    let Some(obj) = value.as_object() else {
+        return Err(throw_type_error(ctx, "animate options must be a number or an object"));
+    };
+    if let Ok(v) = obj.get::<_, Value>("duration") {
+        if !v.is_undefined() && !v.is_null() {
+            spec.duration_ms = parse_duration_ms(ctx, &v)?;
+        }
+    }
+    if let Ok(v) = obj.get::<_, Value>("delay") {
+        if !v.is_undefined() && !v.is_null() {
+            spec.delay_ms = parse_duration_ms(ctx, &v)?;
+        }
+    }
+    if let Ok(s) = obj.get::<_, String>("easing") {
+        spec.easing = s;
+    }
+    if let Ok(v) = obj.get::<_, Value>("iterations") {
+        if !v.is_undefined() && !v.is_null() {
+            if let Some(n) = v.as_number() {
+                spec.iterations = if n.is_infinite() { None } else { Some(n as f32) };
+            }
+        }
+    }
+    if let Ok(s) = obj.get::<_, String>("direction") {
+        spec.direction = s;
+    }
+    if let Ok(s) = obj.get::<_, String>("fill") {
+        spec.fill = s;
+    }
+    Ok(spec)
+}
+
+/// Get-or-create the JS `Animation` object for a running animation,
+/// with its `playState` / `currentTime` getters and the
+/// pause/play/cancel/finish methods. `anim_id` is `Some` for WAAPI
+/// (host id) and `None` for CSS (identified by `name`).
+#[allow(clippy::too_many_arguments)]
+fn animation_object<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    key: DomKey,
+    anim_id: Option<u64>,
+    name: Option<String>,
+    reg_id: u64,
+    is_css: bool,
+    duration_ms: f32,
+) -> rquickjs::Result<Object<'js>> {
+    let animations = registry_map(ctx, "animations")?;
+    if let Ok(existing) = map_get(ctx, &animations, reg_id) {
+        if let Some(obj) = existing.as_object() {
+            return Ok(obj.clone());
+        }
+    }
+    let obj = Object::new(ctx.clone())?;
+
+    // playState (live from the local bookkeeping).
+    let b = Rc::clone(bindings);
+    let get_state = move |ctx: Ctx<'js>, This(_this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+        let state = b
+            .borrow()
+            .animation_locals
+            .get(&reg_id)
+            .map(|l| l.play_state.clone())
+            .unwrap_or_else(|| "idle".to_string());
+        Ok(js(&ctx, state))
+    };
+    obj.prop("playState", Accessor::from(get_state))?;
+
+    // currentTime (ms since start, less paused time; null for CSS).
+    let b = Rc::clone(bindings);
+    let get_time = move |ctx: Ctx<'js>, This(_this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+        let ms = b
+            .borrow()
+            .animation_locals
+            .get(&reg_id)
+            .and_then(|l| l.current_time_ms());
+        Ok(match ms {
+            Some(v) => js(&ctx, v),
+            None => js_null(&ctx),
+        })
+    };
+    obj.prop("currentTime", Accessor::from(get_time))?;
+
+    // pause / play / cancel / finish — each forwards to the host
+    // (which queues it for the tab thread's engine) and updates
+    // the local state so the getters move at once.
+    for (method, op) in [
+        ("pause", WaapiOp::Pause),
+        ("play", WaapiOp::Play),
+        ("cancel", WaapiOp::Cancel),
+        ("finish", WaapiOp::Finish),
+    ] {
+        let b = Rc::clone(bindings);
+        let name2 = name.clone();
+        let f = Function::new(
+            ctx.clone(),
+            move |_ctx: Ctx<'js>, This(_this): This<Object<'js>>| -> rquickjs::Result<()> {
+                let host = match host_of(&b) {
+                    Ok(h) => h,
+                    Err(_) => return Ok(()),
+                };
+                if let Some(id) = anim_id {
+                    host.borrow_mut().waapi_control(key, id, op);
+                } else if let Some(n) = &name2 {
+                    host.borrow_mut().css_animation_control(key, n, op);
+                }
+                let now = Instant::now();
+                let mut state = b.borrow_mut();
+                match op {
+                    WaapiOp::Pause => {
+                        if let Some(l) = state.animation_locals.get_mut(&reg_id) {
+                            if l.play_state == "running" {
+                                l.play_state = "paused".to_string();
+                                l.paused_at = Some(now);
+                            }
+                        }
+                    }
+                    WaapiOp::Play => {
+                        if let Some(l) = state.animation_locals.get_mut(&reg_id) {
+                            if l.play_state == "paused" {
+                                if let Some(p) = l.paused_at.take() {
+                                    l.paused_total += now.duration_since(p);
+                                }
+                                l.play_state = "running".to_string();
+                            }
+                        }
+                        // A finished WAAPI animation is gone from
+                        // the engine, so `play()` restarts it with
+                        // the same spec (a fresh host id; the
+                        // object keeps its identity). A finished
+                        // CSS animation has no spec to replay with
+                        // — `play()` leaves it finished.
+                        if anim_id.is_some() {
+                            let finished = state
+                                .animation_locals
+                                .get(&reg_id)
+                                .map(|l| l.play_state == "finished")
+                                .unwrap_or(false);
+                            if finished {
+                                if let Some(spec) = state.animation_specs.get(&reg_id).cloned() {
+                                    drop(state);
+                                    let new_id =
+                                        host.borrow_mut().request_animate(key, spec);
+                                    let mut state = b.borrow_mut();
+                                    if let Some(new_id) = new_id {
+                                        if let Some(old) = anim_id {
+                                            state.animation_objects.remove(&(key, old));
+                                        }
+                                        state.animation_objects.insert((key, new_id), reg_id);
+                                        if let Some(l) =
+                                            state.animation_locals.get_mut(&reg_id)
+                                        {
+                                            l.play_state = "running".to_string();
+                                            l.started = Instant::now();
+                                            l.paused_at = None;
+                                            l.paused_total = std::time::Duration::ZERO;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    WaapiOp::Cancel => {
+                        if let Some(l) = state.animation_locals.get_mut(&reg_id) {
+                            l.play_state = "idle".to_string();
+                        }
+                        if let Some(id) = anim_id {
+                            state.animation_objects.remove(&(key, id));
+                            state.animation_tombstones.insert((key, id));
+                        } else if let Some(n) = &name2 {
+                            state.css_animation_objects.remove(&(key, n.clone()));
+                        }
+                    }
+                    WaapiOp::Finish => {
+                        if let Some(l) = state.animation_locals.get_mut(&reg_id) {
+                            l.play_state = "finished".to_string();
+                            l.paused_at = None;
+                        }
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        def_method(ctx, &obj, method, f).map_err(|e| {
+            rquickjs::Error::new_from_js_message("TypeError", "Animation", e)
+        })?;
+    }
+
+    let _ = (is_css, duration_ms);
+    map_set(ctx, &animations, reg_id, Value::from(obj.clone()))?;
+    Ok(obj)
+}
+
+/// Create the `Animation` object for a freshly started animation
+/// (WAAPI or CSS) and record its local state.
+fn new_animation_object<'js>(
+    ctx: &Ctx<'js>,
+    bindings: &Rc<RefCell<BindingState>>,
+    key: DomKey,
+    anim_id: Option<u64>,
+    name: Option<String>,
+    is_css: bool,
+    duration_ms: f32,
+    spec: Option<AnimateSpec>,
+    initial_play_state: Option<&str>,
+) -> rquickjs::Result<Object<'js>> {
+    let reg_id = {
+        let mut state = bindings.borrow_mut();
+        let id = state.next_animation_id;
+        state.next_animation_id += 1;
+        state.animation_locals.insert(
+            id,
+            AnimationLocal {
+                play_state: initial_play_state.unwrap_or("running").to_string(),
+                started: Instant::now(),
+                duration_ms,
+                paused_at: None,
+                paused_total: std::time::Duration::ZERO,
+                is_css,
+            },
+        );
+        if let Some(aid) = anim_id {
+            state.animation_objects.insert((key, aid), id);
+        } else if let Some(n) = &name {
+            state.css_animation_objects.insert((key, n.clone()), id);
+        }
+        if let Some(spec) = spec {
+            state.animation_specs.insert(id, spec);
+        }
+        id
+    };
+    animation_object(ctx, bindings, key, anim_id, name, reg_id, is_css, duration_ms)
+}
+
 fn install_element_methods<'js>(
     ctx: &Ctx<'js>,
     bindings: &Rc<RefCell<BindingState>>,
@@ -1029,6 +1473,117 @@ fn install_element_methods<'js>(
 
     // Form element APIs + validation + FormData (Stage 13 Rec 5/7/8).
     crate::bindings::forms::install_form_methods(ctx, bindings, element)?;
+
+    // Web Animations API (M6 Phase 3, Rec 11): `Element.animate`
+    // queues the animation with the host (the tab thread starts it
+    // in the engine on the next tick) and returns an `Animation`
+    // object; `getAnimations` returns the running animations for
+    // this element (WAAPI by id, CSS by name).
+    let b = Rc::clone(bindings);
+    let animate = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>,
+              This(this): This<Object<'js>>,
+              keyframes: Value<'js>,
+              options: Opt<Value<'js>>|
+              -> rquickjs::Result<Value<'js>> {
+            let key = dom_key_of_this(&ctx, &b, &this)?;
+            let host = host_of(&b).map_err(|e| throw_type_error(&ctx, &e))?;
+            if !host.borrow().validate(key) {
+                return Err(throw_type_error(&ctx, "the element is no longer in the document"));
+            }
+            let steps = parse_keyframes(&ctx, &keyframes)?;
+            let mut spec = parse_animate_options(&ctx, &options.0)?;
+            spec.steps = steps;
+            let duration_ms = spec.duration_ms;
+            let anim_id = host.borrow_mut().request_animate(key, spec.clone());
+            let obj = match anim_id {
+                Some(id) => new_animation_object(
+                    &ctx, &b, key, Some(id), None, false, duration_ms, Some(spec), None,
+                )?,
+                // No host: a stillborn Animation whose playState
+                // is "idle" (it never runs anywhere).
+                None => new_animation_object(
+                    &ctx, &b, key, None, None, false, duration_ms, Some(spec), Some("idle"),
+                )?,
+            };
+            Ok(Value::from(obj))
+        },
+    )
+    .map_err(|e| format!("animate: {e}"))?;
+    def_method(ctx, element, "animate", animate)?;
+
+    let b = Rc::clone(bindings);
+    let get_anims = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+            let key = dom_key_of_this(&ctx, &b, &this)?;
+            let host = match host_of(&b) {
+                Ok(h) => h,
+                Err(_) => return Ok(Value::from(Array::new(ctx.clone())?)),
+            };
+            let infos: Vec<AnimationInfo> = host.borrow().get_animations(key);
+            let arr = Array::new(ctx.clone())?;
+            let mut i = 0usize;
+            for info in infos {
+                // A cancelled WAAPI animation stays reported by
+                // the host until the tab thread drains the cancel
+                // — the tombstone keeps `getAnimations` from
+                // resurrecting it in between.
+                if let Some(id) = info.id {
+                    if b.borrow().animation_tombstones.contains(&(key, id)) {
+                        continue;
+                    }
+                }
+                let obj = match (info.id, info.name) {
+                    (Some(id), _) => {
+                        let reg_id = b.borrow().animation_objects.get(&(key, id)).copied();
+                        match reg_id {
+                            Some(reg_id) => {
+                                // Refresh the local playState from
+                                // the host's finished flag.
+                                if info.finished {
+                                    if let Some(l) =
+                                        b.borrow_mut().animation_locals.get_mut(&reg_id)
+                                    {
+                                        l.play_state = "finished".to_string();
+                                    }
+                                }
+                                animation_object(
+                                    &ctx, &b, key, Some(id), None, reg_id, false, f32::INFINITY,
+                                )?
+                            }
+                            None => new_animation_object(
+                                &ctx, &b, key, Some(id), None, false, f32::INFINITY, None, None,
+                            )?,
+                        }
+                    }
+                    (None, Some(name)) => {
+                        let reg_id = b
+                            .borrow()
+                            .css_animation_objects
+                            .get(&(key, name.clone()))
+                            .copied();
+                        match reg_id {
+                            Some(reg_id) => animation_object(
+                                &ctx, &b, key, None, Some(name), reg_id, true, f32::INFINITY,
+                            )?,
+                            None => new_animation_object(
+                                &ctx, &b, key, None, Some(name), true, f32::INFINITY, None, None,
+                            )?,
+                        }
+                    }
+                    (None, None) => continue,
+                };
+                arr.set(i, Value::from(obj))?;
+                i += 1;
+            }
+            Ok(Value::from(arr))
+        },
+    )
+    .map_err(|e| format!("getAnimations: {e}"))?;
+    def_method(ctx, element, "getAnimations", get_anims)?;
+
     Ok(())
 }
 
@@ -2207,6 +2762,53 @@ pub fn install_window<'js>(
         .map_err(|e| format!("install onerror: {e}"))?;
 
     install_location(ctx, bindings).map_err(|e| format!("install location: {e}"))?;
+
+    // `window.getComputedStyle` (M6 Phase 3, Rec 11): a read-only
+    // snapshot object whose own properties are the host's cached
+    // computed values (animatable properties the engine has
+    // sampled — see `DomHost::computed_styles`), under both the
+    // CSS name (`background-color`) and its camelCase alias
+    // (`backgroundColor`), plus `getPropertyValue(name)`. The
+    // pseudo-element argument is accepted and ignored (v1: no
+    // pseudo-element styles). A non-element argument throws
+    // `TypeError`, per WebIDL.
+    let b = Rc::clone(bindings);
+    let gcs = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, el: Value<'js>, _pseudo: Opt<Value<'js>>| -> rquickjs::Result<Value<'js>> {
+            let key = node_arg(&ctx, &b, &el)?;
+            let host = host_of(&b).map_err(|e| throw_type_error(&ctx, &e))?;
+            let pairs = host.borrow().computed_styles(key);
+            let obj = Object::new(ctx.clone())?;
+            for (name, value) in &pairs {
+                obj.set(name.as_str(), value.as_str())?;
+                let camel = kebab_to_camel(name);
+                if camel != *name {
+                    obj.set(camel.as_str(), value.as_str())?;
+                }
+            }
+            let b2 = Rc::clone(&b);
+            let get_prop = Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, This(_this): This<Object<'js>>, name: Coerced<String>| -> rquickjs::Result<Value<'js>> {
+                    let host = match host_of(&b2) {
+                        Ok(h) => h,
+                        Err(_) => return Ok(js(&ctx, "")),
+                    };
+                    Ok(match host.borrow().computed_style(key, &name.to_ascii_lowercase()) {
+                        Some(v) => js(&ctx, v),
+                        None => js(&ctx, ""),
+                    })
+                },
+            )?;
+            obj.set("getPropertyValue", get_prop)?;
+            Ok(Value::from(obj))
+        },
+    )
+    .map_err(|e| format!("install getComputedStyle: {e}"))?;
+    globals
+        .set("getComputedStyle", gcs)
+        .map_err(|e| format!("install getComputedStyle: {e}"))?;
 
     // `window` is an EventTarget: the same three methods live on the
     // global object (its prototype chain does not include

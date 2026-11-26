@@ -34,7 +34,7 @@
 //! that carries no canvas or damage leaves the previous maximum
 //! in place.
 
-use pluto_paint::{perf, DisplayItem, DisplayList, ResourceTable};
+use pluto_paint::{CompositedUpdate, DisplayItem, DisplayList, ResourceTable, perf};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
@@ -234,6 +234,37 @@ impl Compositor {
         self.active.borrow().epoch
     }
 
+    /// Patch a display list in place with a compositing update
+    /// (M6 Phase 2, Rec 9): a transform/opacity-only change
+    /// moves items without a new list. The update targets the
+    /// list the worker last submitted — the pending one when it
+    /// has not activated yet, else the active one. A pending
+    /// list NEWER than the update already carries the new values
+    /// (it was built after the update was produced), so the
+    /// update is stale then; so is an update for any other
+    /// epoch. `Arc::make_mut` clones the list only when an
+    /// in-flight frame still holds it. Returns how many items
+    /// were patched.
+    pub fn apply_compositing_update(&self, epoch: u64, updates: &[CompositedUpdate]) -> usize {
+        if let Some(pending) = self.pending.borrow_mut().as_mut() {
+            if pending.epoch == epoch {
+                return Arc::make_mut(&mut pending.display)
+                    .apply_compositing_update(updates);
+            }
+            if pending.epoch > epoch {
+                return 0;
+            }
+            // A pending list OLDER than the update: the update's
+            // list superseded it, so it must be the active one —
+            // fall through to the active check below.
+        }
+        if epoch != self.active.borrow().epoch {
+            return 0;
+        }
+        let mut active = self.active.borrow_mut();
+        Arc::make_mut(&mut active.display).apply_compositing_update(updates)
+    }
+
     /// Current scroll offset, in page pixels.
     pub fn scroll(&self) -> (f32, f32) {
         self.scroll.get()
@@ -317,6 +348,136 @@ mod tests {
             color: [1.0; 4],
         });
         Arc::new(list)
+    }
+
+    #[test]
+    fn compositing_update_patches_the_active_list_only_at_its_epoch() {
+        // M6 Phase 2 (Rec 9): the shell patches the active list
+        // in place — no new submit, no activation — and only
+        // when the update's epoch is the active list's epoch. A
+        // stale epoch (an older update, or one for a pending
+        // newer list that already carries the new values)
+        // patches nothing.
+        use pluto_css::Affine;
+        let holder = Compositor::new();
+        let mut list = DisplayList::new();
+        list.push(DisplayItem::FillRect {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 600.0,
+            color: [1.0; 4],
+        });
+        list.push(DisplayItem::PushTransform {
+            id: 7,
+            matrix: Affine::translate(10.0, 0.0),
+        });
+        list.push(DisplayItem::FillRect {
+            x: 10.0,
+            y: 10.0,
+            width: 100.0,
+            height: 100.0,
+            color: [1.0, 0.0, 0.0, 1.0],
+        });
+        list.push(DisplayItem::PopTransform);
+        assert!(holder.submit(1, Arc::new(list), Arc::new(ResourceTable::new())));
+        // Reading the holder IS the boundary: the pending list
+        // activates and becomes the active list.
+        let _ = holder.display();
+        assert_eq!(holder.epoch(), 1);
+        // A stale epoch patches nothing.
+        assert_eq!(
+            holder.apply_compositing_update(
+                0,
+                &[CompositedUpdate {
+                    id: 7,
+                    matrix: Affine::translate(30.0, 0.0),
+                    opacity: 1.0,
+                }]
+            ),
+            0
+        );
+        // The active epoch patches the transform in place.
+        assert_eq!(
+            holder.apply_compositing_update(
+                1,
+                &[CompositedUpdate {
+                    id: 7,
+                    matrix: Affine::translate(30.0, 0.0),
+                    opacity: 1.0,
+                }]
+            ),
+            1
+        );
+        let patched = holder.display();
+        match patched
+            .0
+            .iter()
+            .find(|i| matches!(i, DisplayItem::PushTransform { .. }))
+        {
+            Some(DisplayItem::PushTransform { matrix, .. }) => {
+                assert_eq!(*matrix, Affine::translate(30.0, 0.0));
+            }
+            other => panic!("expected a patched PushTransform, got {other:?}"),
+        }
+        // A newer pending list makes the same update stale: the
+        // pending list already carries the new values.
+        assert!(holder.submit(2, list_with_canvas(800.0, 600.0), Arc::new(ResourceTable::new())));
+        assert_eq!(
+            holder.apply_compositing_update(
+                1,
+                &[CompositedUpdate {
+                    id: 7,
+                    matrix: Affine::translate(50.0, 0.0),
+                    opacity: 1.0,
+                }]
+            ),
+            0,
+            "epoch 1 is stale once epoch 2 is pending"
+        );
+        // But an update for the pending list itself patches it
+        // in place — the list activates with the new values.
+        // (A transform-only tick can land while the list it
+        // targets is still pending; skipping it would lose the
+        // transform until the next full rebuild.)
+        let holder = Compositor::new();
+        let mut list = DisplayList::new();
+        list.push(DisplayItem::FillRect {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 600.0,
+            color: [1.0; 4],
+        });
+        list.push(DisplayItem::PushTransform {
+            id: 7,
+            matrix: Affine::translate(10.0, 0.0),
+        });
+        list.push(DisplayItem::PopTransform);
+        assert!(holder.submit(1, Arc::new(list), Arc::new(ResourceTable::new())));
+        assert_eq!(
+            holder.apply_compositing_update(
+                1,
+                &[CompositedUpdate {
+                    id: 7,
+                    matrix: Affine::translate(30.0, 0.0),
+                    opacity: 1.0,
+                }]
+            ),
+            1,
+            "the pending list takes the update"
+        );
+        let activated = holder.display();
+        match activated
+            .0
+            .iter()
+            .find(|i| matches!(i, DisplayItem::PushTransform { .. }))
+        {
+            Some(DisplayItem::PushTransform { matrix, .. }) => {
+                assert_eq!(*matrix, Affine::translate(30.0, 0.0));
+            }
+            other => panic!("expected a patched PushTransform, got {other:?}"),
+        }
     }
 
     #[test]

@@ -32,6 +32,7 @@ use pluto_html::{
     resolve_url,
 };
 use pluto_ipc::{Destination, Origin, Priority, RequestMode, ResourceRequest};
+use pluto_js::host::{AnimateSpec, AnimationInfo, WaapiOp};
 use pluto_js::{
     DomHost, DomHostError, DomKey, FetchBackend, FetchCompletion, FetchError, FetchRequest,
     FetchResponse, Geometry, JsError, RealmConfig, ResponseType, TabJs,
@@ -143,6 +144,37 @@ pub struct BrowserDomHost {
     /// 10c). `None` until the tab thread attaches the loader's
     /// jar with `set_cookie_jar`.
     cookie_jar: Option<Arc<std::sync::Mutex<pluto_net::CookieJar>>>,
+    /// Computed-style cache for JS (M6 Phase 3, Rec 11): the tab
+    /// thread merges the actor's `changed_styles` (underlying
+    /// values) and the engine's in-flight samples here, so
+    /// `getComputedStyle` reads current values without a layout
+    /// round trip. Cleared on navigation.
+    computed_styles: std::collections::HashMap<DomKey, Vec<(String, String)>>,
+    /// WAAPI animation ids that finished on an element (M6 Phase
+    /// 3, Rec 11): the tab thread records engine finishes here so
+    /// `getAnimations` can report their `playState`. Cleared on
+    /// navigation.
+    waapi_finished: std::collections::HashSet<(DomKey, u64)>,
+    /// WAAPI animations queued by JS (`Element.animate`): the tab
+    /// thread drains these each tick and starts them in the
+    /// animation engine. `(element, host anim id, spec)`.
+    pending_animate: Vec<(DomKey, u64, AnimateSpec)>,
+    /// WAAPI play-state controls queued by JS (`pause` / `play` /
+    /// `cancel` / `finish` on an `Animation`): drained per tick.
+    pending_waapi_control: Vec<(DomKey, u64, WaapiOp)>,
+    /// CSS-animation play-state controls queued by JS (same ops,
+    /// by animation name): drained per tick.
+    pending_css_control: Vec<(DomKey, String, WaapiOp)>,
+    /// Next WAAPI animation id (host-allocated, monotonic across
+    /// navigations — a stale id can never address a new animation).
+    next_waapi_id: u64,
+    /// WAAPI animations the tab thread has started, by (element,
+    /// id) — the spec is kept so `getAnimations` can report them.
+    waapi_known: std::collections::HashMap<(DomKey, u64), AnimateSpec>,
+    /// CSS animations currently running per element, by name —
+    /// the tab thread refreshes this from the engine (starts on
+    /// `process_animation_outcome`, ends on `animationend`).
+    css_animations: std::collections::HashMap<DomKey, Vec<String>>,
 }
 
 impl BrowserDomHost {
@@ -176,6 +208,14 @@ impl BrowserDomHost {
             pending_focus: None,
             focused: None,
             cookie_jar: None,
+            computed_styles: std::collections::HashMap::new(),
+            waapi_finished: std::collections::HashSet::new(),
+            pending_animate: Vec::new(),
+            pending_waapi_control: Vec::new(),
+            pending_css_control: Vec::new(),
+            next_waapi_id: 1,
+            waapi_known: std::collections::HashMap::new(),
+            css_animations: std::collections::HashMap::new(),
         }
     }
 
@@ -235,6 +275,41 @@ impl BrowserDomHost {
         self.focused = focused;
     }
 
+    /// Merge computed-style pairs for one element into the JS
+    /// cache (M6 Phase 3, Rec 11): the tab thread feeds the
+    /// actor's `changed_styles` and the engine's in-flight
+    /// samples here; same-name properties replace, others keep
+    /// their last value.
+    pub fn set_computed_styles(&mut self, id: DomKey, pairs: Vec<(String, String)>) {
+        let entry = self.computed_styles.entry(id).or_default();
+        for (prop, value) in pairs {
+            if let Some((_, old)) = entry.iter_mut().find(|(p, _)| *p == prop) {
+                *old = value;
+            } else {
+                entry.push((prop, value));
+            }
+        }
+    }
+
+    /// Drop the whole computed-style cache + WAAPI finish records
+    /// (navigation boundary).
+    pub fn clear_computed_style_cache(&mut self) {
+        self.computed_styles.clear();
+        self.waapi_finished.clear();
+    }
+
+    /// Record that a WAAPI animation finished on an element (the
+    /// tab thread calls this from the engine outcome, so
+    /// `getAnimations` can report `finished`).
+    pub fn mark_waapi_finished(&mut self, id: DomKey, anim_id: u64) {
+        self.waapi_finished.insert((id, anim_id));
+    }
+
+    /// Whether a WAAPI animation on an element has finished.
+    pub fn waapi_is_finished(&self, id: DomKey, anim_id: u64) -> bool {
+        self.waapi_finished.contains(&(id, anim_id))
+    }
+
     /// Take the pending JS navigation request, if any (last
     /// request wins; see the field docs).
     pub fn take_pending_navigation(&mut self) -> Option<(String, bool)> {
@@ -244,6 +319,66 @@ impl BrowserDomHost {
     /// Take the pending JS image requests, if any.
     pub fn take_pending_images(&mut self) -> Vec<crate::images::ImageRequest> {
         std::mem::take(&mut self.pending_images)
+    }
+
+    /// Take the pending WAAPI animation starts, if any (M6 Phase
+    /// 3, Rec 11): `(element, host anim id, spec)`.
+    pub fn take_pending_animate(&mut self) -> Vec<(DomKey, u64, AnimateSpec)> {
+        std::mem::take(&mut self.pending_animate)
+    }
+
+    /// Take the pending WAAPI play-state controls, if any.
+    pub fn take_pending_waapi_control(&mut self) -> Vec<(DomKey, u64, WaapiOp)> {
+        std::mem::take(&mut self.pending_waapi_control)
+    }
+
+    /// Take the pending CSS-animation play-state controls, if any.
+    pub fn take_pending_css_control(&mut self) -> Vec<(DomKey, String, WaapiOp)> {
+        std::mem::take(&mut self.pending_css_control)
+    }
+
+    /// Record that the tab thread started a WAAPI animation (so
+    /// `getAnimations` reports it from then on).
+    pub fn note_waapi_started(&mut self, id: DomKey, anim_id: u64, spec: AnimateSpec) {
+        self.waapi_known.insert((id, anim_id), spec);
+    }
+
+    /// Record that a CSS animation started on an element (called
+    /// from `process_animation_outcome` for each pending animation).
+    pub fn note_css_animation_started(&mut self, id: DomKey, name: String) {
+        let names = self.css_animations.entry(id).or_default();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+
+    /// Forget a WAAPI animation entirely (cancel): it drops
+    /// out of `getAnimations` (and its finish record, if any).
+    pub fn waapi_forget(&mut self, id: DomKey, anim_id: u64) {
+        self.waapi_known.remove(&(id, anim_id));
+        self.waapi_finished.remove(&(id, anim_id));
+    }
+
+    /// Forget a CSS animation by name (cancel): it drops out of
+    /// `getAnimations`.
+    pub fn css_forget(&mut self, id: DomKey, name: &str) {
+        if let Some(names) = self.css_animations.get_mut(&id) {
+            names.retain(|n| n != name);
+            if names.is_empty() {
+                self.css_animations.remove(&id);
+            }
+        }
+    }
+
+    /// Replace the running CSS animation names for an element
+    /// (called after an `animationend` — the engine is the
+    /// authority, so the finished name drops out here).
+    pub fn set_css_animations(&mut self, id: DomKey, names: Vec<String>) {
+        if names.is_empty() {
+            self.css_animations.remove(&id);
+        } else {
+            self.css_animations.insert(id, names);
+        }
     }
 
     /// The `<img>` nodes whose resolved `src` is `url`: the
@@ -1086,6 +1221,67 @@ impl DomHost for BrowserDomHost {
             is_imageset: false,
             integrity: None,
         });
+    }
+
+    // M6 Phase 3 (Rec 11): computed style + WAAPI. The tab thread
+    // owns the engine; this host is the queue + the read cache.
+    fn computed_style(&self, key: DomKey, property: &str) -> Option<String> {
+        self.computed_styles
+            .get(&key)
+            .and_then(|pairs| pairs.iter().find(|(p, _)| p == property))
+            .map(|(_, v)| v.clone())
+    }
+
+    fn computed_styles(&self, key: DomKey) -> Vec<(String, String)> {
+        self.computed_styles.get(&key).cloned().unwrap_or_default()
+    }
+
+    fn request_animate(&mut self, key: DomKey, spec: AnimateSpec) -> Option<u64> {
+        let id = self.next_waapi_id;
+        self.next_waapi_id += 1;
+        self.pending_animate.push((key, id, spec));
+        Some(id)
+    }
+
+    fn get_animations(&self, key: DomKey) -> Vec<AnimationInfo> {
+        let mut out: Vec<AnimationInfo> = self
+            .waapi_known
+            .keys()
+            .filter(|(k, _)| *k == key)
+            .map(|(_, id)| AnimationInfo {
+                id: Some(*id),
+                name: None,
+                finished: self.waapi_finished.contains(&(key, *id)),
+            })
+            .collect();
+        out.sort_by_key(|info| info.id);
+        if let Some(names) = self.css_animations.get(&key) {
+            for name in names {
+                out.push(AnimationInfo {
+                    id: None,
+                    name: Some(name.clone()),
+                    finished: false,
+                });
+            }
+        }
+        out
+    }
+
+    fn waapi_control(&mut self, key: DomKey, anim_id: u64, op: WaapiOp) {
+        self.pending_waapi_control.push((key, anim_id, op));
+    }
+
+    fn css_animation_control(&mut self, key: DomKey, name: &str, op: WaapiOp) {
+        self.pending_css_control.push((key, name.to_string(), op));
+    }
+
+    fn clear_animations(&mut self) {
+        self.clear_computed_style_cache();
+        self.pending_animate.clear();
+        self.pending_waapi_control.clear();
+        self.pending_css_control.clear();
+        self.waapi_known.clear();
+        self.css_animations.clear();
     }
 
     // Stage 8 Rec 7: the mutation-observer registry lives in the

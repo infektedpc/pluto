@@ -48,6 +48,10 @@
 //! mutations, so the retained tree's `dom_to_taffy` map stays valid.
 
 use super::*;
+use crate::animation::{
+    ANIMATABLE_PROPERTIES, AnimatedValue, animatable_pairs, animated_value_of_style,
+    apply_animated_value,
+};
 use pluto_html::DirtySet;
 
 /// What a restyle costs, in increasing severity. The order matters:
@@ -164,6 +168,19 @@ fn layout_properties_changed(old: &ComputedStyle, new: &ComputedStyle) -> bool {
 /// the relayout path routes it through the subtree rebuild anyway:
 /// glyph colours are baked into the shaped leaves, so a colour
 /// change needs new spans, not just a style refresh.
+///
+/// M6 Phase 2 (Rec 9): `z-index` changes reorder paint without
+/// layout (`PaintOnly` — the display list is rebuilt, taffy never
+/// runs), and transform/opacity-only changes are
+/// `CompositingOnly` — no layout, no list rebuild, the shell
+/// patches the retained list from a `CompositingUpdate`. But a
+/// transform/opacity change that creates or destroys a stacking
+/// context (opacity crossing 1.0, a transform appearing or
+/// disappearing) reorders paint, so it is `PaintOnly`, not
+/// `CompositingOnly`: the patch cannot move the element between
+/// paint steps. `will-change` is a hint only and changes nothing
+/// visual; `transition`/`animation` change future behaviour, not
+/// the current frame — both classify `None` here.
 pub fn classify_style_change(old: &ComputedStyle, new: &ComputedStyle) -> DamageKind {
     // Entering or leaving `display: none` adds or removes boxes.
     if old.display != new.display {
@@ -183,6 +200,37 @@ pub fn classify_style_change(old: &ComputedStyle, new: &ComputedStyle) -> Damage
             return DamageKind::PositionOnly;
         }
         return DamageKind::Layout;
+    }
+    // A `z-index` change reorders paint without layout. (On a
+    // static box the value is ignored — but the classifier does
+    // not know flex/grid-item status, and a spurious list rebuild
+    // is merely a repaint, never wrong; see the doc above.)
+    if old.z_index != new.z_index {
+        return DamageKind::PaintOnly;
+    }
+    // Transform / opacity only: the cheap path — unless the
+    // change crosses a stacking-context boundary, which reorders
+    // paint (opacity crossing 1.0, or a transform appearing or
+    // disappearing), or a paint property changed in the same
+    // restyle (a background repaint cannot ride a compositing
+    // patch — the list must be rebuilt). `transform-origin`/
+    // `transform-box` only change the resolved matrix, so they
+    // ride along.
+    if old.transform != new.transform
+        || old.transform_origin != new.transform_origin
+        || old.transform_box != new.transform_box
+        || old.opacity != new.opacity
+    {
+        let crosses_context = (old.opacity < 1.0) != (new.opacity < 1.0)
+            || old.transform.is_empty() != new.transform.is_empty();
+        let paint_changed = old.color != new.color
+            || old.background != new.background
+            || old.border_radius != new.border_radius
+            || old.box_shadow != new.box_shadow;
+        if crosses_context || paint_changed {
+            return DamageKind::PaintOnly;
+        }
+        return DamageKind::CompositingOnly;
     }
     if old.color != new.color
         || old.background != new.background
@@ -206,15 +254,37 @@ fn is_positioned(position: PositionKind) -> bool {
     )
 }
 
-/// True when the subtree of `root` contains an absolutely-positioned
-/// descendant whose containing block is outside the root (no
-/// positioned ancestor between it and the root, and the root itself
-/// is not positioned). Such a descendant resolves its size and
-/// offsets against that outside block, so re-laying out the subtree
-/// in isolation could not place it. `fixed` descendants are fine:
-/// they resolve against the viewport, which is constant during the
-/// pass. `display: none` subtrees are skipped — they produce no
-/// boxes.
+/// True when the subtree of `root` contains an absolutely- or
+/// fixed-positioned descendant whose containing block is outside
+/// the root (no positioned ancestor between it and the root, and
+/// the root itself is not positioned). Such a descendant resolves
+/// its size and offsets against that outside block, so re-laying
+/// out the subtree in isolation could not place it. `display:
+/// none` subtrees are skipped — they produce no boxes.
+///
+/// M6 Phase 3 (Rec 1): the old comment here said "`fixed`
+/// descendants are fine: they resolve against the viewport" —
+///
+/// that was the false safe-root exemption the Stage 14 report
+/// names. It is only true when no transformed ancestor sits
+/// above the root: a transformed ancestor is the containing
+/// block for `fixed` descendants, and the predicate cannot see
+/// above the root, so a barrier-less `fixed` descendant is
+/// unsafe — its containing block may be the viewport (constant
+/// during the pass) or a transformed ancestor outside the root
+/// (not constant). The conservative choice is to flag it like
+/// `absolute`: the subtree falls back to a full rebuild. A
+/// `fixed` descendant behind a positioned or transformed barrier
+/// inside the root resolves inside the root and stays safe.
+///
+/// M6 Phase 1: a transformed ancestor is a containing block too
+/// (CSS Transforms 1 — a non-`none` transform makes the element a
+/// containing block for abs descendants), and `to_taffy_style`
+/// maps transformed static boxes to `Position::Relative` so taffy
+/// agrees. The predicate counts a transformed ancestor as a
+/// barrier in the same step, so the two can never disagree (the
+/// report §4 sharpest trap: widening one without the other makes
+/// `incremental == cold` pass while both are wrong vs CSS).
 fn has_outside_resolving_descendant(
     dom: &Dom,
     styles: &HashMap<DomId, Arc<ComputedStyle>>,
@@ -236,14 +306,19 @@ fn has_outside_resolving_descendant(
             if style.display == DisplayKind::None {
                 continue;
             }
-            if style.position == PositionKind::Absolute && !root_positioned && !positioned_above {
+            if matches!(style.position, PositionKind::Absolute | PositionKind::Fixed)
+                && !root_positioned
+                && !positioned_above
+            {
                 return true;
             }
             if walk(
                 dom,
                 styles,
                 child,
-                positioned_above || is_positioned(style.position),
+                positioned_above
+                    || is_positioned(style.position)
+                    || !style.transform.is_empty(),
                 root_positioned,
             ) {
                 return true;
@@ -328,7 +403,14 @@ pub fn unsafe_layout_root_reason(
     // ancestor on a subtree rebuild; see the doc comment above.
     // (3) Floats: vacuous, see the doc comment above.
     // (4) No percentage descendants resolving outside the root.
-    if has_outside_resolving_descendant(dom, styles, root, is_positioned(style.position)) {
+    // M6 Phase 1: a transformed root is a containing block for
+    // its abs descendants too (same barrier as a positioned root).
+    if has_outside_resolving_descendant(
+        dom,
+        styles,
+        root,
+        is_positioned(style.position) || !style.transform.is_empty(),
+    ) {
         return Some(
             "subtree has an absolutely-positioned descendant whose containing block \
              is outside the root",
@@ -366,6 +448,13 @@ pub enum RelayoutKind {
     /// Only out-of-flow offsets changed: boxes translated, taffy
     /// never ran.
     PositionOnly,
+    /// Only transform / opacity changed, without crossing a
+    /// stacking-context boundary (M6 Phase 2, Rec 9): box styles
+    /// refreshed and boxes re-collected (so the retained matrices
+    /// are current), taffy never ran, and NO display list is
+    /// rebuilt — the tab thread sends a `CompositingUpdate` with
+    /// just the changed elements' state instead.
+    CompositingOnly,
     /// The dirty subtree was rebuilt and re-laid out; everything
     /// else kept its cached taffy layout.
     SubtreeLayout,
@@ -380,7 +469,7 @@ pub enum RelayoutKind {
 impl RelayoutKind {
     /// Number of variants — the histogram's per-kind counter array
     /// is sized by this, so the two cannot drift apart silently.
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 7;
 
     /// Index into the histogram's per-kind counters, in
     /// declaration order.
@@ -389,24 +478,95 @@ impl RelayoutKind {
             RelayoutKind::NothingToDo => 0,
             RelayoutKind::PaintOnly => 1,
             RelayoutKind::PositionOnly => 2,
-            RelayoutKind::SubtreeLayout => 3,
-            RelayoutKind::FullLayout => 4,
-            RelayoutKind::ColdBuild => 5,
+            RelayoutKind::CompositingOnly => 3,
+            RelayoutKind::SubtreeLayout => 4,
+            RelayoutKind::FullLayout => 5,
+            RelayoutKind::ColdBuild => 6,
         }
     }
 }
 
 /// The outcome of `relayout_incremental`: which path ran, and why.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RelayoutOutcome {
     pub kind: RelayoutKind,
     /// Why this path was chosen (static diagnostic string).
     pub reason: &'static str,
+    /// The dirty elements whose transform/opacity changed, for a
+    /// `CompositingOnly` outcome (M6 Phase 2, Rec 9): the tab
+    /// thread asks the actor for their new compositing state and
+    /// sends it as a `CompositingUpdate`. Empty for every other
+    /// kind.
+    pub composited: Vec<DomId>,
+    /// Transitions that start on this layout (M6 Phase 3, Rec
+    /// 11): the tab thread feeds each one to its animation
+    /// engine with the `from` value the element had before this
+    /// pass. Empty when no transitioned property changed.
+    pub pending_transitions: Vec<PendingTransition>,
+    /// Keyframe animations that start (or restart) on this
+    /// layout: the tab thread feeds each one to its engine with
+    /// the resolved `@keyframes` rule. Empty when no `animation`
+    /// entry is new or changed.
+    pub pending_animations: Vec<PendingAnimation>,
+    /// The animatable properties of the dirty elements after this
+    /// pass, as `(element, [(property, css text)])` — the tab
+    /// thread merges these into its `getComputedStyle` cache, so
+    /// a restyle is visible to JS even while no animation runs.
+    pub changed_styles: Vec<(DomId, Vec<(String, String)>)>,
+}
+
+/// One transition the actor detected on this layout: `spec`'s
+/// property changed from `from` to `to` (underlying values — the
+/// tab thread substitutes the currently sampled value for `from`
+/// when a transition on the same property is already running).
+#[derive(Debug, Clone)]
+pub struct PendingTransition {
+    pub id: DomId,
+    pub spec: Transition,
+    pub from: AnimatedValue,
+    pub to: AnimatedValue,
+}
+
+/// One keyframe animation the actor detected on this layout: the
+/// `animation` entry plus the `@keyframes` rule it names
+/// (resolved from the sheet by the actor, so the tab thread never
+/// has to re-parse the sheet).
+#[derive(Debug, Clone)]
+pub struct PendingAnimation {
+    pub id: DomId,
+    pub spec: Animation,
+    pub keyframes: Keyframes,
+    /// The underlying (non-animated) values of the animated
+    /// properties, for the fill-`none` return — the tab thread
+    /// feeds them to the engine as the animation's base.
+    pub base: Vec<(String, AnimatedValue)>,
 }
 
 impl RelayoutOutcome {
     fn of(kind: RelayoutKind, reason: &'static str) -> Self {
-        RelayoutOutcome { kind, reason }
+        RelayoutOutcome {
+            kind,
+            reason,
+            composited: Vec::new(),
+            pending_transitions: Vec::new(),
+            pending_animations: Vec::new(),
+            changed_styles: Vec::new(),
+        }
+    }
+
+    fn with_composited(
+        kind: RelayoutKind,
+        reason: &'static str,
+        composited: Vec<DomId>,
+    ) -> Self {
+        RelayoutOutcome {
+            kind,
+            reason,
+            composited,
+            pending_transitions: Vec::new(),
+            pending_animations: Vec::new(),
+            changed_styles: Vec::new(),
+        }
     }
 }
 
@@ -657,7 +817,7 @@ impl LayoutTree {
         // diff below and the subtree rebuild read them exactly as
         // they read the whole-document maps before.
         let ua = Stylesheet::ua();
-        let (styles, node_styles) = resolve_subtree_styles(
+        let (mut styles, node_styles) = resolve_subtree_styles(
             dom,
             &ua,
             sheet,
@@ -666,12 +826,39 @@ impl LayoutTree {
             state,
             dirty_root,
             &self.node_styles,
+            self.theme,
         );
+        // M6 Phase 3 (Rec 11): in-flight sampled values ride over
+        // the resolved (underlying) styles before classification,
+        // so an animated transform/opacity takes the
+        // CompositingOnly path and an animated width re-lays out
+        // like any other style change. Only `styles` (the
+        // classification map) is overridden — `node_styles` stays
+        // underlying, so the next pass still diffs against the
+        // real cascade, not last frame's sample.
+        for (id, pairs) in &self.animation_overrides {
+            if let Some(old) = styles.get(id) {
+                let mut new_style = (**old).clone();
+                for (prop, val) in pairs {
+                    apply_animated_value(&mut new_style, prop, val);
+                }
+                styles.insert(*id, Arc::new(new_style));
+            }
+        }
         // Classify the change: this tree's `node_styles` are the old
         // styles, the freshly resolved map the new ones.
         let dirty_els = dirty_elements(dom, dirty, &image_changed);
         let mut aggregate = DamageKind::None;
         let mut color_changed = false;
+        // M6 Phase 2 (Rec 9): the elements that classified
+        // `CompositingOnly`, and whether any element classified
+        // `PaintOnly`. `max_damage` ties `PaintOnly` and
+        // `CompositingOnly` at rank 1, so the aggregate alone
+        // cannot prove a batch is purely compositing — a `PaintOnly`
+        // element in the batch needs the list rebuilt, and the
+        // cheap path must not swallow its repaint.
+        let mut composited_ids: Vec<DomId> = Vec::new();
+        let mut any_paint_only = false;
         for &id in &dirty_els {
             match (self.node_styles.get(id), styles.get(&id)) {
                 (Some(old), Some(new)) => {
@@ -679,6 +866,12 @@ impl LayoutTree {
                         color_changed = true;
                     }
                     let kind = classify_style_change(&old.computed, new);
+                    if kind == DamageKind::CompositingOnly {
+                        composited_ids.push(id);
+                    }
+                    if kind == DamageKind::PaintOnly {
+                        any_paint_only = true;
+                    }
                     // A dirty node whose own style did not change was
                     // dirtied by a descendant or by structure: it
                     // needs at least a subtree re-layout.
@@ -694,52 +887,179 @@ impl LayoutTree {
                 _ => aggregate = DamageKind::Reconstruct,
             }
         }
+        // M6 Phase 3 (Rec 11): transitions / animations that start
+        // on this pass, plus the animatable values for the
+        // `getComputedStyle` cache. Computed from the old
+        // (retained) and new (resolved, override-applied) styles.
+        let mut pending_transitions: Vec<PendingTransition> = Vec::new();
+        let mut pending_animations: Vec<PendingAnimation> = Vec::new();
+        let mut changed_styles: Vec<(DomId, Vec<(String, String)>)> = Vec::new();
+        for &id in &dirty_els {
+            let (Some(old), Some(new)) = (self.node_styles.get(id), styles.get(&id)) else {
+                continue;
+            };
+            let old = &old.computed;
+            let new = &**new;
+            let box_width = self
+                .boxes
+                .iter()
+                .find(|b| b.dom == Some(id))
+                .map(|b| b.width);
+            let ctx = CalcCtx {
+                font_size: new.font_size,
+                root_font_size: self.root_font_size,
+                viewport: (viewport_width, viewport_height),
+                pct_basis: box_width,
+            };
+            for spec in &new.transitions {
+                if spec.duration <= 0.0 {
+                    continue;
+                }
+                let props: Vec<&str> = if spec.property == "all" {
+                    ANIMATABLE_PROPERTIES.to_vec()
+                } else {
+                    vec![spec.property.as_str()]
+                };
+                for prop in props {
+                    let (Some(from), Some(to)) = (
+                        animated_value_of_style(old, prop, &ctx),
+                        animated_value_of_style(new, prop, &ctx),
+                    ) else {
+                        continue;
+                    };
+                    if from != to {
+                        pending_transitions.push(PendingTransition {
+                            id,
+                            spec: spec.clone(),
+                            from,
+                            to,
+                        });
+                    }
+                }
+            }
+            for spec in &new.animations {
+                if spec.name == "none" {
+                    continue;
+                }
+                let already = old
+                    .animations
+                    .iter()
+                    .any(|o| o.name == spec.name && o == spec);
+                if already {
+                    continue;
+                }
+                if let Some(kf) = sheet.keyframes.iter().find(|k| k.name == spec.name) {
+                    let base = ANIMATABLE_PROPERTIES
+                        .iter()
+                        .filter_map(|p| {
+                            animated_value_of_style(new, p, &ctx)
+                                .map(|v| (p.to_string(), v))
+                        })
+                        .collect();
+                    pending_animations.push(PendingAnimation {
+                        id,
+                        spec: spec.clone(),
+                        keyframes: kf.clone(),
+                        base,
+                    });
+                }
+            }
+            let pairs = animatable_pairs(new, &ctx);
+            if !pairs.is_empty() {
+                changed_styles.push((id, pairs));
+            }
+        }
+        // Every outcome below carries the pending work — a full
+        // rebuild still restyles, so its transitions start too.
+        let attach = |mut o: RelayoutOutcome| -> RelayoutOutcome {
+            o.pending_transitions = pending_transitions.clone();
+            o.pending_animations = pending_animations.clone();
+            o.changed_styles = changed_styles.clone();
+            o
+        };
         match self.effective_layout_root(dom, dirty_root) {
             EffectiveRoot::NotRendered => {
                 self.node_styles = node_styles;
-                Ok(RelayoutOutcome::of(
+                Ok(attach(RelayoutOutcome::of(
                     RelayoutKind::NothingToDo,
                     "dirty subtree has no boxes (display:none / head)",
-                ))
+                )))
             }
-            EffectiveRoot::DocumentRoot => self.full_rebuild(
-                dom,
-                sheet,
-                viewport_width,
-                viewport_height,
-                state,
-                "dirty root is the document root",
-            ),
+            EffectiveRoot::DocumentRoot => self
+                .full_rebuild(
+                    dom,
+                    sheet,
+                    viewport_width,
+                    viewport_height,
+                    state,
+                    "dirty root is the document root",
+                )
+                .map(attach),
             EffectiveRoot::Node(eff) => {
                 // A display change can move the effective root: an
                 // element that became inline (or `display: none`) no
                 // longer owns a taffy node, so its owning block
                 // container is the root to rebuild instead.
                 let Some(eff) = self.adjust_effective_root(dom, &styles, eff) else {
-                    return self.full_rebuild(
-                        dom,
-                        sheet,
-                        viewport_width,
-                        viewport_height,
-                        state,
-                        "display change moved the layout root out of the tree",
-                    );
+                    return self
+                        .full_rebuild(
+                            dom,
+                            sheet,
+                            viewport_width,
+                            viewport_height,
+                            state,
+                            "display change moved the layout root out of the tree",
+                        )
+                        .map(attach);
                 };
                 if self.dom_to_taffy.get(&eff).copied() == self.root {
-                    return self.full_rebuild(
-                        dom,
-                        sheet,
-                        viewport_width,
-                        viewport_height,
-                        state,
-                        "dirty root is the document root",
-                    );
+                    return self
+                        .full_rebuild(
+                            dom,
+                            sheet,
+                            viewport_width,
+                            viewport_height,
+                            state,
+                            "dirty root is the document root",
+                        )
+                        .map(attach);
                 }
                 // The cheap paths need proof that nothing structural
                 // or textual changed — only style values did. The
                 // gate is conservative: any doubt takes the subtree
                 // path, which is always correct.
                 let structure_unchanged = self.subtree_structure_unchanged(dom, &styles, eff);
+                // Compositing-only (M6 Phase 2, Rec 9): every dirty
+                // element changed only transform/opacity, without
+                // crossing a stacking-context boundary. Refresh box
+                // styles and re-collect — the retained boxes carry
+                // the new matrices, so the tab thread can read the
+                // changed elements' state and send it as a
+                // `CompositingUpdate` — taffy never runs and NO
+                // display list is rebuilt. The `any_paint_only`
+                // guard matters: a `PaintOnly` element in the same
+                // batch needs the list rebuilt, and this path must
+                // not swallow its repaint.
+                if aggregate == DamageKind::CompositingOnly
+                    && !any_paint_only
+                    && !composited_ids.is_empty()
+                    && structure_unchanged
+                {
+                    self.refresh_meta_styles(&styles);
+                    self.node_styles = node_styles;
+                    self.recollect();
+                    self.debug_assert_matches_cold(
+                        dom,
+                        sheet,
+                        (viewport_width, viewport_height),
+                        state,
+                    );
+                    return Ok(attach(RelayoutOutcome::with_composited(
+                        RelayoutKind::CompositingOnly,
+                        "only transform/opacity changed; no layout, no list rebuild",
+                        composited_ids,
+                    )));
+                }
                 // Paint-only, with no text-colour change (glyph
                 // colours are baked into shaped leaves, so a colour
                 // change needs the subtree path): refresh box styles
@@ -755,10 +1075,10 @@ impl LayoutTree {
                         (viewport_width, viewport_height),
                         state,
                     );
-                    return Ok(RelayoutOutcome::of(
+                    return Ok(attach(RelayoutOutcome::of(
                         RelayoutKind::PaintOnly,
                         "only paint properties changed; no layout",
-                    ));
+                    )));
                 }
                 // Position-only: exactly one dirty element, an
                 // out-of-flow box whose offsets moved by a computable
@@ -787,10 +1107,10 @@ impl LayoutTree {
                             (viewport_width, viewport_height),
                             state,
                         );
-                        return Ok(RelayoutOutcome::of(
+                        return Ok(attach(RelayoutOutcome::of(
                             RelayoutKind::PositionOnly,
                             "only out-of-flow offsets changed; boxes translated",
-                        ));
+                        )));
                     }
                     // `translate_subtree` said no (the node owns
                     // no taffy node — e.g. an absolutely
@@ -801,15 +1121,17 @@ impl LayoutTree {
                 // safe ancestor of the effective root when there is
                 // one, else fall back to a full rebuild.
                 match self.nearest_safe_ancestor(dom, &styles, eff) {
-                    Some(safe) => self.relayout_subtree(
-                        dom,
-                        sheet,
-                        &styles,
-                        node_styles,
-                        safe,
-                        (viewport_width, viewport_height),
-                        state,
-                    ),
+                    Some(safe) => self
+                        .relayout_subtree(
+                            dom,
+                            sheet,
+                            &styles,
+                            node_styles,
+                            safe,
+                            (viewport_width, viewport_height),
+                            state,
+                        )
+                        .map(attach),
                     None => {
                         let reason = unsafe_layout_root_reason(dom, &styles, eff)
                             .unwrap_or("no safe layout root above the dirty node");
@@ -821,6 +1143,7 @@ impl LayoutTree {
                             state,
                             reason,
                         )
+                        .map(attach)
                     }
                 }
             }
@@ -1237,6 +1560,19 @@ impl LayoutTree {
         reason: &'static str,
     ) -> Result<RelayoutOutcome, LayoutError> {
         let scroll_offsets = std::mem::take(&mut self.scroll_offsets);
+        // M6 Phase 3 (Rec 1/3/12): a fresh tree starts with no
+        // viewport scroll, the Light theme, and no loaded web
+        // fonts — carry the retained ones across, or a rebuild
+        // would silently drop the viewport scroll (sticky/fixed
+        // hit-testing), the dark theme, and every downloaded font.
+        let theme = self.theme;
+        let viewport_scroll = self.viewport_scroll;
+        let loaded_font_hashes = std::mem::take(&mut self.loaded_font_hashes);
+        // M6 Phase 3 (Rec 11): the in-flight animation values
+        // survive a rebuild like the theme and the scroll — the
+        // fresh tree resolves underlying styles only, so the
+        // overrides are re-applied to its meta styles below.
+        let animation_overrides = std::mem::take(&mut self.animation_overrides);
         // Reuse this tree's FontSystem (Stage 8 Rec 9): a fresh one
         // re-scans the system fonts (~1.5 s, more in debug), and a
         // plain page has no safe layout root, so even ordinary
@@ -1260,6 +1596,7 @@ impl LayoutTree {
                 state,
                 fs,
                 &self.images,
+                theme,
             ),
             None => Self::build_with_state_and_images(
                 dom,
@@ -1268,16 +1605,57 @@ impl LayoutTree {
                 viewport_height,
                 state,
                 &self.images,
+                theme,
             ),
         }?;
         *self = fresh;
         self.scroll_offsets = scroll_offsets;
+        self.viewport_scroll = viewport_scroll;
+        self.loaded_font_hashes = loaded_font_hashes;
+        self.animation_overrides = animation_overrides;
         // The fresh build collected boxes without the retained
-        // offsets; re-collect so the boxes carry them.
-        if !self.scroll_offsets.is_empty() {
+        // offsets; re-collect so the boxes carry them. The
+        // viewport scroll matters too: sticky offsets are
+        // scroll-derived, so a retained viewport scroll also
+        // forces a re-collect.
+        if !self.scroll_offsets.is_empty() || self.viewport_scroll != (0.0, 0.0) {
             self.recollect();
         }
+        // Re-apply in-flight animation values over the fresh
+        // tree's underlying styles (see above).
+        if !self.animation_overrides.is_empty() {
+            self.apply_animation_overrides_to_meta();
+        }
         Ok(RelayoutOutcome::of(RelayoutKind::FullLayout, reason))
+    }
+
+    /// Apply the retained `animation_overrides` to the fresh
+    /// tree's meta styles after a full rebuild (the fresh build
+    /// resolves underlying styles only), then re-collect so the
+    /// boxes carry the sampled values. Text leaves pick the
+    /// overridden style up through `refresh_meta_styles`' parent
+    /// fallback, exactly as at build time. `pub` so the renderer's
+    /// actor can apply it after a cold `build_full_tree` too.
+    pub fn apply_animation_overrides_to_meta(&mut self) {
+        if self.animation_overrides.is_empty() {
+            return;
+        }
+        let mut overridden: HashMap<DomId, Arc<ComputedStyle>> = HashMap::new();
+        for (id, pairs) in &self.animation_overrides {
+            let Some(&t) = self.dom_to_taffy.get(id) else {
+                continue;
+            };
+            let Some(m) = self.meta.get(&t) else {
+                continue;
+            };
+            let mut style = m.style.clone();
+            for (prop, val) in pairs {
+                apply_animated_value(&mut style, prop, val);
+            }
+            overridden.insert(*id, Arc::new(style));
+        }
+        self.refresh_meta_styles(&overridden);
+        self.recollect();
     }
 
     /// Refresh the meta styles from a freshly resolved map, so a
@@ -1385,6 +1763,17 @@ impl LayoutTree {
         viewport: (f32, f32),
         state: &ElementState,
     ) {
+        // M6 Phase 3 (Rec 11): the cold twin resolves underlying
+        // styles only — it cannot reproduce in-flight animated
+        // values, and must not be asked to. A geometry-changing
+        // override (animated width / left) would false-fail the
+        // tripwire, so the check is skipped while overrides are
+        // active. This is the report §4 trap in the other
+        // direction: cold is not the reference for animated
+        // geometry; the engine's own tests are.
+        if !self.animation_overrides.is_empty() {
+            return;
+        }
         // Stage 12 Rec 5: the cold twin builds with the same image
         // map as this tree — the old no-images build would false-
         // fail the assertion on any image tick (the incremental
@@ -1396,14 +1785,18 @@ impl LayoutTree {
             viewport.1,
             state,
             &self.images,
+            self.theme,
         ) {
             Ok(tree) => tree,
             Err(e) => panic!("incremental==cold check: cold build failed: {e}"),
         };
         // The cold tree starts with no retained scroll offsets; give
-        // it this tree's so the comparison is apples-to-apples.
+        // it this tree's so the comparison is apples-to-apples —
+        // and the same viewport scroll, so fixed/sticky boxes (whose
+        // positions depend on it) compare too.
         cold.scroll_offsets.clone_from(&self.scroll_offsets);
-        if !cold.scroll_offsets.is_empty() {
+        cold.viewport_scroll = self.viewport_scroll;
+        if !cold.scroll_offsets.is_empty() || cold.viewport_scroll != (0.0, 0.0) {
             cold.recollect();
         }
         assert_eq!(
@@ -1439,7 +1832,49 @@ impl LayoutTree {
                 inc.glyphs.len(),
                 c.glyphs.len()
             );
+            // M6 Phase 2: the old comparison is blind to paint
+            // order and compositing state — a z-index or transform
+            // regression passes it while painting wrong. Compare
+            // the accumulated matrices and the compositing style
+            // (opacity / z-index) per box, and the Appendix E
+            // paint order of the whole tree, so the cheap paths
+            // (PaintOnly / CompositingOnly) are covered too.
+            for (name, a, b) in [
+                ("matrix.a", c.matrix.a, inc.matrix.a),
+                ("matrix.b", c.matrix.b, inc.matrix.b),
+                ("matrix.c", c.matrix.c, inc.matrix.c),
+                ("matrix.d", c.matrix.d, inc.matrix.d),
+                ("matrix.e", c.matrix.e, inc.matrix.e),
+                ("matrix.f", c.matrix.f, inc.matrix.f),
+                ("opacity", c.style.opacity, inc.style.opacity),
+            ] {
+                assert!(
+                    (a - b).abs() < 0.001,
+                    "incremental==cold: box {i} {name} differs: incremental {b}, cold {a}"
+                );
+            }
+            assert_eq!(
+                c.style.z_index, inc.style.z_index,
+                "incremental==cold: box {i} z-index differs (incremental {:?}, cold {:?})",
+                inc.style.z_index, c.style.z_index
+            );
+            assert_eq!(
+                c.is_stacking_context, inc.is_stacking_context,
+                "incremental==cold: box {i} stacking-context flag differs"
+            );
+            assert_eq!(
+                c.is_viewport_fixed, inc.is_viewport_fixed,
+                "incremental==cold: box {i} viewport-fixed flag differs"
+            );
         }
+        // Paint order must agree too: it is a permutation of the
+        // box indices, so comparing the two orders catches a
+        // reordering the per-box checks cannot see.
+        assert_eq!(
+            cold.paint_order(),
+            self.paint_order(),
+            "incremental==cold: paint order differs"
+        );
     }
 
     #[cfg(not(debug_assertions))]
@@ -1507,12 +1942,15 @@ mod tests {
     fn build(html: &str, css: &str) -> (Dom, Stylesheet, LayoutTree) {
         let dom = parse_html(html);
         let sheet = Stylesheet::parse(css);
-        let tree = LayoutTree::build(&dom, &sheet, VIEWPORT.0, VIEWPORT.1).expect("layout builds");
+        let tree =
+            LayoutTree::build(&dom, &sheet, VIEWPORT.0, VIEWPORT.1, Theme::Light)
+                .expect("layout builds");
         (dom, sheet, tree)
     }
 
     fn cold(dom: &Dom, sheet: &Stylesheet) -> LayoutTree {
-        LayoutTree::build(dom, sheet, VIEWPORT.0, VIEWPORT.1).expect("cold layout builds")
+        LayoutTree::build(dom, sheet, VIEWPORT.0, VIEWPORT.1, Theme::Light)
+            .expect("cold layout builds")
     }
 
     /// Geometry equality between two trees (the same check the debug
@@ -1562,7 +2000,16 @@ mod tests {
 
     fn styles_of(dom: &Dom, sheet: &Stylesheet) -> HashMap<DomId, Arc<ComputedStyle>> {
         let ua = Stylesheet::ua();
-        resolve_document_styles(dom, &ua, sheet, false, VIEWPORT, &ElementState::default()).0
+        resolve_document_styles(
+            dom,
+            &ua,
+            sheet,
+            false,
+            VIEWPORT,
+            &ElementState::default(),
+            Theme::Light,
+        )
+        .0
     }
 
     /// Mutate (already done by the caller), relayout incrementally,
@@ -1603,6 +2050,7 @@ mod tests {
             VIEWPORT.1,
             &ElementState::default(),
             images,
+            Theme::Light,
         )
         .expect("cold layout builds")
     }
@@ -1717,6 +2165,68 @@ mod tests {
     }
 
     #[test]
+    fn safe_root_rejects_abspos_descendant_under_transformed_ancestor() {
+        // M6 Phase 1: a transformed ancestor is a containing
+        // block for abs descendants, so a root below it is unsafe
+        // when the abs descendant resolves against that outside
+        // transformed ancestor. (Without the predicate change the
+        // root would be accepted and the subtree laid out in
+        // isolation against the wrong containing block.)
+        let (dom, sheet, _) = build(
+            r#"<div class="outer"><section class="box"><div class="abs">x</div></section></div>"#,
+            ".outer { transform: translateX(10px); } .box { width: 300px; height: 200px; overflow: hidden; } .abs { position: absolute; left: 10px; top: 10px; }",
+        );
+        let styles = styles_of(&dom, &sheet);
+        let reason =
+            unsafe_layout_root_reason(&dom, &styles, el(&dom, "section")).expect("unsafe");
+        assert!(reason.contains("containing block"), "reason: {reason}");
+    }
+
+    #[test]
+    fn safe_root_accepts_abspos_descendant_when_root_transformed() {
+        // The transformed root itself IS the containing block, so
+        // the abs descendant resolves inside the root.
+        let (dom, sheet, _) = build(
+            r#"<section class="box"><div class="abs">x</div></section>"#,
+            ".box { transform: translateX(10px); width: 300px; height: 200px; overflow: hidden; } .abs { position: absolute; left: 10px; top: 10px; }",
+        );
+        let styles = styles_of(&dom, &sheet);
+        assert!(is_safe_layout_root(&dom, &styles, el(&dom, "section")));
+    }
+
+    #[test]
+    fn safe_root_rejects_fixed_descendant_outside_cb() {
+        // M6 Phase 3 (Rec 1): a `fixed` descendant resolves
+        // against the viewport — not against the root — unless a
+        // positioned or transformed ancestor inside the root
+        // re-parents it. The old predicate claimed fixed
+        // descendants were always fine because they resolve
+        // against the viewport; that exemption is false when a
+        // transformed ancestor sits above the root, and the
+        // predicate cannot see it — so the conservative rule
+        // flags any barrier-less fixed descendant.
+        let (dom, sheet, _) = build(
+            r#"<div class="box"><div class="fix">x</div></div>"#,
+            ".box { width: 300px; height: 200px; overflow: hidden; } .fix { position: fixed; left: 10px; top: 10px; }",
+        );
+        let styles = styles_of(&dom, &sheet);
+        let reason = unsafe_layout_root_reason(&dom, &styles, el(&dom, "div")).expect("unsafe");
+        assert!(reason.contains("containing block"), "reason: {reason}");
+    }
+
+    #[test]
+    fn safe_root_accepts_fixed_descendant_when_root_positioned() {
+        // The positioned root itself IS the containing block for
+        // the fixed descendant, so it resolves inside the root.
+        let (dom, sheet, _) = build(
+            r#"<div class="box"><div class="fix">x</div></div>"#,
+            ".box { position: relative; width: 300px; height: 200px; overflow: hidden; } .fix { position: fixed; left: 10px; top: 10px; }",
+        );
+        let styles = styles_of(&dom, &sheet);
+        assert!(is_safe_layout_root(&dom, &styles, el(&dom, "div")));
+    }
+
+    #[test]
     fn safe_root_rejects_inline() {
         let (dom, sheet, _) = build(
             r#"<p><span style="width: 100px; height: 50px;">hi</span></p>"#,
@@ -1806,6 +2316,358 @@ mod tests {
             DamageKind::Layout
         );
         assert_eq!(classify_style_change(&base, &base), DamageKind::None);
+        // M6 Phase 2 (Rec 9): transform / opacity only.
+        use pluto_css::{CssLength, TransformFunction};
+        // A transform value change on an already-transformed box
+        // (still a stacking context either way) is the cheap path.
+        let mut transformed = base.clone();
+        transformed.transform =
+            vec![TransformFunction::Translate(CssLength::Px(0.0), CssLength::Px(0.0))];
+        let mut moved_transform = transformed.clone();
+        moved_transform.transform =
+            vec![TransformFunction::Translate(CssLength::Px(10.0), CssLength::Px(0.0))];
+        assert_eq!(
+            classify_style_change(&transformed, &moved_transform),
+            DamageKind::CompositingOnly
+        );
+        // An opacity change between two translucent values is too.
+        let mut translucent = base.clone();
+        translucent.opacity = 0.5;
+        let mut more_translucent = translucent.clone();
+        more_translucent.opacity = 0.8;
+        assert_eq!(
+            classify_style_change(&translucent, &more_translucent),
+            DamageKind::CompositingOnly
+        );
+        // But appearing/disappearing a transform creates or
+        // destroys a stacking context, which reorders paint.
+        assert_eq!(
+            classify_style_change(&base, &transformed),
+            DamageKind::PaintOnly
+        );
+        assert_eq!(
+            classify_style_change(&transformed, &base),
+            DamageKind::PaintOnly
+        );
+        // Likewise opacity crossing 1.0.
+        assert_eq!(
+            classify_style_change(&base, &translucent),
+            DamageKind::PaintOnly
+        );
+        assert_eq!(
+            classify_style_change(&translucent, &base),
+            DamageKind::PaintOnly
+        );
+        // A transform-origin change only re-pivots the matrix.
+        let mut origin = transformed.clone();
+        origin.transform_origin = TransformOrigin {
+            x: OriginComponent::Percentage(0.0),
+            y: OriginComponent::Percentage(0.0),
+        };
+        assert_eq!(
+            classify_style_change(&transformed, &origin),
+            DamageKind::CompositingOnly
+        );
+        // `z-index` alone reorders paint without layout — never
+        // swallowed, never a relayout.
+        let mut zed = base.clone();
+        zed.position = PositionKind::Absolute;
+        zed.z_index = Some(1);
+        let mut zed2 = zed.clone();
+        zed2.z_index = Some(2);
+        assert_eq!(
+            classify_style_change(&zed, &zed2),
+            DamageKind::PaintOnly
+        );
+        // `will-change` is a hint: no visual change, no damage.
+        let mut hinted = base.clone();
+        hinted.will_change_transform = true;
+        assert_eq!(classify_style_change(&base, &hinted), DamageKind::None);
+    }
+
+    // ---- (b2) compositing-only fast path (M6 Phase 2, Rec 9) ----
+
+    #[test]
+    fn transform_only_change_is_compositing_only() {
+        // A `transform` edit on a transformed element takes the
+        // cheap path: no taffy, no list rebuild, and the outcome
+        // names the changed element for the `CompositingUpdate`.
+        // The debug `incremental == cold` check inside the path
+        // also proves the retained matrices match a cold build.
+        let (mut dom, sheet, mut tree) = build(
+            r#"<div class="wrap"><div class="spin">S</div></div>"#,
+            ".wrap { position: relative; width: 400px; height: 300px; } \
+             .spin { width: 100px; height: 100px; transform: translateX(0px); }",
+        );
+        let spin = dom
+            .children(el(&dom, "div"))
+            .iter()
+            .copied()
+            .find(|&c| dom.tag(c) == Some("div"))
+            .unwrap();
+        dom.set_attribute(
+            spin,
+            "style",
+            "width: 100px; height: 100px; transform: translateX(30px);",
+        );
+        dom.mark_dirty(spin);
+        let out = relayout(&mut tree, &mut dom, &sheet);
+        assert_eq!(
+            out.kind,
+            RelayoutKind::CompositingOnly,
+            "reason: {}",
+            out.reason
+        );
+        assert_eq!(out.composited, vec![spin]);
+        // The retained box's matrix carries the new translate.
+        let bx = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom == Some(spin))
+            .expect("spin box");
+        let transforms = tree.page_transforms();
+        let idx = tree
+            .boxes
+            .iter()
+            .position(|b| b.dom == Some(spin))
+            .unwrap();
+        let (tx, ty) = transforms[idx].apply(bx.x, bx.y);
+        assert!((tx - (bx.x + 30.0)).abs() < 0.01, "translated x {tx}");
+        assert!((ty - bx.y).abs() < 0.01, "translated y {ty}");
+        assert_same_geometry(&tree, &cold(&dom, &sheet));
+    }
+
+    #[test]
+    fn opacity_only_change_is_compositing_only() {
+        let (mut dom, sheet, mut tree) = build(
+            r#"<div class="wrap"><div class="ghost">G</div></div>"#,
+            ".wrap { position: relative; width: 400px; height: 300px; } \
+             .ghost { width: 100px; height: 100px; opacity: 0.5; }",
+        );
+        let ghost = dom
+            .children(el(&dom, "div"))
+            .iter()
+            .copied()
+            .find(|&c| dom.tag(c) == Some("div"))
+            .unwrap();
+        dom.set_attribute(
+            ghost,
+            "style",
+            "width: 100px; height: 100px; opacity: 0.8;",
+        );
+        dom.mark_dirty(ghost);
+        let out = relayout(&mut tree, &mut dom, &sheet);
+        assert_eq!(
+            out.kind,
+            RelayoutKind::CompositingOnly,
+            "reason: {}",
+            out.reason
+        );
+        assert_eq!(out.composited, vec![ghost]);
+        let bx = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom == Some(ghost))
+            .expect("ghost box");
+        assert!((bx.style.opacity - 0.8).abs() < 1e-6);
+    }
+
+    // ---- M6 Phase 3 (Rec 11): transitions / animations / overrides ----
+
+    #[test]
+    fn opacity_change_reports_pending_transition() {
+        // A `transition`ed property change reports the pending
+        // transition (from/to underlying values) on the outcome,
+        // so the tab thread can start its engine — and the new
+        // value rides in `changed_styles` for the computed-style
+        // cache.
+        let (mut dom, sheet, mut tree) = build(
+            r#"<div class="wrap"><div class="ghost">G</div></div>"#,
+            ".wrap { position: relative; width: 400px; height: 300px; } \
+             .ghost { width: 100px; height: 100px; opacity: 0.5; transition: opacity 1s linear; }",
+        );
+        let ghost = dom
+            .children(el(&dom, "div"))
+            .iter()
+            .copied()
+            .find(|&c| dom.tag(c) == Some("div"))
+            .unwrap();
+        dom.set_attribute(
+            ghost,
+            "style",
+            "width: 100px; height: 100px; opacity: 0.8;",
+        );
+        dom.mark_dirty(ghost);
+        let out = relayout(&mut tree, &mut dom, &sheet);
+        assert_eq!(
+            out.kind,
+            RelayoutKind::CompositingOnly,
+            "reason: {}",
+            out.reason
+        );
+        assert_eq!(out.pending_transitions.len(), 1, "one pending transition");
+        let pt = &out.pending_transitions[0];
+        assert_eq!(pt.id, ghost);
+        assert_eq!(pt.spec.property, "opacity");
+        assert_eq!(pt.from, AnimatedValue::Number(0.5));
+        assert_eq!(pt.to, AnimatedValue::Number(0.8));
+        let cached = out
+            .changed_styles
+            .iter()
+            .find(|(id, _)| *id == ghost)
+            .expect("changed_styles names the ghost");
+        assert!(
+            cached.1.iter().any(|(p, v)| p == "opacity" && v == "0.8"),
+            "cache pairs: {:?}",
+            cached.1
+        );
+    }
+
+    #[test]
+    fn new_animation_reports_pending_animation() {
+        // A restyle that adds an `animation` entry reports the
+        // pending animation with its resolved `@keyframes` rule.
+        let (mut dom, sheet_a, mut tree) = build(
+            r#"<div class="wrap"><div class="ghost">G</div></div>"#,
+            ".wrap { position: relative; width: 400px; height: 300px; } \
+             .ghost { width: 100px; height: 100px; opacity: 0.5; }",
+        );
+        let ghost = dom
+            .children(el(&dom, "div"))
+            .iter()
+            .copied()
+            .find(|&c| dom.tag(c) == Some("div"))
+            .unwrap();
+        let sheet_b = Stylesheet::parse(
+            ".wrap { position: relative; width: 400px; height: 300px; } \
+             .ghost { width: 100px; height: 100px; opacity: 0.5; animation: fade 1s linear; } \
+             @keyframes fade { from { opacity: 0; } to { opacity: 1; } }",
+        );
+        dom.mark_dirty(ghost);
+        let out = relayout(&mut tree, &mut dom, &sheet_b);
+        assert_eq!(out.pending_animations.len(), 1, "one pending animation");
+        let pa = &out.pending_animations[0];
+        assert_eq!(pa.id, ghost);
+        assert_eq!(pa.spec.name, "fade");
+        assert_eq!(pa.keyframes.name, "fade");
+        assert_eq!(pa.keyframes.steps.len(), 2);
+        // The same animation restyled identically does NOT
+        // re-report: a second pass with the same sheet is quiet.
+        dom.clear_dirty();
+        dom.mark_dirty(ghost);
+        let out2 = relayout(&mut tree, &mut dom, &sheet_b);
+        assert!(
+            out2.pending_animations.is_empty(),
+            "no re-report: {:?}",
+            out2.pending_animations
+        );
+        let _ = sheet_a;
+    }
+
+    #[test]
+    fn animation_overrides_apply_over_resolved_styles() {
+        // In-flight sampled values ride over the resolved styles:
+        // a dirty pass with an opacity override on the ghost
+        // paints 0.3 even though the cascade says 0.5 — and the
+        // retained `node_styles` stay underlying (0.5), so the
+        // next pass still diffs against the real cascade.
+        let (mut dom, sheet, mut tree) = build(
+            r#"<div class="wrap"><div class="ghost">G</div></div>"#,
+            ".wrap { position: relative; width: 400px; height: 300px; } \
+             .ghost { width: 100px; height: 100px; opacity: 0.5; }",
+        );
+        let ghost = dom
+            .children(el(&dom, "div"))
+            .iter()
+            .copied()
+            .find(|&c| dom.tag(c) == Some("div"))
+            .unwrap();
+        tree.animation_overrides = vec![(
+            ghost,
+            vec![("opacity".to_string(), AnimatedValue::Number(0.3))],
+        )];
+        dom.mark_dirty(ghost);
+        let _out = relayout(&mut tree, &mut dom, &sheet);
+        let bx = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom == Some(ghost))
+            .expect("ghost box");
+        assert!((bx.style.opacity - 0.3).abs() < 1e-6, "override applied");
+        let retained = tree.node_styles.get(ghost).expect("retained style");
+        assert!(
+            (retained.computed.opacity - 0.5).abs() < 1e-6,
+            "retained style stays underlying"
+        );
+    }
+
+    #[test]
+    fn z_index_only_change_is_paint_only_not_swallowed() {
+        // The trap: a `z-index`-only change used to classify
+        // `None` and vanish. It must rebuild the list (paint
+        // order changes) without laying out.
+        let (mut dom, sheet, mut tree) = build(
+            r#"<div class="wrap"><div class="a">A</div><div class="b">B</div></div>"#,
+            ".wrap { position: relative; width: 400px; height: 300px; } \
+             .a { position: absolute; left: 0; top: 0; width: 100px; height: 100px; z-index: 1; } \
+             .b { position: absolute; left: 0; top: 0; width: 100px; height: 100px; z-index: 2; }",
+        );
+        let a = dom
+            .children(el(&dom, "div"))
+            .iter()
+            .copied()
+            .find(|&c| dom.tag(c) == Some("div"))
+            .unwrap();
+        dom.set_attribute(
+            a,
+            "style",
+            "position: absolute; left: 0; top: 0; width: 100px; height: 100px; z-index: 3;",
+        );
+        dom.mark_dirty(a);
+        let out = relayout(&mut tree, &mut dom, &sheet);
+        assert_eq!(out.kind, RelayoutKind::PaintOnly, "reason: {}", out.reason);
+        // And the new order is visible in the tree: a now paints
+        // after b.
+        let order = tree.paint_order();
+        let pos = |id: DomId| {
+            let idx = tree.boxes.iter().position(|b| b.dom == Some(id)).unwrap();
+            order.iter().position(|&i| i == idx).unwrap()
+        };
+        let b = dom
+            .children(el(&dom, "div"))
+            .iter()
+            .copied()
+            .filter(|&c| dom.tag(c) == Some("div") && c != a)
+            .next()
+            .unwrap();
+        assert!(pos(b) < pos(a), "b now paints before a");
+    }
+
+    #[test]
+    fn transform_plus_background_change_is_paint_only() {
+        // A transform change bundled with a paint change needs
+        // the list rebuilt (the background repaint cannot ride a
+        // compositing patch), so the aggregate is `PaintOnly`,
+        // not `CompositingOnly`.
+        let (mut dom, sheet, mut tree) = build(
+            r#"<div class="wrap"><div class="spin">S</div></div>"#,
+            ".wrap { position: relative; width: 400px; height: 300px; } \
+             .spin { width: 100px; height: 100px; transform: translateX(0px); background-color: #ff0000; }",
+        );
+        let spin = dom
+            .children(el(&dom, "div"))
+            .iter()
+            .copied()
+            .find(|&c| dom.tag(c) == Some("div"))
+            .unwrap();
+        dom.set_attribute(
+            spin,
+            "style",
+            "width: 100px; height: 100px; transform: translateX(30px); background-color: #00ff00;",
+        );
+        dom.mark_dirty(spin);
+        let out = relayout(&mut tree, &mut dom, &sheet);
+        assert_eq!(out.kind, RelayoutKind::PaintOnly, "reason: {}", out.reason);
     }
 
     // ---- (b) position-only fast path ----

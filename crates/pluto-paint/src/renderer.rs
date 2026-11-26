@@ -3,12 +3,15 @@
 //!
 //! Five pipelines share one uniform (the viewport size, for
 //! pixel-to-clip conversion) plus a clip uniform (the rounded-clip
-//! slots, see [`ClipUniformData`]). Rects are opaque quads; rounded
-//! rects evaluate the rounded-box SDF for coverage; box shadows use
-//! the erf closed-form blur profile of that SDF (sharp branch at
-//! blur 0); glyphs sample a 1024x1024 R8 atlas of cosmic-text/Swash
-//! alpha masks, tinted by the text color. The atlas is shelf-packed
-//! on demand in `prepare`; the same glyph rasterized once stays
+//! slots, see [`ClipUniformData`]). Rects are quads blended with
+//! `ALPHA_BLENDING` (opaque at alpha 1, so the old `blend: None`
+//! behaviour is preserved, and a translucent `PushOpacity` group
+//! composites instead of overwriting); rounded rects evaluate the
+//! rounded-box SDF for coverage; box shadows use the erf
+//! closed-form blur profile of that SDF (sharp branch at blur 0);
+//! glyphs sample a 1024x1024 R8 atlas of cosmic-text/Swash alpha
+//! masks, tinted by the text color. The atlas is shelf-packed on
+//! demand in `prepare`; the same glyph rasterized once stays
 //! cached across frames. Color glyphs (emoji) and subpixel-mask
 //! glyphs are skipped in M1.
 //!
@@ -57,7 +60,9 @@ use crate::image::{IMAGE_CACHE_BYTE_CAP, build_mip_chain, mip_chain_bytes, mip_l
 use crate::perf::{self, SpanKind};
 use crate::{
     DecodedImage, DisplayItem, DisplayList, PaintGlyph, Resource, ResourceId, ResourceTable,
+    scale_radii, transform_rect,
 };
+use pluto_css::Affine;
 use cosmic_text::{FontSystem, SwashCache, SwashContent};
 use pluto_css::ResolvedCorners;
 use std::collections::{HashMap, HashSet};
@@ -322,12 +327,14 @@ var tex_sampler: sampler;
 struct ImageVertex {
     @location(0) position: vec2<f32>,
     @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
 }
 
 struct ImageOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) page: vec2<f32>,
+    @location(2) color: vec4<f32>,
 }
 
 @vertex
@@ -341,13 +348,14 @@ fn image_vs(v: ImageVertex) -> ImageOut {
     out.pos = vec4<f32>(clip, 0.0, 1.0);
     out.uv = v.uv;
     out.page = v.position;
+    out.color = v.color;
     return out;
 }
 
 @fragment
 fn image_fs(in: ImageOut) -> @location(0) vec4<f32> {
     let texel = textureSample(tex, tex_sampler, in.uv);
-    let a = texel.a * clip_coverage(in.page);
+    let a = texel.a * in.color.a * clip_coverage(in.page);
     if (a <= 0.0) { discard; }
     return vec4<f32>(texel.rgb, a);
 }
@@ -532,6 +540,13 @@ struct GlyphVertex {
 struct ImageVertex {
     pos: [f32; 2],
     uv: [f32; 2],
+    /// Tint/opacity (M6 Phase 2, Rec 6): white at full opacity
+    /// normally, with the alpha scaled by the effective group
+    /// opacity inside a `PushOpacity` group. The fragment
+    /// multiplies it into the texel alpha — the only per-vertex
+    /// channel images have, since they carry no colour of their
+    /// own. Location 2 in the shader and the pipeline layout.
+    color: [f32; 4],
 }
 
 /// One rounded-rect fill vertex: the quad position, the colour, and
@@ -758,7 +773,11 @@ pub fn shadow_coverage(
 
 /// Six vertices (two triangles) for one rounded rect, with the rect
 /// + radii carried per vertex. Pure: unit-tested.
-fn rounded_vertices_for(item: &DisplayItem) -> Vec<RoundedVertex> {
+fn rounded_vertices_for(
+    item: &DisplayItem,
+    transform: &Affine,
+    opacity: f32,
+) -> Vec<RoundedVertex> {
     let DisplayItem::RoundedRect {
         x,
         y,
@@ -771,22 +790,30 @@ fn rounded_vertices_for(item: &DisplayItem) -> Vec<RoundedVertex> {
         return Vec::new();
     };
     let (x0, y0, x1, y1) = (*x, *y, x + width, y + height);
-    let rect = [*x, *y, *width, *height];
+    // The SDF fields are evaluated in page space: the rect is the
+    // AABB of the transformed rect and the radii are scaled by the
+    // transform's per-axis stretch — exact for translate/scale,
+    // an over-approximation for rotate/skew (the quad itself is
+    // the exact transformed corners, so the fragment only ever
+    // runs inside the true shape). The colour rides the group
+    // opacity (M6 Phase 2, Rec 6).
+    let rect = transform_rect([*x, *y, *width, *height], transform);
+    let scaled = scale_radii(*radii, transform);
     let radii_a = [
-        radii.top_left.0,
-        radii.top_left.1,
-        radii.top_right.0,
-        radii.top_right.1,
+        scaled.top_left.0,
+        scaled.top_left.1,
+        scaled.top_right.0,
+        scaled.top_right.1,
     ];
     let radii_b = [
-        radii.bottom_right.0,
-        radii.bottom_right.1,
-        radii.bottom_left.0,
-        radii.bottom_left.1,
+        scaled.bottom_right.0,
+        scaled.bottom_right.1,
+        scaled.bottom_left.0,
+        scaled.bottom_left.1,
     ];
-    let c = *color;
+    let c = dim(*color, opacity);
     let quad = |pos: [f32; 2]| RoundedVertex {
-        pos,
+        pos: xform(pos, transform),
         color: c,
         rect,
         radii_a,
@@ -871,8 +898,19 @@ fn shadow_geometry(
 }
 
 /// Six vertices (two triangles) for one shadow item. Pure:
-/// unit-tested.
-fn shadow_vertices_for(item: &DisplayItem) -> Vec<ShadowVertex> {
+/// unit-tested. The SDF fields are evaluated in page space, so
+/// the shape and the padding box become the AABBs of their
+/// transformed rects and their radii are scaled by the
+/// transform's per-axis stretch — exact for translate/scale, an
+/// over-approximation for rotate/skew (the quad itself is the
+/// exact transformed corners, so the fragment only ever runs
+/// inside the true shape). The colour rides the group opacity
+/// (M6 Phase 2, Rec 6).
+fn shadow_vertices_for(
+    item: &DisplayItem,
+    transform: &Affine,
+    opacity: f32,
+) -> Vec<ShadowVertex> {
     let DisplayItem::BoxShadow { color, blur, inset, .. } = item else {
         return Vec::new();
     };
@@ -880,6 +918,10 @@ fn shadow_vertices_for(item: &DisplayItem) -> Vec<ShadowVertex> {
         return Vec::new();
     };
     let (x0, y0, x1, y1) = (quad[0], quad[1], quad[0] + quad[2], quad[1] + quad[3]);
+    let shape = transform_rect(shape, transform);
+    let pad = transform_rect(pad, transform);
+    let shape_radii = scale_radii(shape_radii, transform);
+    let pad_radii = scale_radii(pad_radii, transform);
     let shape_radii_a = [
         shape_radii.top_left.0,
         shape_radii.top_left.1,
@@ -904,10 +946,10 @@ fn shadow_vertices_for(item: &DisplayItem) -> Vec<ShadowVertex> {
         pad_radii.bottom_left.0,
         pad_radii.bottom_left.1,
     ];
-    let c = *color;
+    let c = dim(*color, opacity);
     let params = [*blur / 2.0, if *inset { 1.0 } else { 0.0 }];
     let quad_v = |pos: [f32; 2]| ShadowVertex {
-        pos,
+        pos: xform(pos, transform),
         color: c,
         shape,
         shape_radii_a,
@@ -1631,7 +1673,26 @@ impl ImageTextureCache {
     }
 }
 /// Six vertices (two triangles) for one solid rect. Pure: unit-tested.
-fn rect_vertices_for(item: &DisplayItem) -> Vec<RectVertex> {
+/// Apply a page transform to a vertex position (M6 Phase 2,
+/// Rec 7): the current `PushTransform` matrix, or the identity
+/// when no transform is active. Pure.
+fn xform(p: [f32; 2], m: &Affine) -> [f32; 2] {
+    let (x, y) = m.apply(p[0], p[1]);
+    [x, y]
+}
+
+/// Scale a vertex colour's alpha by the effective group opacity
+/// (M6 Phase 2, Rec 6): the product of the enclosing
+/// `PushOpacity` values, 1.0 outside any group. This is an
+/// explicit documented approximation of true group compositing
+/// (overlapping translucent siblings inside one group
+/// double-apply); the display list already groups correctly for
+/// a future offscreen-compositing renderer. Pure.
+fn dim(color: [f32; 4], opacity: f32) -> [f32; 4] {
+    [color[0], color[1], color[2], color[3] * opacity]
+}
+
+fn rect_vertices_for(item: &DisplayItem, transform: &Affine, opacity: f32) -> Vec<RectVertex> {
     // Caret / selection paint as plain rects (Stage 13 Rec 4):
     // normalise them to a `FillRect` at this seam so the run
     // builder below needs no new run kind.
@@ -1681,22 +1742,48 @@ fn rect_vertices_for(item: &DisplayItem) -> Vec<RectVertex> {
         return Vec::new();
     };
     let (x0, y0, x1, y1) = (*x, *y, x + width, y + height);
-    let c = *color;
+    let c = dim(*color, opacity);
     vec![
-        RectVertex { pos: [x0, y0], color: c },
-        RectVertex { pos: [x1, y0], color: c },
-        RectVertex { pos: [x0, y1], color: c },
-        RectVertex { pos: [x1, y0], color: c },
-        RectVertex { pos: [x1, y1], color: c },
-        RectVertex { pos: [x0, y1], color: c },
+        RectVertex {
+            pos: xform([x0, y0], transform),
+            color: c,
+        },
+        RectVertex {
+            pos: xform([x1, y0], transform),
+            color: c,
+        },
+        RectVertex {
+            pos: xform([x0, y1], transform),
+            color: c,
+        },
+        RectVertex {
+            pos: xform([x1, y0], transform),
+            color: c,
+        },
+        RectVertex {
+            pos: xform([x1, y1], transform),
+            color: c,
+        },
+        RectVertex {
+            pos: xform([x0, y1], transform),
+            color: c,
+        },
     ]
 }
 
 /// Six vertices (two triangles) for one image/blob item, with UVs
 /// spanning the whole texture. Pure: unit-tested. UV (0,0) is the
 /// texture's first texel (top-left as uploaded), and it lands on the
-/// quad's top-left, so the image draws upright.
-fn image_vertices_for(item: &DisplayItem) -> Vec<ImageVertex> {
+/// quad's top-left, so the image draws upright. `color` is the
+/// tint/opacity — white at full opacity, alpha scaled by the
+/// effective group opacity (M6 Phase 2, Rec 6) — and `transform`
+/// is the current page transform (Rec 7), applied to the quad's
+/// corners so a rotated image stays a rotated quad.
+fn image_vertices_for(
+    item: &DisplayItem,
+    color: [f32; 4],
+    transform: &Affine,
+) -> Vec<ImageVertex> {
     let (x, y, width, height) = match item {
         DisplayItem::Image {
             x,
@@ -1717,28 +1804,34 @@ fn image_vertices_for(item: &DisplayItem) -> Vec<ImageVertex> {
     let (x0, y0, x1, y1) = (x, y, x + width, y + height);
     vec![
         ImageVertex {
-            pos: [x0, y0],
+            pos: xform([x0, y0], transform),
             uv: [0.0, 0.0],
+            color,
         },
         ImageVertex {
-            pos: [x1, y0],
+            pos: xform([x1, y0], transform),
             uv: [1.0, 0.0],
+            color,
         },
         ImageVertex {
-            pos: [x0, y1],
+            pos: xform([x0, y1], transform),
             uv: [0.0, 1.0],
+            color,
         },
         ImageVertex {
-            pos: [x1, y0],
+            pos: xform([x1, y0], transform),
             uv: [1.0, 0.0],
+            color,
         },
         ImageVertex {
-            pos: [x1, y1],
+            pos: xform([x1, y1], transform),
             uv: [1.0, 1.0],
+            color,
         },
         ImageVertex {
-            pos: [x0, y1],
+            pos: xform([x0, y1], transform),
             uv: [0.0, 1.0],
+            color,
         },
     ]
 }
@@ -2253,7 +2346,12 @@ impl PaintRenderer {
                 entry_point: Some("rect_fs"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: None,
+                    // M6 Phase 2 (Rec 6): group opacity rides in
+                    // the vertex alpha, so rects must blend —
+                    // opaque content (alpha 1) reproduces the old
+                    // `blend: None` exactly, and a translucent
+                    // group now composites instead of overwriting.
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -2396,6 +2494,14 @@ impl PaintRenderer {
                             format: wgpu::VertexFormat::Float32x2,
                             offset: 8,
                             shader_location: 1,
+                        },
+                        // M6 Phase 2 (Rec 6): the tint/opacity
+                        // channel — white at full opacity, alpha
+                        // scaled by the group opacity.
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 16,
+                            shader_location: 2,
                         },
                     ],
                 }],
@@ -2722,6 +2828,27 @@ impl PaintRenderer {
         let mut clip_groups: Vec<wgpu::BindGroup> = Vec::new();
         let mut clip_data: Vec<ClipUniformData> = Vec::new();
         let mut clip_stack: Vec<ClipEntry> = Vec::new();
+        // M6 Phase 2 (Rec 7/6): the transform and opacity
+        // stacks. The transform stack holds absolute page
+        // transforms (`PushTransform` matrices already include
+        // the ancestors), so the current transform is the top,
+        // or the identity when the stack is empty. The opacity
+        // stack holds one group opacity per enclosing
+        // `PushOpacity`; the effective opacity is their product
+        // (recomputed on pop, so no float division drift).
+        // Both stacks are structural: they update on every
+        // push/pop item even under `clip_empty`, or the list
+        // would desynchronise.
+        let mut transform_stack: Vec<Affine> = Vec::new();
+        let mut opacity_stack: Vec<f32> = Vec::new();
+        // M6 Phase 3 (Rec 1): the viewport-fixed depth — items
+        // inside a `PushFixed` scope paint in viewport
+        // coordinates, so their vertices translate by +scroll
+        // (the `canvas_rect` pattern) instead of scrolling away.
+        // Structural like the other stacks: it updates on every
+        // push/pop even under `clip_empty`.
+        let mut fixed_depth = 0usize;
+        let mut effective_opacity: f32 = 1.0;
         // The current run's clip, recomputed when the stack
         // changes: the clip bind-group index, the page-space
         // scissor (already intersected with the visible region
@@ -2790,6 +2917,20 @@ impl PaintRenderer {
                     // alone), so a scissor of `None` there would
                     // draw items the clip excludes.
                     let (rect, rounded) = clip_stack_effective(&clip_stack);
+                    // M6 Phase 3 (Rec 1): a clip inside a fixed
+                    // scope is viewport-space — translate it to
+                    // page space so the intersect + scissor math
+                    // below (which subtracts the scroll) lands
+                    // right. Rounded slots stay page-space data
+                    // (a fixed rounded clip is an approximation
+                    // gap — see the `PushFixed` docs).
+                    let rect = rect.map(|r| {
+                        if fixed_depth > 0 {
+                            [r[0] + scroll.0, r[1] + scroll.1, r[2], r[3]]
+                        } else {
+                            r
+                        }
+                    });
                     clip_empty = matches!(rect, Some(r) if r[2] <= 0.0 || r[3] <= 0.0)
                         || matches!(rect, Some(r) if intersect_rect(r, visible).is_none());
                     let data = clip_uniform_data(&rounded);
@@ -2837,6 +2978,20 @@ impl PaintRenderer {
                 DisplayItem::PopClip => {
                     clip_stack.pop();
                     let (rect, rounded) = clip_stack_effective(&clip_stack);
+                    // M6 Phase 3 (Rec 1): a clip inside a fixed
+                    // scope is viewport-space — translate it to
+                    // page space so the intersect + scissor math
+                    // below (which subtracts the scroll) lands
+                    // right. Rounded slots stay page-space data
+                    // (a fixed rounded clip is an approximation
+                    // gap — see the `PushFixed` docs).
+                    let rect = rect.map(|r| {
+                        if fixed_depth > 0 {
+                            [r[0] + scroll.0, r[1] + scroll.1, r[2], r[3]]
+                        } else {
+                            r
+                        }
+                    });
                     clip_empty = matches!(rect, Some(r) if r[2] <= 0.0 || r[3] <= 0.0)
                         || matches!(rect, Some(r) if intersect_rect(r, visible).is_none());
                     let data = clip_uniform_data(&rounded);
@@ -2881,6 +3036,38 @@ impl PaintRenderer {
                     });
                     continue;
                 }
+                // M6 Phase 2 (Rec 7/6): the transform and opacity
+                // stacks. A pop on an empty stack is a no-op (a
+                // malformed list must not take the frame down).
+                // The clip stack above is the same pattern.
+                DisplayItem::PushTransform { matrix, .. } => {
+                    transform_stack.push(*matrix);
+                    continue;
+                }
+                DisplayItem::PopTransform => {
+                    transform_stack.pop();
+                    continue;
+                }
+                DisplayItem::PushOpacity { opacity, .. } => {
+                    opacity_stack.push(*opacity);
+                    effective_opacity = opacity_stack.iter().product();
+                    continue;
+                }
+                DisplayItem::PopOpacity => {
+                    opacity_stack.pop();
+                    effective_opacity = opacity_stack.iter().product();
+                    continue;
+                }
+                // M6 Phase 3 (Rec 1): viewport-fixed scope. A pop
+                // on an empty stack is a no-op, like the others.
+                DisplayItem::PushFixed => {
+                    fixed_depth += 1;
+                    continue;
+                }
+                DisplayItem::PopFixed => {
+                    fixed_depth = fixed_depth.saturating_sub(1);
+                    continue;
+                }
                 _ => {}
             }
             if clip_empty {
@@ -2889,6 +3076,24 @@ impl PaintRenderer {
                 culled += 1;
                 continue;
             }
+            // The transform active for this item (Rec 7): the
+            // stack top, or the identity. Item 0 (the canvas)
+            // always sees the identity — no transform is pushed
+            // before it.
+            let current_transform = transform_stack
+                .last()
+                .copied()
+                .unwrap_or_else(Affine::identity);
+            // M6 Phase 3 (Rec 1): inside a fixed scope the item's
+            // coordinates are viewport-space — translate by +scroll
+            // after the page transform, so the shader's scroll
+            // subtraction leaves them glued to the viewport (the
+            // same pattern as `canvas_rect` for item 0).
+            let effective_transform = if fixed_depth > 0 {
+                current_transform.then(Affine::translate(scroll.0, scroll.1))
+            } else {
+                current_transform
+            };
             // Item 0 is the canvas fill (DisplayList::build pushes
             // it first): translate it by the scroll so the shader's
             // subtraction leaves it covering the viewport. Every
@@ -2896,7 +3101,11 @@ impl PaintRenderer {
             // never culled — it is the viewport background.
             if i == 0 {
                 let first = rect_vertices.len() as u32;
-                let verts = rect_vertices_for(&canvas_rect(item, scroll));
+                let verts = rect_vertices_for(
+                    &canvas_rect(item, scroll),
+                    &Affine::identity(),
+                    1.0,
+                );
                 let count = verts.len() as u32;
                 rect_vertices.extend(verts);
                 if count > 0 {
@@ -2913,10 +3122,13 @@ impl PaintRenderer {
                 continue;
             }
             // CPU cull: an item fully outside the visible region
-            // or the effective rect clip never uploads. Glyphs
+            // or the effective rect clip never uploads. The bounds
+            // are the TRANSFORMED bounds (Rec 7) — an
+            // untransformed rect would cull a rotated item that
+            // still shows, or upload one that does not. Glyphs
             // have no item bounds — their quads are culled
             // per-glyph below.
-            if let Some(bounds) = item.bounds()
+            if let Some(bounds) = item.transformed_bounds(&effective_transform)
                 && !bounds_visible(bounds, scissor, visible)
             {
                 culled += 1;
@@ -2928,7 +3140,8 @@ impl PaintRenderer {
                 | DisplayItem::SelectionRect { .. } => {
                     has_content = true;
                     let first = rect_vertices.len() as u32;
-                    let verts = rect_vertices_for(item);
+                    let verts =
+                        rect_vertices_for(item, &effective_transform, effective_opacity);
                     let count = verts.len() as u32;
                     rect_vertices.extend(verts);
                     extend_run(
@@ -2944,7 +3157,8 @@ impl PaintRenderer {
                 DisplayItem::RoundedRect { .. } => {
                     has_content = true;
                     let first = rounded_vertices.len() as u32;
-                    let verts = rounded_vertices_for(item);
+                    let verts =
+                        rounded_vertices_for(item, &effective_transform, effective_opacity);
                     let count = verts.len() as u32;
                     rounded_vertices.extend(verts);
                     extend_run(
@@ -2960,7 +3174,8 @@ impl PaintRenderer {
                 DisplayItem::BoxShadow { .. } => {
                     has_content = true;
                     let first = shadow_vertices.len() as u32;
-                    let verts = shadow_vertices_for(item);
+                    let verts =
+                        shadow_vertices_for(item, &effective_transform, effective_opacity);
                     let count = verts.len() as u32;
                     shadow_vertices.extend(verts);
                     extend_run(
@@ -3021,11 +3236,43 @@ impl PaintRenderer {
                             }
                             continue;
                         }
-                        let (x0, y0, x1, y1) = glyph_quad(glyph, placement);
+                        let (gx0, gy0, gx1, gy1) = glyph_quad(glyph, placement);
+                        // The quad's corners through the current
+                        // transform (Rec 7): a rotated glyph stays
+                        // a rotated quad — the AABB alone would
+                        // smear it into a rectangle. The cull uses
+                        // the transformed AABB; the vertices use
+                        // the exact corners.
+                        let corners = [
+                            xform([gx0, gy0], &effective_transform),
+                            xform([gx1, gy0], &effective_transform),
+                            xform([gx0, gy1], &effective_transform),
+                            xform([gx1, gy1], &effective_transform),
+                        ];
+                        let min_x = corners
+                            .iter()
+                            .map(|c| c[0])
+                            .fold(f32::INFINITY, f32::min);
+                        let max_x = corners
+                            .iter()
+                            .map(|c| c[0])
+                            .fold(f32::NEG_INFINITY, f32::max);
+                        let min_y = corners
+                            .iter()
+                            .map(|c| c[1])
+                            .fold(f32::INFINITY, f32::min);
+                        let max_y = corners
+                            .iter()
+                            .map(|c| c[1])
+                            .fold(f32::NEG_INFINITY, f32::max);
                         // Per-quad cull: a glyph fully outside the
                         // visible region or the clip rect never
                         // uploads (its atlas slot stays free).
-                        if !bounds_visible([x0, y0, x1 - x0, y1 - y0], scissor, visible) {
+                        if !bounds_visible(
+                            [min_x, min_y, max_x - min_x, max_y - min_y],
+                            scissor,
+                            visible,
+                        ) {
                             culled += 1;
                             continue;
                         }
@@ -3084,36 +3331,36 @@ impl PaintRenderer {
                             (rect.x + rect.w) as f32 / ATLAS_TEXTURE_SIZE as f32,
                             (rect.y + rect.h) as f32 / ATLAS_TEXTURE_SIZE as f32,
                         );
-                        let c = *color;
+                        let c = dim(*color, effective_opacity);
                         let first = glyph_vertices.len() as u32;
                         glyph_vertices.extend([
                             GlyphVertex {
-                                pos: [x0, y0],
+                                pos: corners[0],
                                 uv: [u0, v0],
                                 color: c,
                             },
                             GlyphVertex {
-                                pos: [x1, y0],
+                                pos: corners[1],
                                 uv: [u1, v0],
                                 color: c,
                             },
                             GlyphVertex {
-                                pos: [x0, y1],
+                                pos: corners[2],
                                 uv: [u0, v1],
                                 color: c,
                             },
                             GlyphVertex {
-                                pos: [x1, y0],
+                                pos: corners[1],
                                 uv: [u1, v0],
                                 color: c,
                             },
                             GlyphVertex {
-                                pos: [x1, y1],
+                                pos: corners[3],
                                 uv: [u1, v1],
                                 color: c,
                             },
                             GlyphVertex {
-                                pos: [x0, y1],
+                                pos: corners[2],
                                 uv: [u0, v1],
                                 color: c,
                             },
@@ -3276,7 +3523,11 @@ impl PaintRenderer {
                     // the bind group out here.
                     let bind_group = bind_group.clone();
                     let first = image_vertices.len() as u32;
-                    let verts = image_vertices_for(item);
+                    let verts = image_vertices_for(
+                        item,
+                        [1.0, 1.0, 1.0, effective_opacity],
+                        &effective_transform,
+                    );
                     let count = verts.len() as u32;
                     image_vertices.extend(verts);
                     extend_run(
@@ -3289,8 +3540,15 @@ impl PaintRenderer {
                         Some(bind_group),
                     );
                 }
-                DisplayItem::PushClip { .. } | DisplayItem::PopClip => {
-                    unreachable!("clip items handled above")
+                DisplayItem::PushClip { .. }
+                | DisplayItem::PopClip
+                | DisplayItem::PushTransform { .. }
+                | DisplayItem::PopTransform
+                | DisplayItem::PushOpacity { .. }
+                | DisplayItem::PopOpacity
+                | DisplayItem::PushFixed
+                | DisplayItem::PopFixed => {
+                    unreachable!("stack items handled above")
                 }
             }
         }
@@ -3462,13 +3720,17 @@ mod tests {
 
     #[test]
     fn rect_vertices_cover_the_rect() {
-        let verts = rect_vertices_for(&DisplayItem::FillRect {
-            x: 10.0,
-            y: 20.0,
-            width: 30.0,
-            height: 40.0,
-            color: [1.0, 0.0, 0.0, 1.0],
-        });
+        let verts = rect_vertices_for(
+            &DisplayItem::FillRect {
+                x: 10.0,
+                y: 20.0,
+                width: 30.0,
+                height: 40.0,
+                color: [1.0, 0.0, 0.0, 1.0],
+            },
+            &Affine::identity(),
+            1.0,
+        );
         assert_eq!(verts.len(), 6);
         let xs: Vec<f32> = verts.iter().map(|v| v.pos[0]).collect();
         let ys: Vec<f32> = verts.iter().map(|v| v.pos[1]).collect();
@@ -3476,12 +3738,56 @@ mod tests {
         assert!(ys.contains(&20.0) && ys.contains(&60.0));
         assert!(verts.iter().all(|v| v.color == [1.0, 0.0, 0.0, 1.0]));
         assert!(
-            rect_vertices_for(&DisplayItem::Glyphs {
-                color: [0.0; 4],
-                glyphs: vec![],
-            })
+            rect_vertices_for(
+                &DisplayItem::Glyphs {
+                    color: [0.0; 4],
+                    glyphs: vec![],
+                },
+                &Affine::identity(),
+                1.0,
+            )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn rect_vertices_apply_transform_and_opacity() {
+        // M6 Phase 2 (Rec 6/7): a 90-degree rotation about the
+        // origin maps the rect's corners, and a group opacity of
+        // 0.5 halves the vertex alpha — the two mechanisms ride
+        // together in one helper, so they are tested together.
+        let verts = rect_vertices_for(
+            &DisplayItem::FillRect {
+                x: 10.0,
+                y: 0.0,
+                width: 20.0,
+                height: 10.0,
+                color: [1.0, 0.0, 0.0, 1.0],
+            },
+            &Affine::rotate(90.0),
+            0.5,
+        );
+        assert_eq!(verts.len(), 6);
+        // (10, 0) rotates to (0, 10); (30, 10) to (-10, 30).
+        let pts: Vec<[f32; 2]> = verts.iter().map(|v| v.pos).collect();
+        assert!(pts.iter().any(|p| (p[0] - 0.0).abs() < 0.01 && (p[1] - 10.0).abs() < 0.01));
+        assert!(pts.iter().any(|p| (p[0] + 10.0).abs() < 0.01 && (p[1] - 30.0).abs() < 0.01));
+        assert!(verts.iter().all(|v| v.color == [1.0, 0.0, 0.0, 0.5]));
+        // Identity + full opacity reproduces the untransformed
+        // vertices exactly.
+        let plain = rect_vertices_for(
+            &DisplayItem::FillRect {
+                x: 10.0,
+                y: 0.0,
+                width: 20.0,
+                height: 10.0,
+                color: [1.0, 0.0, 0.0, 1.0],
+            },
+            &Affine::identity(),
+            1.0,
+        );
+        assert_eq!(plain[0].pos, [10.0, 0.0]);
+        assert_eq!(plain[0].color, [1.0, 0.0, 0.0, 1.0]);
     }
 
     /// Distinct cache keys, derived from one shaped key by varying
@@ -3724,12 +4030,14 @@ mod tests {
             width: 30.0,
             height: 40.0,
         };
-        let verts = image_vertices_for(&item);
+        let white = [1.0, 1.0, 1.0, 1.0];
+        let verts = image_vertices_for(&item, white, &Affine::identity());
         assert_eq!(verts.len(), 6);
         let xs: Vec<f32> = verts.iter().map(|v| v.pos[0]).collect();
         let ys: Vec<f32> = verts.iter().map(|v| v.pos[1]).collect();
         assert!(xs.contains(&10.0) && xs.contains(&40.0));
         assert!(ys.contains(&20.0) && ys.contains(&60.0));
+        assert!(verts.iter().all(|v| v.color == white));
         // UVs span the whole texture, top-left to bottom-right.
         assert!(verts.iter().any(|v| v.uv == [0.0, 0.0]));
         assert!(verts.iter().any(|v| v.uv == [1.0, 0.0]));
@@ -3743,18 +4051,152 @@ mod tests {
             width: 30.0,
             height: 40.0,
         };
-        assert_eq!(image_vertices_for(&blob), verts);
+        assert_eq!(image_vertices_for(&blob, white, &Affine::identity()), verts);
         // Rects and glyphs are not images.
         assert!(
-            image_vertices_for(&DisplayItem::FillRect {
-                x: 0.0,
-                y: 0.0,
-                width: 1.0,
-                height: 1.0,
-                color: [0.0; 4],
-            })
+            image_vertices_for(
+                &DisplayItem::FillRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                    color: [0.0; 4],
+                },
+                white,
+                &Affine::identity(),
+            )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn image_vertices_apply_transform_and_opacity() {
+        // M6 Phase 2 (Rec 6/7): the quad's corners rotate and
+        // the colour channel carries the group opacity — the
+        // fragment multiplies it into the texel alpha.
+        let verts = image_vertices_for(
+            &DisplayItem::Image {
+                resource: ResourceId(3),
+                x: 10.0,
+                y: 0.0,
+                width: 20.0,
+                height: 10.0,
+            },
+            [1.0, 1.0, 1.0, 0.25],
+            &Affine::rotate(90.0),
+        );
+        assert_eq!(verts.len(), 6);
+        let pts: Vec<[f32; 2]> = verts.iter().map(|v| v.pos).collect();
+        assert!(pts.iter().any(|p| (p[0] - 0.0).abs() < 0.01 && (p[1] - 10.0).abs() < 0.01));
+        assert!(pts.iter().any(|p| (p[0] + 10.0).abs() < 0.01 && (p[1] - 30.0).abs() < 0.01));
+        assert!(verts.iter().all(|v| v.color == [1.0, 1.0, 1.0, 0.25]));
+        // UVs are untouched by the transform.
+        assert!(verts.iter().any(|v| v.uv == [0.0, 0.0]));
+        assert!(verts.iter().any(|v| v.uv == [1.0, 1.0]));
+    }
+
+    #[test]
+    fn rounded_vertices_apply_transform_and_opacity() {
+        // M6 Phase 2 (Rec 6/7): the quad's corners rotate, the
+        // SDF rect becomes the AABB of the rotated rect, and the
+        // colour rides the group opacity. A 20x10 rect at (10, 0)
+        // rotated 90 degrees about the origin occupies x in
+        // [-10, 0], y in [10, 30].
+        let radii = ResolvedCorners {
+            top_left: (8.0, 4.0),
+            top_right: (8.0, 4.0),
+            bottom_right: (8.0, 4.0),
+            bottom_left: (8.0, 4.0),
+        };
+        let verts = rounded_vertices_for(
+            &DisplayItem::RoundedRect {
+                x: 10.0,
+                y: 0.0,
+                width: 20.0,
+                height: 10.0,
+                radii,
+                color: [0.0, 0.0, 1.0, 1.0],
+            },
+            &Affine::rotate(90.0),
+            0.5,
+        );
+        assert_eq!(verts.len(), 6);
+        let pts: Vec<[f32; 2]> = verts.iter().map(|v| v.pos).collect();
+        assert!(pts.iter().any(|p| (p[0] - 0.0).abs() < 0.01 && (p[1] - 10.0).abs() < 0.01));
+        assert!(pts.iter().any(|p| (p[0] + 10.0).abs() < 0.01 && (p[1] - 30.0).abs() < 0.01));
+        // Every vertex carries the same SDF rect (the AABB) and
+        // the halved alpha. A pure rotation does not stretch the
+        // radii (both axis stretches are 1), so they stay (8, 4).
+        assert!(verts.iter().all(|v| (v.rect[0] + 10.0).abs() < 0.01
+            && (v.rect[1] - 10.0).abs() < 0.01
+            && (v.rect[2] - 10.0).abs() < 0.01
+            && (v.rect[3] - 20.0).abs() < 0.01));
+        assert!(verts.iter().all(|v| (v.radii_a[0] - 8.0).abs() < 0.01
+            && (v.radii_a[1] - 4.0).abs() < 0.01));
+        assert!(verts.iter().all(|v| v.color == [0.0, 0.0, 1.0, 0.5]));
+        // A scale stretches the radii with it: 2x in x, 3x in y
+        // turns (8, 4) into (16, 12), and the rect 20x10 at
+        // (10, 0) into the AABB (20, 0, 40, 30).
+        let scaled = rounded_vertices_for(
+            &DisplayItem::RoundedRect {
+                x: 10.0,
+                y: 0.0,
+                width: 20.0,
+                height: 10.0,
+                radii,
+                color: [0.0, 0.0, 1.0, 1.0],
+            },
+            &Affine::scale(2.0, 3.0),
+            1.0,
+        );
+        assert!(scaled.iter().all(|v| (v.rect[0] - 20.0).abs() < 0.01
+            && (v.rect[1] - 0.0).abs() < 0.01
+            && (v.rect[2] - 40.0).abs() < 0.01
+            && (v.rect[3] - 30.0).abs() < 0.01));
+        assert!(scaled.iter().all(|v| (v.radii_a[0] - 16.0).abs() < 0.01
+            && (v.radii_a[1] - 12.0).abs() < 0.01));
+    }
+
+    #[test]
+    fn shadow_vertices_apply_transform_and_opacity() {
+        // M6 Phase 2 (Rec 6/7): the shadow quad's corners
+        // translate, the shape/pad SDF fields translate with
+        // them, and the colour rides the group opacity. A
+        // translate(50, 60) moves a 100x50 shadow at (10, 20)
+        // to (60, 80); the blur falloff quad moves with it.
+        let radii = ResolvedCorners {
+            top_left: (4.0, 4.0),
+            top_right: (4.0, 4.0),
+            bottom_right: (4.0, 4.0),
+            bottom_left: (4.0, 4.0),
+        };
+        let verts = shadow_vertices_for(
+            &DisplayItem::BoxShadow {
+                x: 10.0,
+                y: 20.0,
+                width: 100.0,
+                height: 50.0,
+                radii,
+                offset_x: 0.0,
+                offset_y: 0.0,
+                blur: 0.0,
+                spread: 0.0,
+                color: [0.0, 0.0, 0.0, 0.8],
+                inset: false,
+            },
+            &Affine::translate(50.0, 60.0),
+            0.5,
+        );
+        assert_eq!(verts.len(), 6);
+        let pts: Vec<[f32; 2]> = verts.iter().map(|v| v.pos).collect();
+        // Blur 0, spread 0: the quad is the box (falloff 1px).
+        assert!(pts.iter().any(|p| (p[0] - 59.0).abs() < 0.01 && (p[1] - 79.0).abs() < 0.01));
+        assert!(pts.iter().any(|p| (p[0] - 161.0).abs() < 0.01 && (p[1] - 131.0).abs() < 0.01));
+        assert!(verts.iter().all(|v| (v.shape[0] - 60.0).abs() < 0.01
+            && (v.shape[1] - 80.0).abs() < 0.01
+            && (v.shape[2] - 100.0).abs() < 0.01
+            && (v.shape[3] - 50.0).abs() < 0.01));
+        assert!(verts.iter().all(|v| v.color == [0.0, 0.0, 0.0, 0.4]));
     }
 
     #[test]

@@ -30,8 +30,10 @@
 //! * A renderer that sends a malformed IPC message is treated as
 //!   COMPROMISED and killed, never recovered ([`RendererProcess::recv`]
 //!   SIGKILLs on any `InvalidData` decode error — the report's
-//!   broker rule). A renderer that dies on its own is observed as a
-//!   clean EOF, not a compromise.
+//!   broker rule — and poisons the handle, so no later `recv` can
+//!   deliver a frame the child queued before the kill). A renderer
+//!   that dies on its own is observed as a clean EOF, not a
+//!   compromise.
 //! * A hung tab closes cleanly: [`RendererProcess::close`] asks the
 //!   renderer to shut down, waits a grace period, then SIGKILLs it.
 //!   `close` always reaps the child (no zombies).
@@ -1173,6 +1175,19 @@ pub enum Closed {
 pub struct RendererProcess {
     child: Child,
     transport: SocketTransport,
+    /// Set once a malformed message has been treated as a
+    /// compromise (see [`RendererProcess::recv`]). A compromised
+    /// handle never delivers another message — not even one the
+    /// child wrote before the SIGKILL landed and that is still
+    /// sitting in the socket buffer — and never accepts another
+    /// send. Without this, a valid frame the child queued
+    /// immediately after the garbage frame (the `SandboxReport`)
+    /// could be delivered after the kill, and a caller that
+    /// reads on would see a live-looking message from a dead,
+    /// compromised renderer. CI run 45699261848 failed exactly
+    /// that way: the kill was logged, but a queued frame arrived
+    /// afterwards.
+    compromised: bool,
 }
 
 impl RendererProcess {
@@ -1251,7 +1266,11 @@ impl RendererProcess {
             }
         };
         match tokio::time::timeout(HANDSHAKE_TIMEOUT, transport.handshake()).await {
-            Ok(Ok(())) => Ok(Self { child, transport }),
+            Ok(Ok(())) => Ok(Self {
+                child,
+                transport,
+                compromised: false,
+            }),
             Ok(Err(e)) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -1279,8 +1298,17 @@ impl RendererProcess {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// Send one command to the renderer.
+    /// Send one command to the renderer. A handle poisoned by a
+    /// compromise (see [`RendererProcess::recv`]) refuses the
+    /// send: the child is dead, and writing to it would only
+    /// produce a confusing broken-pipe error.
     pub async fn send(&mut self, message: &BrowserToRenderer) -> io::Result<()> {
+        if self.compromised {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "renderer already treated as compromised; channel is closed",
+            ));
+        }
         self.transport.send_message(message).await
     }
 
@@ -1290,13 +1318,25 @@ impl RendererProcess {
     /// A malformed message — undecodable bytes, a stale protocol
     /// version, an over-cap frame — is treated as COMPROMISED: the
     /// child is SIGKILLed here, before the error is returned, and
-    /// is never recovered. A clean EOF (`Ok(None)`) is the renderer
+    /// is never recovered. The handle is poisoned at the same time:
+    /// every later `recv` (and `send`) fails immediately without
+    /// touching the socket, so a valid frame the child wrote
+    /// before the kill — the `SandboxReport` it sends right after
+    /// the garbage frame — can never be delivered from a dead
+    /// renderer. A clean EOF (`Ok(None)`) is the renderer
     /// exiting on its own, not a compromise; other I/O errors (a
     /// socket that died with the child) are returned as-is.
     pub async fn recv(&mut self) -> io::Result<Option<RendererToBrowser>> {
+        if self.compromised {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "renderer already treated as compromised; channel is closed",
+            ));
+        }
         match recv_renderer_message(&mut self.transport).await {
             Ok(message) => Ok(message),
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                self.compromised = true;
                 eprintln!(
                     "[pluto] renderer pid {} sent a malformed IPC message ({e}) — treating as compromised, killing it",
                     self.pid()

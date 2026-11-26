@@ -169,6 +169,12 @@ pub struct PlutoBrowser {
     /// lists (the worker still runs JS timers), and the flag is
     /// re-synced to a restarted worker on `RendererReady`.
     visible: bool,
+    /// Whether the OS / desktop theme is dark (M6 Phase 3, Rec
+    /// 12): read from libcosmic at startup, updated by the
+    /// `system_theme_*_update` hooks, and forwarded to every
+    /// tab's worker as `SetTheme` — the workers restyle against
+    /// it (never a refetch).
+    dark_theme: bool,
     /// The persisted bookmarks (nav feature): toggled by the
     /// star, listed in the hamburger menu's Bookmarks panel.
     bookmarks: BookmarkStore,
@@ -379,6 +385,22 @@ impl PlutoBrowser {
                 && tx.send(command).is_err()
             {
                 tab.renderer_tx = None;
+            }
+        }
+    }
+
+    /// Record a theme change and forward it to every tab's worker
+    /// as `SetTheme` (M6 Phase 3, Rec 12). A repeat of the current
+    /// theme is not re-sent (both hooks can fire for one switch).
+    /// The workers restyle against the new theme — never a refetch.
+    fn apply_theme(&mut self, dark: bool) {
+        if dark == self.dark_theme {
+            return;
+        }
+        self.dark_theme = dark;
+        for tab in &mut self.tabs {
+            if let Some(tx) = &tab.renderer_tx {
+                let _ = tx.send(BrowserToRenderer::SetTheme { dark });
             }
         }
     }
@@ -755,6 +777,10 @@ impl Application for PlutoBrowser {
             next_tab_id: 1,
             viewport: page::DEFAULT_VIEWPORT,
             visible: true,
+            // M6 Phase 3 (Rec 12): the real OS theme at startup
+            // — libcosmic reads the system theme; the workers get
+            // it on `RendererReady` and on every change after.
+            dark_theme: cosmic::theme::is_dark(),
             bookmarks: load_bookmarks(),
             menu_open: false,
             panel: None,
@@ -766,6 +792,32 @@ impl Application for PlutoBrowser {
         (app, Task::none())
     }
 
+    /// The OS theme mode changed (M6 Phase 3, Rec 12): libcosmic
+    /// calls this when the system light/dark mode flips. The mode
+    /// carries the dark flag directly — the authoritative signal
+    /// for `prefers-color-scheme`.
+    fn system_theme_mode_update(
+        &mut self,
+        _keys: &[&'static str],
+        new_theme: &cosmic::cosmic_theme::ThemeMode,
+    ) -> Task<Self::Message> {
+        self.apply_theme(new_theme.is_dark);
+        Task::none()
+    }
+
+    /// The OS theme itself changed (M6 Phase 3, Rec 12): a theme
+    /// switch that keeps the mode (e.g. a new light theme) still
+    /// re-reads the active theme — libcosmic installs it before
+    /// calling this hook, so `is_dark()` sees the new one.
+    fn system_theme_update(
+        &mut self,
+        _keys: &[&'static str],
+        _new_theme: &cosmic::cosmic_theme::Theme,
+    ) -> Task<Self::Message> {
+        self.apply_theme(cosmic::theme::is_dark());
+        Task::none()
+    }
+
     /// The renderer worker subscriptions (Stage 4 #2, Stage 11
     /// Rec 4): one per tab, keyed by the shell-assigned tab id —
     /// plus the window focus subscription (Stage 8 Rec 1), which
@@ -773,8 +825,7 @@ impl Application for PlutoBrowser {
     /// keyboard subscription (Stage 8 Rec 9), which forwards page
     /// keys. The page pipeline runs in the workers, off the UI
     /// thread.
-    fn subscription(&self) -> cosmic::iced::Subscription<Self::Message> {
-        let mut subscriptions: Vec<cosmic::iced::Subscription<Self::Message>> = self
+    fn subscription(&self) -> cosmic::iced::Subscription<Self::Message> {        let mut subscriptions: Vec<cosmic::iced::Subscription<Self::Message>> = self
             .tabs
             .iter()
             .map(|tab| renderer::renderer_subscription_for_tab(tab.id))
@@ -858,6 +909,11 @@ impl Application for PlutoBrowser {
                 );
                 self.send_command_to(tab_id, BrowserToRenderer::SetVisible { visible });
                 self.send_command_to(tab_id, BrowserToRenderer::SetFocused { focused: visible });
+                // M6 Phase 3 (Rec 12): a (re)started worker gets
+                // the current OS theme, so its first layout
+                // evaluates `prefers-color-scheme` correctly.
+                let dark = self.dark_theme;
+                self.send_command_to(tab_id, BrowserToRenderer::SetTheme { dark });
                 if let Some(url) = pending {
                     // The first navigation expects a list too, and
                     // starts the first-paint clock (no previous
@@ -981,6 +1037,23 @@ impl Application for PlutoBrowser {
                             Err(err) => eprintln!(
                                 "[pluto] ignoring undecodable display list (epoch {epoch}): {err:?}"
                             ),
+                        }
+                    }
+                    RendererToBrowser::CompositingUpdate { epoch, updates } => {
+                        // M6 Phase 2 (Rec 9): a transform/opacity-only
+                        // change — patch the submitted list in place
+                        // instead of installing a new one. The
+                        // compositor targets the active list, or the
+                        // pending one when it has not activated yet;
+                        // a newer pending list already carries the
+                        // new values, so the update is stale then.
+                        let tab = &mut self.tabs[tab_index];
+                        let patched =
+                            tab.compositor.apply_compositing_update(epoch, &updates);
+                        if patched > 0 {
+                            eprintln!(
+                                "[pluto] compositing update: {patched} items (epoch {epoch})"
+                            );
                         }
                     }
                     RendererToBrowser::ResourceReady {
@@ -1132,6 +1205,8 @@ impl Application for PlutoBrowser {
                             tab_id,
                             BrowserToRenderer::SetFocused { focused: visible },
                         );
+                        let dark = self.dark_theme;
+                        self.send_command_to(tab_id, BrowserToRenderer::SetTheme { dark });
                     }
                     RendererToBrowser::ScrollViewport { dx, dy } => {
                         // Stage 8 Rec 9: the worker owns the wheel —

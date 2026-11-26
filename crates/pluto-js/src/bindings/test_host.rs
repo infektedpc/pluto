@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use pluto_html::observers::{MutationObserverOptions, ObserverMutationRecord};
 use pluto_html::{Dom, NodeId, NodeKind, parse, parse_fragment};
 
-use crate::host::{DomHost, DomHostError, DomKey, Geometry};
+use crate::host::{AnimateSpec, AnimationInfo, DomHost, DomHostError, DomKey, Geometry, WaapiOp};
 
 /// Host-visible side effects the test host records (navigation +
 /// image requests), shared with the test through an `Arc` so the
@@ -35,6 +35,15 @@ pub struct TestHostLog {
     /// Image requests from `Image()` / `<img>.src`, as
     /// `(url, base_url)` in order.
     pub image_requests: Vec<(String, String)>,
+    /// WAAPI animation starts from `Element.animate`, as
+    /// `(element, host anim id, spec)` in order (M6 Phase 3,
+    /// Rec 11).
+    pub animate_requests: Vec<(DomKey, u64, AnimateSpec)>,
+    /// WAAPI play-state controls, as `(element, anim id, op)` in
+    /// order.
+    pub waapi_controls: Vec<(DomKey, u64, WaapiOp)>,
+    /// CSS-animation play-state controls, as `(element, name, op)`.
+    pub css_controls: Vec<(DomKey, String, WaapiOp)>,
 }
 
 // ------------------------------------------------------------------ host
@@ -66,6 +75,24 @@ pub struct TestHost {
     pub pending_form_submits: Vec<(DomKey, Option<DomKey>)>,
     /// The focused element (`document.activeElement`).
     pub focused: Option<DomKey>,
+    /// Computed-style cache for `getComputedStyle` tests: tests
+    /// set pairs here directly (M6 Phase 3, Rec 11).
+    pub computed_styles: std::collections::HashMap<DomKey, Vec<(String, String)>>,
+    /// Next WAAPI animation id for `request_animate`.
+    pub next_waapi_id: u64,
+    /// WAAPI animations started via `request_animate`, by
+    /// (element, id) — `get_animations` reports these.
+    pub waapi: std::collections::HashMap<(DomKey, u64), AnimateSpec>,
+    /// Finished WAAPI animations, by (element, id).
+    pub waapi_finished: std::collections::HashSet<(DomKey, u64)>,
+    /// CSS animations "running" per element, by name — tests set
+    /// these directly to exercise `getAnimations`.
+    pub css_animations: std::collections::HashMap<DomKey, Vec<String>>,
+    /// Play-state controls received, in order — tests assert the
+    /// binding forwarded pause/cancel/finish here.
+    pub waapi_controls: Vec<(DomKey, u64, WaapiOp)>,
+    /// CSS play-state controls received, in order.
+    pub css_controls: Vec<(DomKey, String, WaapiOp)>,
 }
 
 impl TestHost {
@@ -88,6 +115,13 @@ impl TestHost {
             custom_validity: std::collections::HashMap::new(),
             pending_form_submits: Vec::new(),
             focused: None,
+            computed_styles: std::collections::HashMap::new(),
+            next_waapi_id: 1,
+            waapi: std::collections::HashMap::new(),
+            waapi_finished: std::collections::HashSet::new(),
+            css_animations: std::collections::HashMap::new(),
+            waapi_controls: Vec::new(),
+            css_controls: Vec::new(),
         }
     }
 
@@ -863,6 +897,90 @@ impl DomHost for TestHost {
             return None;
         }
         self.clone_within(key, deep)
+    }
+
+    // M6 Phase 3 (Rec 11): computed style + WAAPI. The test
+    // host applies controls synchronously (no engine): pause /
+    // cancel / finish update the records `get_animations` reads,
+    // so binding tests can assert the round trip.
+    fn computed_style(&self, key: DomKey, property: &str) -> Option<String> {
+        self.computed_styles
+            .get(&key)
+            .and_then(|pairs| pairs.iter().find(|(p, _)| p == property))
+            .map(|(_, v)| v.clone())
+    }
+
+    fn computed_styles(&self, key: DomKey) -> Vec<(String, String)> {
+        self.computed_styles.get(&key).cloned().unwrap_or_default()
+    }
+
+    fn request_animate(&mut self, key: DomKey, spec: AnimateSpec) -> Option<u64> {
+        let id = self.next_waapi_id;
+        self.next_waapi_id += 1;
+        self.waapi.insert((key, id), spec.clone());
+        self.log
+            .lock()
+            .unwrap()
+            .animate_requests
+            .push((key, id, spec));
+        Some(id)
+    }
+
+    fn get_animations(&self, key: DomKey) -> Vec<AnimationInfo> {
+        let mut out: Vec<AnimationInfo> = self
+            .waapi
+            .keys()
+            .filter(|(k, _)| *k == key)
+            .map(|(_, id)| AnimationInfo {
+                id: Some(*id),
+                name: None,
+                finished: self.waapi_finished.contains(&(key, *id)),
+            })
+            .collect();
+        out.sort_by_key(|info| info.id);
+        if let Some(names) = self.css_animations.get(&key) {
+            for name in names {
+                out.push(AnimationInfo {
+                    id: None,
+                    name: Some(name.clone()),
+                    finished: false,
+                });
+            }
+        }
+        out
+    }
+
+    fn waapi_control(&mut self, key: DomKey, anim_id: u64, op: WaapiOp) {
+        self.waapi_controls.push((key, anim_id, op));
+        self.log
+            .lock()
+            .unwrap()
+            .waapi_controls
+            .push((key, anim_id, op));
+        match op {
+            WaapiOp::Cancel => {
+                self.waapi.remove(&(key, anim_id));
+                self.waapi_finished.remove(&(key, anim_id));
+            }
+            WaapiOp::Finish => {
+                self.waapi_finished.insert((key, anim_id));
+            }
+            _ => {}
+        }
+    }
+
+    fn css_animation_control(&mut self, key: DomKey, name: &str, op: WaapiOp) {
+        self.css_controls.push((key, name.to_string(), op));
+        self.log
+            .lock()
+            .unwrap()
+            .css_controls
+            .push((key, name.to_string(), op));
+        if op == WaapiOp::Cancel {
+            if let Some(names) = self.css_animations.get_mut(&key) {
+                names.retain(|n| n != name);
+            }
+        }
     }
 
     fn request_image(&mut self, url: &str, base_url: &str) {

@@ -2001,3 +2001,138 @@ fn form_focus_and_active_element() {
     assert_eq!(read_str(&mut tab, "document.activeElement.id"), "sel");
     assert_eq!(read_str(&mut tab, "window.__focus.join(',')"), "blur,focus");
 }
+
+// ------------------------------------------------------------------ M6 Phase 3 (Rec 11): computed style + WAAPI
+
+/// A tab whose test host has a seeded computed-style cache for
+/// `#app` (the tab thread's `changed_styles` feed, in production).
+fn anim_tab() -> (TabJs, Arc<Mutex<TestHostLog>>) {
+    let log = Arc::new(Mutex::new(TestHostLog::default()));
+    let mut host = TestHost::from_html_with_log(DOC, Arc::clone(&log));
+    let root = host.dom.root().unwrap();
+    let app = host.find_tag(root, "div").unwrap();
+    host.computed_styles.insert(
+        app,
+        vec![
+            ("opacity".to_string(), "0.5".to_string()),
+            ("background-color".to_string(), "rgb(255, 0, 0)".to_string()),
+        ],
+    );
+    let mut tab = TabJs::new(&RealmConfig::default()).unwrap();
+    tab.set_dom_host(Box::new(host));
+    (tab, log)
+}
+
+#[test]
+fn get_computed_style_reads_host_cache() {
+    let (mut tab, _log) = anim_tab();
+    run(&mut tab, "window.__cs = getComputedStyle(document.getElementById('app'));");
+    assert_eq!(read_str(&mut tab, "window.__cs.opacity"), "0.5");
+    assert_eq!(
+        read_str(&mut tab, "window.__cs.backgroundColor"),
+        "rgb(255, 0, 0)"
+    );
+    assert_eq!(
+        read_str(
+            &mut tab,
+            "window.__cs.getPropertyValue('background-color')"
+        ),
+        "rgb(255, 0, 0)"
+    );
+    assert_eq!(
+        read_str(&mut tab, "window.__cs.getPropertyValue('color')"),
+        ""
+    );
+}
+
+#[test]
+fn element_animate_returns_animation_with_play_state() {
+    let (mut tab, log) = anim_tab();
+    run(
+        &mut tab,
+        "window.__a = document.getElementById('app').animate([{opacity: '0'}, {opacity: '0.5'}, {opacity: '1'}], {duration: 1000});",
+    );
+    assert_eq!(read_str(&mut tab, "window.__a.playState"), "running");
+    assert!(read_num(&mut tab, "window.__a.currentTime") >= 0.0);
+    assert_eq!(
+        read_num(&mut tab, "document.getElementById('app').getAnimations().length"),
+        1.0
+    );
+    assert!(read_bool(
+        &mut tab,
+        "document.getElementById('app').getAnimations()[0] === window.__a"
+    ));
+    // The host got the request: missing middle offset distributed
+    // to 0.5, duration in ms, default easing/direction/fill.
+    let logged = log.lock().unwrap();
+    assert_eq!(logged.animate_requests.len(), 1);
+    let (_, _, spec) = &logged.animate_requests[0];
+    assert_eq!(spec.duration_ms, 1000.0);
+    assert_eq!(spec.easing, "linear");
+    assert_eq!(spec.direction, "normal");
+    assert_eq!(spec.fill, "none");
+    let offsets: Vec<f32> = spec.steps.iter().map(|(o, _)| *o).collect();
+    assert_eq!(offsets, vec![0.0, 0.5, 1.0]);
+    assert_eq!(spec.steps[1].1, vec![("opacity".to_string(), "0.5".to_string())]);
+}
+
+#[test]
+fn animation_pause_play_finish_cancel() {
+    use crate::host::WaapiOp;
+    let (mut tab, log) = anim_tab();
+    run(
+        &mut tab,
+        "window.__a = document.getElementById('app').animate([{opacity: '0'}, {opacity: '1'}], 500);",
+    );
+    run(&mut tab, "window.__a.pause();");
+    assert_eq!(read_str(&mut tab, "window.__a.playState"), "paused");
+    run(&mut tab, "window.__a.play();");
+    assert_eq!(read_str(&mut tab, "window.__a.playState"), "running");
+    run(&mut tab, "window.__a.finish();");
+    assert_eq!(read_str(&mut tab, "window.__a.playState"), "finished");
+    run(
+        &mut tab,
+        "window.__b = document.getElementById('app').animate([{opacity: '0'}, {opacity: '1'}], 500); window.__b.cancel();",
+    );
+    assert_eq!(read_str(&mut tab, "window.__b.playState"), "idle");
+    // Only the finished animation is still reported — the
+    // cancelled one does not resurrect in `getAnimations`.
+    assert_eq!(
+        read_num(&mut tab, "document.getElementById('app').getAnimations().length"),
+        1.0
+    );
+    assert!(read_bool(
+        &mut tab,
+        "document.getElementById('app').getAnimations()[0] === window.__a"
+    ));
+    let logged = log.lock().unwrap();
+    let ops: Vec<WaapiOp> = logged.waapi_controls.iter().map(|(_, _, op)| *op).collect();
+    assert_eq!(
+        ops,
+        vec![WaapiOp::Pause, WaapiOp::Play, WaapiOp::Finish, WaapiOp::Cancel]
+    );
+}
+
+#[test]
+fn css_animation_in_get_animations() {
+    let log = Arc::new(Mutex::new(TestHostLog::default()));
+    let mut host = TestHost::from_html_with_log(DOC, Arc::clone(&log));
+    let root = host.dom.root().unwrap();
+    let app = host.find_tag(root, "div").unwrap();
+    host.css_animations.insert(app, vec!["fade".to_string()]);
+    let mut tab = TabJs::new(&RealmConfig::default()).unwrap();
+    tab.set_dom_host(Box::new(host));
+    run(&mut tab, "window.__anims = document.getElementById('app').getAnimations();");
+    assert_eq!(read_num(&mut tab, "window.__anims.length"), 1.0);
+    assert_eq!(read_str(&mut tab, "window.__anims[0].playState"), "running");
+    // CSS animations have no JS-visible currentTime in v1.
+    assert!(matches!(
+        tab.eval_value("window.__anims[0].currentTime").unwrap(),
+        JsValue::Null
+    ));
+    run(&mut tab, "window.__anims[0].pause();");
+    assert_eq!(read_str(&mut tab, "window.__anims[0].playState"), "paused");
+    let logged = log.lock().unwrap();
+    assert_eq!(logged.css_controls.len(), 1);
+    assert_eq!(logged.css_controls[0].1, "fade");
+}

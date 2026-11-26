@@ -315,7 +315,7 @@ mod tests {
     };
     use pluto_css::Stylesheet;
     use pluto_html::parse as parse_html;
-    use pluto_layout::LayoutTree;
+    use pluto_layout::{LayoutTree, Theme};
     use pluto_paint::{DisplayItem, DisplayList, Resource, ResourceId, ResourceTable};
     use tokio::io::AsyncWriteExt;
 
@@ -323,7 +323,7 @@ mod tests {
         let html = "<html><head><style>body { background-color: #f0f0f2; }</style></head><body><p>Hello</p></body></html>";
         let dom = parse_html(html);
         let sheet = Stylesheet::parse("body { background-color: #f0f0f2; }");
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         DisplayList::build(&tree)
     }
 

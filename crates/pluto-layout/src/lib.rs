@@ -104,12 +104,15 @@
 
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, Weight};
 use pluto_css::{
-    AnPlusB, AttrOp, BorderRadius, BoxShadow, CascadeKey, Combinator, Origin, PseudoClass,
-    ResolvedCorners, Rule, Selector, SimpleSelector, Stylesheet, SupportsCondition, Value,
-    parse_value,
+    Affine, AnPlusB, Animation, AnimationDirection, AttrOp, BorderRadius, BoxShadow, CalcCtx,
+    CalcExpr, CalcNumber, CascadeKey, Combinator, Easing, FillMode, IterationCount, Keyframes,
+    Origin, PlayState, PseudoClass, ResolvedCorners, Rule, Selector, SimpleSelector, Stylesheet,
+    SupportsCondition, TransformList, TransformListExt, Transition,
+    Value, parse_value,
 };
 use pluto_html::{Dom, NodeId as DomId};
 use rayon::prelude::*;
+use slotmap::Key as _;
 use slotmap::SparseSecondaryMap;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -129,10 +132,18 @@ use taffy::prelude::{line as grid_line, span as grid_span};
 /// entry point, and the position-only fast path.
 mod incremental;
 
+/// M6 Rec 11 — the animation engine: CSS transitions, keyframe
+/// animations, and the `Element.animate` / `getAnimations` subset.
+pub mod animation;
+
 pub use incremental::{
     classify_damage, classify_style_change, is_safe_layout_root, unsafe_layout_root_reason,
     DamageKind, RelayoutKind, RelayoutOutcome,
 };
+
+/// Re-exported for callers that build trees: the theme a layout
+/// pass evaluates `prefers-color-scheme` against (M6 Rec 12).
+pub use pluto_css::Theme;
 
 /// One styled run inside a text leaf.
 #[derive(Debug, Clone)]
@@ -383,10 +394,35 @@ pub struct ComputedStyle {
     pub background_image: Option<String>,
     /// `background-size` (Stage 11 Rec 3).
     pub background_size: BackgroundSize,
-    /// `background-repeat` (Stage 11 Rec 3).
+    /// `background-repeat` (Stage 11 Rec 3; two-value form M6).
     pub background_repeat: BackgroundRepeat,
     /// `background-position` `(x, y)` (Stage 11 Rec 3).
     pub background_position: (BackgroundPosition, BackgroundPosition),
+    /// `z-index`: `None` = `auto` (no explicit stacking level).
+    pub z_index: Option<i32>,
+    /// `opacity`, clamped to `0..=1` (initial 1.0).
+    pub opacity: f32,
+    /// `transform` function list (initial `none` = empty).
+    pub transform: TransformList,
+    /// `transform-origin` (initial `50% 50%`). Percentages
+    /// resolve against the border box at box-build time, never
+    /// here.
+    pub transform_origin: TransformOrigin,
+    /// `transform-box` (initial `view-box`; only view-box
+    /// semantics are implemented — the value is stored so the
+    /// later paint phase can read it).
+    pub transform_box: TransformBox,
+    /// `will-change: transform` was declared. A hint only: it
+    /// does NOT create a stacking context (see
+    /// [`is_stacking_context`]).
+    pub will_change_transform: bool,
+    /// `transition` entries, in author order.
+    pub transitions: Vec<Transition>,
+    /// `animation` entries, in author order.
+    pub animations: Vec<Animation>,
+    /// Custom properties (`--*`) for this element: its own
+    /// declarations over the inherited chain (see `resolve_style`).
+    pub custom_properties: HashMap<String, Value>,
 }
 
 impl ComputedStyle {
@@ -438,8 +474,113 @@ impl ComputedStyle {
             background_size: BackgroundSize::Auto,
             background_repeat: BackgroundRepeat::Repeat,
             background_position: (BackgroundPosition::Start, BackgroundPosition::Start),
+            z_index: None,
+            opacity: 1.0,
+            transform: Vec::new(),
+            transform_origin: TransformOrigin {
+                x: OriginComponent::Percentage(50.0),
+                y: OriginComponent::Percentage(50.0),
+            },
+            transform_box: TransformBox::ViewBox,
+            will_change_transform: false,
+            transitions: Vec::new(),
+            animations: Vec::new(),
+            custom_properties: HashMap::new(),
         }
     }
+}
+
+/// `transform-box`: which box the transform reference box is.
+/// Only `view-box` semantics are implemented (the initial value);
+/// the other values are stored so a later phase can honour them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransformBox {
+    ContentBox,
+    BorderBox,
+    FillBox,
+    StrokeBox,
+    ViewBox,
+}
+
+/// One axis of `transform-origin`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OriginComponent {
+    Length(Dim),
+    Percentage(f32),
+    Keyword(OriginKeyword),
+}
+
+/// A `transform-origin` keyword.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginKeyword {
+    Left,
+    Center,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// `transform-origin`: the pivot a transform rotates / scales
+/// about, resolved against the border box at box-build time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TransformOrigin {
+    pub x: OriginComponent,
+    pub y: OriginComponent,
+}
+
+impl TransformOrigin {
+    /// Resolve one axis to used pixels against a border-box side
+    /// of `size` (width for x, height for y).
+    pub fn resolve_axis(component: OriginComponent, size: f32, viewport: (f32, f32)) -> f32 {
+        match component {
+            OriginComponent::Length(d) => match d {
+                Dim::Px(v) => v,
+                Dim::Pct(f) => f * size,
+                Dim::Vh(v) => v / 100.0 * viewport.1,
+                Dim::Vw(v) => v / 100.0 * viewport.0,
+            },
+            OriginComponent::Percentage(p) => p / 100.0 * size,
+            OriginComponent::Keyword(k) => match k {
+                OriginKeyword::Left | OriginKeyword::Top => 0.0,
+                OriginKeyword::Center => size / 2.0,
+                OriginKeyword::Right | OriginKeyword::Bottom => size,
+            },
+        }
+    }
+
+    /// Resolve both axes against a `width` × `height` border box.
+    pub fn resolve(self, width: f32, height: f32, viewport: (f32, f32)) -> (f32, f32) {
+        (
+            Self::resolve_axis(self.x, width, viewport),
+            Self::resolve_axis(self.y, height, viewport),
+        )
+    }
+}
+
+/// Whether `style` makes its box a stacking context (M6 Rec 5,
+/// Phase 1 model only — paint order is a later phase).
+///
+/// Explicit: `position != static` with a non-`auto` `z-index`,
+/// or a flex/grid item with a non-`auto` `z-index`.
+/// Implicit: `opacity < 1.0`, or a non-`none` transform.
+///
+/// Deliberately NOT in the predicate: `will-change` (a hint
+/// only — it must not create a context), and `isolation` /
+/// `filter` / `mix-blend-mode`, which are unmodelled in this
+/// phase, so they cannot create one either.
+pub fn is_stacking_context(style: &ComputedStyle, is_flex_or_grid_item: bool) -> bool {
+    if style.z_index.is_some()
+        && (style.position != PositionKind::Static || is_flex_or_grid_item)
+    {
+        return true;
+    }
+    if style.opacity < 1.0 {
+        return true;
+    }
+    if !style.transform.is_empty() {
+        return true;
+    }
+    false
 }
 
 /// `background-size` (Stage 11 Rec 3): `cover` / `contain` scale
@@ -454,13 +595,16 @@ pub enum BackgroundSize {
     Auto,
 }
 
-/// `background-repeat` (Stage 11 Rec 3).
+/// `background-repeat` (Stage 11 Rec 3; two-value form M6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackgroundRepeat {
     Repeat,
     NoRepeat,
     RepeatX,
     RepeatY,
+    /// Two-value form: `(repeat_x, repeat_y)` — e.g.
+    /// `repeat no-repeat` tiles x only.
+    RepeatXY(bool, bool),
 }
 
 /// One axis of `background-position` (Stage 11 Rec 3): keyword
@@ -736,6 +880,30 @@ pub struct LayoutBox {
     /// element has no background image or it has not arrived yet.
     pub background_image: Option<u32>,
     pub background_image_size: Option<(u32, u32)>,
+    /// The DOM id of the nearest ancestor box (`None` for the
+    /// root box).
+    pub parent: Option<DomId>,
+    /// The accumulated transform mapping this box's local
+    /// coordinates to page coordinates: the parent box's matrix
+    /// composed with this box's own origin-resolved transform
+    /// (`T(origin) * M * T(-origin)`). Identity when nothing in
+    /// the ancestor chain (or this box) is transformed. This is
+    /// the transform part only — the box's layout offset lives
+    /// in `x`/`y`, and paint composes the two.
+    pub matrix: Affine,
+    /// Whether this box is a stacking context (see
+    /// [`is_stacking_context`]). Model only in this phase —
+    /// paint order is a later phase.
+    pub is_stacking_context: bool,
+    /// Whether this box is viewport-fixed (M6 Phase 3, Rec 1):
+    /// `position: fixed` with no transformed ancestor, so it
+    /// resolves against the viewport — not against the nearest
+    /// positioned ancestor, and not against any scroll container.
+    /// Its `x`/`y` are viewport coordinates (insets resolved
+    /// against the viewport); paint must exempt it from the
+    /// viewport scroll subtraction (see `PushFixed`), and
+    /// hit-testing tests it in viewport coordinates.
+    pub is_viewport_fixed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -816,6 +984,36 @@ pub struct LayoutTree {
     /// re-layout after an image arrival picks the new image up
     /// without the caller re-threading the map.
     pub images: ImageMap,
+    /// The `prefers-color-scheme` theme this tree was built with
+    /// (M6 Phase 3, Rec 12): restyles after a theme change rebuild
+    /// against the new theme instead of the hardcoded Light the
+    /// incremental path used before.
+    pub theme: Theme,
+    /// The viewport (page) scroll offset, in page px (M6 Phase 3,
+    /// Rec 1/3): mirrored from the shell by
+    /// [`LayoutTree::set_viewport_scroll`]. Boxes are in page
+    /// coordinates, so this is NOT subtracted in `collect_boxes` —
+    /// it drives sticky offsets and viewport-fixed hit-testing.
+    pub viewport_scroll: (f32, f32),
+    /// Scroll-derived sticky offsets (M6 Phase 3, Rec 3), keyed by
+    /// taffy node: `(dx, dy)` added to the sticky subtree's boxes
+    /// when they are re-collected. Recomputed from scratch on every
+    /// `recollect` (scroll or layout change); never set by hand.
+    sticky_offsets: HashMap<TaffyId, (f32, f32)>,
+    /// Hashes of web-font byte blobs already loaded into
+    /// `font_system` (M6 Phase 3, Rec 12): `@font-face` downloads
+    /// arrive per navigation and must not be re-loaded on every
+    /// rebuild.
+    loaded_font_hashes: HashSet<u64>,
+    /// In-flight sampled animation values (M6 Phase 3, Rec 11):
+    /// `(element, [(property, value)])`, owned by the tab thread
+    /// and set on the actor's tree before each layout. The actor
+    /// applies them over the resolved (underlying) styles before
+    /// classification, so an animated transform routes through
+    /// the CompositingOnly path and an animated width re-lays out
+    /// like any other style change. The retained `node_styles`
+    /// stay underlying — overrides never persist there.
+    pub animation_overrides: Vec<(DomId, Vec<(String, animation::AnimatedValue)>)>,
 }
 
 impl LayoutTree {
@@ -834,6 +1032,11 @@ impl LayoutTree {
             position_overrides: HashMap::new(),
             meta: HashMap::new(),
             images: ImageMap::default(),
+            theme: Theme::Light,
+            viewport_scroll: (0.0, 0.0),
+            sticky_offsets: HashMap::new(),
+            loaded_font_hashes: HashSet::new(),
+            animation_overrides: Vec::new(),
         }
     }
 
@@ -842,11 +1045,16 @@ impl LayoutTree {
     /// page coordinates (origin = viewport top-left). `sheet` is the
     /// document's author sheet; the parsed UA stylesheet
     /// (`Stylesheet::ua()`) is always applied underneath it.
+    /// Lay out `dom` with `sheet` in a viewport of the given size,
+    /// evaluating `prefers-color-scheme` against `theme` (M6 Rec 12).
+    /// The shell theme signal is a later phase; callers that have no
+    /// theme yet pass [`Theme::Light`].
     pub fn build(
         dom: &Dom,
         sheet: &Stylesheet,
         viewport_width: f32,
         viewport_height: f32,
+        theme: Theme,
     ) -> Result<Self, LayoutError> {
         Self::build_with_state(
             dom,
@@ -854,6 +1062,7 @@ impl LayoutTree {
             viewport_width,
             viewport_height,
             &ElementState::default(),
+            theme,
         )
     }
 
@@ -865,6 +1074,7 @@ impl LayoutTree {
         viewport_width: f32,
         viewport_height: f32,
         state: &ElementState,
+        theme: Theme,
     ) -> Result<Self, LayoutError> {
         // A fresh `FontSystem` scans the system fonts (~1.5 s):
         // fine for a first layout, but a full rebuild must not pay
@@ -877,6 +1087,7 @@ impl LayoutTree {
             state,
             FontSystem::new(),
             &ImageMap::default(),
+            theme,
         )
     }
 
@@ -894,6 +1105,7 @@ impl LayoutTree {
         viewport_height: f32,
         state: &ElementState,
         images: &ImageMap,
+        theme: Theme,
     ) -> Result<Self, LayoutError> {
         Self::build_with_state_and_font_system(
             dom,
@@ -903,6 +1115,7 @@ impl LayoutTree {
             state,
             FontSystem::new(),
             images,
+            theme,
         )
     }
 
@@ -922,6 +1135,7 @@ impl LayoutTree {
         viewport_height: f32,
         state: &ElementState,
         font_system: FontSystem,
+        theme: Theme,
     ) -> Result<Self, LayoutError> {
         Self::build_with_state_and_font_system(
             dom,
@@ -931,6 +1145,7 @@ impl LayoutTree {
             state,
             font_system,
             &ImageMap::default(),
+            theme,
         )
     }
 
@@ -945,6 +1160,7 @@ impl LayoutTree {
         state: &ElementState,
         font_system: FontSystem,
         images: &ImageMap,
+        theme: Theme,
     ) -> Result<Self, LayoutError> {
         Self::build_with_state_and_font_system(
             dom,
@@ -954,6 +1170,7 @@ impl LayoutTree {
             state,
             font_system,
             images,
+            theme,
         )
     }
 
@@ -965,6 +1182,7 @@ impl LayoutTree {
         state: &ElementState,
         font_system: FontSystem,
         images: &ImageMap,
+        theme: Theme,
     ) -> Result<Self, LayoutError> {
         let ua = Stylesheet::ua();
         // Two-phase style resolution (Stage 4 #5): every element's
@@ -977,6 +1195,7 @@ impl LayoutTree {
             true,
             (viewport_width, viewport_height),
             state,
+            theme,
         );
         // The root element's font size is the `rem` basis for
         // border-radius / box-shadow resolution (Stage 8). Read it
@@ -1066,6 +1285,11 @@ impl LayoutTree {
             position_overrides: HashMap::new(),
             meta,
             images: images.clone(),
+            theme,
+            viewport_scroll: (0.0, 0.0),
+            sticky_offsets: HashMap::new(),
+            loaded_font_hashes: HashSet::new(),
+            animation_overrides: Vec::new(),
         };
         // Re-collect boxes (which also shapes glyphs at final width).
         tree.recollect();
@@ -1085,27 +1309,21 @@ impl LayoutTree {
     /// Re-collect `boxes` from the taffy tree, applying the retained
     /// scroll offsets and re-shaping glyphs at their final positions.
     /// Called after layout and after every `set_scroll_offset`.
+    /// Sticky offsets are computed from the first pass and applied
+    /// in a second collect (M6 Phase 3, Rec 3): a sticky box lays
+    /// out in flow, then shifts by a scroll-derived offset clamped
+    /// to its containing block — never through taffy insets.
     fn recollect(&mut self) {
-        let Some(root) = self.root else {
+        if self.root.is_none() {
             return;
-        };
-        let mut boxes = Vec::new();
-        collect_boxes(
-            &self.taffy,
-            &self.meta,
-            root,
-            (0.0, 0.0),
-            &self.scroll_offsets,
-            None,
-            None,
-            None,
-            None,
-            self.viewport,
-            self.root_font_size,
-            &self.position_overrides,
-            &self.images,
-            &mut boxes,
-        );
+        }
+        self.sticky_offsets.clear();
+        let mut boxes = self.collect_all();
+        let sticky = self.sticky_offsets_for(&boxes);
+        if !sticky.is_empty() {
+            self.sticky_offsets = sticky;
+            boxes = self.collect_all();
+        }
         // `None` only transiently inside `full_rebuild` (see the
         // field docs): every other path holds a font system.
         let fs = self
@@ -1118,6 +1336,264 @@ impl LayoutTree {
             }
         }
         self.boxes = boxes;
+    }
+
+    /// One `collect_boxes` pass over the taffy tree, with the
+    /// current `sticky_offsets` applied.
+    fn collect_all(&self) -> Vec<LayoutBox> {
+        let Some(root) = self.root else {
+            return Vec::new();
+        };
+        let mut boxes = Vec::new();
+        collect_boxes(
+            &self.taffy,
+            &self.meta,
+            root,
+            (0.0, 0.0),
+            (0.0, 0.0),
+            &self.scroll_offsets,
+            None,
+            None,
+            None,
+            None,
+            self.viewport,
+            self.root_font_size,
+            &self.position_overrides,
+            &self.sticky_offsets,
+            &self.images,
+            None,
+            Affine::identity(),
+            false,
+            false,
+            &mut boxes,
+        );
+        boxes
+    }
+
+    /// The scroll-derived sticky offsets for `boxes` (M6 Phase 3,
+    /// Rec 3), keyed by taffy node. For each `position: sticky`
+    /// box, in its scroll space — the content space of its nearest
+    /// scroll container (or page space for viewport scrolling),
+    /// with the origin at that container's content-box top-left:
+    /// `top` sticks the box `top` px below the scrollport top once
+    /// the scroll passes its flow position, and releases it when
+    /// its bottom would pass its containing block's bottom edge
+    /// (same on the horizontal axis with `left` / `right`). The
+    /// containing block is the nearest ancestor box; a sticky box
+    /// inside a viewport-fixed subtree is already pinned and gets
+    /// no offset. Percentages in insets resolve against the
+    /// containing block's size; `auto` insets stick at 0 on that
+    /// side only when the opposite inset is also `auto`.
+    fn sticky_offsets_for(&self, boxes: &[LayoutBox]) -> HashMap<TaffyId, (f32, f32)> {
+        let mut by_dom: HashMap<DomId, usize> = HashMap::new();
+        for (i, bx) in boxes.iter().enumerate() {
+            if let Some(dom) = bx.dom {
+                by_dom.entry(dom).or_insert(i);
+            }
+        }
+        // Flow (unscrolled, page-space) position of a box: its
+        // collected position plus the scroll offsets of the scroll
+        // containers above it (a container's own box does NOT move
+        // with its own offset, so its own offset is never added
+        // back — only its ancestors' are).
+        let flow_pos = |bx: &LayoutBox| -> (f32, f32) {
+            let mut ox = 0.0f32;
+            let mut oy = 0.0f32;
+            let mut cur = bx.parent;
+            while let Some(dom) = cur {
+                let Some(&pi) = by_dom.get(&dom) else {
+                    break;
+                };
+                let p = &boxes[pi];
+                if p.style.overflow_x.is_scroll_container()
+                    || p.style.overflow_y.is_scroll_container()
+                {
+                    let (ax, ay) =
+                        self.scroll_offsets.get(&dom).copied().unwrap_or((0.0, 0.0));
+                    ox += ax;
+                    oy += ay;
+                }
+                cur = p.parent;
+            }
+            (bx.x + ox, bx.y + oy)
+        };
+        let has_fixed_ancestor = |bx: &LayoutBox| -> bool {
+            let mut cur = bx.parent;
+            while let Some(dom) = cur {
+                let Some(&pi) = by_dom.get(&dom) else {
+                    break;
+                };
+                if boxes[pi].is_viewport_fixed {
+                    return true;
+                }
+                cur = boxes[pi].parent;
+            }
+            false
+        };
+        let mut out: HashMap<TaffyId, (f32, f32)> = HashMap::new();
+        for bx in boxes {
+            if bx.dom.is_none() {
+                continue;
+            }
+            if bx.style.position != PositionKind::Sticky || has_fixed_ancestor(bx) {
+                continue;
+            }
+            // Scroll offset, visible size, and content origin of
+            // the scrollport the box scrolls in (its nearest scroll
+            // container, else the viewport — origin 0,0 in page
+            // space). All sticky math below is in this scroll
+            // space, so a container at page y=8 still sticks its
+            // header at its own top, not at y=0.
+            let (sx, sy, vis_w, vis_h, origin_x, origin_y) = match bx.scroll_ancestor {
+                Some(c) => {
+                    let (ox, oy) = self.scroll_offsets.get(&c).copied().unwrap_or((0.0, 0.0));
+                    let (w, h, ox0, oy0) = by_dom
+                        .get(&c)
+                        .map(|&i| {
+                            let (fx, fy) = flow_pos(&boxes[i]);
+                            (boxes[i].width, boxes[i].height, fx, fy)
+                        })
+                        .unwrap_or((self.viewport.0, self.viewport.1, 0.0, 0.0));
+                    (ox, oy, w, h, ox0, oy0)
+                }
+                None => (
+                    self.viewport_scroll.0,
+                    self.viewport_scroll.1,
+                    self.viewport.0,
+                    self.viewport.1,
+                    0.0,
+                    0.0,
+                ),
+            };
+            let (flow_x, flow_y) = flow_pos(bx);
+            let (flow_x, flow_y) = (flow_x - origin_x, flow_y - origin_y);
+            // Containing block: nearest ancestor box, in the same
+            // scroll space (unbounded when there is none — the
+            // root, whose content runs to the end of the page).
+            let (cb_left, cb_top, cb_right, cb_bottom) = match bx
+                .parent
+                .and_then(|p| by_dom.get(&p))
+            {
+                Some(&ci) => {
+                    let cb = &boxes[ci];
+                    let (cx, cy) = flow_pos(cb);
+                    (
+                        cx - origin_x,
+                        cy - origin_y,
+                        cx - origin_x + cb.width,
+                        cy - origin_y + cb.height,
+                    )
+                }
+                None => (0.0, 0.0, f32::INFINITY, f32::INFINITY),
+            };
+            let resolve = |d: Option<Dim>, basis: f32| {
+                d.map(|dim| match dim {
+                    Dim::Px(v) => v,
+                    Dim::Pct(f) => f * basis,
+                    Dim::Vh(v) => v / 100.0 * self.viewport.1,
+                    Dim::Vw(v) => v / 100.0 * self.viewport.0,
+                })
+            };
+            let cb_w = if cb_right.is_finite() {
+                cb_right - cb_left
+            } else {
+                self.viewport.0
+            };
+            let cb_h = if cb_bottom.is_finite() {
+                cb_bottom - cb_top
+            } else {
+                self.viewport.1
+            };
+            let dy = match (
+                resolve(bx.style.inset[0], cb_h),
+                resolve(bx.style.inset[2], cb_h),
+            ) {
+                (Some(top), _) => {
+                    let max = (cb_bottom - flow_y - bx.height).max(0.0);
+                    (sy - (flow_y - top)).clamp(0.0, max)
+                }
+                (None, Some(bottom)) => {
+                    let min = cb_top - flow_y;
+                    ((sy + vis_h) - bottom - (flow_y + bx.height)).clamp(min, 0.0)
+                }
+                (None, None) => 0.0,
+            };
+            let dx = match (
+                resolve(bx.style.inset[3], cb_w),
+                resolve(bx.style.inset[1], cb_w),
+            ) {
+                (Some(left), _) => {
+                    let max = (cb_right - flow_x - bx.width).max(0.0);
+                    (sx - (flow_x - left)).clamp(0.0, max)
+                }
+                (None, Some(right)) => {
+                    let min = cb_left - flow_x;
+                    ((sx + vis_w) - right - (flow_x + bx.width)).clamp(min, 0.0)
+                }
+                (None, None) => 0.0,
+            };
+            if dx != 0.0 || dy != 0.0 {
+                out.insert(bx.taffy, (dx, dy));
+            }
+        }
+        out
+    }
+
+    /// Set the viewport (page) scroll offset (M6 Phase 3, Rec 3):
+    /// sticky boxes re-anchor against it, and viewport-fixed boxes
+    /// hit-test against it. No layout is recomputed — boxes are
+    /// re-collected with the new scroll applied. The offset is
+    /// stored as given; the caller (the worker's viewport-scroll
+    /// mirror) clamps it to the page maximum.
+    ///
+    /// Returns `true` when the scroll moved a sticky box (the
+    /// sticky offsets changed) — only then does the re-collected
+    /// display list differ from the previous one. A pure viewport
+    /// scroll with no sticky content leaves the list identical
+    /// (fixed boxes are viewport-anchored, containers scroll
+    /// through their own offsets), so the worker skips the submit
+    /// and the shell just scrolls its cached list.
+    pub fn set_viewport_scroll(&mut self, x: f32, y: f32) -> bool {
+        let before = self.sticky_offsets.clone();
+        self.viewport_scroll = (x, y);
+        self.recollect();
+        self.sticky_offsets != before
+    }
+
+    /// Change the theme this tree resolves `prefers-color-scheme`
+    /// against (M6 Phase 3, Rec 12). Only records the theme — the
+    /// caller rebuilds (full rebuild, no refetch) for the restyle
+    /// to take effect.
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+    }
+
+    /// Load web-font bytes into the tree's font system (M6 Phase 3,
+    /// Rec 12, `@font-face`): each blob is loaded once (deduped by
+    /// a hash of its bytes — the same URL fetched twice still loads
+    /// once). Returns true when at least one new face landed, in
+    /// which case the caller must rebuild: shaping changes with the
+    /// available faces. Invalid blobs are ignored by fontdb, so a
+    /// corrupt download degrades to the fallback font, never an
+    /// error.
+    pub fn load_fonts(&mut self, fonts: &[Vec<u8>]) -> bool {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let Some(fs) = self.font_system.as_mut() else {
+            return false;
+        };
+        let mut loaded = false;
+        for bytes in fonts {
+            let mut hasher = DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            let hash = hasher.finish();
+            if !self.loaded_font_hashes.insert(hash) {
+                continue;
+            }
+            fs.db_mut().load_font_data(bytes.clone());
+            loaded = true;
+        }
+        loaded
     }
 
     /// Boxes in document order.
@@ -1175,7 +1651,30 @@ impl LayoutTree {
         // scrolls nowhere.
         let mut max_right = container.width;
         let mut max_bottom = container.height;
+        // M6 Phase 3 (Rec 1): viewport-fixed boxes are not content
+        // of any scroll container — neither they nor their
+        // descendants may inflate a container's maximum. A fixed
+        // box's descendants scroll with the fixed box, not with
+        // the container underneath it.
+        let mut fixed_subtree: HashSet<TaffyId> = HashSet::new();
+        let mut stack: Vec<TaffyId> = self
+            .boxes
+            .iter()
+            .filter(|b| b.is_viewport_fixed)
+            .map(|b| b.taffy)
+            .collect();
+        while let Some(node) = stack.pop() {
+            if !fixed_subtree.insert(node) {
+                continue;
+            }
+            if let Some(m) = self.meta.get(&node) {
+                stack.extend(m.children.iter().copied());
+            }
+        }
         for b in &self.boxes {
+            if fixed_subtree.contains(&b.taffy) {
+                continue;
+            }
             if b.dom == Some(id) {
                 continue;
             }
@@ -1201,19 +1700,285 @@ impl LayoutTree {
         ))
     }
 
-    /// Hit-test: the topmost (latest in document order) box whose rect
-    /// contains `(x, y)`. Boxes already carry their scroll offsets
-    /// (applied in `recollect`), so no offset subtraction is needed
-    /// here. Text leaves have no `DomId` and never win.
+    /// Hit-test: the topmost box (in *paint* order, M6 Phase 2
+    /// Rec 4 — paint order and hit order must never disagree)
+    /// whose rect contains `(x, y)`. Boxes already carry their
+    /// scroll offsets (applied in `recollect`), so no offset
+    /// subtraction is needed here. Text leaves have no `DomId`
+    /// and never win. A transformed box is tested through the
+    /// inverse of its page transform (Rec 7/8): the point is
+    /// mapped back into the box's layout rect, so a click inside
+    /// the axis-aligned bounding box but outside the rotated rect
+    /// misses. A box whose transform is singular (e.g. a
+    /// `scale(0)`) has no inverse and is unhittable. The point
+    /// must also lie inside the box's effective clip (mapped back
+    /// to layout space the same way) — a point under a clipped
+    /// box's overflow region does not hit it.
     pub fn hit_test(&self, x: f32, y: f32) -> Option<DomId> {
-        self.boxes.iter().rev().find_map(|b| {
-            let dom = b.dom?;
-            if x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height {
-                Some(dom)
-            } else {
-                None
+        let transforms = self.page_transforms();
+        let order = self.paint_order();
+        // M6 Phase 3 (Rec 1): the point arrives in page
+        // coordinates (the shell added the viewport scroll), but a
+        // viewport-fixed box lives in viewport coordinates — test
+        // it against the point with the viewport scroll removed.
+        let (vx, vy) = (x - self.viewport_scroll.0, y - self.viewport_scroll.1);
+        for &i in order.iter().rev() {
+            let b = &self.boxes[i];
+            let Some(dom) = b.dom else {
+                continue;
+            };
+            let (px, py) = if b.is_viewport_fixed { (vx, vy) } else { (x, y) };
+            let inv = match transforms[i].invert() {
+                Some(inv) => inv,
+                None => continue,
+            };
+            let (lx, ly) = inv.apply(px, py);
+            if !(lx >= b.x && lx < b.x + b.width && ly >= b.y && ly < b.y + b.height) {
+                continue;
             }
-        })
+            if let Some(clip) = b.clip
+                && !(lx >= clip[0]
+                    && lx < clip[0] + clip[2]
+                    && ly >= clip[1]
+                    && ly < clip[1] + clip[3])
+            {
+                continue;
+            }
+            return Some(dom);
+        }
+        None
+    }
+
+    /// The stable wire key for a DOM id (M6 Phase 2, Rec 9): the
+    /// slotmap key's ffi value. The display list's
+    /// `PushTransform`/`PushOpacity` items and the `CompositingUpdate`
+    /// IPC message agree on this key — both are produced
+    /// worker-side from the same tree, so the key never needs to
+    /// be interpreted, only matched.
+    pub fn dom_key(id: DomId) -> u64 {
+        id.data().as_ffi()
+    }
+
+    /// Paint order (CSS 2.1 Appendix E, M6 Phase 2 Rec 4): box
+    /// indices in the order their items paint — a permutation of
+    /// `boxes()`, computed from the stacking-context tree, not
+    /// document order. The walk, per stacking context:
+    ///
+    /// 1. the context root's own box;
+    /// 2. child stacking contexts with negative `z-index`, in
+    ///    `z-index` order (then tree order);
+    /// 3. in-flow, non-positioned members, in tree order
+    ///    (blocks and inlines together — floats and borders do
+    ///    not exist yet, so there is no float step to split out;
+    ///    when floats land they slot in between steps 3 and 4);
+    /// 4. positioned members with `z-index: auto` and child
+    ///    stacking contexts with `z-index: auto`/`0`, interleaved
+    ///    in tree order (Appendix E step 8);
+    /// 5. child stacking contexts with positive `z-index`, in
+    ///    `z-index` order (then tree order).
+    ///
+    /// A member is any box whose nearest stacking-context
+    /// ancestor is the context being walked; a member's own
+    /// descendants that belong to a deeper context paint inside
+    /// that context's group, never with the member. `z-index` is
+    /// ignored on static boxes (they are never stacking contexts
+    /// and never positioned, so they stay in step 3). The root
+    /// element is always the root stacking context, whatever its
+    /// style says.
+    pub fn paint_order(&self) -> Vec<usize> {
+        if self.boxes.is_empty() {
+            return Vec::new();
+        }
+        // Nearest stacking-context ancestor for every box, by
+        // walking the `parent` chain (the root box, index 0, is
+        // the root context when no ancestor qualifies).
+        let mut by_dom: HashMap<DomId, usize> = HashMap::new();
+        for (i, bx) in self.boxes.iter().enumerate() {
+            if let Some(dom) = bx.dom {
+                by_dom.entry(dom).or_insert(i);
+            }
+        }
+        let mut context_of: Vec<usize> = Vec::with_capacity(self.boxes.len());
+        for bx in &self.boxes {
+            let mut ctx = 0;
+            let mut cur = bx.parent;
+            while let Some(dom) = cur {
+                let Some(&pi) = by_dom.get(&dom) else {
+                    break;
+                };
+                if self.boxes[pi].is_stacking_context {
+                    ctx = pi;
+                    break;
+                }
+                cur = self.boxes[pi].parent;
+            }
+            context_of.push(ctx);
+        }
+        // Members per context, in tree order (`boxes()` is
+        // pre-order, so index order is tree order).
+        let mut members: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, &ctx) in context_of.iter().enumerate() {
+            if i != ctx {
+                members.entry(ctx).or_default().push(i);
+            }
+        }
+        let mut out = Vec::with_capacity(self.boxes.len());
+        paint_context(0, &members, &self.boxes, &mut out);
+        debug_assert_eq!(out.len(), self.boxes.len());
+        out
+    }
+
+    /// The page-space transform for every box (M6 Phase 2,
+    /// Rec 7/8): one affine per box, aligned with `boxes()`,
+    /// mapping the box's *layout* coordinates to page
+    /// coordinates. For a box with transformed top-left `P` and
+    /// accumulated matrix `M`, the mapping is `P + M_lin·(p -
+    /// (x, y))` folded into a single matrix — paint applies it to
+    /// item coordinates, hit-testing inverts it. `P` is the page
+    /// position of the box's local origin, and it composes as
+    /// `P(child) = P(parent) + M_lin(parent)·offset +
+    /// (M(child).e - M(parent).e, M(child).f - M(parent).f)`:
+    /// the parent's linear part rotates the child's offset, and
+    /// the translation difference is the child's own transform's
+    /// contribution (a rotated box's own origin moves its
+    /// top-left; a child with no transform of its own
+    /// contributes nothing). The linear part only for the
+    /// offset: the offset is a parent-local *vector*, and the
+    /// parent's translation already lives in the parent's `P`.
+    /// The root's top-left is its layout position plus its own
+    /// matrix's translation. A box whose parent box is missing
+    /// (unreachable in a well-formed tree) falls back to its
+    /// layout position.
+    pub fn page_transforms(&self) -> Vec<Affine> {
+        let mut by_dom: HashMap<DomId, usize> = HashMap::new();
+        for (i, bx) in self.boxes.iter().enumerate() {
+            if let Some(dom) = bx.dom {
+                by_dom.entry(dom).or_insert(i);
+            }
+        }
+        // Transformed top-lefts, in pre-order (parents precede
+        // children, so each parent's top-left is ready).
+        let mut tops: Vec<(f32, f32)> = Vec::with_capacity(self.boxes.len());
+        for bx in &self.boxes {
+            // M6 Phase 3 (Rec 1): a viewport-fixed box is rooted
+            // at the viewport — its parent's page offset must not
+            // leak into its top-left (its `x`/`y` are already
+            // viewport coordinates).
+            let top = match bx.parent.and_then(|p| by_dom.get(&p)) {
+                Some(&pi) if !bx.is_viewport_fixed => {
+                    let parent = &self.boxes[pi];
+                    let (ppx, ppy) = tops[pi];
+                    let m = parent.matrix;
+                    let (dx, dy) = (bx.x - parent.x, bx.y - parent.y);
+                    (
+                        ppx + m.a * dx + m.c * dy + (bx.matrix.e - m.e),
+                        ppy + m.b * dx + m.d * dy + (bx.matrix.f - m.f),
+                    )
+                }
+                _ => (bx.x + bx.matrix.e, bx.y + bx.matrix.f),
+            };
+            tops.push(top);
+        }
+        self.boxes
+            .iter()
+            .zip(tops)
+            .map(|(bx, (px, py))| {
+                let m = bx.matrix;
+                Affine {
+                    a: m.a,
+                    b: m.b,
+                    c: m.c,
+                    d: m.d,
+                    // Fold `P + M_lin·(p - (x, y))` into the
+                    // matrix: e = Px - (a*x + c*y),
+                    // f = Py - (b*x + d*y). Only the linear part
+                    // folds in — `M`'s own translation already
+                    // lives in `P`.
+                    e: px - (m.a * bx.x + m.c * bx.y),
+                    f: py - (m.b * bx.x + m.d * bx.y),
+                }
+            })
+            .collect()
+    }
+
+    /// The compositing state of `ids` (M6 Phase 2, Rec 9): one
+    /// `(key, matrix, opacity)` triple per id that has a box —
+    /// the key is [`LayoutTree::dom_key`], the matrix the box's
+    /// page transform, the opacity its computed opacity. The tab
+    /// thread turns these into the `CompositingUpdate` IPC
+    /// message; ids with no box (unrendered elements) are
+    /// skipped, not errors.
+    pub fn composited_state(&self, ids: &[DomId]) -> Vec<(u64, Affine, f32)> {
+        let transforms = self.page_transforms();
+        let mut by_dom: HashMap<DomId, usize> = HashMap::new();
+        for (i, bx) in self.boxes.iter().enumerate() {
+            if let Some(dom) = bx.dom {
+                by_dom.entry(dom).or_insert(i);
+            }
+        }
+        ids.iter()
+            .filter_map(|&id| {
+                let &i = by_dom.get(&id)?;
+                let bx = &self.boxes[i];
+                Some((Self::dom_key(id), transforms[i], bx.style.opacity))
+            })
+            .collect()
+    }
+
+    /// The compositing state of `ids` and every element in their
+    /// box subtrees (M6 Phase 2, Rec 9): a transform change on an
+    /// element moves its whole subtree — every descendant box's
+    /// page transform changes with it — so a `CompositingUpdate`
+    /// must carry the new state for the changed elements AND
+    /// their descendants, or the descendants would keep their
+    /// stale matrices (a rotated container would move its
+    /// background and leave its text behind). Text leaves share
+    /// their parent element's page transform (the same map), so
+    /// they ride on the parent's entry and need no entry of
+    /// their own. An opacity-only change needs no subtree
+    /// expansion, but including the descendants is idempotent
+    /// (their opacity is unchanged), so one method serves both.
+    pub fn composited_subtree_state(&self, ids: &[DomId]) -> Vec<(u64, Affine, f32)> {
+        let transforms = self.page_transforms();
+        let mut by_dom: HashMap<DomId, usize> = HashMap::new();
+        for (i, bx) in self.boxes.iter().enumerate() {
+            if let Some(dom) = bx.dom {
+                by_dom.entry(dom).or_insert(i);
+            }
+        }
+        let wanted: HashSet<DomId> = ids.iter().copied().collect();
+        let mut expanded: Vec<DomId> = Vec::new();
+        let mut seen: HashSet<DomId> = HashSet::new();
+        for bx in &self.boxes {
+            let Some(dom) = bx.dom else {
+                continue;
+            };
+            if !seen.insert(dom) {
+                continue;
+            }
+            // Walk the box's ancestor chain: the element is
+            // affected when it, or any ancestor, is dirty.
+            let mut cur = Some(dom);
+            let mut hit = false;
+            while let Some(d) = cur {
+                if wanted.contains(&d) {
+                    hit = true;
+                    break;
+                }
+                cur = by_dom.get(&d).and_then(|&i| self.boxes[i].parent);
+            }
+            if hit {
+                expanded.push(dom);
+            }
+        }
+        expanded
+            .iter()
+            .map(|&id| {
+                let i = by_dom[&id];
+                let bx = &self.boxes[i];
+                (Self::dom_key(id), transforms[i], bx.style.opacity)
+            })
+            .collect()
     }
 
     /// All boxes belonging to one DOM node (element boxes; text leaves
@@ -1279,6 +2044,69 @@ impl LayoutTree {
 impl Default for LayoutTree {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// One stacking context's span of the Appendix E walk (M6 Phase
+/// 2, Rec 4): the context root's own box first, then its members
+/// in the step order documented on [`LayoutTree::paint_order`].
+/// `members` maps a context root's box index to its member box
+/// indices, in tree order. Recursion is over stacking contexts
+/// only — a member that is itself a context recurses, a plain
+/// member is emitted once, in its step's pass.
+fn paint_context(
+    ctx: usize,
+    members: &HashMap<usize, Vec<usize>>,
+    boxes: &[LayoutBox],
+    out: &mut Vec<usize>,
+) {
+    out.push(ctx);
+    let Some(ctx_members) = members.get(&ctx) else {
+        return;
+    };
+    let mut neg: Vec<usize> = Vec::new();
+    let mut inflow: Vec<usize> = Vec::new();
+    let mut pos_auto: Vec<usize> = Vec::new();
+    let mut sc_auto0: Vec<usize> = Vec::new();
+    let mut pos: Vec<usize> = Vec::new();
+    for &m in ctx_members {
+        let bx = &boxes[m];
+        if bx.is_stacking_context {
+            match bx.style.z_index {
+                Some(z) if z < 0 => neg.push(m),
+                Some(z) if z > 0 => pos.push(m),
+                _ => sc_auto0.push(m),
+            }
+        } else if bx.style.position == PositionKind::Static {
+            inflow.push(m);
+        } else {
+            // Positioned, `z-index: auto`, not a stacking
+            // context: Appendix E step 8, in tree order.
+            pos_auto.push(m);
+        }
+    }
+    // Negative, then positive `z-index`: `z-index` order, ties
+    // broken by tree order (box index order is tree order).
+    neg.sort_by_key(|&m| (boxes[m].style.z_index.unwrap_or(0), m));
+    pos.sort_by_key(|&m| (boxes[m].style.z_index.unwrap_or(0), m));
+    for m in neg {
+        paint_context(m, members, boxes, out);
+    }
+    out.extend(inflow);
+    // Step 8: positioned `auto` members and `auto`/`0` stacking
+    // contexts interleaved in tree order.
+    let mut step8: Vec<usize> = pos_auto;
+    step8.extend(sc_auto0);
+    step8.sort_unstable();
+    for m in step8 {
+        if boxes[m].is_stacking_context {
+            paint_context(m, members, boxes, out);
+        } else {
+            out.push(m);
+        }
+    }
+    for m in pos {
+        paint_context(m, members, boxes, out);
     }
 }
 
@@ -1425,6 +2253,11 @@ impl<'a, 't> Builder<'a, 't> {
     /// Recursively collect an inline element's text into `spans`. A
     /// block-level descendant flushes the spans and becomes a sibling
     /// block child instead (browsers split inline boxes the same way).
+    /// M6 Phase 3 (Rec 2): a positioned inline element
+    /// (`position: absolute` / `fixed`) does NOT fold its text into
+    /// the parent leaf — it gets its own box, like a block child.
+    /// (A `relative` inline stays inline: it lays out in flow and
+    /// only offsets.)
     fn append_inline(
         &mut self,
         id: DomId,
@@ -1433,6 +2266,16 @@ impl<'a, 't> Builder<'a, 't> {
         spans: &mut Vec<TextSpan>,
         out: &mut Vec<TaffyId>,
     ) {
+        if matches!(
+            style.position,
+            PositionKind::Absolute | PositionKind::Fixed
+        ) {
+            self.flush_spans(spans, parent_style, out);
+            if let Some(node) = self.build_positioned_inline(id, style) {
+                out.push(node);
+            }
+            return;
+        }
         if self.dom.tag(id) == Some("img") {
             // Replaced element (Stage 11 Rec 2): an `<img>` is
             // atomic even though the UA sheet says `display:
@@ -1499,6 +2342,40 @@ impl<'a, 't> Builder<'a, 't> {
                 }
             }
         }
+    }
+
+    /// Build a taffy node for a positioned inline element (M6 Phase
+    /// 3, Rec 2): like [`Builder::build_node`]'s block arm, but
+    /// reached for `display: inline` elements whose position takes
+    /// them out of flow. Its children build the same way a block's
+    /// do (inline runs merge into text leaves, block children
+    /// become nodes); `to_taffy_style` already maps `display:
+    /// inline` to a block display for taffy, so the node lays out
+    /// as a box, not a run.
+    fn build_positioned_inline(
+        &mut self,
+        id: DomId,
+        style: &ComputedStyle,
+    ) -> Option<TaffyId> {
+        let children = self.build_children(id, style);
+        let taffy_style = to_taffy_style(style, self.viewport);
+        let node = if children.is_empty() {
+            self.taffy
+                .new_leaf_with_context(taffy_style, None)
+                .ok()?
+        } else {
+            self.taffy.new_with_children(taffy_style, &children).ok()?
+        };
+        self.meta.insert(
+            node,
+            BoxMeta {
+                dom: Some(id),
+                style: style.clone(),
+                children,
+                text: None,
+            },
+        );
+        Some(node)
     }
 
     /// An atomic inline-level box (`display: inline-block`, or an
@@ -2214,6 +3091,11 @@ fn collect_boxes(
     meta: &HashMap<TaffyId, BoxMeta>,
     node: TaffyId,
     offset: (f32, f32),
+    // The same accumulation as `offset`, but with no scroll
+    // offset ever subtracted (M6 Phase 3, Rec 1): a
+    // viewport-fixed box's fallback position, and the base its
+    // descendants accumulate from.
+    offset_ns: (f32, f32),
     scroll_offsets: &HashMap<DomId, (f32, f32)>,
     parent_clip: Option<[f32; 4]>,
     parent_clip_radii: Option<ResolvedCorners>,
@@ -2228,9 +3110,26 @@ fn collect_boxes(
     // and clips are computed from the translated rects, so an inner
     // clip moves with its subtree while an outer clip stays put.
     position_overrides: &HashMap<TaffyId, (f32, f32)>,
+    // Scroll-derived sticky offsets (M6 Phase 3, Rec 3), keyed by
+    // taffy node: added to the sticky subtree's position like a
+    // position override. Never through taffy insets.
+    sticky: &HashMap<TaffyId, (f32, f32)>,
     // Images decoded so far (Stage 11, M3): `<img>` resource ids
     // and background-image resource ids land on the boxes here.
     images: &ImageMap,
+    // M6 Phase 1: the DOM id of the nearest ancestor box (None
+    // for the root), the ancestor chain's accumulated transform,
+    // and whether this node is a flex/grid item (its parent's
+    // display is Flex/Grid) — the stacking-context predicate
+    // needs the last one.
+    parent_dom: Option<DomId>,
+    parent_matrix: Affine,
+    is_flex_or_grid_item: bool,
+    // Whether any ancestor has a non-`none` transform (M6 Phase
+    // 3, Rec 1): a transformed ancestor is the containing block
+    // for `fixed` descendants, so they stop being
+    // viewport-relative and fall back to the absolute path.
+    ancestor_transformed: bool,
     out: &mut Vec<LayoutBox>,
 ) {
     let Some(layout) = taffy.layout(node).ok() else {
@@ -2240,10 +3139,58 @@ fn collect_boxes(
         return;
     };
     let (ox, oy) = position_overrides.get(&node).copied().unwrap_or((0.0, 0.0));
-    let x = offset.0 + layout.location.x + ox;
-    let y = offset.1 + layout.location.y + oy;
+    let (sox, soy) = sticky.get(&node).copied().unwrap_or((0.0, 0.0));
+    let mut x = offset.0 + layout.location.x + ox + sox;
+    let mut y = offset.1 + layout.location.y + oy + soy;
     let width = layout.size.width;
     let height = layout.size.height;
+    // The unscrolled position (same accumulation, no scroll
+    // subtraction, no sticky shift — sticky is scroll-derived).
+    let x_ns = offset_ns.0 + layout.location.x + ox;
+    let y_ns = offset_ns.1 + layout.location.y + oy;
+    // M6 Phase 3 (Rec 1): a `fixed` box with no transformed
+    // ancestor resolves against the viewport — its insets are
+    // resolved against the viewport, and no ancestor scroll
+    // offset or parent position applies. This is the re-anchor
+    // the old comments promised but never built: laying fixed
+    // out as absolute in taffy is only the sizing step, never
+    // the positioning step. `left` wins over `right`, `top` over
+    // `bottom`; with both insets `auto` the taffy position
+    // (unscrolled) is the fallback — the static position is not
+    // modelled, and this preserves the pre-M6 unscrolled
+    // behaviour for that case.
+    let is_viewport_fixed = m.dom.is_some()
+        && m.style.position == PositionKind::Fixed
+        && !ancestor_transformed;
+    if is_viewport_fixed {
+        let resolve = |d: Option<Dim>, basis: f32| {
+            d.map(|dim| match dim {
+                Dim::Px(v) => v,
+                Dim::Pct(f) => f * basis,
+                Dim::Vh(v) => v / 100.0 * viewport.1,
+                Dim::Vw(v) => v / 100.0 * viewport.0,
+            })
+        };
+        let inset = m.style.inset;
+        x = match (resolve(inset[3], viewport.0), resolve(inset[1], viewport.0)) {
+            (Some(left), _) => left + ox,
+            (None, Some(right)) => viewport.0 - right - width + ox,
+            (None, None) => x_ns,
+        };
+        y = match (resolve(inset[0], viewport.1), resolve(inset[2], viewport.1)) {
+            (Some(top), _) => top + oy,
+            (None, Some(bottom)) => viewport.1 - bottom - height + oy,
+            (None, None) => y_ns,
+        };
+    }
+    // A viewport-fixed box is clipped by the viewport alone (M6
+    // Phase 3, Rec 1): no ancestor overflow clip reaches it or
+    // its descendants — the clip chain restarts here.
+    let (parent_clip, parent_clip_radii, parent_clip_source) = if is_viewport_fixed {
+        (None, None, None)
+    } else {
+        (parent_clip, parent_clip_radii, parent_clip_source)
+    };
     let radii = m
         .style
         .border_radius
@@ -2276,9 +3223,17 @@ fn collect_boxes(
         (parent_clip, parent_clip_radii, parent_clip_source)
     };
     // Only a real scroll container becomes a scroll ancestor:
-    // `overflow: clip` clips but never scrolls.
+    // `overflow: clip` clips but never scrolls. A viewport-fixed
+    // box is its own scroll root (M6 Phase 3, Rec 1): its
+    // descendants scroll with it, never with the container
+    // underneath — except when the fixed box itself is a scroll
+    // container, in which case it is its descendants' ancestor
+    // (and the `scroll_ancestor` handed to the children below is
+    // its own id, so no ancestor above it leaks through).
     let scroll_ancestor = if is_scroll_container {
         m.dom.or(parent_scroll_ancestor)
+    } else if is_viewport_fixed {
+        None
     } else {
         parent_scroll_ancestor
     };
@@ -2295,6 +3250,42 @@ fn collect_boxes(
         .and_then(|url| images.backgrounds.get(url))
         .map(|info| (Some(info.resource), Some((info.width, info.height))))
         .unwrap_or((None, None));
+    // M6 Phase 1: this box's own transform, origin-resolved
+    // against its border box (`transform-origin` % is of the
+    // width/height), composed after the parent chain's matrix:
+    // `parent matrix * own transform`, applied own-first. The
+    // box's layout offset (`x`/`y`) is NOT folded in — the
+    // matrix is the transform part only (identity when nothing
+    // in the chain is transformed), and paint composes it with
+    // the box's position.
+    //
+    // M6 Phase 2 (Rec 7/8): a box with no `dom` is a text leaf
+    // whose style is its parent element's clone, not its own —
+    // `transform`, `opacity`, `z-index` and `position` in it are
+    // the parent's. Composing the cloned transform again would
+    // double-apply it (a leaf under a 45-degree parent would
+    // render at 90 degrees), and the cloned opacity/transform
+    // would wrongly make the leaf a stacking context of its own.
+    // The leaf has no transform and no context of its own: the
+    // parent chain's matrix already carries the transform, and
+    // the leaf paints inside the parent's opacity group.
+    let origin = m
+        .style
+        .transform_origin
+        .resolve(width, height, viewport);
+    let own_matrix = if m.dom.is_none() || m.style.transform.is_empty() {
+        Affine::identity()
+    } else {
+        m.style.transform.to_affine_in(
+            origin,
+            (width, height),
+            m.style.font_size,
+            root_font_size,
+            viewport,
+        )
+    };
+    let matrix = own_matrix.then(parent_matrix);
+    let stacking = m.dom.is_some() && is_stacking_context(&m.style, is_flex_or_grid_item);
     out.push(LayoutBox {
         taffy: node,
         dom: m.dom,
@@ -2313,6 +3304,10 @@ fn collect_boxes(
         image,
         background_image,
         background_image_size,
+        parent: parent_dom,
+        matrix,
+        is_stacking_context: stacking,
+        is_viewport_fixed,
     });
     // Descendants of a scroll container move with its offset.
     let (sx, sy) = match m.dom {
@@ -2327,6 +3322,14 @@ fn collect_boxes(
             meta,
             child,
             (x - sx, y - sy),
+            // The unscrolled base: this node's unscrolled
+            // position, with no scroll subtraction at any level
+            // (M6 Phase 3, Rec 1). A fixed child's fallback reads
+            // this; a normal child's own scroll subtraction still
+            // applies through `offset` above. A viewport-fixed
+            // node's unscrolled position IS its resolved viewport
+            // position — its descendants accumulate from there.
+            if is_viewport_fixed { (x, y) } else { (x_ns, y_ns) },
             scroll_offsets,
             clip,
             clip_radii,
@@ -2335,7 +3338,20 @@ fn collect_boxes(
             viewport,
             root_font_size,
             position_overrides,
+            sticky,
             images,
+            // The nearest ancestor box with a DOM id: this node's
+            // own id when it has one, else the one passed in
+            // (anonymous text leaves carry no id of their own).
+            m.dom.or(parent_dom),
+            matrix,
+            matches!(m.style.display, DisplayKind::Flex | DisplayKind::Grid),
+            // A transformed ancestor (this node included, text
+            // leaves excluded — their style is their parent's
+            // clone) is the containing block for `fixed`
+            // descendants below it.
+            ancestor_transformed
+                || (m.dom.is_some() && !m.style.transform.is_empty()),
             out,
         );
     }
@@ -2406,13 +3422,15 @@ struct RuleIndex<'a> {
 impl<'a> RuleIndex<'a> {
     /// Build the index over the UA sheet then the author sheet, in
     /// document order. Rules whose `@media` / `@supports` condition
-    /// does not hold at this viewport are dropped here (conditions
-    /// are evaluated at style time, not flattened at parse time — a
-    /// later viewport change rebuilds the index).
+    /// does not hold at this viewport / theme are dropped here
+    /// (conditions are evaluated at style time, not flattened at
+    /// parse time — a later viewport or theme change rebuilds the
+    /// index).
     fn build(
         ua: &'a Stylesheet,
         author: &'a Stylesheet,
         viewport: (f32, f32),
+        theme: Theme,
     ) -> Self {
         let mut index = RuleIndex {
             by_id: HashMap::new(),
@@ -2423,7 +3441,7 @@ impl<'a> RuleIndex<'a> {
         let mut offset = 0u32;
         for sheet in [ua, author] {
             for rule in &sheet.rules {
-                if !rule_applies(rule, viewport) {
+                if !rule_applies(rule, viewport, theme) {
                     continue;
                 }
                 let layer_order = sheet.layer_order(&rule.layer);
@@ -2491,9 +3509,9 @@ impl<'a> RuleIndex<'a> {
 /// Unknown media features evaluate to `None` and the rule is skipped
 /// (a query that cannot be judged does not apply) — documented M2
 /// choice; `@supports` unknown values likewise skip the rule.
-fn rule_applies(rule: &Rule, viewport: (f32, f32)) -> bool {
+fn rule_applies(rule: &Rule, viewport: (f32, f32), theme: Theme) -> bool {
     if let Some(media) = &rule.media {
-        if media.eval(viewport.0, viewport.1) != Some(true) {
+        if media.eval(viewport.0, viewport.1, theme) != Some(true) {
             return false;
         }
     }
@@ -2541,6 +3559,7 @@ fn resolve_styles(
     state: &ElementState,
     seed_parent_style: Option<Arc<ComputedStyle>>,
     root_font_size_seed: f32,
+    theme: Theme,
 ) -> (
     HashMap<DomId, Arc<ComputedStyle>>,
     SparseSecondaryMap<DomId, NodeStyle>,
@@ -2548,6 +3567,11 @@ fn resolve_styles(
     let mut resolved: HashMap<DomId, Arc<ComputedStyle>> = HashMap::new();
     let mut node_styles: SparseSecondaryMap<DomId, NodeStyle> = SparseSecondaryMap::new();
     let mut root_font_size = root_font_size_seed;
+    // `theme` is consumed upstream by `RuleIndex::build`
+    // (`rule_applies`); it is threaded through this signature so
+    // the whole resolution chain carries it for later phases
+    // (e.g. per-element media re-evaluation).
+    let _ = theme;
     for (level_no, level) in levels.iter().enumerate() {
         // Parent computed styles first (serial, cheap): the parallel
         // closure then only reads `&Dom` / `&Stylesheet` plus its own
@@ -2630,6 +3654,7 @@ fn resolve_document_styles(
     parallel: bool,
     viewport: (f32, f32),
     state: &ElementState,
+    theme: Theme,
 ) -> (
     HashMap<DomId, Arc<ComputedStyle>>,
     SparseSecondaryMap<DomId, NodeStyle>,
@@ -2646,8 +3671,8 @@ fn resolve_document_styles(
             .collect(),
     };
     let levels = collect_style_levels(dom, &roots);
-    let index = RuleIndex::build(ua, sheet, viewport);
-    resolve_styles(dom, &index, &levels, parallel, viewport, state, None, 16.0)
+    let index = RuleIndex::build(ua, sheet, viewport, theme);
+    resolve_styles(dom, &index, &levels, parallel, viewport, state, None, 16.0, theme)
 }
 
 /// Resolve styles for one subtree only (Stage 12 Rec 6): the dirty
@@ -2671,6 +3696,7 @@ pub(crate) fn resolve_subtree_styles(
     state: &ElementState,
     root: DomId,
     retained: &SparseSecondaryMap<DomId, NodeStyle>,
+    theme: Theme,
 ) -> (
     HashMap<DomId, Arc<ComputedStyle>>,
     SparseSecondaryMap<DomId, NodeStyle>,
@@ -2696,7 +3722,7 @@ pub(crate) fn resolve_subtree_styles(
             .unwrap_or(16.0)
     };
     let levels = collect_style_levels(dom, &[(root, parent_element(dom, root))]);
-    let index = RuleIndex::build(ua, sheet, viewport);
+    let index = RuleIndex::build(ua, sheet, viewport, theme);
     let (sub_styles, sub_node_styles) = resolve_styles(
         dom,
         &index,
@@ -2706,6 +3732,7 @@ pub(crate) fn resolve_subtree_styles(
         state,
         seed_parent_style,
         root_font_size_seed,
+        theme,
     );
     let mut styles: HashMap<DomId, Arc<ComputedStyle>> =
         HashMap::with_capacity(retained.len() + sub_styles.len());
@@ -3165,6 +4192,17 @@ fn resolve_style(
     style.grid_column = (GridPlace::Auto, GridPlace::Auto);
     style.grid_row = (GridPlace::Auto, GridPlace::Auto);
     style.grid_auto_flow = GridAutoFlow::Row;
+    style.z_index = None;
+    style.opacity = 1.0;
+    style.transform = Vec::new();
+    style.transform_origin = init.transform_origin;
+    style.transform_box = TransformBox::ViewBox;
+    style.will_change_transform = false;
+    style.transitions = Vec::new();
+    style.animations = Vec::new();
+    // `custom_properties` is inherited, NOT reset: the merged map
+    // is built below from the parent's chain plus this element's
+    // own `--*` declarations.
 
     // Collect matching declarations with their cascade keys.
     // (Owned property/value: the inline-style sheet below is a
@@ -3233,6 +4271,26 @@ fn resolve_style(
     }
     decls.sort_by_key(|(key, _, _)| *key);
 
+    // M6 Rec 12: custom properties first. The element's own `--*`
+    // declarations (in cascade order — the sorted list, so the
+    // winner is last) layer over the inherited chain seeded from
+    // the parent's map. The merged map is what `var()` lookups
+    // read below.
+    //
+    // NOTE: a `var()` change on `:root` is document-wide restyle
+    // by nature — subtree restyle does NOT short-circuit custom
+    // property changes (a later phase may refine this; the
+    // incremental path re-resolves the dirty subtree, and a
+    // `:root` change dirties the root, so the restyle still
+    // reaches every descendant).
+    let mut custom: HashMap<String, Value> = parent.custom_properties.clone();
+    for (_, property, value) in decls.iter() {
+        if property.starts_with("--") {
+            custom.insert(property.clone(), value.clone());
+        }
+    }
+    style.custom_properties = custom.clone();
+
     let parent_font_size = parent.font_size;
     let root_font_size = ctx.root_font_size;
     let viewport = ctx.viewport;
@@ -3245,10 +4303,21 @@ fn resolve_style(
             "font-size" | "font-family" | "font-weight" | "font-style" | "font-variant" | "line-height"
         )
     }) {
+        // Custom properties are already stored above; they are
+        // resolved at use time, not at definition time.
+        if property.starts_with("--") {
+            continue;
+        }
+        // An unresolvable `var()` with no fallback makes the
+        // declaration invalid at computed-value time: skip it,
+        // keeping the inherited / initial value.
+        let Some(resolved) = resolve_vars(value, &custom) else {
+            continue;
+        };
         apply_decl(
             &mut style,
             property,
-            value,
+            &resolved,
             parent_font_size,
             root_font_size,
             viewport,
@@ -3261,16 +4330,112 @@ fn resolve_style(
             "font-size" | "font-family" | "font-weight" | "font-style" | "font-variant" | "line-height"
         )
     }) {
+        if property.starts_with("--") {
+            continue;
+        }
+        let Some(resolved) = resolve_vars(value, &custom) else {
+            continue;
+        };
         apply_decl(
             &mut style,
             property,
-            value,
+            &resolved,
             parent_font_size,
             root_font_size,
             viewport,
         );
     }
     (style, flags)
+}
+
+/// Resolve `var()` references in one declaration value against
+/// `custom` (the element's merged custom-property map — its own
+/// `--*` declarations over the inherited chain). Returns `None`
+/// when the value is unresolvable with no fallback (invalid at
+/// computed-value time — the caller skips the declaration).
+/// Non-`var()` values pass through unchanged.
+///
+/// `Raw` strings containing `var(` are left unresolved
+/// (documented limitation): the raw text is not re-parsed here,
+/// so e.g. `background: var(--x)` keeps its text and the
+/// property arm finds no colour / URL in it.
+fn resolve_vars(value: &Value, custom: &HashMap<String, Value>) -> Option<Value> {
+    resolve_vars_depth(value, custom, 0)
+}
+
+fn resolve_vars_depth(
+    value: &Value,
+    custom: &HashMap<String, Value>,
+    depth: usize,
+) -> Option<Value> {
+    if depth > 8 {
+        return None;
+    }
+    match value {
+        Value::Var { name, fallback } => {
+            if let Some(stored) = custom.get(name) {
+                let stored = stored.clone();
+                resolve_vars_depth(&stored, custom, depth + 1)
+            } else if let Some(fb) = fallback {
+                resolve_vars_depth(fb, custom, depth + 1)
+            } else {
+                None
+            }
+        }
+        Value::Calc(expr) => {
+            let resolved = resolve_calc_vars(expr, custom, depth)?;
+            Some(Value::Calc(resolved))
+        }
+        Value::Clamp { min, val, max } => Some(Value::Clamp {
+            min: Box::new(resolve_calc_vars(min, custom, depth)?),
+            val: Box::new(resolve_calc_vars(val, custom, depth)?),
+            max: Box::new(resolve_calc_vars(max, custom, depth)?),
+        }),
+        _ => Some(value.clone()),
+    }
+}
+
+/// Resolve `var()` nodes inside a [`CalcExpr`], substituting the
+/// looked-up value (converted with [`CalcExpr::from_value`]) or
+/// the fallback expression. `None` when a `var()` has neither.
+fn resolve_calc_vars(
+    expr: &CalcExpr,
+    custom: &HashMap<String, Value>,
+    depth: usize,
+) -> Option<CalcExpr> {
+    if depth > 8 {
+        return None;
+    }
+    match expr {
+        CalcExpr::Var(name, fallback) => {
+            if let Some(stored) = custom.get(name) {
+                let stored = stored.clone();
+                let as_expr = CalcExpr::from_value(&stored)?;
+                resolve_calc_vars(&as_expr, custom, depth + 1)
+            } else if let Some(fb) = fallback {
+                resolve_calc_vars(fb, custom, depth + 1)
+            } else {
+                None
+            }
+        }
+        CalcExpr::Add(a, b) => Some(CalcExpr::Add(
+            Box::new(resolve_calc_vars(a, custom, depth)?),
+            Box::new(resolve_calc_vars(b, custom, depth)?),
+        )),
+        CalcExpr::Sub(a, b) => Some(CalcExpr::Sub(
+            Box::new(resolve_calc_vars(a, custom, depth)?),
+            Box::new(resolve_calc_vars(b, custom, depth)?),
+        )),
+        CalcExpr::Mul(e, n) => Some(CalcExpr::Mul(
+            Box::new(resolve_calc_vars(e, custom, depth)?),
+            *n,
+        )),
+        CalcExpr::Div(e, n) => Some(CalcExpr::Div(
+            Box::new(resolve_calc_vars(e, custom, depth)?),
+            *n,
+        )),
+        _ => Some(expr.clone()),
+    }
 }
 
 fn apply_decl(
@@ -3427,8 +4592,7 @@ fn apply_decl(
                     style.font_size = v;
                 }
             }
-            Value::Color(..) | Value::ColorA(..) | Value::BorderRadius(..)
-            | Value::BoxShadow(..) | Value::Url(..) => {}
+            _ => {}
         },
         "font-family" => match value {
             Value::Raw(raw) | Value::Keyword(raw) => {
@@ -3556,16 +4720,37 @@ fn apply_decl(
                     _ => BackgroundRepeat::Repeat,
                 };
             } else if let Value::Raw(raw) = value {
-                // Two-value form (`repeat no-repeat` etc.) is
-                // staged: the first keyword wins, the second is
-                // ignored until M6.
-                let first = raw.split_whitespace().next().unwrap_or("repeat");
-                style.background_repeat = match first {
-                    "no-repeat" => BackgroundRepeat::NoRepeat,
-                    "repeat-x" => BackgroundRepeat::RepeatX,
-                    "repeat-y" => BackgroundRepeat::RepeatY,
-                    _ => BackgroundRepeat::Repeat,
+                // Two-value form (`repeat no-repeat`, `no-repeat
+                // repeat`): each axis repeats independently. A
+                // single keyword cannot arrive here (it parses to
+                // `Keyword` above).
+                let parts: Vec<&str> = raw.split_whitespace().collect();
+                let axis = |tok: &str| match tok {
+                    "repeat" => Some(true),
+                    "no-repeat" => Some(false),
+                    _ => None,
                 };
+                match parts.as_slice() {
+                    [a, b] => {
+                        if let (Some(x), Some(y)) = (axis(a), axis(b)) {
+                            style.background_repeat = BackgroundRepeat::RepeatXY(x, y);
+                        }
+                    }
+                    [a] => match *a {
+                        "repeat-x" => style.background_repeat = BackgroundRepeat::RepeatX,
+                        "repeat-y" => style.background_repeat = BackgroundRepeat::RepeatY,
+                        _ => {
+                            if let Some(x) = axis(a) {
+                                style.background_repeat = if x {
+                                    BackgroundRepeat::Repeat
+                                } else {
+                                    BackgroundRepeat::NoRepeat
+                                };
+                            }
+                        }
+                    },
+                    _ => {}
+                }
             }
         }
         "background-position" => {
@@ -3834,13 +5019,426 @@ fn apply_decl(
                 None => return,
             }
         }
+        // M6 Phase 1: stacking / transform / transition / animation
+        // model (paint order, the animation engine and the
+        // `CompositingOnly` classifier are later phases — these
+        // fields are deliberately NOT in
+        // `layout_properties_changed`).
+        "z-index" => match value {
+            Value::Keyword(k) if k == "auto" => style.z_index = None,
+            // Bare numbers arrive as `Length` (the parser cannot
+            // tell `2` from `2px`); only integral ones are valid
+            // `z-index` values.
+            Value::Length(n) if n.fract() == 0.0 => style.z_index = Some(*n as i32),
+            _ => {}
+        },
+        "opacity" => match value {
+            Value::Length(n) => style.opacity = n.clamp(0.0, 1.0),
+            Value::Percentage(p) => style.opacity = (p / 100.0).clamp(0.0, 1.0),
+            _ => {}
+        },
+        "transform" => match value {
+            Value::Transform(list) => style.transform = list.clone(),
+            Value::Keyword(k) if k == "none" => style.transform = Vec::new(),
+            _ => {}
+        },
+        "transform-origin" => {
+            if let Some(origin) =
+                parse_transform_origin(value, style.font_size, root_font_size, viewport)
+            {
+                style.transform_origin = origin;
+            }
+        }
+        "transform-box" => {
+            if let Value::Keyword(k) = value {
+                style.transform_box = match k.as_str() {
+                    "content-box" => TransformBox::ContentBox,
+                    "border-box" => TransformBox::BorderBox,
+                    "fill-box" => TransformBox::FillBox,
+                    "stroke-box" => TransformBox::StrokeBox,
+                    _ => TransformBox::ViewBox,
+                };
+            }
+        }
+        "will-change" => {
+            // `will-change: transform` is a hint only — it does
+            // NOT create a stacking context. `opacity` / `auto` /
+            // `contents` parse without effect.
+            let has_transform = match value {
+                Value::Keyword(k) => k == "transform",
+                Value::Raw(raw) => raw.split_whitespace().any(|w| w == "transform"),
+                _ => false,
+            };
+            style.will_change_transform = has_transform;
+        }
+        "transition" => {
+            if let Value::Transitions(list) = value {
+                style.transitions = list.clone();
+            }
+        }
+        "transition-property" => {
+            let items = longhand_values(value);
+            let names: Option<Vec<String>> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Keyword(k) => Some(k.clone()),
+                    Value::Raw(r) => Some(r.trim().to_string()),
+                    _ => None,
+                })
+                .collect();
+            if let Some(names) = names {
+                apply_transition_longhand(&mut style.transitions, &names, |t, name| {
+                    t.property = name.clone()
+                });
+            }
+        }
+        "transition-duration" => {
+            let times = longhand_times(value);
+            if let Some(times) = times {
+                apply_transition_longhand(&mut style.transitions, &times, |t, d| {
+                    t.duration = *d
+                });
+            }
+        }
+        "transition-timing-function" => {
+            let items = longhand_values(value);
+            let easings: Option<Vec<Easing>> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Keyword(k) => Easing::parse(k),
+                    Value::Raw(r) => Easing::parse(r),
+                    _ => None,
+                })
+                .collect();
+            if let Some(easings) = easings {
+                apply_transition_longhand(&mut style.transitions, &easings, |t, e| {
+                    t.timing = e.clone()
+                });
+            }
+        }
+        "transition-delay" => {
+            let times = longhand_times(value);
+            if let Some(times) = times {
+                apply_transition_longhand(&mut style.transitions, &times, |t, d| {
+                    t.delay = *d
+                });
+            }
+        }
+        "animation" => {
+            if let Value::Animations(list) = value {
+                style.animations = list.clone();
+            }
+        }
+        "animation-name" => {
+            let items = longhand_values(value);
+            let names: Option<Vec<String>> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Keyword(k) => Some(k.clone()),
+                    Value::Raw(r) => Some(r.trim().to_string()),
+                    _ => None,
+                })
+                .collect();
+            if let Some(names) = names {
+                apply_animation_longhand(&mut style.animations, &names, |a, name| {
+                    a.name = name.clone()
+                });
+            }
+        }
+        "animation-duration" => {
+            let times = longhand_times(value);
+            if let Some(times) = times {
+                apply_animation_longhand(&mut style.animations, &times, |a, d| {
+                    a.duration = *d
+                });
+            }
+        }
+        "animation-timing-function" => {
+            let items = longhand_values(value);
+            let easings: Option<Vec<Easing>> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Keyword(k) => Easing::parse(k),
+                    Value::Raw(r) => Easing::parse(r),
+                    _ => None,
+                })
+                .collect();
+            if let Some(easings) = easings {
+                apply_animation_longhand(&mut style.animations, &easings, |a, e| {
+                    a.timing = e.clone()
+                });
+            }
+        }
+        "animation-delay" => {
+            let times = longhand_times(value);
+            if let Some(times) = times {
+                apply_animation_longhand(&mut style.animations, &times, |a, d| {
+                    a.delay = *d
+                });
+            }
+        }
+        "animation-iteration-count" => {
+            let items = longhand_values(value);
+            let counts: Option<Vec<IterationCount>> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Keyword(k) if k == "infinite" => {
+                        Some(IterationCount::Infinite)
+                    }
+                    Value::Length(n) => Some(IterationCount::Finite(*n)),
+                    Value::Raw(r) => r
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .map(IterationCount::Finite),
+                    _ => None,
+                })
+                .collect();
+            if let Some(counts) = counts {
+                apply_animation_longhand(&mut style.animations, &counts, |a, c| {
+                    a.iteration_count = *c
+                });
+            }
+        }
+        "animation-direction" => {
+            let items = longhand_values(value);
+            let dirs: Option<Vec<AnimationDirection>> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Keyword(k) => match k.as_str() {
+                        "normal" => Some(AnimationDirection::Normal),
+                        "reverse" => Some(AnimationDirection::Reverse),
+                        "alternate" => Some(AnimationDirection::Alternate),
+                        "alternate-reverse" => Some(AnimationDirection::AlternateReverse),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            if let Some(dirs) = dirs {
+                apply_animation_longhand(&mut style.animations, &dirs, |a, d| {
+                    a.direction = *d
+                });
+            }
+        }
+        "animation-fill-mode" => {
+            let items = longhand_values(value);
+            let fills: Option<Vec<FillMode>> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Keyword(k) => match k.as_str() {
+                        "none" => Some(FillMode::None),
+                        "forwards" => Some(FillMode::Forwards),
+                        "backwards" => Some(FillMode::Backwards),
+                        "both" => Some(FillMode::Both),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            if let Some(fills) = fills {
+                apply_animation_longhand(&mut style.animations, &fills, |a, f| {
+                    a.fill_mode = *f
+                });
+            }
+        }
+        "animation-play-state" => {
+            let items = longhand_values(value);
+            let states: Option<Vec<PlayState>> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Keyword(k) => match k.as_str() {
+                        "running" => Some(PlayState::Running),
+                        "paused" => Some(PlayState::Paused),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            if let Some(states) = states {
+                apply_animation_longhand(&mut style.animations, &states, |a, s| {
+                    a.play_state = *s
+                });
+            }
+        }
+        "inset" => {
+            // 1–4 values → top/right/bottom/left, same expansion
+            // shape as `margin`/`padding`. A single value arrives
+            // typed; several arrive as `Raw`.
+            let tokens: Vec<Value> = match value {
+                Value::Raw(raw) => raw.split_whitespace().map(parse_value).collect(),
+                v => vec![v.clone()],
+            };
+            if !tokens.is_empty() && tokens.len() <= 4 {
+                let dims: Vec<Option<Dim>> = tokens
+                    .iter()
+                    .map(|t| dim_value(t, style.font_size, root_font_size, viewport))
+                    .collect();
+                let (top, right, bottom, left) = match dims.len() {
+                    1 => (dims[0], dims[0], dims[0], dims[0]),
+                    2 => (dims[0], dims[1], dims[0], dims[1]),
+                    3 => (dims[0], dims[1], dims[2], dims[1]),
+                    4 => (dims[0], dims[1], dims[2], dims[3]),
+                    _ => unreachable!(),
+                };
+                style.inset = [top, right, bottom, left];
+            }
+        }
         // Deliberately unmodelled in M2 (stored nowhere, never an
         // error): float/clear (no float layout yet), border widths
         // (no border painting yet), text-decoration, list-style-type,
-        // visibility, opacity, z-index, justify-content/align-*,
-        // transform/transition, cursor, content. They are ignored
+        // visibility, justify-content/align-*,
+        // cursor, content. They are ignored
         // here; adding them is data, not a rewrite.
         _ => {}
+    }
+}
+
+/// Parse `transform-origin`: 1–2 components, each a length, a
+/// percentage, or a keyword (`left` / `center` / `right` for x,
+/// `top` / `center` / `bottom` for y). One value centres the
+/// other axis. `None` when the value is invalid (the declaration
+/// is then ignored, keeping the previous origin).
+fn parse_transform_origin(
+    value: &Value,
+    font_size: f32,
+    root_font_size: f32,
+    viewport: (f32, f32),
+) -> Option<TransformOrigin> {
+    let tokens: Vec<Value> = match value {
+        Value::Keyword(k) => vec![Value::Keyword(k.clone())],
+        Value::Raw(raw) => raw.split_whitespace().map(parse_value).collect(),
+        v => vec![v.clone()],
+    };
+    if tokens.is_empty() || tokens.len() > 2 {
+        return None;
+    }
+    let component = |v: &Value| -> Option<OriginComponent> {
+        match v {
+            Value::Keyword(k) => match k.as_str() {
+                "left" => Some(OriginComponent::Keyword(OriginKeyword::Left)),
+                "center" => Some(OriginComponent::Keyword(OriginKeyword::Center)),
+                "right" => Some(OriginComponent::Keyword(OriginKeyword::Right)),
+                "top" => Some(OriginComponent::Keyword(OriginKeyword::Top)),
+                "bottom" => Some(OriginComponent::Keyword(OriginKeyword::Bottom)),
+                _ => None,
+            },
+            Value::Percentage(p) => Some(OriginComponent::Percentage(*p)),
+            _ => dim_value(v, font_size, root_font_size, viewport)
+                .map(OriginComponent::Length),
+        }
+    };
+    let first = component(&tokens[0])?;
+    if tokens.len() == 1 {
+        return Some(match first {
+            OriginComponent::Keyword(OriginKeyword::Top)
+            | OriginComponent::Keyword(OriginKeyword::Bottom) => TransformOrigin {
+                x: OriginComponent::Keyword(OriginKeyword::Center),
+                y: first,
+            },
+            _ => TransformOrigin {
+                x: first,
+                y: OriginComponent::Keyword(OriginKeyword::Center),
+            },
+        });
+    }
+    let second = component(&tokens[1])?;
+    // Two keywords may arrive in either order (`top left`);
+    // lengths / percentages are positional (first = x).
+    let (x, y) = match (first, second) {
+        (
+            OriginComponent::Keyword(OriginKeyword::Top)
+            | OriginComponent::Keyword(OriginKeyword::Bottom),
+            OriginComponent::Keyword(
+                OriginKeyword::Left | OriginKeyword::Center | OriginKeyword::Right,
+            ),
+        ) => (second, first),
+        (a, b) => (a, b),
+    };
+    Some(TransformOrigin { x, y })
+}
+
+/// Split a comma-separated longhand list (`transition-duration:
+/// .3s, .5s`) into its per-item values. A single value arrives
+/// typed; a list arrives as `Raw` and is split at top level
+/// (commas inside `cubic-bezier()` do not split).
+fn longhand_values(value: &Value) -> Vec<Value> {
+    match value {
+        Value::Raw(raw) => {
+            // Split on top-level commas without re-entering the
+            // css parser's private splitter: a small depth walk.
+            let mut out = Vec::new();
+            let mut depth = 0i32;
+            let mut start = 0usize;
+            for (i, c) in raw.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    ',' if depth == 0 => {
+                        out.push(parse_value(raw[start..i].trim()));
+                        start = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            out.push(parse_value(raw[start..].trim()));
+            out
+        }
+        v => vec![v.clone()],
+    }
+}
+
+/// A `transition-duration` / `transition-delay` /
+/// `animation-duration` / `animation-delay` longhand as seconds.
+/// `None` when any item is not a time (the whole declaration is
+/// then ignored).
+fn longhand_times(value: &Value) -> Option<Vec<f32>> {
+    longhand_values(value)
+        .iter()
+        .map(|v| match v {
+            Value::Time(t) => Some(*t),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Apply one `transition-*` longhand list to the transitions vec:
+/// items zip by index, repeating the list when it is shorter than
+/// the vec (CSS list repetition); an empty vec is grown from the
+/// list. `apply` sets the one field this longhand owns.
+fn apply_transition_longhand<T>(
+    transitions: &mut Vec<Transition>,
+    items: &[T],
+    mut apply: impl FnMut(&mut Transition, &T),
+) {
+    if items.is_empty() {
+        return;
+    }
+    let n = transitions.len().max(items.len());
+    while transitions.len() < n {
+        transitions.push(Transition::default());
+    }
+    for i in 0..n {
+        apply(&mut transitions[i], &items[i % items.len()]);
+    }
+}
+
+/// The `animation-*` counterpart of
+/// [`apply_transition_longhand`].
+fn apply_animation_longhand<T>(
+    animations: &mut Vec<Animation>,
+    items: &[T],
+    mut apply: impl FnMut(&mut Animation, &T),
+) {
+    if items.is_empty() {
+        return;
+    }
+    let n = animations.len().max(items.len());
+    while animations.len() < n {
+        animations.push(Animation::default());
+    }
+    for i in 0..n {
+        apply(&mut animations[i], &items[i % items.len()]);
     }
 }
 
@@ -3878,12 +5476,28 @@ fn number_value(value: &Value) -> Option<f32> {
 /// A width/height/min/max value. `em`/`rem` resolve now (computed
 /// values, against the element's own / root font size); `%` and
 /// `vh`/`vw` stay unresolved for layout (`Dim::Pct` / `Dim::Vh` /
-/// `Dim::Vw`); `auto` is `None`.
+/// `Dim::Vw`); `auto` is `None`. `calc()` / `clamp()` evaluate
+/// here; a `%` inside them has no containing-block basis at style
+/// time, so a mixed calc is unresolvable and yields `None` (the
+/// declaration falls back to `auto` / initial).
 fn dim_value(
     value: &Value,
     font_size: f32,
     root_font_size: f32,
     viewport: (f32, f32),
+) -> Option<Dim> {
+    dim_value_with_basis(value, font_size, root_font_size, viewport, None)
+}
+
+/// [`dim_value`] with a percentage basis, for call sites that
+/// have one (a `calc(100% - 20px)` only evaluates when the basis
+/// is known).
+fn dim_value_with_basis(
+    value: &Value,
+    font_size: f32,
+    root_font_size: f32,
+    viewport: (f32, f32),
+    pct_basis: Option<f32>,
 ) -> Option<Dim> {
     match value {
         Value::Length(v) => Some(Dim::Px(*v)),
@@ -3893,6 +5507,36 @@ fn dim_value(
         Value::Vh(v) => Some(Dim::Vh(*v)),
         Value::Vw(v) => Some(Dim::Vw(*v)),
         Value::Keyword(k) if k == "auto" => None,
+        Value::Calc(expr) => {
+            let ctx = CalcCtx {
+                font_size,
+                root_font_size,
+                viewport,
+                pct_basis,
+            };
+            match expr.eval(&ctx)? {
+                CalcNumber::Px(v) => Some(Dim::Px(v)),
+                CalcNumber::Pct(p) => Some(Dim::Pct(p / 100.0)),
+            }
+        }
+        Value::Clamp { min, val, max } => {
+            let ctx = CalcCtx {
+                font_size,
+                root_font_size,
+                viewport,
+                pct_basis,
+            };
+            let (lo, v, hi) = (min.eval(&ctx)?, val.eval(&ctx)?, max.eval(&ctx)?);
+            match (lo, v, hi) {
+                (CalcNumber::Px(a), CalcNumber::Px(b), CalcNumber::Px(c)) => {
+                    Some(Dim::Px(b.clamp(a, c)))
+                }
+                (CalcNumber::Pct(a), CalcNumber::Pct(b), CalcNumber::Pct(c)) => {
+                    Some(Dim::Pct(b.clamp(a, c) / 100.0))
+                }
+                _ => None,
+            }
+        }
         Value::Raw(raw) => {
             parse_spacing_single(raw, font_size, root_font_size, viewport)
                 .and_then(spacing_to_dim)
@@ -3913,6 +5557,8 @@ fn spacing_to_dim(sp: Spacing) -> Option<Dim> {
 
 /// A margin/padding value, resolving `em`/`rem` against the font
 /// sizes; `vh`/`vw` stay as used values for `to_taffy_style`.
+/// `calc()` / `clamp()` evaluate through `dim_value` (same
+/// no-basis limitation as there).
 fn spacing_value(
     value: &Value,
     font_size: f32,
@@ -3927,6 +5573,14 @@ fn spacing_value(
         Value::Vh(v) => Some(Spacing::Vh(*v)),
         Value::Vw(v) => Some(Spacing::Vw(*v)),
         Value::Keyword(k) if k == "auto" => Some(Spacing::Auto),
+        Value::Calc(_) | Value::Clamp { .. } => {
+            dim_value(value, font_size, root_font_size, viewport).map(|d| match d {
+                Dim::Px(v) => Spacing::Px(v),
+                Dim::Pct(f) => Spacing::Pct(f),
+                Dim::Vh(v) => Spacing::Vh(v),
+                Dim::Vw(v) => Spacing::Vw(v),
+            })
+        }
         Value::Raw(raw) => parse_spacing_single(raw, font_size, root_font_size, viewport),
         _ => None,
     }
@@ -4167,6 +5821,25 @@ fn to_taffy_style(style: &ComputedStyle, viewport: (f32, f32)) -> Style {
     s.inset.right = inset(style.inset[1]);
     s.inset.bottom = inset(style.inset[2]);
     s.inset.left = inset(style.inset[3]);
+    // M6 Phase 1 (report §4 sharpest trap): taffy 0.15 cannot
+    // override `is_containing_block`, so a transformed element
+    // does NOT become a containing block for absolutely-positioned
+    // descendants in taffy. Mapping a transformed static box to
+    // `Position::Relative` makes taffy resolve abs descendants
+    // against it — the correct CSS containing block — without
+    // moving the element itself (relative with auto insets lays
+    // out identically to static). The insets are forced back to
+    // `auto` here: a static box's `top`/`left` must not move it.
+    // The predicate change in `has_outside_resolving_descendant`
+    // (incremental.rs) lands in the same change, so the two never
+    // disagree.
+    if !style.transform.is_empty() && style.position == PositionKind::Static {
+        s.position = Position::Relative;
+        s.inset.top = LengthPercentageAuto::auto();
+        s.inset.right = LengthPercentageAuto::auto();
+        s.inset.bottom = LengthPercentageAuto::auto();
+        s.inset.left = LengthPercentageAuto::auto();
+    }
     let overflow = |o: OverflowKind| match o {
         OverflowKind::Visible => Overflow::Visible,
         OverflowKind::Hidden => Overflow::Hidden,
@@ -4250,6 +5923,7 @@ fn to_taffy_style(style: &ComputedStyle, viewport: (f32, f32)) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pluto_css::TransformFunction;
     use pluto_html::parse as parse_html;
 
     const EXAMPLE_COM: &str = r#"<!doctype html>
@@ -4293,7 +5967,7 @@ mod tests {
             .filter_map(|&c| dom.text(c))
             .collect();
         let sheet = Stylesheet::parse(&css);
-        LayoutTree::build(&dom, &sheet, 1024.0, 768.0).expect("layout builds")
+        LayoutTree::build(&dom, &sheet, 1024.0, 768.0, Theme::Light).expect("layout builds")
     }
 
     fn box_for<'a>(tree: &'a LayoutTree, dom: &Dom, tag: &str) -> &'a LayoutBox {
@@ -4312,7 +5986,7 @@ mod tests {
         let dom = parse_html(html);
         let sheet = Stylesheet::parse(css);
         let ua = Stylesheet::ua();
-        resolve_document_styles(&dom, &ua, &sheet, false, viewport, &ElementState::default()).0
+        resolve_document_styles(&dom, &ua, &sheet, false, viewport, &ElementState::default(), Theme::Light).0
     }
 
     #[test]
@@ -4395,7 +6069,7 @@ mod tests {
             r#"<div class="hide"><p>one</p></div><div><p>two</p></div>"#,
         );
         let sheet = Stylesheet::parse(".hide { display: none; }");
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let texts: Vec<String> = tree
             .boxes
             .iter()
@@ -4427,7 +6101,7 @@ mod tests {
             ".outer { height: 100px; overflow: auto; } \
              .tall { height: 250px; } .wide { width: 900px; height: 10px; }",
         );
-        let mut tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let mut tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let outer = id_of_class(&tree, &dom, "outer");
         // Tall child bottoms at 250, wide child at 260 x 900, in a
         // 100px box (body margins cancel in the relative math; the
@@ -4454,7 +6128,7 @@ mod tests {
              .nested { height: 60px; overflow: auto; } .deep { height: 300px; } \
              .sib { height: 50px; }",
         );
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let outer = id_of_class(&tree, &dom, "outer");
         let nested = id_of_class(&tree, &dom, "nested");
         // The nested container's 300px of inner content scrolls
@@ -4477,7 +6151,7 @@ mod tests {
             ".outer { height: 100px; overflow: auto; } \
              .tall { height: 250px; } .wide { width: 900px; height: 10px; }",
         );
-        let mut tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let mut tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let outer = id_of_class(&tree, &dom, "outer");
         assert_eq!(tree.scrollable_size(outer), Some((116.0, 160.0)));
         tree.set_scroll_offset(outer, 500.0, 9999.0);
@@ -4500,11 +6174,314 @@ mod tests {
             ".hide { display: none; } \
              .outer { height: 100px; overflow: auto; } .small { height: 50px; }",
         );
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let outer = id_of_class(&tree, &dom, "outer");
         assert_eq!(tree.scrollable_size(outer), Some((0.0, 0.0)));
         let hidden = find_element(&dom, dom.root().unwrap(), "div").unwrap();
         assert_eq!(tree.scrollable_size(hidden), None);
+    }
+
+    // ---- M6 Phase 3 (Rec 1/2/3): fixed / absolute / sticky ----
+
+    /// Rec 1: a `fixed` box resolves its insets against the
+    /// viewport — not against the nearest positioned ancestor, and
+    /// not against any scroll container. `top`/`left` win over
+    /// `bottom`/`right`.
+    #[test]
+    fn fixed_box_resolves_insets_against_the_viewport() {
+        let dom = parse_html(
+            r#"<div class="spacer"></div><div class="fixed">F</div><div class="fixed2">G</div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".spacer { height: 2000px; } \
+             .fixed { position: fixed; top: 10px; left: 20px; width: 100px; height: 50px; } \
+             .fixed2 { position: fixed; right: 30px; bottom: 40px; width: 100px; height: 50px; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        let fixed = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom.is_some_and(|id| dom.attr(id, "class") == Some("fixed")))
+            .unwrap();
+        assert_eq!((fixed.x, fixed.y), (20.0, 10.0));
+        assert_eq!((fixed.width, fixed.height), (100.0, 50.0));
+        assert!(fixed.is_viewport_fixed);
+        let fixed2 = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom.is_some_and(|id| dom.attr(id, "class") == Some("fixed2")))
+            .unwrap();
+        assert_eq!((fixed2.x, fixed2.y), (800.0 - 30.0 - 100.0, 600.0 - 40.0 - 50.0));
+        assert!(fixed2.is_viewport_fixed);
+    }
+
+    /// Rec 1: a `fixed` box inside a scroll container does not
+    /// move with it, and does not inflate the container's maximum
+    /// scroll — the fixed box is viewport content, not container
+    /// content.
+    #[test]
+    fn fixed_box_ignores_scroll_container_offset_and_size() {
+        let dom = parse_html(
+            r#"<div class="outer"><div class="tall"></div><div class="fixed">F</div></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".outer { height: 100px; overflow: auto; } \
+             .tall { height: 250px; } \
+             .fixed { position: fixed; top: 0px; left: 0px; width: 50px; height: 500px; }",
+        );
+        let mut tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        let outer = id_of_class(&tree, &dom, "outer");
+        // Only the 250px tall child counts: 250 - 100 = 150. The
+        // 500px fixed box must not add a single px.
+        assert_eq!(tree.scrollable_size(outer), Some((0.0, 150.0)));
+        tree.set_scroll_offset(outer, 0.0, 100.0);
+        let fixed = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom.is_some_and(|id| dom.attr(id, "class") == Some("fixed")))
+            .unwrap();
+        assert_eq!((fixed.x, fixed.y), (0.0, 0.0));
+        assert_eq!(tree.scrollable_size(outer), Some((0.0, 150.0)));
+    }
+
+    /// Rec 1: a transformed ancestor is the containing block for
+    /// `fixed` descendants — they stop being viewport-relative
+    /// and lay out as absolute against it.
+    #[test]
+    fn fixed_box_under_transformed_ancestor_behaves_absolute() {
+        let dom = parse_html(r#"<div class="outer"><div class="fixed">F</div></div>"#);
+        let sheet = Stylesheet::parse(
+            ".outer { transform: translateX(10px); } \
+             .fixed { position: fixed; top: 10px; left: 20px; width: 100px; height: 50px; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        let fixed = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom.is_some_and(|id| dom.attr(id, "class") == Some("fixed")))
+            .unwrap();
+        assert!(!fixed.is_viewport_fixed, "transformed ancestor re-parents fixed");
+        // Absolute path: the outer box sits at the body margin
+        // (8, 8); the fixed child resolves against its padding
+        // box, so (8 + 20, 8 + 10). The 10px transform rides on
+        // the paint matrix, not on x/y.
+        assert_eq!((fixed.x, fixed.y), (28.0, 18.0));
+    }
+
+    /// Rec 1: hit-testing a viewport-fixed box uses viewport
+    /// coordinates — the shell passes page coordinates, so the
+    /// viewport scroll is removed for fixed boxes only.
+    #[test]
+    fn fixed_box_hit_tests_in_viewport_coordinates() {
+        let dom = parse_html(
+            r#"<div class="fixed">F</div><div class="content"></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".fixed { position: fixed; top: 10px; left: 20px; width: 100px; height: 50px; } \
+             .content { height: 2000px; }",
+        );
+        let mut tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        let fixed = id_of_class(&tree, &dom, "fixed");
+        let content = id_of_class(&tree, &dom, "content");
+        // Page point (25, 115) is inside the content div in page
+        // space — but in viewport space (25, 15) it is inside the
+        // fixed box, which paints on top.
+        tree.set_viewport_scroll(0.0, 100.0);
+        assert_eq!(tree.hit_test(25.0, 115.0), Some(fixed));
+        // Page point (25, 65) is viewport (25, -35): above the
+        // fixed box, so the content underneath wins.
+        assert_eq!(tree.hit_test(25.0, 65.0), Some(content));
+    }
+
+    /// Rec 2: a positioned `display: inline` element gets its own
+    /// box instead of vanishing into the parent's text leaf — and
+    /// the surrounding inline text still lays out.
+    #[test]
+    fn positioned_inline_element_gets_a_box() {
+        let dom = parse_html(r#"<p class="wrap">before <span class="abs">X</span> after</p>"#);
+        let sheet = Stylesheet::parse(
+            ".wrap { position: relative; } \
+             .abs { position: absolute; left: 30px; top: 40px; width: 50px; height: 20px; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        let abs = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom.is_some_and(|id| dom.attr(id, "class") == Some("abs")))
+            .expect("positioned span has a box");
+        let wrap = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom.is_some_and(|id| dom.attr(id, "class") == Some("wrap")))
+            .unwrap();
+        assert_eq!((abs.x, abs.y), (wrap.x + 30.0, wrap.y + 40.0));
+        assert_eq!((abs.width, abs.height), (50.0, 20.0));
+        let texts: Vec<String> = tree
+            .boxes
+            .iter()
+            .filter_map(|b| b.text.as_ref())
+            .flat_map(|t| t.spans.iter().map(|s| s.text.clone()))
+            .collect();
+        assert!(texts.iter().any(|t| t.contains("before")));
+        assert!(texts.iter().any(|t| t.contains("after")));
+        assert!(texts.iter().any(|t| t.contains('X')));
+    }
+
+    /// Rec 2: absolute geometry against the containing block —
+    /// percentage insets resolve against the CB, and
+    /// over-constrained insets resolve with `left` winning.
+    #[test]
+    fn absolute_geometry_against_containing_block() {
+        let dom = parse_html(
+            r#"<div class="cb"><div class="a"></div><div class="b"></div></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".cb { position: relative; width: 300px; height: 200px; } \
+             .a { position: absolute; left: 10%; top: 20px; width: 50%; height: 30px; } \
+             .b { position: absolute; left: 10px; right: 20px; top: 0px; width: 100px; height: 10px; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        let cb = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom.is_some_and(|id| dom.attr(id, "class") == Some("cb")))
+            .unwrap();
+        let a = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom.is_some_and(|id| dom.attr(id, "class") == Some("a")))
+            .unwrap();
+        assert_eq!((a.x, a.y), (cb.x + 30.0, cb.y + 20.0));
+        assert_eq!((a.width, a.height), (150.0, 30.0));
+        let b = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom.is_some_and(|id| dom.attr(id, "class") == Some("b")))
+            .unwrap();
+        assert_eq!((b.x, b.y), (cb.x + 10.0, cb.y));
+        assert_eq!(b.width, 100.0);
+    }
+
+    /// Rec 2: the `inset` shorthand (parsed in Phase 1) positions
+    /// an absolute box end to end — `top right bottom left`.
+    #[test]
+    fn inset_shorthand_positions_absolute_box() {
+        let dom = parse_html(r#"<div class="cb"><div class="abs"></div></div>"#);
+        let sheet = Stylesheet::parse(
+            ".cb { position: relative; width: 300px; height: 200px; } \
+             .abs { position: absolute; inset: 10px 20px 30px 40px; width: 50px; height: 60px; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        let cb = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom.is_some_and(|id| dom.attr(id, "class") == Some("cb")))
+            .unwrap();
+        let abs = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom.is_some_and(|id| dom.attr(id, "class") == Some("abs")))
+            .unwrap();
+        assert_eq!((abs.x, abs.y), (cb.x + 40.0, cb.y + 10.0));
+        assert_eq!((abs.width, abs.height), (50.0, 60.0));
+    }
+
+    /// Rec 3: a sticky navbar lays out in flow, sticks at `top: 0`
+    /// while the page scrolls, and releases when its bottom would
+    /// pass its containing block's bottom edge.
+    #[test]
+    fn sticky_navbar_sticks_at_top_and_releases_at_cb_end() {
+        let dom = parse_html(
+            r#"<div class="page"><div class="nav">Nav</div><div class="filler"></div></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".page { height: 2000px; } .nav { position: sticky; top: 0px; height: 50px; } \
+             .filler { height: 1900px; }",
+        );
+        let mut tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        let nav = |tree: &LayoutTree| {
+            tree.boxes
+                .iter()
+                .find(|b| b.dom.is_some_and(|id| dom.attr(id, "class") == Some("nav")))
+                .unwrap()
+                .clone()
+        };
+        // In flow at the top of the page (body margin 8).
+        assert_eq!(nav(&tree).y, 8.0);
+        // Scrolled 100: stuck at the viewport top. Layout `y`
+        // is a page coordinate — the viewport scroll is subtracted
+        // at paint — so the stuck box sits at y == 100, painted
+        // at 100 - 100 == 0. The scroll moved the sticky box, so
+        // the worker must resubmit the re-collected list.
+        assert!(tree.set_viewport_scroll(0.0, 100.0));
+        assert_eq!(nav(&tree).y, 100.0);
+        // Scrolled to the containing block's end: the nav's bottom
+        // aligns with the page bottom in page coordinates
+        // (2008); painted at 2008 - 1960 == 48.
+        tree.set_viewport_scroll(0.0, 1960.0);
+        let n = nav(&tree);
+        assert_eq!(n.y + n.height, 2008.0);
+        // Back to the top: unstuck, back in flow.
+        tree.set_viewport_scroll(0.0, 0.0);
+        assert_eq!(nav(&tree).y, 8.0);
+    }
+
+    /// Rec 3 follow-up: a viewport scroll with no sticky content
+    /// moves nothing — `set_viewport_scroll` reports `false`, so
+    /// the worker skips the resubmit and the event stream stays
+    /// clean (a spurious submit here poisoned the wheel/resize
+    /// worker tests' event order).
+    #[test]
+    fn viewport_scroll_without_sticky_reports_no_movement() {
+        let dom = parse_html(
+            r#"<div class="page"><div class="filler"></div></div>"#,
+        );
+        let sheet = Stylesheet::parse(".page { height: 2000px; } .filler { height: 1900px; }");
+        let mut tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        assert!(!tree.set_viewport_scroll(0.0, 100.0));
+        assert!(!tree.set_viewport_scroll(0.0, 200.0));
+        assert!(!tree.set_viewport_scroll(0.0, 0.0));
+    }
+
+    /// Rec 3: a sticky header inside a scroll container sticks at
+    /// the container's top (not the viewport's) and releases at
+    /// the container's bottom edge.
+    #[test]
+    fn sticky_header_sticks_inside_scroll_container() {
+        let dom = parse_html(
+            r#"<div class="outer"><div class="head">H</div><div class="tall"></div></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".outer { height: 100px; overflow: auto; } \
+             .head { position: sticky; top: 0px; height: 20px; } .tall { height: 300px; }",
+        );
+        let mut tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        let outer = id_of_class(&tree, &dom, "outer");
+        let head = |tree: &LayoutTree| {
+            tree.boxes
+                .iter()
+                .find(|b| b.dom.is_some_and(|id| dom.attr(id, "class") == Some("head")))
+                .unwrap()
+                .clone()
+        };
+        let outer_box = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom == Some(outer))
+            .unwrap()
+            .clone();
+        assert_eq!(head(&tree).y, outer_box.y);
+        // Scrolled 50: stuck at the container's top.
+        tree.set_scroll_offset(outer, 0.0, 50.0);
+        assert_eq!(head(&tree).y, outer_box.y);
+        // Scrolled to the container's end (max 220): released —
+        // the header's content position caps at the containing
+        // block's bottom minus its height (100 - 20 = 80), which
+        // is above the visible window [220, 320], so it has
+        // scrolled off the top: painted at 8 + (80 - 220) = -132.
+        tree.set_scroll_offset(outer, 0.0, 220.0);
+        let h = head(&tree);
+        assert_eq!(h.y, outer_box.y + (80.0 - 220.0));
     }
 
     #[test]
@@ -4515,7 +6492,7 @@ mod tests {
         let sheet = Stylesheet::parse(
             ".row { display: flex; } .a { width: 100px; } .b { width: 100px; }",
         );
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let a = tree
             .boxes
             .iter()
@@ -4615,9 +6592,9 @@ mod tests {
         let ua = Stylesheet::ua();
         let state = ElementState::default();
         let parallel =
-            resolve_document_styles(dom, &ua, sheet, true, (1024.0, 768.0), &state).0;
+            resolve_document_styles(dom, &ua, sheet, true, (1024.0, 768.0), &state, Theme::Light).0;
         let serial =
-            resolve_document_styles(dom, &ua, sheet, false, (1024.0, 768.0), &state).0;
+            resolve_document_styles(dom, &ua, sheet, false, (1024.0, 768.0), &state, Theme::Light).0;
         (parallel, serial)
     }
 
@@ -4736,8 +6713,8 @@ mod tests {
         let state = ElementState::default();
         let viewport = (800.0, 600.0);
         let (full_styles, _) =
-            resolve_document_styles(&dom, &ua, &sheet, false, viewport, &state);
-        let tree = LayoutTree::build(&dom, &sheet, viewport.0, viewport.1)
+            resolve_document_styles(&dom, &ua, &sheet, false, viewport, &state, Theme::Light);
+        let tree = LayoutTree::build(&dom, &sheet, viewport.0, viewport.1, Theme::Light)
             .expect("layout builds");
         let root = dom.root().unwrap();
         let html = find_element(&dom, root, "html").unwrap();
@@ -4753,6 +6730,7 @@ mod tests {
                 &state,
                 sub_root,
                 &tree.node_styles,
+                Theme::Light,
             );
             assert_eq!(
                 sub_styles.len(),
@@ -4903,14 +6881,14 @@ mod tests {
         // No visited state: `:visited` matches nothing — both links
         // keep the UA default blue, not the green rule.
         let plain =
-            resolve_document_styles(&dom, &ua, &sheet, false, (800.0, 600.0), &ElementState::default()).0;
+            resolve_document_styles(&dom, &ua, &sheet, false, (800.0, 600.0), &ElementState::default(), Theme::Light).0;
         assert_eq!(plain[&a].color, [255, 0, 0]);
         assert_eq!(plain[&b].color, [0, 0, 0]);
         assert_eq!(plain[&visited_link].color, [0, 0, 238]);
         assert_eq!(plain[&unvisited_link].color, [0, 0, 238]);
         // One link visited: the `a:visited` rule applies to it only.
         let visited =
-            resolve_document_styles(&dom, &ua, &sheet, false, (800.0, 600.0), &ElementState::default().with_visited(visited_link)).0;
+            resolve_document_styles(&dom, &ua, &sheet, false, (800.0, 600.0), &ElementState::default().with_visited(visited_link), Theme::Light).0;
         assert_eq!(visited[&visited_link].color, [0, 255, 0]);
         assert_eq!(visited[&unvisited_link].color, [0, 0, 238]);
     }
@@ -4926,7 +6904,7 @@ mod tests {
         assert_eq!(links.len(), 2);
         let (visited_link, unvisited_link) = (links[0], links[1]);
         let styles =
-            resolve_document_styles(&dom, &ua, &sheet, false, (800.0, 600.0), &ElementState::default().with_visited(visited_link)).0;
+            resolve_document_styles(&dom, &ua, &sheet, false, (800.0, 600.0), &ElementState::default().with_visited(visited_link), Theme::Light).0;
         // UA sheet: `a { color: #0000EE; } a:visited { color: #551A8B; }`.
         assert_eq!(styles[&visited_link].color, [0x55, 0x1a, 0x8b]);
         assert_eq!(styles[&unvisited_link].color, [0, 0, 238]);
@@ -4954,6 +6932,7 @@ mod tests {
             false,
             (800.0, 600.0),
             &ElementState::default().with_visited(visited_link),
+            Theme::Light,
         )
         .0;
         assert_eq!(styles[&visited_link].color, [0, 255, 0]);
@@ -4968,6 +6947,7 @@ mod tests {
             false,
             (800.0, 600.0),
             &ElementState::default().with_visited(visited_link),
+            Theme::Light,
         )
         .0;
         assert_eq!(styles[&visited_link].color, [0, 0, 255]);
@@ -4988,6 +6968,7 @@ mod tests {
             false,
             (800.0, 600.0),
             &ElementState::default(),
+            Theme::Light,
         )
         .0;
         assert_eq!(plain[&link].color, [0, 0, 238]);
@@ -4998,6 +6979,7 @@ mod tests {
             false,
             (800.0, 600.0),
             &ElementState::default().with_hover(link),
+            Theme::Light,
         )
         .0;
         assert_eq!(hovered[&link].color, [255, 0, 0]);
@@ -5046,7 +7028,7 @@ mod tests {
     fn br_is_a_forced_break_not_a_leaf() {
         let dom = parse_html("<p>one<br>two</p>");
         let sheet = Stylesheet::parse("");
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         // No box exists for <br> itself.
         assert!(!tree.boxes.iter().any(|b| {
             b.dom.is_some_and(|id| dom.tag(id) == Some("br"))
@@ -5078,7 +7060,7 @@ mod tests {
             r#"<div style="text-align: center; width: 400px;">hi</div>"#,
         );
         let sheet = Stylesheet::parse("");
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let div = box_for(&tree, &dom, "div");
         assert_eq!(div.width, 400.0);
         let leaf = tree
@@ -5098,7 +7080,7 @@ mod tests {
     fn pre_preserves_whitespace() {
         let dom = parse_html("<pre>  a   b  </pre>");
         let sheet = Stylesheet::parse("");
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let leaf = tree
             .boxes
             .iter()
@@ -5118,7 +7100,7 @@ mod tests {
         let sheet = Stylesheet::parse(
             ".w { width: 800px; max-width: 400px; } .pad { padding-top: 25vh; }",
         );
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let root = dom.root().unwrap();
         let w = find_by_class(&dom, root, "w").unwrap();
         let wbox = tree.boxes.iter().find(|b| b.dom == Some(w)).unwrap();
@@ -5145,7 +7127,7 @@ mod tests {
             .filter_map(|&c| dom.text(c))
             .collect();
         let sheet = Stylesheet::parse(&css);
-        let tree = LayoutTree::build(&dom, &sheet, 1024.0, 768.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 1024.0, 768.0, Theme::Light).expect("layout builds");
         let body = box_for(&tree, &dom, "body");
         // 26em at 16px = 416px content width; with `content-box`
         // the 2em side padding adds 64px, so the border box is 480
@@ -5184,7 +7166,7 @@ mod tests {
         let sheet = Stylesheet::parse(
             ".grid { display: grid; grid-template-columns: 100px 100px; width: 200px; }",
         );
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let root = dom.root().unwrap();
         let at = |class: &str| {
             let id = find_by_class(&dom, root, class).unwrap();
@@ -5211,7 +7193,7 @@ mod tests {
         let sheet = Stylesheet::parse(
             ".grid { display: grid; grid-template-columns: 1fr 1fr; width: 300px; }",
         );
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let root = dom.root().unwrap();
         let a = find_by_class(&dom, root, "a").unwrap();
         let bid = find_by_class(&dom, root, "b").unwrap();
@@ -5287,7 +7269,7 @@ mod tests {
         let sheet = Stylesheet::parse(
             ".grid { display: grid; grid-template-columns: 100px 100px; grid-template-rows: 20px 20px; grid-auto-flow: column; width: 200px; }",
         );
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let root = dom.root().unwrap();
         let at = |class: &str| {
             let id = find_by_class(&dom, root, class).unwrap();
@@ -5313,7 +7295,7 @@ mod tests {
         let sheet = Stylesheet::parse(
             ".grid { display: grid; grid-template-columns: 100px 100px; grid-auto-flow: sideways; width: 200px; }",
         );
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let root = dom.root().unwrap();
         let at = |class: &str| {
             let id = find_by_class(&dom, root, class).unwrap();
@@ -5338,7 +7320,7 @@ mod tests {
         let sheet = Stylesheet::parse(
             ".scroll { overflow: hidden; height: 50px; width: 200px; } .tall { height: 200px; }",
         );
-        let mut tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let mut tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let root = dom.root().unwrap();
         let scroll = find_by_class(&dom, root, "scroll").unwrap();
         let tall = find_by_class(&dom, root, "tall").unwrap();
@@ -5385,6 +7367,392 @@ mod tests {
         assert!(!tree.mark_dirty(dom.root().unwrap()));
     }
 
+    // ---- M6 Phase 2 (Rec 4/5/7/8): Appendix E paint order,
+    // stacking contexts, page transforms, transformed hit-test ----
+
+    /// The paint-order position of one element's box (its index in
+    /// `tree.paint_order()`), for asserting relative order.
+    fn paint_pos(tree: &LayoutTree, dom: &Dom, class: &str) -> usize {
+        let root = dom.root().unwrap();
+        let id = find_by_class(dom, root, class).unwrap();
+        let idx = tree
+            .boxes
+            .iter()
+            .position(|b| b.dom == Some(id))
+            .expect("box for class");
+        tree.paint_order()
+            .iter()
+            .position(|&i| i == idx)
+            .expect("box in paint order")
+    }
+
+    #[test]
+    fn paint_order_is_a_permutation_of_boxes() {
+        let dom = parse_html(
+            "<html><head></head><body><div class=\"a\">A</div><div class=\"b\">B</div></body></html>",
+        );
+        let sheet = Stylesheet::parse("");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        let mut order = tree.paint_order();
+        order.sort_unstable();
+        let expected: Vec<usize> = (0..tree.boxes.len()).collect();
+        assert_eq!(order, expected, "paint order covers every box once");
+    }
+
+    #[test]
+    fn paint_order_follows_z_index_not_document_order() {
+        // Three overlapping absolutely-positioned siblings in
+        // document order a, b, c with z-index 3, 1, 2: Appendix E
+        // paints them b (1), c (2), a (3) — and hit-testing agrees.
+        let dom = parse_html(
+            r#"<div class="wrap"><div class="a">A</div><div class="b">B</div><div class="c">C</div></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".wrap { position: relative; width: 200px; height: 200px; } \
+             .a { position: absolute; left: 0; top: 0; width: 100px; height: 100px; z-index: 3; background-color: #ff0000; } \
+             .b { position: absolute; left: 0; top: 0; width: 100px; height: 100px; z-index: 1; background-color: #00ff00; } \
+             .c { position: absolute; left: 0; top: 0; width: 100px; height: 100px; z-index: 2; background-color: #0000ff; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        let root = dom.root().unwrap();
+        let (a, b, c) = (
+            find_by_class(&dom, root, "a").unwrap(),
+            find_by_class(&dom, root, "b").unwrap(),
+            find_by_class(&dom, root, "c").unwrap(),
+        );
+        assert!(
+            paint_pos(&tree, &dom, "b") < paint_pos(&tree, &dom, "c")
+                && paint_pos(&tree, &dom, "c") < paint_pos(&tree, &dom, "a"),
+            "z-index order b < c < a, got b={} c={} a={}",
+            paint_pos(&tree, &dom, "b"),
+            paint_pos(&tree, &dom, "c"),
+            paint_pos(&tree, &dom, "a")
+        );
+        // All three overlap at (30, 30) (inside the wrap at the
+        // 8px body margin); the topmost by paint order wins.
+        assert_eq!(tree.hit_test(30.0, 30.0), Some(a));
+        // `z-index` is ignored on a static box: a static sibling
+        // with z-index 99 still paints in-flow, below a
+        // positioned z-index: 1 sibling.
+        let dom = parse_html(
+            r#"<div class="wrap"><div class="s">S</div><div class="p">P</div></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".wrap { position: relative; width: 200px; height: 200px; } \
+             .s { width: 100px; height: 100px; z-index: 99; background-color: #ff0000; } \
+             .p { position: absolute; left: 0; top: 0; width: 100px; height: 100px; z-index: 1; background-color: #00ff00; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        assert!(
+            paint_pos(&tree, &dom, "s") < paint_pos(&tree, &dom, "p"),
+            "static z-index: 99 paints below positioned z-index: 1"
+        );
+    }
+
+    #[test]
+    fn paint_order_negative_z_behind_parent_background() {
+        // A negative-z child paints before (behind) its parent's
+        // in-flow content — but after the parent's own background,
+        // which is the context root's box and paints first. The
+        // parent needs `z-index: 0` to be a stacking context at
+        // all: a negative-z child of a non-context parent paints
+        // in the *root* context's negative step, behind the
+        // parent's own background.
+        let dom = parse_html(
+            r#"<div class="parent"><div class="neg">N</div><div class="flow">F</div></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".parent { position: relative; z-index: 0; width: 200px; height: 200px; background-color: #ffffff; } \
+             .neg { position: absolute; left: 0; top: 0; width: 100px; height: 100px; z-index: -1; background-color: #ff0000; } \
+             .flow { width: 50px; height: 50px; background-color: #00ff00; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        assert!(
+            paint_pos(&tree, &dom, "parent") < paint_pos(&tree, &dom, "neg")
+                && paint_pos(&tree, &dom, "neg") < paint_pos(&tree, &dom, "flow"),
+            "parent bg < negative-z child < in-flow content"
+        );
+        // ...and the negative-z child still hit-tests: (98, 98)
+        // is inside the 100x100 negative child but outside the
+        // 50x50 in-flow sibling, so the negative child is topmost
+        // there.
+        let root = dom.root().unwrap();
+        let neg = find_by_class(&dom, root, "neg").unwrap();
+        assert_eq!(tree.hit_test(8.0 + 90.0, 8.0 + 90.0), Some(neg));
+    }
+
+    #[test]
+    fn paint_order_opacity_creates_stacking_context() {
+        // `opacity: 0.5` is an implicit stacking context: the
+        // translucent parent's children paint inside its group —
+        // after the parent's own box and before the positioned
+        // sibling that follows the parent in the outer context.
+        let dom = parse_html(
+            r#"<div class="ghost"><div class="kid">K</div></div><div class="sib">S</div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".ghost { opacity: 0.5; width: 100px; height: 100px; background-color: #ff0000; } \
+             .kid { width: 50px; height: 50px; background-color: #00ff00; } \
+             .sib { position: absolute; left: 0; top: 0; width: 100px; height: 100px; z-index: 1; background-color: #0000ff; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        let ghost = tree
+            .boxes
+            .iter()
+            .find(|b| {
+                b.dom.is_some_and(|id| {
+                    dom.tag(id) == Some("div")
+                        && dom.get(id)
+                            .and_then(|n| n.attr("class"))
+                            .is_some_and(|c| c == "ghost")
+                })
+            })
+            .expect("ghost box");
+        assert!(ghost.is_stacking_context, "opacity < 1 is a stacking context");
+        assert!(
+            paint_pos(&tree, &dom, "ghost") < paint_pos(&tree, &dom, "kid")
+                && paint_pos(&tree, &dom, "kid") < paint_pos(&tree, &dom, "sib"),
+            "ghost < kid < positioned sibling"
+        );
+    }
+
+    #[test]
+    fn page_transform_composes_through_rotated_ancestor() {
+        // A 90-degree rotation about the parent's centre maps the
+        // parent's local +x axis to page +y; the child's page
+        // transform must carry that rotation, and its transformed
+        // top-left must be the parent's top-left plus the rotated
+        // offset. Parent 100x100 at (8, 8) (body margin), child
+        // 10x10 at layout offset (80, 0) inside the parent.
+        let dom = parse_html(
+            r#"<div class="parent"><div class="child">C</div></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".parent { width: 100px; height: 100px; transform: rotate(90deg); transform-origin: 50% 50%; } \
+             .child { width: 10px; height: 10px; margin-left: 80px; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        let root = dom.root().unwrap();
+        let parent_id = find_by_class(&dom, root, "parent").unwrap();
+        let child_id = find_by_class(&dom, root, "child").unwrap();
+        let transforms = tree.page_transforms();
+        let parent_idx = tree
+            .boxes
+            .iter()
+            .position(|b| b.dom == Some(parent_id))
+            .unwrap();
+        let child_idx = tree
+            .boxes
+            .iter()
+            .position(|b| b.dom == Some(child_id))
+            .unwrap();
+        let parent_box = &tree.boxes[parent_idx];
+        let child_box = &tree.boxes[child_idx];
+        assert_eq!((parent_box.x, parent_box.y), (8.0, 8.0));
+        // The parent's own matrix is a 90-degree rotation about
+        // its centre (origin 50,50): local (0,0) maps to (100,0)
+        // in parent-local space.
+        let (px, py) = parent_box.matrix.apply(0.0, 0.0);
+        assert!((px - 100.0).abs() < 0.01 && (py - 0.0).abs() < 0.01, "parent matrix {px} {py}");
+        // The child's page transform carries the rotation: its
+        // local +x maps to page +y.
+        let child_t = transforms[child_idx];
+        let (cx, cy) = child_t.apply(child_box.x, child_box.y);
+        let (cx1, cy1) = child_t.apply(child_box.x + 10.0, child_box.y);
+        assert!((cx1 - cx).abs() < 0.01, "child local +x is page +y, got {cx},{cy} -> {cx1},{cy1}");
+        assert!((cy1 - cy - 10.0).abs() < 0.01, "child local +x is page +y, got {cx},{cy} -> {cx1},{cy1}");
+        // The child's transformed top-left: parent top-left plus
+        // the parent matrix applied to the (80, 0) offset — the
+        // rotation turns (80, 0) into (100, 80) in parent-local
+        // space, so the child sits at page (8 + 100, 8 + 80) less
+        // the rotation of its own origin... its top-left corner
+        // is the image of its layout top-left under its own page
+        // transform.
+        let (tx, ty) = child_t.apply(child_box.x, child_box.y);
+        assert!((tx - 108.0).abs() < 0.01 && (ty - 88.0).abs() < 0.01, "child top-left {tx} {ty}");
+        // Two levels: a grandchild inside the child composes
+        // through the same rotation — its offset (5, 0) inside
+        // the child maps to page (0, +5).
+        let dom = parse_html(
+            r#"<div class="parent"><div class="child"><div class="grand">G</div></div></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".parent { width: 100px; height: 100px; transform: rotate(90deg); transform-origin: 50% 50%; } \
+             .child { width: 10px; height: 10px; margin-left: 80px; } \
+             .grand { width: 5px; height: 5px; margin-left: 5px; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        let grand_id = find_by_class(&dom, dom.root().unwrap(), "grand").unwrap();
+        let grand_idx = tree
+            .boxes
+            .iter()
+            .position(|b| b.dom == Some(grand_id))
+            .unwrap();
+        let grand_box = &tree.boxes[grand_idx];
+        let grand_t = tree.page_transforms()[grand_idx];
+        let (gx, gy) = grand_t.apply(grand_box.x, grand_box.y);
+        assert!((gx - 108.0).abs() < 0.01 && (gy - 93.0).abs() < 0.01, "grandchild top-left {gx} {gy}");
+    }
+
+    #[test]
+    fn hit_test_goes_through_rotated_box() {
+        // A 100x100 box rotated 45 degrees about its centre: its
+        // axis-aligned bounding box is ~141x141, but the corners
+        // of that bbox are outside the rotated rect. A click at a
+        // bbox corner misses; a click at the centre hits.
+        let dom = parse_html(r#"<div class="spin">S</div>"#);
+        let sheet = Stylesheet::parse(
+            ".spin { position: absolute; left: 100px; top: 100px; width: 100px; height: 100px; transform: rotate(45deg); }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        let root = dom.root().unwrap();
+        let spin = find_by_class(&dom, root, "spin").unwrap();
+        let spin_box = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom == Some(spin))
+            .expect("spin box")
+            .clone();
+        // Points are derived from the box's own geometry, not
+        // assumed coordinates: absolute positioning resolves
+        // against the body's box, so the layout position is the
+        // body's (8, 8) plus the 100px offsets.
+        let (cx, cy) = (spin_box.x + 50.0, spin_box.y + 50.0);
+        // Centre of the box hits.
+        assert_eq!(tree.hit_test(cx, cy), Some(spin));
+        // The bbox corner (the layout top-left) is outside the
+        // rotated diamond.
+        assert_eq!(tree.hit_test(spin_box.x, spin_box.y), None);
+        // Just inside the diamond's top edge hits: the top vertex
+        // is the image of the layout top-left under the page
+        // transform, and 12px below it (toward the centre) is
+        // inside.
+        let transforms = tree.page_transforms();
+        let spin_idx = tree
+            .boxes
+            .iter()
+            .position(|b| b.dom == Some(spin))
+            .unwrap();
+        let (vx, vy) = transforms[spin_idx].apply(spin_box.x, spin_box.y);
+        assert_eq!(tree.hit_test(vx, vy + 12.0), Some(spin));
+        // And a point just outside the top vertex misses.
+        assert_eq!(tree.hit_test(vx, vy - 12.0), None);
+        // A singular transform (scale 0) is unhittable.
+        let dom = parse_html(r#"<div class="flat">F</div>"#);
+        let sheet = Stylesheet::parse(
+            ".flat { position: absolute; left: 100px; top: 100px; width: 100px; height: 100px; transform: scale(0); }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        let flat = find_by_class(&dom, dom.root().unwrap(), "flat").unwrap();
+        assert_eq!(tree.hit_test(150.0, 150.0), None);
+        let _ = flat;
+    }
+
+    #[test]
+    fn text_leaf_under_rotated_parent_is_not_double_rotated() {
+        // A text leaf clones its parent element's computed style,
+        // so without special handling it would compose the
+        // parent's transform a second time (its own matrix would
+        // be rotate(45) * rotate(45)) and paint its glyphs at
+        // 90 degrees. The leaf has no transform of its own: its
+        // matrix must equal the parent's, its page transform the
+        // same map (same linear part, same image of any point),
+        // and it is never a stacking context of its own — it
+        // paints inside the parent's group.
+        let dom = parse_html(r#"<div class="spin">S</div>"#);
+        let sheet = Stylesheet::parse(
+            ".spin { position: absolute; left: 100px; top: 100px; width: 100px; height: 100px; transform: rotate(45deg); }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light)
+            .expect("layout builds");
+        let spin = find_by_class(&dom, dom.root().unwrap(), "spin").unwrap();
+        let spin_idx = tree
+            .boxes
+            .iter()
+            .position(|b| b.dom == Some(spin))
+            .unwrap();
+        let leaf_idx = tree
+            .boxes
+            .iter()
+            .position(|b| b.dom.is_none() && b.text.is_some())
+            .expect("text leaf");
+        let spin_box = &tree.boxes[spin_idx];
+        let leaf_box = &tree.boxes[leaf_idx];
+        assert_eq!(leaf_box.matrix, spin_box.matrix);
+        assert!(!leaf_box.is_stacking_context);
+        let transforms = tree.page_transforms();
+        let (lx, ly) = transforms[leaf_idx].apply(leaf_box.x, leaf_box.y);
+        let (sx, sy) = transforms[spin_idx].apply(leaf_box.x, leaf_box.y);
+        assert!((lx - sx).abs() < 0.01 && (ly - sy).abs() < 0.01,
+            "leaf page transform ({lx}, {ly}) != parent ({sx}, {sy})");
+    }
+
+    #[test]
+    fn composited_state_reports_matrix_and_opacity() {
+        let dom = parse_html(r#"<div class="ghost">G</div>"#);
+        let sheet = Stylesheet::parse(
+            ".ghost { width: 100px; height: 100px; opacity: 0.5; transform: translate(10px, 20px); }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
+        let ghost = find_by_class(&dom, dom.root().unwrap(), "ghost").unwrap();
+        let state = tree.composited_state(&[ghost]);
+        assert_eq!(state.len(), 1);
+        let (key, matrix, opacity) = state[0];
+        assert_eq!(key, LayoutTree::dom_key(ghost));
+        assert!((opacity - 0.5).abs() < 1e-6);
+        // The page transform carries the translate: the layout
+        // top-left (8, 8) maps to (18, 28).
+        let ghost_box = tree.boxes.iter().find(|b| b.dom == Some(ghost)).unwrap();
+        let (tx, ty) = matrix.apply(ghost_box.x, ghost_box.y);
+        assert!((tx - 18.0).abs() < 0.01 && (ty - 28.0).abs() < 0.01, "translated {tx} {ty}");
+        // Ids with no box are skipped, not errors: `<head>` is
+        // unrendered, and the document root itself has no box.
+        let head = find_element(&dom, dom.root().unwrap(), "head").unwrap();
+        assert!(tree.composited_state(&[head]).is_empty());
+        assert!(tree
+            .composited_state(&[dom.root().unwrap()])
+            .is_empty());
+    }
+
+    #[test]
+    fn composited_subtree_state_covers_descendants() {
+        // A transform change on a container moves its whole
+        // subtree: the update must carry the child element too,
+        // with the child's own new page transform — not just the
+        // container's. The text leaf needs no entry of its own
+        // (it shares its parent element's page transform).
+        let dom = parse_html(
+            r#"<div class="wrap"><div class="inner">I</div></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            ".wrap { width: 200px; height: 200px; transform: translate(10px, 0px); } \
+             .inner { width: 50px; height: 50px; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light)
+            .expect("layout builds");
+        let root = dom.root().unwrap();
+        let wrap = find_by_class(&dom, root, "wrap").unwrap();
+        let inner = find_by_class(&dom, root, "inner").unwrap();
+        let state = tree.composited_subtree_state(&[wrap]);
+        let keys: Vec<u64> = state.iter().map(|s| s.0).collect();
+        assert!(keys.contains(&LayoutTree::dom_key(wrap)));
+        assert!(keys.contains(&LayoutTree::dom_key(inner)));
+        assert_eq!(state.len(), 2, "only the wrap and its child");
+        // The inner's matrix carries the wrap's translate.
+        let inner_box = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom == Some(inner))
+            .unwrap();
+        let (_, im, _) = state
+            .iter()
+            .find(|s| s.0 == LayoutTree::dom_key(inner))
+            .unwrap();
+        let (tx, ty) = im.apply(inner_box.x, inner_box.y);
+        assert!((tx - (inner_box.x + 10.0)).abs() < 0.01, "inner moved {tx}");
+        assert!((ty - inner_box.y).abs() < 0.01, "inner y {ty}");
+    }
+
     #[test]
     fn overscroll_behavior_parses_to_computed_style() {
         // Stage 8 Rec 9: `overscroll-behavior` (and the -x/-y
@@ -5399,7 +7767,7 @@ mod tests {
              .c { overflow: auto; } \
              .d { overflow: auto; overscroll-behavior: bogus; }",
         );
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let root = dom.root().unwrap();
         let style_of = |class: &str| {
             let id = find_by_class(&dom, root, class).unwrap();
@@ -5461,7 +7829,7 @@ mod tests {
         let sheet = Stylesheet::parse(
             ".r { border-radius: 8px; box-shadow: 2px 2px 4px #000000; }",
         );
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let rbox = tree.boxes.iter().find(|b| b.dom == Some(r)).unwrap();
         assert!(rbox.style.border_radius.is_some());
         assert_eq!(rbox.style.box_shadow.len(), 1);
@@ -5480,7 +7848,7 @@ mod tests {
         let sheet = Stylesheet::parse(
             ".clip { overflow: clip; height: 50px; width: 200px; } .tall { height: 200px; }",
         );
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let root = dom.root().unwrap();
         let clip = find_by_class(&dom, root, "clip").unwrap();
         let tall = find_by_class(&dom, root, "tall").unwrap();
@@ -5507,7 +7875,7 @@ mod tests {
             ".scroll { overflow: hidden; height: 50px; width: 200px; border-radius: 50%; } \
              .tall { height: 200px; border-radius: 4px; }",
         );
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let root = dom.root().unwrap();
         let scroll = find_by_class(&dom, root, "scroll").unwrap();
         let tall = find_by_class(&dom, root, "tall").unwrap();
@@ -5521,7 +7889,7 @@ mod tests {
         // A square box carries zero radii and no clip radii.
         let dom = parse_html(r#"<div class="plain">x</div>"#);
         let sheet = Stylesheet::parse(".plain { width: 100px; height: 100px; }");
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let plain = find_by_class(&dom, dom.root().unwrap(), "plain").unwrap();
         let plain_box = tree.boxes.iter().find(|b| b.dom == Some(plain)).unwrap();
         assert!(plain_box.radii.is_zero());
@@ -5534,7 +7902,7 @@ mod tests {
     fn node_styles_populated_with_full_hints() {
         let dom = parse_html("<html><body><p>hi</p></body></html>");
         let sheet = Stylesheet::parse("");
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let p = find_element(&dom, dom.root().unwrap(), "p").unwrap();
         let ns = tree.node_styles.get(p).expect("node style for <p>");
         assert_eq!(ns.computed.font_size, 16.0);
@@ -5578,6 +7946,7 @@ mod tests {
             768.0,
             &ElementState::default(),
             images,
+            Theme::Light,
         )
         .expect("layout builds");
         (dom, tree)
@@ -5657,6 +8026,7 @@ mod tests {
             768.0,
             &ElementState::default(),
             &images,
+            Theme::Light
         )
         .expect("layout builds");
         let img = box_for(&tree, &dom, "img");
@@ -5679,6 +8049,7 @@ mod tests {
             768.0,
             &ElementState::default(),
             &images,
+            Theme::Light
         )
         .expect("layout builds");
         // The alt text is a text leaf on the img box itself.
@@ -5702,6 +8073,7 @@ mod tests {
             768.0,
             &ElementState::default(),
             &images,
+            Theme::Light
         )
         .expect("layout builds");
         let img = box_for(&tree, &dom, "img");
@@ -5731,6 +8103,7 @@ mod tests {
             768.0,
             &ElementState::default(),
             &images,
+            Theme::Light
         )
         .expect("layout builds");
         let div = box_for(&tree, &dom, "div");
@@ -5748,6 +8121,7 @@ mod tests {
             768.0,
             &ElementState::default(),
             &ImageMap::default(),
+            Theme::Light,
         )
         .expect("layout builds");
         let div = box_for(&tree, &dom, "div");
@@ -5776,5 +8150,310 @@ mod tests {
             div.background_size,
             BackgroundSize::Lengths(Some(Dim::Px(50.0)), Some(Dim::Px(25.0)))
         );
+    }
+
+    // ---- M6 Phase 1 ----
+
+    #[test]
+    fn z_index_and_opacity_parse() {
+        let styles = styles_for(
+            "<html><body><div></div></body></html>",
+            "div { z-index: -1; opacity: 0.5; }",
+            (800.0, 600.0),
+        );
+        let dom = parse_html("<html><body><div></div></body></html>");
+        let div_id = find_element(&dom, dom.root().unwrap(), "div").expect("div in dom");
+        let div = styles.get(&div_id).expect("div style");
+        assert_eq!(div.z_index, Some(-1));
+        assert_eq!(div.opacity, 0.5);
+        // `auto` → None; opacity clamps to 0..=1.
+        let styles = styles_for(
+            "<html><body><div></div></body></html>",
+            "div { z-index: auto; opacity: 1.5; }",
+            (800.0, 600.0),
+        );
+        let div = styles.get(&div_id).expect("div style");
+        assert_eq!(div.z_index, None);
+        assert_eq!(div.opacity, 1.0);
+        let styles = styles_for(
+            "<html><body><div></div></body></html>",
+            "div { opacity: 50%; }",
+            (800.0, 600.0),
+        );
+        let div = styles.get(&div_id).expect("div style");
+        assert_eq!(div.opacity, 0.5);
+    }
+
+    #[test]
+    fn transform_origin_and_will_change_parse() {
+        let styles = styles_for(
+            "<html><body><div></div></body></html>",
+            "div { transform: rotate(45deg); transform-origin: 25% 75%; transform-box: fill-box; will-change: transform; }",
+            (800.0, 600.0),
+        );
+        let dom = parse_html("<html><body><div></div></body></html>");
+        let div_id = find_element(&dom, dom.root().unwrap(), "div").expect("div in dom");
+        let div = styles.get(&div_id).expect("div style");
+        assert_eq!(
+            div.transform,
+            vec![TransformFunction::Rotate(45.0)]
+        );
+        assert_eq!(
+            div.transform_origin,
+            TransformOrigin {
+                x: OriginComponent::Percentage(25.0),
+                y: OriginComponent::Percentage(75.0),
+            }
+        );
+        assert_eq!(div.transform_box, TransformBox::FillBox);
+        assert!(div.will_change_transform);
+        // One origin value centres the other axis; `will-change:
+        // opacity` does not set the transform hint.
+        let styles = styles_for(
+            "<html><body><div></div></body></html>",
+            "div { transform-origin: left; will-change: opacity; }",
+            (800.0, 600.0),
+        );
+        let div = styles.get(&div_id).expect("div style");
+        assert_eq!(
+            div.transform_origin,
+            TransformOrigin {
+                x: OriginComponent::Keyword(OriginKeyword::Left),
+                y: OriginComponent::Keyword(OriginKeyword::Center),
+            }
+        );
+        assert!(!div.will_change_transform);
+        // Defaults: empty transform, 50% 50% origin, view-box.
+        let styles = styles_for("<html><body><div></div></body></html>", "div {}", (800.0, 600.0));
+        let div = styles.get(&div_id).expect("div style");
+        assert!(div.transform.is_empty());
+        assert_eq!(
+            div.transform_origin,
+            TransformOrigin {
+                x: OriginComponent::Percentage(50.0),
+                y: OriginComponent::Percentage(50.0),
+            }
+        );
+        assert_eq!(div.transform_box, TransformBox::ViewBox);
+    }
+
+    #[test]
+    fn transition_and_animation_shorthand_and_longhands() {
+        let styles = styles_for(
+            "<html><body><div></div></body></html>",
+            "div { transition: opacity .3s ease-in .1s; animation: spin 2s linear infinite; }",
+            (800.0, 600.0),
+        );
+        let dom = parse_html("<html><body><div></div></body></html>");
+        let div_id = find_element(&dom, dom.root().unwrap(), "div").expect("div in dom");
+        let div = styles.get(&div_id).expect("div style");
+        assert_eq!(div.transitions.len(), 1);
+        assert_eq!(div.transitions[0].property, "opacity");
+        assert!((div.transitions[0].duration - 0.3).abs() < 1e-6);
+        assert_eq!(div.transitions[0].timing, Easing::EaseIn);
+        assert!((div.transitions[0].delay - 0.1).abs() < 1e-6);
+        assert_eq!(div.animations.len(), 1);
+        assert_eq!(div.animations[0].name, "spin");
+        assert_eq!(div.animations[0].duration, 2.0);
+        assert_eq!(div.animations[0].timing, Easing::Linear);
+        assert_eq!(
+            div.animations[0].iteration_count,
+            IterationCount::Infinite
+        );
+        // Longhands zip onto the shorthand entry; a longhand
+        // alone creates a default entry.
+        let styles = styles_for(
+            "<html><body><div></div></body></html>",
+            "div { transition-duration: .5s; transition-delay: .2s; animation-name: fade; animation-duration: 1s; animation-direction: reverse; }",
+            (800.0, 600.0),
+        );
+        let div = styles.get(&div_id).expect("div style");
+        assert_eq!(div.transitions.len(), 1);
+        assert!((div.transitions[0].duration - 0.5).abs() < 1e-6);
+        assert!((div.transitions[0].delay - 0.2).abs() < 1e-6);
+        assert_eq!(div.animations.len(), 1);
+        assert_eq!(div.animations[0].name, "fade");
+        assert_eq!(div.animations[0].duration, 1.0);
+        assert_eq!(div.animations[0].direction, AnimationDirection::Reverse);
+    }
+
+    #[test]
+    fn var_resolves_with_fallback_and_root_chain() {
+        let html = "<html><body><div class=\"a\"><div class=\"b\"></div><div class=\"c\"></div></div></body></html>";
+        let css = "html { --main: 20px; } \
+                   .a { width: var(--main); } \
+                   .b { width: var(--nope, 30px); height: var(--nope); } \
+                   .c { width: calc(var(--main) + 10px); }";
+        let styles = styles_for(html, css, (800.0, 600.0));
+        let dom = parse_html(html);
+        let root = dom.root().unwrap();
+        let a = find_by_class(&dom, root, "a").expect("a");
+        let b = find_by_class(&dom, root, "b").expect("b");
+        let c = find_by_class(&dom, root, "c").expect("c");
+        let a = styles.get(&a).expect("a style");
+        let b = styles.get(&b).expect("b style");
+        let c = styles.get(&c).expect("c style");
+        // `:root`-inherited `--main` resolves for the descendant.
+        assert_eq!(a.width, Some(Dim::Px(20.0)));
+        // Fallback used when the var is undefined...
+        assert_eq!(b.width, Some(Dim::Px(30.0)));
+        // ...and an unresolvable var with no fallback drops the
+        // declaration (height stays initial `None`).
+        assert_eq!(b.height, None);
+        // A `var()` inside `calc()` resolves first, then evaluates.
+        assert_eq!(c.width, Some(Dim::Px(30.0)));
+    }
+
+    #[test]
+    fn calc_and_clamp_evaluate_in_dim_value() {
+        let styles = styles_for(
+            "<html><body><div></div></body></html>",
+            "div { width: calc(100px + 20px); height: clamp(10px, 50px, 20px); }",
+            (800.0, 600.0),
+        );
+        let dom = parse_html("<html><body><div></div></body></html>");
+        let div_id = find_element(&dom, dom.root().unwrap(), "div").expect("div in dom");
+        let div = styles.get(&div_id).expect("div style");
+        assert_eq!(div.width, Some(Dim::Px(120.0)));
+        assert_eq!(div.height, Some(Dim::Px(20.0)));
+        // `calc(100% - 20px)` has no containing-block basis at
+        // style time: unresolvable → falls back to `auto`.
+        let styles = styles_for(
+            "<html><body><div></div></body></html>",
+            "div { width: calc(100% - 20px); }",
+            (800.0, 600.0),
+        );
+        let div = styles.get(&div_id).expect("div style");
+        assert_eq!(div.width, None);
+    }
+
+    #[test]
+    fn prefers_color_scheme_rules_apply_only_with_theme() {
+        let html = "<html><body><div></div></body></html>";
+        let css = "@media (prefers-color-scheme: dark) { div { background-color: #000000; } } \
+                   div { width: 100px; height: 100px; }";
+        let sheet = Stylesheet::parse(css);
+        for (theme, want) in [(Theme::Dark, Some([0, 0, 0])), (Theme::Light, None)] {
+            let dom = parse_html(html);
+            let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, theme)
+                .expect("layout builds");
+            let div = box_for(&tree, &dom, "div");
+            assert_eq!(div.style.background, want, "theme {theme:?}");
+        }
+    }
+
+    #[test]
+    fn origin_percent_resolves_against_border_box() {
+        let dom = parse_html("<html><body><div></div></body></html>");
+        let sheet = Stylesheet::parse(
+            "div { width: 200px; height: 100px; transform: rotate(90deg); transform-origin: 50% 50%; }",
+        );
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light)
+            .expect("layout builds");
+        let div = box_for(&tree, &dom, "div");
+        assert_eq!((div.width, div.height), (200.0, 100.0));
+        // The transform makes the box a stacking context.
+        assert!(div.is_stacking_context);
+        // The origin (100, 50) is the fixed point of the rotation.
+        let (x, y) = div.matrix.apply(100.0, 50.0);
+        assert!((x - 100.0).abs() < 1e-4, "x={x}");
+        assert!((y - 50.0).abs() < 1e-4, "y={y}");
+        // A point 100px right of the origin lands 100px below it.
+        let (x, y) = div.matrix.apply(200.0, 50.0);
+        assert!((x - 100.0).abs() < 1e-4, "x={x}");
+        assert!((y - 150.0).abs() < 1e-4, "y={y}");
+        // `parent` is the body box's DOM id.
+        let body_id = find_element(&dom, dom.root().unwrap(), "body").expect("body");
+        assert_eq!(div.parent, Some(body_id));
+    }
+
+    #[test]
+    fn abs_descendant_of_transformed_static_ancestor() {
+        // The sharpest-trap test (report §4): the abs child must
+        // resolve against the transformed static ancestor, not
+        // the outer relative box.
+        let html = "<html><body><div class=\"outer\"><div class=\"t\"><div class=\"abs\">x</div></div></div></body></html>";
+        let css = "body { margin: 0; } .outer { position: relative; width: 400px; height: 400px; padding: 60px 0 0 50px; } \
+                   .t { width: 200px; height: 200px; transform: translate(5px, 5px); } \
+                   .abs { position: absolute; left: 10px; top: 20px; width: 50px; height: 50px; }";
+        let dom = parse_html(html);
+        let sheet = Stylesheet::parse(css);
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light)
+            .expect("layout builds");
+        let root = dom.root().unwrap();
+        let t = find_by_class(&dom, root, "t").expect("t");
+        let abs = find_by_class(&dom, root, "abs").expect("abs");
+        let t_box = tree
+            .boxes()
+            .iter()
+            .find(|b| b.dom == Some(t))
+            .expect("t box");
+        let abs_box = tree
+            .boxes()
+            .iter()
+            .find(|b| b.dom == Some(abs))
+            .expect("abs box");
+        // The transform is visual only: `.t` still lays out at
+        // the padding offset, and its matrix carries translate.
+        assert_eq!((t_box.x, t_box.y), (50.0, 60.0));
+        assert!((t_box.matrix.e - 5.0).abs() < 1e-4);
+        assert!((t_box.matrix.f - 5.0).abs() < 1e-4);
+        // Against `.t` (50, 60) + (10, 20) — NOT against `.outer`
+        // (which would give (10, 20)).
+        assert_eq!((abs_box.x, abs_box.y), (60.0, 80.0));
+    }
+
+    #[test]
+    fn background_repeat_two_value_parses() {
+        let styles = styles_for(
+            "<html><body><div></div></body></html>",
+            "div { background-repeat: repeat no-repeat; }",
+            (800.0, 600.0),
+        );
+        let dom = parse_html("<html><body><div></div></body></html>");
+        let div_id = find_element(&dom, dom.root().unwrap(), "div").expect("div in dom");
+        let div = styles.get(&div_id).expect("div style");
+        assert_eq!(
+            div.background_repeat,
+            BackgroundRepeat::RepeatXY(true, false)
+        );
+        let styles = styles_for(
+            "<html><body><div></div></body></html>",
+            "div { background-repeat: no-repeat repeat; }",
+            (800.0, 600.0),
+        );
+        let div = styles.get(&div_id).expect("div style");
+        assert_eq!(
+            div.background_repeat,
+            BackgroundRepeat::RepeatXY(false, true)
+        );
+    }
+
+    #[test]
+    fn stacking_context_predicate() {
+        let mut style = ComputedStyle::initial();
+        // Nothing by default.
+        assert!(!is_stacking_context(&style, false));
+        // Explicit: positioned + z-index.
+        style.position = PositionKind::Relative;
+        assert!(!is_stacking_context(&style, false));
+        style.z_index = Some(0);
+        assert!(is_stacking_context(&style, false));
+        // Static + z-index alone is not a context...
+        style.position = PositionKind::Static;
+        assert!(!is_stacking_context(&style, false));
+        // ...unless it is a flex/grid item.
+        assert!(is_stacking_context(&style, true));
+        // Implicit: opacity < 1, or a non-empty transform.
+        style.z_index = None;
+        style.opacity = 0.5;
+        assert!(is_stacking_context(&style, false));
+        style.opacity = 1.0;
+        style.transform = vec![TransformFunction::Rotate(10.0)];
+        assert!(is_stacking_context(&style, false));
+        // `will-change: transform` is a hint only — no context.
+        style.transform = Vec::new();
+        style.will_change_transform = true;
+        assert!(!is_stacking_context(&style, false));
     }
 }

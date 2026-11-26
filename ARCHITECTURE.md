@@ -530,6 +530,61 @@ are not yet threaded over IPC.
 Goal: handle modern web layouts, animations, and mobile/desktop
 responsive sites without layout breakage.
 
+**Built — Stage 14 (2026-11-25):** all 12 Stage 14
+recommendations applied, in three phases; suite 845 → 928
+(+83 tests). IPC `PROTOCOL_VERSION` 7 → 9. Phase 1 (value +
+layout model): `Time`/`Angle`/`Transform`/`Var`/`Calc`/`Clamp`
+values, one 2D `Affine` type with `TransformListExt::to_affine`
+(origin-resolved against the border box), `Easing`,
+`Transition`/`Animation` parsed types, structured `@keyframes`
+steps, `Theme` + `prefers-color-scheme` media evaluation;
+`ComputedStyle` gains `z_index`/`opacity`/`transform`/
+`transform_origin`/`transform_box`/`will_change_transform`/
+`transitions`/`animations`/`custom_properties`; transformed
+containing blocks fixed both halves together (taffy
+`Position::Relative` mapping for transformed static elements +
+matching safe-root predicate change); `var()`/`calc()`/`clamp()`
+resolution; two-value `background-repeat`. Phase 2 (paint +
+IPC): CSS 2.1 Appendix E paint order as the single source of
+truth for `DisplayList::build` and hit-testing; stacking
+contexts (explicit + implicit) with a real clip stack (the
+single `current_clip` scalar is gone); `PushOpacity`/`PopOpacity`
+(group opacity as a documented vertex-alpha approximation —
+true offscreen group compositing is a future step);
+`PushTransform`/`PopTransform` with CPU-side vertex application
+(no new bind group — both are spoken for); `CompositingOnly`
+classifier (transform/opacity-only diffs, z-index-only diffs
+are `PaintOnly`, never swallowed) + out-of-band
+`CompositingUpdate` IPC message, so a transform-only frame
+neither rebuilds nor resubmits the full list. Phase 3
+(geometry + animation engine + extras): `position: fixed`
+re-anchored to the viewport via `PushFixed` (translate by
+`+scroll` at paint time; the false safe-root exemption that
+assumed fixed resolves against the viewport is gone);
+positioned inline elements now build a real box instead of
+vanishing; `position: sticky` as a scroll-derived offset via
+`position_overrides` (never through taffy insets); animation
+engine on the tab tick sampling a monotonic `Instant` (never
+tick-counting), with `transitionend`/`animationend`,
+`getComputedStyle` reflecting in-flight values, and
+`Element.animate`/`getAnimations`; `prefers-color-scheme`
+driven by the real system theme (`cosmic::theme::is_dark()` at
+startup, live updates, `SetTheme` over IPC, restyle never
+refetch); `@font-face` downloads through the existing loader
+with the Stage 9 gates (never a second fetch path).
+Also folded in: a `RendererProcess` poison flag — once a
+renderer sends a malformed IPC message, the handle refuses all
+further sends/recvs, so a frame the child queued before the
+kill can never be delivered (CI run 45699261848).
+Deferred from the Stage 14 research: 3D transforms /
+perspective / preserve-3d; true offscreen group opacity;
+fixed rounded clips stay page-space (documented
+approximation); `CompositingOnly` frames skip
+ResizeObserver/IntersectionObserver steps; a transform on
+`<html>`/`<body>` still full-rebuilds; `getComputedStyle`
+covers animatable properties only; WAAPI v1 is
+array-of-objects keyframes only.
+
 - **pluto-css & pluto-layout**: CSS Custom Properties (`var(--name)`),
   `@media` queries (viewport width/height, `prefers-color-scheme`
   synced with libcosmic's dark/light theme), `@font-face` web font

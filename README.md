@@ -113,6 +113,12 @@ during bootstrap, verified against the actual sources:
   FormData, constraint validation, persisted cookies, one shared
   storage store across tabs, fetch behind a broker, fail-closed
   sandbox with watchdog + sad tab.
+- **M6 — done.** Modern CSS: fixed/sticky/absolute positioning,
+  `z-index` with Appendix E paint order, stacking contexts, opacity,
+  2D transforms, transitions/`@keyframes` on a monotonic animation
+  engine, `var()`/`calc()`/`clamp()`, `prefers-color-scheme`,
+  `@font-face`; IPC protocol 7 → 9; CI sandbox race fixed
+  (compromised-renderer poison flag).
 
-Full workspace suite: 845 tests, all passing. See `ARCHITECTURE.md`
+Full workspace suite: 928 tests, all passing. See `ARCHITECTURE.md`
 for the full M1–M12 roadmap.

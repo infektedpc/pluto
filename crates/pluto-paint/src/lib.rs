@@ -21,7 +21,7 @@
 //! vocabulary + renderer support for M3; no borders or color glyphs
 //! (emoji) yet.
 
-use pluto_css::{MAX_BOX_SHADOW_BLUR, ResolvedCorners, ResolvedShadow};
+use pluto_css::{Affine, MAX_BOX_SHADOW_BLUR, ResolvedCorners, ResolvedShadow};
 use pluto_layout::{
     BackgroundPosition, BackgroundRepeat, BackgroundSize, Dim, LayoutBox, LayoutTree,
 };
@@ -159,6 +159,58 @@ pub enum DisplayItem {
         height: f32,
         color: [f32; 4],
     },
+    /// Push a transform for the items that follow (M6 Phase 2,
+    /// Rec 7): `matrix` maps layout coordinates to page
+    /// coordinates — the box's page transform, absolute, so it
+    /// already includes the ancestors and nesting never
+    /// double-applies. The renderer applies it CPU-side to every
+    /// vertex it emits until the matching `PopTransform`; no new
+    /// bind group is needed (both are spoken for). `id` is the
+    /// element's compositing key (`LayoutTree::dom_key`): a
+    /// `CompositingUpdate` patches this matrix in place by id, so
+    /// a transform-only change never rebuilds the list.
+    PushTransform { id: u64, matrix: Affine },
+    /// Pop the most recent `PushTransform`.
+    PopTransform,
+    /// Push a group opacity for the items that follow (M6 Phase 2,
+    /// Rec 6): everything between this and the matching
+    /// `PopOpacity` is one stacking-context group, composited at
+    /// `opacity` as a layer. The renderer applies it by scaling
+    /// vertex alpha — an explicit documented approximation of true
+    /// group compositing (overlapping translucent siblings inside
+    /// one group double-apply); the grouping here is already
+    /// correct for a future offscreen-compositing renderer.
+    /// `id` is the same compositing key as `PushTransform`.
+    PushOpacity { id: u64, opacity: f32 },
+    /// Pop the most recent `PushOpacity`.
+    PopOpacity,
+    /// Push viewport-fixed scope for the items that follow (M6
+    /// Phase 3, Rec 1): everything between this and the matching
+    /// `PopFixed` is painted in *viewport* coordinates, not page
+    /// coordinates. The builder wraps every viewport-fixed subtree
+    /// (a `position: fixed` box with no transformed ancestor, plus
+    /// its descendants) in one of these. The renderer, which
+    /// subtracts the viewport scroll from every page-space vertex,
+    /// adds the scroll back inside this scope — the
+    /// `canvas_rect` translate-by-`+scroll` pattern — so fixed
+    /// content stays glued to the viewport. Appended last, so the
+    /// earlier postcard discriminants never move.
+    PushFixed,
+    /// Pop the most recent `PushFixed`.
+    PopFixed,
+}
+
+/// One element's compositing state (M6 Phase 2, Rec 9): the
+/// transform/opacity of a single element, keyed by the same id its
+/// `PushTransform`/`PushOpacity` items carry. Sent out-of-band in
+/// `RendererToBrowser::CompositingUpdate` — the message carries
+/// only the changed elements, never a rebuilt list, and stays far
+/// under the 64 MiB IPC frame cap.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CompositedUpdate {
+    pub id: u64,
+    pub matrix: Affine,
+    pub opacity: f32,
 }
 
 impl DisplayItem {
@@ -242,8 +294,39 @@ impl DisplayItem {
                     ])
                 }
             }
-            DisplayItem::Glyphs { .. } | DisplayItem::PopClip => None,
+            DisplayItem::Glyphs { .. }
+            | DisplayItem::PopClip
+            | DisplayItem::PushTransform { .. }
+            | DisplayItem::PopTransform
+            | DisplayItem::PushOpacity { .. }
+            | DisplayItem::PopOpacity
+            | DisplayItem::PushFixed
+            | DisplayItem::PopFixed => None,
         }
+    }
+
+    /// The item's bounds under a page transform (M6 Phase 2,
+    /// Rec 7): the axis-aligned bounding box of the item's corners
+    /// mapped through `matrix`. `bounds()` is the untransformed
+    /// rect, which is wrong for a rotated item — damage and CPU
+    /// culling must use this. Exact for translate/scale; an
+    /// over-approximation for rotate/skew (the AABB of the rotated
+    /// AABB is bigger than the rotated shape), which is safe for
+    /// both uses. `None` for the items `bounds()` returns `None`
+    /// for.
+    pub fn transformed_bounds(&self, matrix: &Affine) -> Option<[f32; 4]> {
+        let [x, y, w, h] = self.bounds()?;
+        let corners = [
+            matrix.apply(x, y),
+            matrix.apply(x + w, y),
+            matrix.apply(x, y + h),
+            matrix.apply(x + w, y + h),
+        ];
+        let min_x = corners.iter().map(|c| c.0).fold(f32::INFINITY, f32::min);
+        let max_x = corners.iter().map(|c| c.0).fold(f32::NEG_INFINITY, f32::max);
+        let min_y = corners.iter().map(|c| c.1).fold(f32::INFINITY, f32::min);
+        let max_y = corners.iter().map(|c| c.1).fold(f32::NEG_INFINITY, f32::max);
+        Some([min_x, min_y, max_x - min_x, max_y - min_y])
     }
 }
 
@@ -383,6 +466,10 @@ pub enum ValidationError {
     ImageTooBig { id: ResourceId },
     #[error("box-shadow blur {0}px exceeds the {MAX_BOX_SHADOW_BLUR}px cap")]
     ShadowBlurTooLarge(f32),
+    #[error("non-finite transform component {0}")]
+    BadTransform(f32),
+    #[error("opacity {0} outside 0..=1")]
+    BadOpacity(f32),
     #[error("display list bytes do not decode: {0}")]
     Decode(String),
 }
@@ -665,6 +752,26 @@ impl DisplayList {
                         }
                     }
                 }
+                DisplayItem::PushTransform { matrix, .. } => {
+                    // The linear part is a scale/rotation factor, not
+                    // a coordinate — only finiteness is meaningful
+                    // there; the translation is a page coordinate.
+                    for c in [matrix.a, matrix.b, matrix.c, matrix.d] {
+                        if !c.is_finite() {
+                            return Err(ValidationError::BadTransform(c));
+                        }
+                    }
+                    check_coord(matrix.e)?;
+                    check_coord(matrix.f)?;
+                }
+                DisplayItem::PopTransform => {}
+                DisplayItem::PushOpacity { opacity, .. } => {
+                    if !opacity.is_finite() || !(0.0..=1.0).contains(opacity) {
+                        return Err(ValidationError::BadOpacity(*opacity));
+                    }
+                }
+                DisplayItem::PopOpacity => {}
+                DisplayItem::PushFixed | DisplayItem::PopFixed => {}
             }
         }
         Ok(())
@@ -673,111 +780,279 @@ impl DisplayList {
     /// Build the paint operations for one laid-out document. The canvas
     /// background (html/body background, or white by default) paints the
     /// whole viewport first — it is always item 0, which the renderer
-    /// relies on for the scroll-anchored canvas — then, per box: its
-    /// outer box-shadows, its background (a rounded rect when the box
-    /// has a `border-radius`, a plain rect otherwise), its inset
-    /// box-shadows (above the background, below the content), then
-    /// its glyphs. Boxes inside a clipping ancestor carry a clip rect
-    /// (`LayoutBox::clip` + `clip_radii`); when it changes, the
-    /// previous clip is popped and the new one pushed, so a
-    /// container's subtree paints clipped to the container's padding
-    /// box. The list's damage is the union of the canvas and every
-    /// box's bounds (a full rebuild repaints everything it paints).
+    /// relies on for the scroll-anchored canvas — then the boxes in
+    /// Appendix E paint order (`LayoutTree::paint_order`, M6 Phase 2
+    /// Rec 4), not document order, so a higher `z-index` paints
+    /// later (on top) and hit-testing agrees with what is seen.
+    ///
+    /// Per box, in order: the clip stack is reconciled against the
+    /// box's clip chain (Rec 5 — a real stack keyed to the paint
+    /// walk, so a clipped subtree that paints out of document order
+    /// still clips correctly), the opacity stack against the box's
+    /// translucent-ancestor chain (Rec 6 — one `PushOpacity` group
+    /// per stacking context with `opacity < 1`), a `PushTransform`
+    /// carrying the box's page transform when it is not the identity
+    /// (Rec 7 — absolute, so descendants are never double-applied),
+    /// then the box's own items: its outer box-shadows, its
+    /// background (a rounded rect when the box has a
+    /// `border-radius`, a plain rect otherwise), its inset
+    /// box-shadows (above the background, below the content), its
+    /// background image, its `<img>`, then its glyphs. Clip rects
+    /// in the list are page-space AABBs of the layout-space clip
+    /// under the box's page transform (exact for translate/scale,
+    /// an over-approximation for rotate/skew); item coordinates
+    /// stay in layout space and the renderer transforms them.
+    /// The list's damage is the union of the canvas, every box's
+    /// transformed bounds, and every item's transformed bounds (a
+    /// shadow's falloff can leave its box), so a rotated item is
+    /// never damage-culled.
     pub fn build(layout: &LayoutTree) -> Self {
         let mut list = Self::new();
         let bg = layout.canvas_background;
-        list.push(DisplayItem::FillRect {
+        list.0.push(DisplayItem::FillRect {
             x: 0.0,
             y: 0.0,
             width: layout.viewport.0,
             height: layout.viewport.1,
             color: rgba(bg),
         });
-        let mut current_clip: Option<([f32; 4], Option<ResolvedCorners>)> = None;
-        for bx in layout.boxes() {
-            let clip_key = bx.clip.map(|c| (c, bx.clip_radii));
-            if clip_key != current_clip {
-                if current_clip.is_some() {
-                    list.push(DisplayItem::PopClip);
-                }
-                if let Some((c, radii)) = clip_key {
-                    list.push(DisplayItem::PushClip {
-                        x: c[0],
-                        y: c[1],
-                        width: c[2],
-                        height: c[3],
-                        radii,
-                    });
-                }
-                current_clip = clip_key;
+        let boxes = layout.boxes();
+        let order = layout.paint_order();
+        let transforms = layout.page_transforms();
+        let mut by_dom: HashMap<_, usize> = HashMap::new();
+        for (i, bx) in boxes.iter().enumerate() {
+            if let Some(dom) = bx.dom {
+                by_dom.entry(dom).or_insert(i);
             }
-            // Box-shadows, resolved once per box: outer layers before
-            // the background (they paint behind the box), inset
-            // layers after it (above the background, below the
-            // content). Each side is emitted in reverse author order
-            // so the first-listed layer paints on top.
-            let shadows: Vec<ResolvedShadow> = bx
-                .style
-                .box_shadow
+        }
+        // The effective clip chain of a box, root-first: the
+        // box's own clip plus each clipping ancestor's, with
+        // consecutive duplicates merged (a nested clip equal to
+        // its parent's is the same region). Layout space; the
+        // caller maps each entry through the box's page transform.
+        let clip_chain = |bi: usize| -> Vec<([f32; 4], Option<ResolvedCorners>)> {
+            let mut chain: Vec<([f32; 4], Option<ResolvedCorners>)> = Vec::new();
+            let mut cur = Some(bi);
+            while let Some(i) = cur {
+                let bx = &boxes[i];
+                if let Some(c) = bx.clip {
+                    let entry = (c, bx.clip_radii);
+                    if chain.last() != Some(&entry) {
+                        chain.push(entry);
+                    }
+                }
+                cur = bx.parent.and_then(|p| by_dom.get(&p).copied());
+            }
+            chain.reverse();
+            chain
+        };
+        // The translucent stacking-context ancestors of a box,
+        // root-first (the box itself included when it is one):
+        // the groups whose `PushOpacity` must wrap the box's
+        // items. Keyed by the element's compositing key; text
+        // leaves have no key of their own and never contribute
+        // an entry — their parent element's entry covers them.
+        let opacity_chain = |bi: usize| -> Vec<(u64, f32)> {
+            let mut chain: Vec<(u64, f32)> = Vec::new();
+            let mut cur = Some(bi);
+            while let Some(i) = cur {
+                let bx = &boxes[i];
+                if bx.style.opacity < 1.0 {
+                    if let Some(dom) = bx.dom {
+                        chain.push((LayoutTree::dom_key(dom), bx.style.opacity));
+                    }
+                }
+                cur = bx.parent.and_then(|p| by_dom.get(&p).copied());
+            }
+            chain.reverse();
+            chain
+        };
+        // The compositing key of a box: its own element's key, or
+        // for a text leaf the nearest ancestor element's — the
+        // leaf's page transform is the same map as its parent
+        // element's, so a `CompositingUpdate` for the parent
+        // patches the leaf too.
+        let compositing_key = |bi: usize| -> u64 {
+            let mut cur = Some(bi);
+            while let Some(i) = cur {
+                let bx = &boxes[i];
+                if let Some(dom) = bx.dom {
+                    return LayoutTree::dom_key(dom);
+                }
+                cur = bx.parent.and_then(|p| by_dom.get(&p).copied());
+            }
+            0
+        };
+        // The two stacks the walk maintains, reconciled per box
+        // against the box's own chains (pop to the common prefix,
+        // then push the rest).
+        let mut clip_stack: Vec<([f32; 4], Option<ResolvedCorners>)> = Vec::new();
+        let mut opacity_stack: Vec<(u64, f32)> = Vec::new();
+        // The fixed stack (M6 Phase 3, Rec 1): at most one level —
+        // a box is either inside a viewport-fixed subtree or it
+        // is not. The chain walks the box's ancestors (a fixed
+        // box's descendants are fixed too — their own
+        // `is_viewport_fixed` is false, they are static).
+        let fixed_chain = |bi: usize| -> Vec<bool> {
+            let mut cur = Some(bi);
+            while let Some(i) = cur {
+                if boxes[i].is_viewport_fixed {
+                    return vec![true];
+                }
+                cur = boxes[i].parent.and_then(|p| by_dom.get(&p).copied());
+            }
+            Vec::new()
+        };
+        let mut fixed_stack: Vec<bool> = Vec::new();
+        // Damage: the canvas plus every box's transformed bounds
+        // (glyph-only boxes contribute their box rects here, since
+        // glyph items carry no bounds of their own); item bounds
+        // are unioned in a final pass below.
+        let mut damage = DamageRect {
+            x: 0.0,
+            y: 0.0,
+            width: layout.viewport.0,
+            height: layout.viewport.1,
+        };
+        for &bi in &order {
+            let bx = &boxes[bi];
+            let page_t = transforms[bi];
+            // Rec 1 (M6 Phase 3): reconcile the fixed stack first
+            // (outermost) — a viewport-fixed subtree paints in
+            // viewport coordinates, so its items ride inside a
+            // `PushFixed` scope.
+            reconcile_stack(
+                &mut list,
+                &mut fixed_stack,
+                &fixed_chain(bi),
+                |_| DisplayItem::PushFixed,
+                || DisplayItem::PopFixed,
+            );
+            let in_fixed = !fixed_stack.is_empty();
+            // Rec 5: reconcile the clip stack against this box's
+            // chain, each entry mapped to page space by the box's
+            // own page transform.
+            let page_chain: Vec<([f32; 4], Option<ResolvedCorners>)> = clip_chain(bi)
                 .iter()
-                .map(|s| {
-                    s.resolve(
-                        bx.style.font_size,
-                        layout.root_font_size,
-                        layout.viewport,
-                        bx.style.color,
+                .map(|(r, radii)| {
+                    (
+                        transform_rect(*r, &page_t),
+                        radii.map(|r| scale_radii(r, &page_t)),
                     )
                 })
                 .collect();
-            for shadow in shadows.iter().rev().filter(|s| !s.inset) {
-                list.push(shadow_item(bx, *shadow));
+            reconcile_stack(
+                &mut list,
+                &mut clip_stack,
+                &page_chain,
+                |&(r, radii)| DisplayItem::PushClip {
+                    x: r[0],
+                    y: r[1],
+                    width: r[2],
+                    height: r[3],
+                    radii,
+                },
+                || DisplayItem::PopClip,
+            );
+            // Rec 6: reconcile the opacity stack against this
+            // box's translucent-ancestor chain.
+            reconcile_stack(
+                &mut list,
+                &mut opacity_stack,
+                &opacity_chain(bi),
+                |&(id, opacity)| DisplayItem::PushOpacity { id, opacity },
+                || DisplayItem::PopOpacity,
+            );
+            // Rec 7: the box's page transform, pushed around its
+            // own items only. The identity needs no item (the
+            // renderer treats an empty stack as the identity), so
+            // untransformed documents pay nothing for this.
+            let has_transform = page_t != Affine::identity();
+            if has_transform {
+                list.0.push(DisplayItem::PushTransform {
+                    id: compositing_key(bi),
+                    matrix: page_t,
+                });
             }
-            if let Some(bg) = bx.style.background {
-                if bx.radii.is_zero() {
-                    list.push(DisplayItem::FillRect {
-                        x: bx.x,
-                        y: bx.y,
-                        width: bx.width,
-                        height: bx.height,
-                        color: rgba(bg),
-                    });
-                } else {
-                    list.push(DisplayItem::RoundedRect {
-                        x: bx.x,
-                        y: bx.y,
-                        width: bx.width,
-                        height: bx.height,
-                        radii: bx.radii,
-                        color: rgba(bg),
-                    });
+            // A box with no `dom` is a text leaf: its style is its
+            // parent element's clone, so its background and
+            // box-shadows are the parent's — the parent's own box
+            // already paints them, and the leaf painting them
+            // again would draw a second shadow around the text
+            // run's rect. A leaf paints only its glyphs.
+            if bx.dom.is_some() {
+                // Box-shadows, resolved once per box: outer layers before
+                // the background (they paint behind the box), inset
+                // layers after it (above the background, below the
+                // content). Each side is emitted in reverse author order
+                // so the first-listed layer paints on top.
+                let shadows: Vec<ResolvedShadow> = bx
+                    .style
+                    .box_shadow
+                    .iter()
+                    .map(|s| {
+                        s.resolve(
+                            bx.style.font_size,
+                            layout.root_font_size,
+                            layout.viewport,
+                            bx.style.color,
+                        )
+                    })
+                    .collect();
+                for shadow in shadows.iter().rev().filter(|s| !s.inset) {
+                    list.0.push(shadow_item(bx, *shadow));
                 }
-            }
-            for shadow in shadows.iter().rev().filter(|s| s.inset) {
-                list.push(shadow_item(bx, *shadow));
+                if let Some(bg) = bx.style.background {
+                    if bx.radii.is_zero() {
+                        list.0.push(DisplayItem::FillRect {
+                            x: bx.x,
+                            y: bx.y,
+                            width: bx.width,
+                            height: bx.height,
+                            color: rgba(bg),
+                        });
+                    } else {
+                        list.0.push(DisplayItem::RoundedRect {
+                            x: bx.x,
+                            y: bx.y,
+                            width: bx.width,
+                            height: bx.height,
+                            radii: bx.radii,
+                            color: rgba(bg),
+                        });
+                    }
+                }
+                for shadow in shadows.iter().rev().filter(|s| s.inset) {
+                    list.0.push(shadow_item(bx, *shadow));
+                }
             }
             // Stage 11 Rec 1/3: images. The background image paints
             // above the background fill and below the content, clipped
             // to the box's padding box (with its border-radius, when
             // set); the `<img>` content image paints as the content.
             // The PushClip/PopClip pair is balanced inside this box's
-            // iteration, so the outer `current_clip` tracking above
-            // is unaffected.
+            // iteration, so the clip stack above is unaffected. The
+            // clip rect is page space — the box's padding box mapped
+            // through the box's page transform — while the tiles
+            // stay in layout space and the renderer transforms them.
             if let Some(resource) = bx.background_image {
                 let tiles = background_tiles(bx, layout.viewport);
                 if !tiles.is_empty() {
-                    list.push(DisplayItem::PushClip {
-                        x: bx.x,
-                        y: bx.y,
-                        width: bx.width,
-                        height: bx.height,
+                    let clip_rect =
+                        transform_rect([bx.x, bx.y, bx.width, bx.height], &page_t);
+                    list.0.push(DisplayItem::PushClip {
+                        x: clip_rect[0],
+                        y: clip_rect[1],
+                        width: clip_rect[2],
+                        height: clip_rect[3],
                         radii: if bx.radii.is_zero() {
                             None
                         } else {
-                            Some(bx.radii)
+                            Some(scale_radii(bx.radii, &page_t))
                         },
                     });
                     for [x, y, w, h] in tiles {
-                        list.push(DisplayItem::Image {
+                        list.0.push(DisplayItem::Image {
                             resource: ResourceId(resource),
                             x,
                             y,
@@ -785,11 +1060,11 @@ impl DisplayList {
                             height: h,
                         });
                     }
-                    list.push(DisplayItem::PopClip);
+                    list.0.push(DisplayItem::PopClip);
                 }
             }
             if let Some(resource) = bx.image {
-                list.push(DisplayItem::Image {
+                list.0.push(DisplayItem::Image {
                     resource: ResourceId(resource),
                     x: bx.x,
                     y: bx.y,
@@ -803,7 +1078,7 @@ impl DisplayList {
                 let mut current: Vec<PaintGlyph> = Vec::new();
                 for g in &bx.glyphs {
                     if g.color != current_color {
-                        list.push(DisplayItem::Glyphs {
+                        list.0.push(DisplayItem::Glyphs {
                             color: rgba(current_color),
                             glyphs: std::mem::take(&mut current),
                         });
@@ -819,34 +1094,211 @@ impl DisplayList {
                     });
                 }
                 if !current.is_empty() {
-                    list.push(DisplayItem::Glyphs {
+                    list.0.push(DisplayItem::Glyphs {
                         color: rgba(current_color),
                         glyphs: current,
                     });
                 }
             }
+            if has_transform {
+                list.0.push(DisplayItem::PopTransform);
+            }
+            // Damage: this box's bounds under its page transform —
+            // except viewport-fixed boxes, whose bounds are in
+            // viewport space: unioning them would inflate the page
+            // damage (and the page's maximum scroll) by the
+            // viewport scroll.
+            if !in_fixed {
+                damage = damage.union_rect(transform_rect(
+                    [bx.x, bx.y, bx.width, bx.height],
+                    &page_t,
+                ));
+            }
         }
-        if current_clip.is_some() {
-            list.push(DisplayItem::PopClip);
+        // Close whatever the walk left open (the last box's chains).
+        while !clip_stack.is_empty() {
+            clip_stack.pop();
+            list.0.push(DisplayItem::PopClip);
         }
-        // Damage: a full rebuild repaints everything — the canvas
-        // plus every box — so the damage is that union (glyph-only
-        // boxes contribute their box rects here, since glyph items
-        // carry no bounds of their own).
-        let mut damage = DamageRect {
-            x: 0.0,
-            y: 0.0,
-            width: layout.viewport.0,
-            height: layout.viewport.1,
-        };
-        for bx in layout.boxes() {
-            damage = damage.union_rect([bx.x, bx.y, bx.width, bx.height]);
+        while !opacity_stack.is_empty() {
+            opacity_stack.pop();
+            list.0.push(DisplayItem::PopOpacity);
         }
-        list.1 = Some(match list.1 {
-            Some(pushed) => pushed.union(damage),
-            None => damage,
-        });
+        while !fixed_stack.is_empty() {
+            fixed_stack.pop();
+            list.0.push(DisplayItem::PopFixed);
+        }
+        // Damage, second half: every item's bounds under the
+        // transform active at that point in the list — a shadow's
+        // falloff can leave its box, and a rotated item's bounds
+        // exceed its untransformed rect. `PushClip` bounds are
+        // page space already (built that way above) and are
+        // covered by the box bounds, so they are skipped here.
+        // Items inside a fixed scope are viewport-space and
+        // skipped too (same reason as the box union above).
+        let mut transform_stack: Vec<Affine> = Vec::new();
+        let mut fixed_depth = 0usize;
+        for item in &list.0 {
+            match item {
+                DisplayItem::PushFixed => {
+                    fixed_depth += 1;
+                }
+                DisplayItem::PopFixed => {
+                    fixed_depth = fixed_depth.saturating_sub(1);
+                }
+                DisplayItem::PushTransform { matrix, .. } => {
+                    transform_stack.push(*matrix);
+                }
+                DisplayItem::PopTransform => {
+                    transform_stack.pop();
+                }
+                DisplayItem::PushClip { .. } => {}
+                _ => {
+                    if fixed_depth > 0 {
+                        continue;
+                    }
+                    let t = transform_stack
+                        .last()
+                        .copied()
+                        .unwrap_or_else(Affine::identity);
+                    if let Some(b) = item.transformed_bounds(&t) {
+                        damage = damage.union_rect(b);
+                    }
+                }
+            }
+        }
+        list.1 = Some(damage);
         list
+    }
+
+    /// Patch this list in place with a compositing update (M6
+    /// Phase 2, Rec 9): for each `CompositedUpdate`, every
+    /// `PushTransform` with the matching id takes the new matrix
+    /// and every `PushOpacity` with the matching id takes the new
+    /// opacity. The update carries only the changed elements, so
+    /// a transform-only frame never rebuilds or resubmits the
+    /// list. Returns how many items were patched (0 when the
+    /// update names nothing in this list — a stale update for a
+    /// rebuilt list). Damage expands to the whole viewport
+    /// afterwards: the old and new positions of a moved item can
+    /// be anywhere, and a transformed item's old bounds are not
+    /// recoverable from the patched list, so a full repaint is
+    /// the safe invalidation.
+    pub fn apply_compositing_update(&mut self, updates: &[CompositedUpdate]) -> usize {
+        let mut patched = 0;
+        for update in updates {
+            for item in self.0.iter_mut() {
+                match item {
+                    DisplayItem::PushTransform { id, matrix } if *id == update.id => {
+                        *matrix = update.matrix;
+                        patched += 1;
+                    }
+                    DisplayItem::PushOpacity { id, opacity } if *id == update.id => {
+                        *opacity = update.opacity;
+                        patched += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if patched > 0 {
+            // The old damage no longer bounds the moved content —
+            // its old position is not recoverable from the patched
+            // list — so invalidate the whole canvas: old damage
+            // union item 0 (the canvas fill, i.e. the viewport).
+            // A built list's damage already covers the canvas, so
+            // this is a no-op there; it matters when the list's
+            // damage was ever narrowed.
+            let canvas = self.0.first().and_then(|i| i.bounds());
+            self.1 = Some(match (self.1, canvas) {
+                (Some(old), Some(c)) => old.union_rect(c),
+                (Some(old), None) => old,
+                (None, Some(c)) => DamageRect {
+                    x: c[0],
+                    y: c[1],
+                    width: c[2],
+                    height: c[3],
+                },
+                (None, None) => return patched,
+            });
+        }
+        patched
+    }
+}
+
+/// Reconcile a display-list stack against its target chain
+/// (M6 Phase 2, Rec 5/6): pop down to the common prefix with the
+/// stack, then push the rest. The stack and the target hold the
+/// same kind of entry (a page-space clip, or an opacity-group
+/// key), and `push`/`pop` build the list items for one entry.
+fn reconcile_stack<T: PartialEq + Clone, F, G>(
+    list: &mut DisplayList,
+    stack: &mut Vec<T>,
+    target: &[T],
+    push: F,
+    pop: G,
+) where
+    F: Fn(&T) -> DisplayItem,
+    G: Fn() -> DisplayItem,
+{
+    let mut common = 0;
+    while common < stack.len()
+        && common < target.len()
+        && stack[common] == target[common]
+    {
+        common += 1;
+    }
+    while stack.len() > common {
+        stack.pop();
+        list.0.push(pop());
+    }
+    for entry in &target[common..] {
+        list.0.push(push(entry));
+        stack.push(entry.clone());
+    }
+}
+
+/// The axis-aligned bounding box of a rect's corners mapped
+/// through a transform (M6 Phase 2, Rec 7): exact for
+/// translate/scale, an over-approximation for rotate/skew (the
+/// AABB of the rotated AABB is bigger than the rotated shape),
+/// which is safe for damage and clip rects. Shared with the
+/// renderer, which transforms SDF fields the same way.
+pub(crate) fn transform_rect(rect: [f32; 4], matrix: &Affine) -> [f32; 4] {
+    let [x, y, w, h] = rect;
+    let corners = [
+        matrix.apply(x, y),
+        matrix.apply(x + w, y),
+        matrix.apply(x, y + h),
+        matrix.apply(x + w, y + h),
+    ];
+    let min_x = corners.iter().map(|c| c.0).fold(f32::INFINITY, f32::min);
+    let max_x = corners
+        .iter()
+        .map(|c| c.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_y = corners.iter().map(|c| c.1).fold(f32::INFINITY, f32::min);
+    let max_y = corners
+        .iter()
+        .map(|c| c.1)
+        .fold(f32::NEG_INFINITY, f32::max);
+    [min_x, min_y, max_x - min_x, max_y - min_y]
+}
+
+/// Scale corner radii by a transform's per-axis stretch (M6
+/// Phase 2, Rec 5): the x-radius scales with the x-axis stretch
+/// `|(a, b)|`, the y-radius with `|(c, d)|`. Exact for
+/// translate/scale; an approximation for rotate/skew. Shared with
+/// the renderer, which scales SDF radii the same way.
+pub(crate) fn scale_radii(radii: ResolvedCorners, matrix: &Affine) -> ResolvedCorners {
+    let sx = (matrix.a * matrix.a + matrix.b * matrix.b).sqrt();
+    let sy = (matrix.c * matrix.c + matrix.d * matrix.d).sqrt();
+    let scale = |(rx, ry): (f32, f32)| (rx * sx, ry * sy);
+    ResolvedCorners {
+        top_left: scale(radii.top_left),
+        top_right: scale(radii.top_right),
+        bottom_right: scale(radii.bottom_right),
+        bottom_left: scale(radii.bottom_left),
     }
 }
 
@@ -1006,6 +1458,49 @@ fn background_tiles(bx: &LayoutBox, viewport: (f32, f32)) -> Vec<[f32; 4]> {
             }
             out
         }
+        BackgroundRepeat::RepeatXY(repeat_x, repeat_y) => {
+            // Two-value form (M6): each axis tiles independently
+            // — `repeat no-repeat` tiles x only, `no-repeat
+            // repeat` y only, `no-repeat no-repeat` one tile.
+            let mut out = Vec::new();
+            let mut ky = if repeat_y {
+                (-oy / dh).floor() as i32
+            } else {
+                0
+            };
+            loop {
+                let y = if repeat_y { oy + ky as f32 * dh } else { oy };
+                if repeat_y && y >= bh {
+                    break;
+                }
+                let mut kx = if repeat_x {
+                    (-ox / dw).floor() as i32
+                } else {
+                    0
+                };
+                loop {
+                    let x = if repeat_x { ox + kx as f32 * dw } else { ox };
+                    if repeat_x && x >= bw {
+                        break;
+                    }
+                    if x + dw > 0.0 && y + dh > 0.0 {
+                        out.push(tile(x, y));
+                    }
+                    if out.len() >= MAX_TILES {
+                        return out;
+                    }
+                    if !repeat_x {
+                        break;
+                    }
+                    kx += 1;
+                }
+                if !repeat_y {
+                    break;
+                }
+                ky += 1;
+            }
+            out
+        }
         BackgroundRepeat::Repeat => {
             let mut out = Vec::new();
             let mut ky = (-oy / dh).floor() as i32;
@@ -1037,7 +1532,7 @@ mod tests {
     use super::*;
     use pluto_css::Stylesheet;
     use pluto_html::parse as parse_html;
-    use pluto_layout::LayoutTree;
+    use pluto_layout::{LayoutTree, Theme};
 
     const EXAMPLE_COM: &str = r#"<!doctype html>
 <html>
@@ -1098,7 +1593,7 @@ mod tests {
             .filter_map(|&c| dom.text(c))
             .collect();
         let sheet = Stylesheet::parse(&css);
-        let tree = LayoutTree::build(&dom, &sheet, 1024.0, 768.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 1024.0, 768.0, Theme::Light).expect("layout builds");
         DisplayList::build(&tree)
     }
 
@@ -1151,7 +1646,7 @@ mod tests {
         // canvas is white, not transparent.
         let dom = parse_html("<html><head></head><body></body></html>");
         let sheet = Stylesheet::parse("");
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let list = DisplayList::build(&tree);
         assert_eq!(list.0.len(), 1);
         assert!(matches!(
@@ -1201,7 +1696,7 @@ mod tests {
             .filter_map(|&c| dom.text(c))
             .collect();
         let sheet = Stylesheet::parse(&css);
-        let tree = LayoutTree::build(&dom, &sheet, 1024.0, 768.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 1024.0, 768.0, Theme::Light).expect("layout builds");
         let list = DisplayList::build(&tree);
         // White canvas first, then the paragraph glyphs. The script
         // tag contributes nothing: it is an element, not text.
@@ -1252,6 +1747,409 @@ mod tests {
         assert_eq!(back, list, "postcard round-trip must be lossless");
         assert!(DisplayList::from_bytes(b"\xff\xff\xff").is_err());
         assert!(DisplayList::from_bytes(&[]).is_err());
+    }
+
+    /// Build a layout + display list from inline HTML/CSS, for
+    /// the M6 Phase 2 paint tests (viewport 800x600).
+    fn build_list(html: &str, css: &str) -> (pluto_html::Dom, LayoutTree, DisplayList) {
+        let dom = parse_html(html);
+        let sheet = Stylesheet::parse(css);
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light)
+            .expect("layout builds");
+        let list = DisplayList::build(&tree);
+        (dom, tree, list)
+    }
+
+    /// First element with this class, depth-first (mirrors the
+    /// layout tests' helper).
+    fn find_by_class(
+        dom: &pluto_html::Dom,
+        id: pluto_html::NodeId,
+        class: &str,
+    ) -> Option<pluto_html::NodeId> {
+        if dom.attr(id, "class") == Some(class) {
+            return Some(id);
+        }
+        for &child in dom.children(id) {
+            if let Some(found) = find_by_class(dom, child, class) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// The background colours of the `FillRect` items in list
+    /// order, skipping item 0 (the canvas).
+    fn fill_colors(list: &DisplayList) -> Vec<[f32; 4]> {
+        list.0
+            .iter()
+            .skip(1)
+            .filter_map(|item| match item {
+                DisplayItem::FillRect { color, .. } => Some(*color),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_paints_in_z_index_order_not_document_order() {
+        // M6 Phase 2 (Rec 4): three overlapping siblings in
+        // document order a, b, c with z-index 3, 1, 2 paint
+        // b, c, a — the list is Appendix E order, not document
+        // order.
+        let (_dom, _tree, list) = build_list(
+            r#"<div class="wrap"><div class="a">A</div><div class="b">B</div><div class="c">C</div></div>"#,
+            ".wrap { position: relative; width: 200px; height: 200px; } \
+             .a { position: absolute; left: 0; top: 0; width: 100px; height: 100px; z-index: 3; background-color: #ff0000; } \
+             .b { position: absolute; left: 0; top: 0; width: 100px; height: 100px; z-index: 1; background-color: #00ff00; } \
+             .c { position: absolute; left: 0; top: 0; width: 100px; height: 100px; z-index: 2; background-color: #0000ff; }",
+        );
+        assert_eq!(
+            fill_colors(&list),
+            vec![
+                [0.0, 1.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0, 1.0],
+                [1.0, 0.0, 0.0, 1.0],
+            ],
+            "paint order is b (green), c (blue), a (red)"
+        );
+    }
+
+    #[test]
+    fn build_paints_negative_z_after_parent_background_before_content() {
+        // M6 Phase 2 (Rec 4): a negative-z child paints after
+        // the stacking-context root's own background (Appendix E
+        // step 1) but before the root's in-flow content (step 3)
+        // — behind the content, not behind the parent.
+        let (_dom, _tree, list) = build_list(
+            r#"<div class="parent">P<div class="neg"></div></div>"#,
+            ".parent { position: relative; width: 200px; height: 200px; z-index: 0; background-color: #ff0000; } \
+             .neg { position: absolute; left: 0; top: 0; width: 100px; height: 100px; z-index: -1; background-color: #00ff00; }",
+        );
+        let red = list
+            .0
+            .iter()
+            .position(|i| matches!(i, DisplayItem::FillRect { color, .. } if *color == [1.0, 0.0, 0.0, 1.0]))
+            .expect("parent background");
+        let green = list
+            .0
+            .iter()
+            .position(|i| matches!(i, DisplayItem::FillRect { color, .. } if *color == [0.0, 1.0, 0.0, 1.0]))
+            .expect("negative child background");
+        let glyphs = list
+            .0
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Glyphs { .. }))
+            .expect("parent text glyphs");
+        assert!(red < green && green < glyphs, "red {red} < green {green} < glyphs {glyphs}");
+    }
+
+    #[test]
+    fn build_emits_push_transform_with_page_matrix() {
+        // M6 Phase 2 (Rec 7/8): a rotated box's items sit
+        // between a `PushTransform` carrying the box's page
+        // transform (verbatim from the layout tree) and its
+        // `PopTransform`, and the transformed bounds are the
+        // rotated AABB (~141px for a 100px box at 45 degrees).
+        let (dom, tree, list) = build_list(
+            r#"<div class="spin"></div>"#,
+            ".spin { position: absolute; left: 100px; top: 100px; width: 100px; height: 100px; transform: rotate(45deg); background-color: #ff0000; }",
+        );
+        let spin = find_by_class(&dom, dom.root().unwrap(), "spin").unwrap();
+        let spin_idx = tree
+            .boxes
+            .iter()
+            .position(|b| b.dom == Some(spin))
+            .unwrap();
+        let page_t = tree.page_transforms()[spin_idx];
+        assert_ne!(page_t, Affine::identity());
+        let push = list
+            .0
+            .iter()
+            .position(|i| matches!(i, DisplayItem::PushTransform { .. }))
+            .expect("PushTransform");
+        let pop = list
+            .0
+            .iter()
+            .position(|i| matches!(i, DisplayItem::PopTransform))
+            .expect("PopTransform");
+        let fill = list
+            .0
+            .iter()
+            .position(|i| matches!(i, DisplayItem::FillRect { color, .. } if *color == [1.0, 0.0, 0.0, 1.0]))
+            .expect("spin background");
+        assert!(push < fill && fill < pop, "background sits inside the transform pair");
+        match &list.0[push] {
+            DisplayItem::PushTransform { id, matrix } => {
+                assert_eq!(*id, LayoutTree::dom_key(spin));
+                assert_eq!(*matrix, page_t, "the list carries the page transform verbatim");
+            }
+            other => panic!("expected PushTransform, got {other:?}"),
+        }
+        let bounds = list.0[fill]
+            .transformed_bounds(&page_t)
+            .expect("fill has bounds");
+        assert!((bounds[2] - 141.42).abs() < 0.1, "rotated width {}", bounds[2]);
+        assert!((bounds[3] - 141.42).abs() < 0.1, "rotated height {}", bounds[3]);
+        // Rec 8: `transform-origin` resolves against the border
+        // box — rotating about the top-left corner (0% 0%)
+        // leaves the top-left fixed.
+        let (dom2, tree2, _list2) = build_list(
+            r#"<div class="spin"></div>"#,
+            ".spin { position: absolute; left: 100px; top: 100px; width: 100px; height: 100px; transform: rotate(45deg); transform-origin: 0% 0%; background-color: #ff0000; }",
+        );
+        let spin2 = find_by_class(&dom2, dom2.root().unwrap(), "spin").unwrap();
+        let spin_idx2 = tree2
+            .boxes
+            .iter()
+            .position(|b| b.dom == Some(spin2))
+            .unwrap();
+        let spin_box = &tree2.boxes[spin_idx2];
+        let t2 = tree2.page_transforms()[spin_idx2];
+        let (px, py) = t2.apply(spin_box.x, spin_box.y);
+        assert!((px - spin_box.x).abs() < 0.01 && (py - spin_box.y).abs() < 0.01,
+            "top-left stays put with origin 0% 0%: ({px}, {py}) vs ({}, {})",
+            spin_box.x, spin_box.y);
+    }
+
+    #[test]
+    fn build_groups_opacity_with_push_pop() {
+        // M6 Phase 2 (Rec 6): nested translucent stacking
+        // contexts nest their `PushOpacity` groups — the outer
+        // group's items wrap the inner group's, and the inner
+        // background paints inside both.
+        let (dom, tree, list) = build_list(
+            r#"<div class="outer"><div class="inner"></div></div>"#,
+            ".outer { width: 200px; height: 200px; opacity: 0.5; background-color: #ff0000; } \
+             .inner { width: 100px; height: 100px; opacity: 0.5; background-color: #00ff00; }",
+        );
+        let root = dom.root().unwrap();
+        let outer = find_by_class(&dom, root, "outer").unwrap();
+        let inner = find_by_class(&dom, root, "inner").unwrap();
+        let outer_key = LayoutTree::dom_key(outer);
+        let inner_key = LayoutTree::dom_key(inner);
+        let _ = tree;
+        let pushes: Vec<(u64, f32)> = list
+            .0
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::PushOpacity { id, opacity } => Some((*id, *opacity)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pushes,
+            vec![(outer_key, 0.5), (inner_key, 0.5)],
+            "outer group wraps the inner group"
+        );
+        let pops = list
+            .0
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::PopOpacity))
+            .count();
+        assert_eq!(pops, 2, "both groups close");
+        let red = list
+            .0
+            .iter()
+            .position(|i| matches!(i, DisplayItem::FillRect { color, .. } if *color == [1.0, 0.0, 0.0, 1.0]))
+            .unwrap();
+        let green = list
+            .0
+            .iter()
+            .position(|i| matches!(i, DisplayItem::FillRect { color, .. } if *color == [0.0, 1.0, 0.0, 1.0]))
+            .unwrap();
+        let first_push = list
+            .0
+            .iter()
+            .position(|i| matches!(i, DisplayItem::PushOpacity { .. }))
+            .unwrap();
+        let last_pop = list
+            .0
+            .iter()
+            .rposition(|i| matches!(i, DisplayItem::PopOpacity))
+            .unwrap();
+        assert!(
+            first_push < red && red < green && green < last_pop,
+            "both backgrounds sit inside the groups"
+        );
+    }
+
+    #[test]
+    fn apply_compositing_update_patches_and_expands_damage() {
+        // M6 Phase 2 (Rec 9): a `CompositingUpdate` patches the
+        // matching `PushTransform` in place (no list rebuild) and
+        // expands the damage back to the canvas; an update for
+        // an id the list does not carry patches nothing.
+        let (dom, tree, mut list) = build_list(
+            r#"<div class="spin"></div>"#,
+            ".spin { width: 100px; height: 100px; transform: translateX(10px); background-color: #ff0000; }",
+        );
+        let spin = find_by_class(&dom, dom.root().unwrap(), "spin").unwrap();
+        let key = LayoutTree::dom_key(spin);
+        let (_dom2, tree2, _list2) = build_list(
+            r#"<div class="spin"></div>"#,
+            ".spin { width: 100px; height: 100px; transform: translateX(30px); background-color: #ff0000; }",
+        );
+        let spin_idx = tree
+            .boxes
+            .iter()
+            .position(|b| b.dom == Some(spin))
+            .unwrap();
+        let new_matrix = tree2.page_transforms()[spin_idx];
+        // Narrow the damage first, so the expansion is observable:
+        // a patched list must invalidate the whole canvas, not
+        // just the old (small) damage.
+        list.1 = Some(DamageRect {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+        });
+        let patched = list.apply_compositing_update(&[CompositedUpdate {
+            id: key,
+            matrix: new_matrix,
+            opacity: 1.0,
+        }]);
+        assert_eq!(patched, 1, "one PushTransform patched");
+        match list
+            .0
+            .iter()
+            .find(|i| matches!(i, DisplayItem::PushTransform { .. }))
+        {
+            Some(DisplayItem::PushTransform { matrix, .. }) => {
+                assert_eq!(*matrix, new_matrix);
+            }
+            other => panic!("expected a patched PushTransform, got {other:?}"),
+        }
+        assert_eq!(
+            list.1,
+            Some(DamageRect {
+                x: 0.0,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+            }),
+            "damage expands to the canvas"
+        );
+        // An unknown id patches nothing and leaves the list alone.
+        let before = list.clone();
+        assert_eq!(
+            list.apply_compositing_update(&[CompositedUpdate {
+                id: 0xdeadbeef,
+                matrix: Affine::identity(),
+                opacity: 1.0,
+            }]),
+            0
+        );
+        assert_eq!(list, before);
+    }
+
+    #[test]
+    fn display_list_with_transform_and_opacity_round_trips() {
+        // M6 Phase 2 (Rec 6/7): the new items survive the wire
+        // (postcard discriminants appended at the end) and the
+        // decoded list validates.
+        let (_dom, _tree, list) = build_list(
+            r#"<div class="ghost">G</div>"#,
+            ".ghost { width: 100px; height: 100px; opacity: 0.5; transform: rotate(45deg); background-color: #ff0000; }",
+        );
+        assert!(list
+            .0
+            .iter()
+            .any(|i| matches!(i, DisplayItem::PushTransform { .. })));
+        assert!(list
+            .0
+            .iter()
+            .any(|i| matches!(i, DisplayItem::PushOpacity { .. })));
+        let back = DisplayList::from_bytes(&list.to_bytes()).expect("list decodes");
+        assert_eq!(back, list, "round-trip must be lossless");
+        back.validate(&ResourceTable::new())
+            .expect("decoded list validates");
+    }
+
+    #[test]
+    fn fixed_subtree_wraps_in_push_fixed_and_excludes_damage() {
+        // M6 Phase 3 (Rec 1): a viewport-fixed subtree paints
+        // inside one `PushFixed`/`PopFixed` scope (its background
+        // rect sits between them), and its bounds never enter the
+        // page damage — a 2000px fixed box on a short page must
+        // not inflate the damage (or the page's maximum scroll)
+        // past the viewport.
+        let (_dom, _tree, list) = build_list(
+            r#"<div class="fixed"></div><div class="content"></div>"#,
+            ".fixed { position: fixed; top: 0px; left: 0px; width: 100px; height: 2000px; background-color: #ff0000; } \
+             .content { height: 100px; background-color: #00ff00; }",
+        );
+        let push = list
+            .0
+            .iter()
+            .position(|i| matches!(i, DisplayItem::PushFixed))
+            .expect("a PushFixed opens the fixed scope");
+        let pop = list
+            .0
+            .iter()
+            .rposition(|i| matches!(i, DisplayItem::PopFixed))
+            .expect("a PopFixed closes it");
+        assert!(push < pop, "scope is balanced");
+        let red = list
+            .0
+            .iter()
+            .position(|i| {
+                matches!(i, DisplayItem::FillRect { color, .. } if *color == [1.0, 0.0, 0.0, 1.0])
+            })
+            .expect("fixed background rect");
+        assert!(
+            push < red && red < pop,
+            "fixed background paints inside the scope"
+        );
+        assert_eq!(
+            list.1,
+            Some(DamageRect {
+                x: 0.0,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+            }),
+            "damage is the viewport, not the 2000px fixed box"
+        );
+        // The new items survive the wire and validate.
+        let back = DisplayList::from_bytes(&list.to_bytes()).expect("list decodes");
+        assert_eq!(back, list, "round-trip must be lossless");
+        back.validate(&ResourceTable::new())
+            .expect("decoded list validates");
+    }
+
+    #[test]
+    fn validate_rejects_bad_opacity_and_transform() {
+        // M6 Phase 2 (Rec 6/7): the new items are validated —
+        // an opacity outside 0..=1 and a non-finite transform
+        // component are both rejected, not silently rendered.
+        let resources = ResourceTable::new();
+        let mut list = DisplayList::new();
+        list.push(DisplayItem::PushOpacity {
+            id: 1,
+            opacity: 2.0,
+        });
+        assert!(matches!(
+            list.validate(&resources),
+            Err(ValidationError::BadOpacity(_))
+        ));
+        let mut list = DisplayList::new();
+        list.push(DisplayItem::PushTransform {
+            id: 1,
+            matrix: Affine {
+                a: f32::NAN,
+                b: 0.0,
+                c: 0.0,
+                d: 1.0,
+                e: 0.0,
+                f: 0.0,
+            },
+        });
+        assert!(matches!(
+            list.validate(&resources),
+            Err(ValidationError::BadTransform(_))
+        ));
     }
 
     #[test]
@@ -1410,7 +2308,7 @@ mod tests {
             ".r { width: 100px; height: 50px; background-color: #ff0000; border-radius: 8px; \
              box-shadow: 2px 3px 0 #000000, inset 0 0 4px #00ff00; }",
         );
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let list = DisplayList::build(&tree);
         let pos = |pred: &dyn Fn(&DisplayItem) -> bool| {
             list.0.iter().position(pred).expect("item present")
@@ -1454,7 +2352,7 @@ mod tests {
             ".scroll { overflow: hidden; height: 50px; width: 200px; border-radius: 10px; } \
              .tall { height: 200px; }",
         );
-        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0).expect("layout builds");
+        let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let list = DisplayList::build(&tree);
         let radii = list.0.iter().find_map(|item| match item {
             DisplayItem::PushClip { radii, .. } => Some(*radii),
@@ -1585,7 +2483,7 @@ mod tests {
 
     #[test]
     fn display_list_emits_img_image_item() {
-        use pluto_layout::{ElementState, ImageInfo, ImageMap};
+        use pluto_layout::{ElementState, ImageInfo, ImageMap, Theme};
         let dom = parse_html("<html><body><img src=\"a.png\"></body></html>");
         let mut images = ImageMap::default();
         images.by_node.insert(
@@ -1604,6 +2502,7 @@ mod tests {
             768.0,
             &ElementState::default(),
             &images,
+            Theme::Light,
         )
         .expect("layout builds");
         let list = DisplayList::build(&tree);
@@ -1626,7 +2525,7 @@ mod tests {
 
     #[test]
     fn display_list_emits_background_image_cover_and_centered() {
-        use pluto_layout::{ElementState, ImageInfo, ImageMap};
+        use pluto_layout::{ElementState, ImageInfo, ImageMap, Theme};
         // Cover: 800x600 into a 100x100 box scales to 133.3x100.
         let dom = parse_html("<html><body><div></div></body></html>");
         let mut images = ImageMap::default();
@@ -1648,6 +2547,7 @@ mod tests {
             768.0,
             &ElementState::default(),
             &images,
+            Theme::Light,
         )
         .expect("layout builds");
         let list = DisplayList::build(&tree);
@@ -1689,6 +2589,7 @@ mod tests {
             768.0,
             &ElementState::default(),
             &images,
+            Theme::Light,
         )
         .expect("layout builds");
         let div = tree
@@ -1706,7 +2607,7 @@ mod tests {
 
     #[test]
     fn display_list_tiles_repeating_background() {
-        use pluto_layout::{ElementState, ImageInfo, ImageMap};
+        use pluto_layout::{ElementState, ImageInfo, ImageMap, Theme};
         // 30x30 tile repeated over a 100x100 box: 4x4 = 16 tiles.
         let dom = parse_html("<html><body><div></div></body></html>");
         let mut images = ImageMap::default();
@@ -1728,6 +2629,7 @@ mod tests {
             768.0,
             &ElementState::default(),
             &images,
+            Theme::Light,
         )
         .expect("layout builds");
         let list = DisplayList::build(&tree);
@@ -1735,5 +2637,43 @@ mod tests {
         assert_eq!(items.len(), 16, "4x4 tiles: {items:?}");
         assert!(items.iter().all(|i| i.0 == 4));
         assert!(items.iter().all(|i| (i.3, i.4) == (30.0, 30.0)));
+    }
+
+    #[test]
+    fn display_list_tiles_repeat_no_repeat_one_axis_only() {
+        use pluto_layout::{ElementState, ImageInfo, ImageMap, Theme};
+        // M6 Phase 1: `repeat no-repeat` tiles x only — a 100x100
+        // box with a 30x30 tile gives 4 tiles in one row, not 16.
+        let dom = parse_html("<html><body><div></div></body></html>");
+        let mut images = ImageMap::default();
+        images.backgrounds.insert(
+            "tile.png".to_string(),
+            ImageInfo {
+                resource: 4,
+                width: 30,
+                height: 30,
+            },
+        );
+        let sheet = Stylesheet::parse(
+            "div { width: 100px; height: 100px; background-image: url(tile.png); background-repeat: repeat no-repeat; }",
+        );
+        let tree = LayoutTree::build_with_state_and_images(
+            &dom,
+            &sheet,
+            1024.0,
+            768.0,
+            &ElementState::default(),
+            &images,
+            Theme::Light,
+        )
+        .expect("layout builds");
+        let list = DisplayList::build(&tree);
+        let items = image_items(&list);
+        assert_eq!(items.len(), 4, "one row of tiles: {items:?}");
+        assert!(items.iter().all(|i| (i.3, i.4) == (30.0, 30.0)));
+        assert!(
+            items.iter().all(|i| (i.2 - items[0].2).abs() < 0.01),
+            "all tiles share one row: {items:?}"
+        );
     }
 }

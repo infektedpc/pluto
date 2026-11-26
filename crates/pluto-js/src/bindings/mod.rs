@@ -226,6 +226,28 @@ pub struct BindingState {
     /// `Image()` / `<img>` load state, by node key: whether the
     /// current `src` has loaded, and its intrinsic size.
     pub image_states: HashMap<DomKey, dom::ImageLoadState>,
+    /// Next `Animation` registry id (M6 Phase 3, Rec 11).
+    pub next_animation_id: u64,
+    /// WAAPI animation object ids, by (element, host anim id) —
+    /// `getAnimations()` returns the same object `animate()` did.
+    pub animation_objects: HashMap<(DomKey, u64), u64>,
+    /// CSS animation object ids, by (element, animation name).
+    pub css_animation_objects: HashMap<(DomKey, String), u64>,
+    /// Local play-state + clock for an `Animation` object, by
+    /// registry id (the engine is the authority for sampled
+    /// values; this is only the JS-visible `playState` /
+    /// `currentTime` bookkeeping).
+    pub animation_locals: HashMap<u64, dom::AnimationLocal>,
+    /// The `AnimateSpec` behind a WAAPI `Animation` object, by
+    /// registry id — `play()` after `finish()` re-requests the
+    /// animation with the same spec (a finished engine entry is
+    /// gone, so there is nothing to resume).
+    pub animation_specs: HashMap<u64, crate::host::AnimateSpec>,
+    /// Cancelled WAAPI animations, by (element, host anim id):
+    /// `getAnimations` skips these until the host forgets them
+    /// (host ids are monotonic, so a fresh `animate()` never
+    /// collides with a tombstone).
+    pub animation_tombstones: std::collections::HashSet<(DomKey, u64)>,
 }
 
 impl BindingState {
@@ -264,6 +286,12 @@ impl BindingState {
             url_entries: HashMap::new(),
             response_urls: HashMap::new(),
             image_states: HashMap::new(),
+            next_animation_id: 1,
+            animation_objects: HashMap::new(),
+            css_animation_objects: HashMap::new(),
+            animation_locals: HashMap::new(),
+            animation_specs: HashMap::new(),
+            animation_tombstones: std::collections::HashSet::new(),
         }
     }
 }
@@ -318,6 +346,10 @@ pub fn registry<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
         // Stage 12 Rec 7: cached per-element `dataset` objects, by
         // wrapper id (like `classLists` / `styles` above).
         "datasets",
+        // M6 Phase 3 (Rec 11): live `Animation` objects, by
+        // registry id — `animate()` and `getAnimations()` return
+        // the same object for the same running animation.
+        "animations",
         // Stage 12 Rec 7: the cached `searchParams` object per
         // `URL`, by URL id (`URL.searchParams` is `===`-stable).
         "urlSearchParams",

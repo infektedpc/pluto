@@ -21,7 +21,7 @@
 
 use pluto_html::{Dom, NodeId};
 use pluto_js::{ComputedIntersection, ObservedSizes, RootMargin};
-use pluto_layout::{LayoutTree, OverflowKind, Spacing};
+use pluto_layout::{LayoutTree, OverflowKind, Spacing, Theme};
 
 /// Resolve one padding edge to px. `containing_width` is the
 /// approximation for `%` padding (see the module docs).
@@ -262,7 +262,7 @@ fn is_strict_ancestor(dom: &Dom, id: NodeId, ancestor: NodeId) -> bool {
 mod tests {
     use super::*;
     use pluto_js::{ResizeBoxKind, ResizeObserverRegistry, RootMargin};
-    use pluto_layout::LayoutTree;
+    use pluto_layout::{LayoutTree, Theme};
 
     fn find_tag(dom: &Dom, id: NodeId, tag: &str) -> Option<NodeId> {
         for &child in dom.children(id) {
@@ -290,7 +290,9 @@ mod tests {
 
     fn tree_for(html: &str) -> (pluto_html::Dom, LayoutTree) {
         let doc = crate::page::parse_document(html);
-        let tree = LayoutTree::build(doc.dom(), doc.sheet(), 1024.0, 768.0).expect("layout builds");
+        let tree =
+            LayoutTree::build(doc.dom(), doc.sheet(), 1024.0, 768.0, Theme::Light)
+                .expect("layout builds");
         (doc.dom().clone(), tree)
     }
 

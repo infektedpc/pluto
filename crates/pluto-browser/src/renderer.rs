@@ -69,9 +69,17 @@ use pluto_ipc::transport::{recv_browser_message, Transport};
 use pluto_js::DomHost;
 use pluto_js::TabJs;
 use pluto_js::bindings::events::TypedEventKind;
-use pluto_layout::{ElementState, ImageMap, LayoutTree, OverscrollBehavior, RelayoutKind};
+use pluto_css::{CalcCtx, Easing, parse_value};
+use pluto_js::host::WaapiOp;
+use pluto_layout::animation::{
+    AnimTiming, AnimatedValue, AnimationDirection, AnimationEngine, FillMode, IterationCount,
+};
+use pluto_layout::{
+    ElementState, ImageMap, LayoutTree, OverscrollBehavior, RelayoutKind, RelayoutOutcome,
+    Theme,
+};
 use pluto_net::{ResourceLoader, SharedLoader};
-use pluto_paint::{DisplayList, Resource, ResourceId, ResourceTable, perf};
+use pluto_paint::{CompositedUpdate, DisplayList, Resource, ResourceId, ResourceTable, perf};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -439,14 +447,45 @@ pub(crate) enum LayoutJob {
         /// Passed to the incremental path only when `images_dirty`
         /// is set (see above); used on the full-rebuild path always.
         images: ImageMap,
+        /// The shell's theme (M6 Phase 3, Rec 12): a change
+        /// forces a full rebuild (restyle, never a refetch).
+        theme: Theme,
+        /// The viewport (page) scroll the tree mirrors (M6 Phase
+        /// 3, Rec 1/3): sticky offsets are scroll-derived, so the
+        /// tree re-collects when it changes.
+        viewport_scroll: (f32, f32),
+        /// In-flight sampled animation values (M6 Phase 3, Rec
+        /// 11): the actor applies them over the resolved styles
+        /// before classification, so an animated transform routes
+        /// through the CompositingOnly path.
+        animation_overrides: Vec<(NodeId, Vec<(String, AnimatedValue)>)>,
+        /// Downloaded `@font-face` bytes waiting to be loaded
+        /// (M6 Phase 3, Rec 12): the actor loads them into the
+        /// retained FontSystem; a new face forces a full rebuild.
+        fonts: Vec<Vec<u8>>,
         /// Which path the layout took (Stage 12 Rec 3): the actor
-        /// reports the [`RelayoutKind`] — `ColdBuild` for a fresh
-        /// tree, the incremental outcome's kind, or `FullLayout`
-        /// when the incremental attempt failed or was not
-        /// attempted against a retained tree — so the tab thread
-        /// can record it in the frame-time histogram and the
-        /// fallback rate is measured, not guessed.
-        reply: oneshot::Sender<RelayoutKind>,
+        /// reports the [`RelayoutOutcome`] — `ColdBuild` for a fresh
+        /// tree, the incremental outcome, or `FullLayout` when the
+        /// incremental attempt failed or was not attempted against
+        /// a retained tree — so the tab thread can record it in the
+        /// frame-time histogram and the fallback rate is measured,
+        /// not guessed. For a `CompositingOnly` outcome the
+        /// `composited` ids name the dirty elements, so the tab
+        /// thread can ask for their new compositing state (see
+        /// [`LayoutJob::CompositedState`]) instead of rebuilding
+        /// the list.
+        reply: oneshot::Sender<RelayoutOutcome>,
+    },
+    /// The compositing state (page transform + opacity) of `ids`
+    /// and their descendants, from the actor's retained tree (M6
+    /// Phase 2, Rec 9): the tab thread asks for it after a
+    /// `CompositingOnly` layout, so it can send a
+    /// `CompositingUpdate` with just the changed elements instead
+    /// of rebuilding the display list. Empty when the actor has
+    /// no tree.
+    CompositedState {
+        ids: Vec<NodeId>,
+        reply: oneshot::Sender<Vec<CompositedUpdate>>,
     },
     /// Build the display list from the actor's retained tree
     /// (after the ResizeObserver step has run).
@@ -545,6 +584,23 @@ pub(crate) enum LayoutJob {
         x: f32,
         y: f32,
         reply: oneshot::Sender<Option<NodeId>>,
+    },
+    /// Set the viewport (page) scroll offset on the actor's
+    /// retained tree (M6 Phase 3, Rec 1/3): sticky offsets are
+    /// scroll-derived and fixed boxes hit-test in viewport
+    /// coordinates, so the tree must know the scroll — and the
+    /// re-collected display list is the reply, so the tab thread
+    /// submits it in the same frame when it changed. The reply
+    /// also carries whether a sticky box moved: a pure viewport
+    /// scroll with no sticky content leaves the list identical,
+    /// so the worker skips the submit (the shell scrolls its
+    /// cached list) and the event stream stays clean — a spurious
+    /// submit here used to poison the wheel/resize tests' event
+    /// order. `None` when the actor holds no tree.
+    SetViewportScroll {
+        x: f32,
+        y: f32,
+        reply: oneshot::Sender<Option<(Arc<DisplayList>, bool)>>,
     },
 }
 
@@ -656,6 +712,7 @@ fn build_full_tree(
     state: &ElementState,
     old_tree: Option<LayoutTree>,
     images: &ImageMap,
+    theme: Theme,
 ) -> LayoutTree {
     let old_fonts = old_tree.and_then(|t| t.font_system);
     let result = match old_fonts {
@@ -667,6 +724,7 @@ fn build_full_tree(
             state,
             fonts,
             images,
+            theme,
         ),
         None => LayoutTree::build_with_state_and_images(
             doc.dom(),
@@ -675,6 +733,7 @@ fn build_full_tree(
             viewport.1,
             state,
             images,
+            theme,
         ),
     };
     match result {
@@ -691,6 +750,7 @@ fn build_full_tree(
                 viewport.1,
                 state,
                 images,
+                theme,
             )
             .unwrap_or_default()
         }
@@ -713,15 +773,63 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                 incremental,
                 images,
                 images_dirty,
+                theme,
+                viewport_scroll,
+                animation_overrides,
+                fonts,
                 reply,
             } => {
                 if let Some(doc) = *new_document {
                     document = Some(doc);
                 }
                 let Some(doc) = document.as_ref() else {
-                    let _ = reply.send(RelayoutKind::NothingToDo);
+                    let _ = reply.send(RelayoutOutcome {
+                        kind: RelayoutKind::NothingToDo,
+                        reason: "no document",
+                        composited: Vec::new(),
+                        pending_transitions: Vec::new(),
+                        pending_animations: Vec::new(),
+                        changed_styles: Vec::new(),
+                    });
                     continue;
                 };
+                // M6 Phase 3 (Rec 3): the retained tree mirrors
+                // the viewport scroll (sticky offsets are
+                // scroll-derived). Applied before the incremental
+                // attempt so the pass sees current offsets.
+                if let Some(retained) = tree.as_mut()
+                    && retained.viewport_scroll != viewport_scroll
+                {
+                    retained.set_viewport_scroll(viewport_scroll.0, viewport_scroll.1);
+                }
+                // M6 Phase 3 (Rec 12): a theme change forces a
+                // full rebuild — restyle, never a refetch. The
+                // retained tree records it; the fresh build below
+                // (or the incremental path's `full_rebuild`) uses
+                // it. `set_theme` only records — the rebuild is
+                // what applies it.
+                let mut theme_changed = false;
+                if let Some(retained) = tree.as_mut()
+                    && retained.theme != theme
+                {
+                    retained.set_theme(theme);
+                    theme_changed = true;
+                }
+                // M6 Phase 3 (Rec 12): newly downloaded
+                // `@font-face` bytes land in the retained
+                // FontSystem; a new face forces a full rebuild
+                // (like an image arrival — the fresh tree builds
+                // with the new faces, falling back until they
+                // arrive). On a fresh navigation there is no
+                // retained tree yet — fonts arrive after the
+                // commit, so the first layout never carries any.
+                let mut fonts_landed = false;
+                if !fonts.is_empty()
+                    && let Some(retained) = tree.as_mut()
+                    && retained.load_fonts(&fonts)
+                {
+                    fonts_landed = true;
+                }
                 // Stage 8 Rec 6: a dirty tick / resize hands the
                 // actor a snapshot of the same live Dom the
                 // retained tree was built from, so re-lay out
@@ -746,9 +854,25 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                 // that could have been incremental but were not.
                 let mut built_fresh = true;
                 let mut kind = RelayoutKind::ColdBuild;
-                if incremental
+                // The incremental outcome rides back to the tab
+                // thread whole (M6 Phase 2, Rec 9): a
+                // `CompositingOnly` outcome names its dirty
+                // elements in `composited`, so the tab thread can
+                // ask for their new state instead of rebuilding
+                // the list. The fallback paths have no dirty
+                // elements, so they report a bare outcome.
+                let mut outcome: Option<RelayoutOutcome> = None;
+                // A theme change or a newly landed web font is a
+                // full rebuild, not an incremental pass (the whole
+                // cascade re-evaluates under the new theme / faces).
+                let force_full = theme_changed || fonts_landed;
+                if incremental && !force_full
                     && let Some(retained) = tree.as_mut()
                 {
+                    // M6 Phase 3 (Rec 11): the tab thread's
+                    // in-flight sampled values ride over the
+                    // resolved styles for this pass.
+                    retained.animation_overrides = animation_overrides.clone();
                     match retained.relayout_incremental(
                         doc.dom(),
                         doc.sheet(),
@@ -761,13 +885,14 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                         // current and `None` keeps it untouched.
                         if images_dirty { Some(&images) } else { None },
                     ) {
-                        Ok(outcome) => {
+                        Ok(o) => {
                             eprintln!(
                                 "[pluto] incremental layout: {:?} ({})",
-                                outcome.kind, outcome.reason
+                                o.kind, o.reason
                             );
-                            kind = outcome.kind;
+                            kind = o.kind;
                             built_fresh = false;
+                            outcome = Some(o);
                         }
                         Err(e) => {
                             eprintln!(
@@ -785,11 +910,25 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                     // re-scan the system fonts per rebuild.
                     let old_tree = tree.take();
                     let mut new_tree =
-                        build_full_tree(doc, viewport, &state, old_tree, &images);
+                        build_full_tree(doc, viewport, &state, old_tree, &images, theme);
                     if !offsets.is_empty() {
                         for (&id, &(x, y)) in &offsets {
                             new_tree.set_scroll_offset(id, x, y);
                         }
+                    }
+                    // M6 Phase 3 (Rec 11): a fresh build resolves
+                    // underlying styles only — re-apply the
+                    // in-flight sampled values over its meta
+                    // styles, like `full_rebuild` does.
+                    new_tree.animation_overrides = animation_overrides;
+                    if !new_tree.animation_overrides.is_empty() {
+                        new_tree.apply_animation_overrides_to_meta();
+                    }
+                    // M6 Phase 3 (Rec 3): a fresh tree starts at
+                    // scroll (0, 0) — mirror the job's viewport
+                    // scroll so sticky is right on the first list.
+                    if viewport_scroll != (0.0, 0.0) {
+                        new_tree.set_viewport_scroll(viewport_scroll.0, viewport_scroll.1);
                     }
                     tree = Some(new_tree);
                 } else if !offsets.is_empty() {
@@ -803,7 +942,39 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                         }
                     }
                 }
-                let _ = reply.send(kind);
+                let outcome = outcome.unwrap_or(RelayoutOutcome {
+                    kind,
+                    reason: match kind {
+                        RelayoutKind::ColdBuild => "fresh tree",
+                        _ => "incremental layout failed or not attempted, full rebuild",
+                    },
+                    composited: Vec::new(),
+                    pending_transitions: Vec::new(),
+                    pending_animations: Vec::new(),
+                    changed_styles: Vec::new(),
+                });
+                let _ = reply.send(outcome);
+            }
+            LayoutJob::CompositedState { ids, reply } => {
+                // M6 Phase 2 (Rec 9): the compositing state of
+                // the dirty elements AND their descendants — a
+                // transform change moves the whole subtree, so
+                // every descendant box's page transform changes
+                // with it. Empty when the actor has no tree yet.
+                let updates = tree
+                    .as_ref()
+                    .map(|tree| {
+                        tree.composited_subtree_state(&ids)
+                            .into_iter()
+                            .map(|(id, matrix, opacity)| CompositedUpdate {
+                                id,
+                                matrix,
+                                opacity,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let _ = reply.send(updates);
             }
             LayoutJob::CollectDisplayList { reply } => {
                 let display = tree
@@ -916,7 +1087,14 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                     .as_ref()
                     .map(|t| t.images.clone())
                     .unwrap_or_default();
-                let new_tree = build_full_tree(doc, viewport, &state, old_tree, &images);
+                // A flush keeps the retained tree's theme (a
+                // theme change arrives through the layout job,
+                // not through a flush).
+                let theme = old_tree
+                    .as_ref()
+                    .map(|t| t.theme)
+                    .unwrap_or(Theme::Light);
+                let new_tree = build_full_tree(doc, viewport, &state, old_tree, &images, theme);
                 let geometry = geometry_of(&new_tree, id);
                 tree = Some(new_tree);
                 let _ = reply.send(geometry);
@@ -924,6 +1102,21 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
             LayoutJob::HitTest { x, y, reply } => {
                 let target = tree.as_ref().and_then(|tree| tree.hit_test(x, y));
                 let _ = reply.send(target);
+            }
+            LayoutJob::SetViewportScroll { x, y, reply } => {
+                // M6 Phase 3 (Rec 1/3): the tree learns the
+                // viewport scroll — sticky offsets are
+                // scroll-derived, fixed boxes hit-test in viewport
+                // coordinates — and the re-collected display list
+                // is the reply, so the tab thread submits it in
+                // the same frame. No layout runs (no observers):
+                // a scroll frame is a re-collect, like
+                // `ScrollMany`.
+                let display = tree.as_mut().map(|tree| {
+                    let sticky_moved = tree.set_viewport_scroll(x, y);
+                    (Arc::new(DisplayList::build(tree)), sticky_moved)
+                });
+                let _ = reply.send(display);
             }
         }
     }
@@ -1198,7 +1391,7 @@ impl FrameTimeHistogram {
             .fallback_rate()
             .map_or("-".to_string(), |r| format!("{:.1}%", r * 100.0));
         format!(
-            "frames n={} total_recorded={} over_budget={} ({:.1}%) | {} | {} | {} | {} | layout cold={} subtree={} full={} paint={} pos={} nothing={} fallback={}",
+            "frames n={} total_recorded={} over_budget={} ({:.1}%) | {} | {} | {} | {} | layout cold={} subtree={} full={} paint={} pos={} comp={} nothing={} fallback={}",
             self.len,
             self.total_recorded,
             self.over_budget,
@@ -1212,6 +1405,7 @@ impl FrameTimeHistogram {
             self.layout_kind_count(RelayoutKind::FullLayout),
             self.layout_kind_count(RelayoutKind::PaintOnly),
             self.layout_kind_count(RelayoutKind::PositionOnly),
+            self.layout_kind_count(RelayoutKind::CompositingOnly),
             self.layout_kind_count(RelayoutKind::NothingToDo),
             fallback,
         )
@@ -1460,6 +1654,43 @@ struct TabState {
     /// the tick logs only when new frames landed (no spam on
     /// idle ticks).
     last_frame_log_total: u64,
+    /// The CSS transition / keyframe / WAAPI engine (M6 Phase 3,
+    /// Rec 11): one per tab, sampled from the monotonic clock on
+    /// the tab tick — never by counting ticks.
+    animation_engine: AnimationEngine,
+    /// Currently sampled animated values per element, keyed by
+    /// property: the transition `from` source, and the values the
+    /// actor applies as overrides on the next layout.
+    current_animated: HashMap<NodeId, HashMap<String, AnimatedValue>>,
+    /// Underlying computed values merged from actor outcomes
+    /// (`changed_styles`) plus in-flight samples: the
+    /// `getComputedStyle` cache the host reads for JS.
+    computed_style_cache: HashMap<NodeId, HashMap<String, String>>,
+    /// Downloaded `@font-face` bytes waiting for the next layout
+    /// (M6 Phase 3, Rec 12): the actor loads them into the
+    /// retained FontSystem, then the layout rebuilds with the new
+    /// faces (fallback until they arrive — `font-display: swap`
+    /// behaviour falls out of the rebuild).
+    pending_fonts: Vec<Vec<u8>>,
+    /// `@font-face` URLs already fetched or in flight for this
+    /// document (dedup — one fetch per URL per navigation).
+    font_fetch_urls: HashSet<String>,
+    /// Font fetch outcomes, sent back by fetch tasks.
+    font_outcome_tx: tokio::sync::mpsc::UnboundedSender<FontOutcome>,
+    /// Font outcomes, received by the main loop (see `exec_rx`).
+    font_outcome_rx: Option<tokio::sync::mpsc::UnboundedReceiver<FontOutcome>>,
+    /// The shell's theme for this tab (M6 Phase 3, Rec 12):
+    /// forwarded to the actor on every layout; a change forces a
+    /// full rebuild (restyle, never a refetch).
+    theme: Theme,
+}
+
+/// One `@font-face` download outcome (M6 Phase 3, Rec 12): the
+/// URL it was fetched for (the dedup key) plus the bytes, or the
+/// failure — a failed face is never fatal, the fallback font stays.
+enum FontOutcome {
+    Loaded { url: String, epoch: u64, bytes: Vec<u8> },
+    Failed { url: String, epoch: u64 },
 }
 
 impl TabState {
@@ -1486,6 +1717,7 @@ impl TabState {
         let (image_request_tx, image_request_rx) = tokio::sync::mpsc::unbounded_channel();
         let (image_outcome_tx, image_outcome_rx) = tokio::sync::mpsc::unbounded_channel();
         let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (font_outcome_tx, font_outcome_rx) = tokio::sync::mpsc::unbounded_channel();
         // Stage 9 Rec 5: the tab's loader starts with the
         // persisted HSTS store + HTTPS-only preference/exceptions
         // from the browser profile (defaults when none exists).
@@ -1584,6 +1816,14 @@ impl TabState {
             render_requested,
             frame_times: FrameTimeHistogram::new(),
             last_frame_log_total: 0,
+            animation_engine: AnimationEngine::new(),
+            current_animated: HashMap::new(),
+            computed_style_cache: HashMap::new(),
+            pending_fonts: Vec::new(),
+            font_fetch_urls: HashSet::new(),
+            font_outcome_tx,
+            font_outcome_rx: Some(font_outcome_rx),
+            theme: Theme::Light,
         }
     }
 
@@ -1729,6 +1969,10 @@ async fn tab_main(
         .progress_rx
         .take()
         .expect("progress receiver present");
+    let mut font_outcome_rx = state
+        .font_outcome_rx
+        .take()
+        .expect("font outcome receiver present");
     let mut tick = tokio::time::interval(TAB_TICK);
     // `finish_page` blocks this loop for up to a second driving
     // the JS loop after a parse; a Burst interval would then fire
@@ -1826,6 +2070,13 @@ async fn tab_main(
                         submit(&mut state, &events, display).await;
                     }
                 }
+                // M6 Phase 3 (Rec 11): advance the CSS/WAAPI
+                // engine from the monotonic clock (never by
+                // counting ticks — 16 ms != 16.67 ms). Changed
+                // values mark the frame dirty, so the layout below
+                // applies them as overrides; finished events
+                // dispatch into the realm.
+                advance_animations(&mut state, tick_started);
                 // Stage 13 Rec 4: caret blink — when the ~530 ms
                 // phase flips with a focused text control, re-submit
                 // the cached (caret-free) display list with fresh
@@ -1907,6 +2158,10 @@ async fn tab_main(
             outcome = image_outcome_rx.recv() => {
                 let Some(outcome) = outcome else { break };
                 handle_image_outcome(&mut state, &events, outcome).await;
+            }
+            outcome = font_outcome_rx.recv() => {
+                let Some(outcome) = outcome else { break };
+                handle_font_outcome(&mut state, outcome);
             }
             progress = progress_rx.recv() => {
                 let Some((received, total)) = progress else { break };
@@ -2011,6 +2266,17 @@ async fn handle_single_command(
             // worker-side half: keyboard input is acted on only
             // while focused.
             state.window_focused = focused;
+        }
+        BrowserToRenderer::SetTheme { dark } => {
+            // M6 Phase 3 (Rec 12): the OS / desktop theme
+            // changed — restyle against the new theme (the actor
+            // force-rebuilds on a theme change; never a refetch).
+            // A tab with no document yet just records it; the
+            // first layout uses it.
+            state.theme = if dark { Theme::Dark } else { Theme::Light };
+            if state.has_document {
+                state.render_requested.set(true);
+            }
         }
         BrowserToRenderer::ResourceEvent(event) => {
             // Stage 13 Rec 11: the broker streams fetch events
@@ -2146,7 +2412,165 @@ fn handle_exec(state: &mut TabState, msg: crate::js_host::ExecMsg) {
 /// realm), so image requests recorded in the same turn belong
 /// to a page that is already gone and are dropped, not fetched
 /// under the new page's epoch.
+/// Drain the WAAPI queues (M6 Phase 3, Rec 11): `Element.animate`
+/// starts and play-state controls, queued by JS through the host.
+/// Runs on the tick, before layout: a start lands in the engine
+/// with the current monotonic time, so the first tick after the
+/// `animate()` call already samples it.
+fn drain_animate_requests(state: &mut TabState) {
+    let (starts, waapi_ops, css_ops) = {
+        let mut host = state.host.lock().unwrap();
+        (
+            host.take_pending_animate(),
+            host.take_pending_waapi_control(),
+            host.take_pending_css_control(),
+        )
+    };
+    if starts.is_empty() && waapi_ops.is_empty() && css_ops.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let ctx = CalcCtx {
+        font_size: 16.0,
+        root_font_size: 16.0,
+        viewport: state.viewport,
+        pct_basis: None,
+    };
+    for (id, anim_id, spec) in starts {
+        // Keyframe declaration text → sampled values (lengths
+        // resolve to px here; unresolvable declarations — e.g.
+        // `display` — drop out of their step).
+        let mut steps: Vec<(f32, Vec<(String, AnimatedValue)>)> = Vec::new();
+        for (offset, decls) in &spec.steps {
+            let mut vals = Vec::new();
+            for (prop, text) in decls {
+                let value = parse_value(text);
+                if let Some(v) = AnimatedValue::from_value(&value, &ctx) {
+                    vals.push((prop.clone(), v));
+                }
+            }
+            if !vals.is_empty() {
+                steps.push((*offset, vals));
+            }
+        }
+        if steps.is_empty() {
+            // Nothing animatable: report it finished at once
+            // rather than leaving a "running" object that never
+            // samples.
+            state
+                .host
+                .lock()
+                .unwrap()
+                .mark_waapi_finished(id, anim_id);
+            continue;
+        }
+        let timing = AnimTiming {
+            duration: (spec.duration_ms.max(0.0)) / 1000.0,
+            delay: (spec.delay_ms.max(0.0)) / 1000.0,
+            timing: Easing::parse(&spec.easing).unwrap_or(Easing::Linear),
+            iteration_count: match spec.iterations {
+                None => IterationCount::Infinite,
+                Some(n) => IterationCount::Finite(n.max(0.0)),
+            },
+            direction: match spec.direction.as_str() {
+                "reverse" => AnimationDirection::Reverse,
+                "alternate" => AnimationDirection::Alternate,
+                "alternate-reverse" => AnimationDirection::AlternateReverse,
+                _ => AnimationDirection::Normal,
+            },
+            fill_mode: match spec.fill.as_str() {
+                "forwards" => FillMode::Forwards,
+                "backwards" => FillMode::Backwards,
+                "both" => FillMode::Both,
+                _ => FillMode::None,
+            },
+        };
+        // Base values for a fill-`none` return: whatever the
+        // computed cache / in-flight samples currently say.
+        let mut base: HashMap<String, AnimatedValue> = HashMap::new();
+        if let Some(current) = state.current_animated.get(&id) {
+            for (prop, val) in current {
+                base.insert(prop.clone(), val.clone());
+            }
+        }
+        state
+            .animation_engine
+            .start_waapi(id, anim_id, timing, steps, base, now);
+        state
+            .host
+            .lock()
+            .unwrap()
+            .note_waapi_started(id, anim_id, spec);
+    }
+    // Play-state controls. A cancel hands the underlying base
+    // values back — restore them at once so the element snaps
+    // back without waiting for a layout pass.
+    let mut restored: Vec<(NodeId, Vec<(String, AnimatedValue)>)> = Vec::new();
+    for (id, anim_id, op) in waapi_ops {
+        match op {
+            WaapiOp::Pause => {
+                state.animation_engine.pause_waapi(id, anim_id, now);
+            }
+            WaapiOp::Play => {
+                state.animation_engine.resume_waapi(id, anim_id, now);
+            }
+            WaapiOp::Cancel => {
+                if let Some(base) = state.animation_engine.cancel_waapi(id, anim_id) {
+                    restored.push((id, base.into_iter().collect()));
+                    state.host.lock().unwrap().waapi_forget(id, anim_id);
+                }
+            }
+            WaapiOp::Finish => {
+                state.animation_engine.finish_waapi(id, anim_id, now);
+            }
+        }
+    }
+    for (id, name, op) in css_ops {
+        match op {
+            WaapiOp::Pause => {
+                state.animation_engine.pause_css(id, &name, now);
+            }
+            WaapiOp::Play => {
+                state.animation_engine.resume_css(id, &name, now);
+            }
+            WaapiOp::Cancel => {
+                if let Some(base) = state.animation_engine.cancel_css(id, &name) {
+                    restored.push((id, base.into_iter().collect()));
+                    state.host.lock().unwrap().css_forget(id, &name);
+                }
+            }
+            WaapiOp::Finish => {
+                state.animation_engine.finish_css(id, &name, now);
+            }
+        }
+    }
+    if !restored.is_empty() {
+        for (id, vals) in &restored {
+            let entry = state.current_animated.entry(*id).or_default();
+            for (prop, val) in vals {
+                entry.insert(prop.clone(), val.clone());
+            }
+            let cache = state.computed_style_cache.entry(*id).or_default();
+            for (prop, val) in vals {
+                cache.insert(prop.clone(), val.to_css());
+            }
+        }
+        {
+            let mut host = state.host.lock().unwrap();
+            for (id, vals) in &restored {
+                let pairs: Vec<(String, String)> = vals
+                    .iter()
+                    .map(|(p, v)| (p.clone(), v.to_css()))
+                    .collect();
+                host.set_computed_styles(*id, pairs);
+            }
+        }
+        state.render_requested.set(true);
+    }
+}
+
 fn drain_host_requests(state: &mut TabState) {
+    drain_animate_requests(state);
     let (navigation, images) = {
         let mut host = state.host.lock().unwrap();
         (
@@ -3143,6 +3567,16 @@ fn start_navigation_with_body(
     // viewport scroll is mirrored, not messaged — see
     // `viewport_scroll`).
     state.viewport_scroll = (0.0, 0.0);
+    // M6 Phase 3 (Rec 11/12): navigation clears running
+    // animations/transitions, sampled values, the computed-style
+    // cache, and pending fonts — the new document starts clean
+    // and fetches its own faces.
+    state.animation_engine.clear();
+    state.current_animated.clear();
+    state.computed_style_cache.clear();
+    state.pending_fonts.clear();
+    state.font_fetch_urls.clear();
+    state.host.lock().unwrap().clear_animations();
     if let Some(backend) = &state.fetch_backend {
         backend.set_epoch(epoch);
         backend.set_base_url(&url);
@@ -3279,6 +3713,9 @@ async fn handle_nav_outcome(
             // origin's /favicon.ico, once per origin per session.
             // A missing icon is remembered, never re-requested.
             maybe_request_favicon(state, &final_url);
+            // M6 Phase 3 (Rec 12): the committed document's
+            // `@font-face` sources fetch through the loader now.
+            maybe_request_font_faces(state);
             if !emit_tab(events, RendererToBrowser::DidCommit {
                 url: final_url.clone(),
                 status: format!("Loaded {final_url}"),
@@ -3340,6 +3777,121 @@ fn maybe_request_favicon(state: &mut TabState, final_url: &str) {
             CancellationToken::new(),
             state.image_outcome_tx.clone(),
         );
+    }
+}
+
+/// M6 Phase 3 (Rec 12): fetch the committed document's
+/// `@font-face` sources through the existing loader — the same
+/// Stage 9 gates as any other subresource (CSP / referrer /
+/// HTTPS-only / caps), never a second fetch path. At most 16 faces
+/// per document, ~10 MiB per face; dedup by resolved URL. Outcomes
+/// arrive on `font_outcome_rx`; the bytes land in `pending_fonts`
+/// for the next layout (fallback until they arrive).
+fn maybe_request_font_faces(state: &mut TabState) {
+    let Some(doc) = state.document.as_ref() else {
+        return;
+    };
+    let base_url = doc.base_url().to_string();
+    let mut count = 0;
+    for face in doc.sheet().font_faces.iter() {
+        if count >= 16 {
+            break;
+        }
+        let Some(src) = face.src.as_ref() else {
+            continue;
+        };
+        let Some(raw) = parse_font_src_url(src) else {
+            continue;
+        };
+        let Ok(url) = resolve_font_url(&base_url, &raw) else {
+            continue;
+        };
+        if !state.font_fetch_urls.insert(url.clone()) {
+            continue;
+        }
+        count += 1;
+        let request =
+            page::font_resource_request(&url, &base_url, state.tab_id, state.nav_epoch);
+        let fetch = state.fetch_source.clone();
+        let cancel = state
+            .nav_cancel
+            .clone()
+            .unwrap_or_else(CancellationToken::new);
+        let epoch = state.nav_epoch;
+        let tx = state.font_outcome_tx.clone();
+        tokio::task::spawn(async move {
+            let outcome = match fetch.fetch_with(request, cancel).await {
+                Ok(response) => {
+                    if response.body.len() > 10 * 1024 * 1024 {
+                        FontOutcome::Failed { url, epoch }
+                    } else {
+                        FontOutcome::Loaded {
+                            url,
+                            epoch,
+                            bytes: response.body,
+                        }
+                    }
+                }
+                Err(_) => FontOutcome::Failed { url, epoch },
+            };
+            let _ = tx.send(outcome);
+        });
+    }
+}
+
+/// First `url(...)` in a `@font-face` `src` list. `local(...)`
+/// sources are never fetched — the loop looks for `url(` only —
+/// and an empty `url()` is skipped.
+fn parse_font_src_url(src: &str) -> Option<String> {
+    let mut rest = src;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let Some(pos) = lower.find("url(") else {
+            return None;
+        };
+        let after = &rest[pos + 4..];
+        let Some(end) = after.find(')') else {
+            return None;
+        };
+        let inner = after[..end]
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'');
+        if !inner.is_empty() {
+            return Some(inner.to_string());
+        }
+        rest = &after[end + 1..];
+    }
+}
+
+/// Resolve a font URL against the document base. Absolute URLs
+/// (including `data:`) pass through; relative ones join the base.
+fn resolve_font_url(base_url: &str, raw: &str) -> Result<String, url::ParseError> {
+    if raw.contains("://") || raw.starts_with("data:") {
+        return Ok(raw.to_string());
+    }
+    let base = url::Url::parse(base_url)?;
+    Ok(base.join(raw)?.to_string())
+}
+
+/// One `@font-face` outcome: a loaded face waits in
+/// `pending_fonts` for the next layout (which rebuilds with it);
+/// a failed face leaves the fallback in place, never fatal.
+fn handle_font_outcome(state: &mut TabState, outcome: FontOutcome) {
+    match outcome {
+        FontOutcome::Loaded { url, epoch, bytes } => {
+            if epoch != state.nav_epoch {
+                return;
+            }
+            eprintln!("[pluto] font loaded: {url}");
+            state.pending_fonts.push(bytes);
+            state.render_requested.set(true);
+        }
+        FontOutcome::Failed { url, epoch } => {
+            if epoch != state.nav_epoch {
+                return;
+            }
+            eprintln!("[pluto] font failed: {url}");
+        }
     }
 }
 
@@ -3574,6 +4126,137 @@ async fn submit(
 /// callback's write lands one tick later, not in the list being
 /// built here (the actor's tree is already built by then; see
 /// `run_resize_observer_step`).
+/// M6 Phase 3 (Rec 11): fold one layout outcome into the tab's
+/// animation state — merge `changed_styles` into the computed-style
+/// cache (and the host, for `getComputedStyle`), start the pending
+/// transitions (from the currently sampled value when one is already
+/// running on that property) and keyframe animations. Runs for every
+/// outcome kind, including `CompositingOnly`: an animated transform
+/// change reports its pending transitions on that outcome too.
+fn process_animation_outcome(
+    state: &mut TabState,
+    outcome: &RelayoutOutcome,
+    now: std::time::Instant,
+) {
+    for (id, pairs) in &outcome.changed_styles {
+        let entry = state.computed_style_cache.entry(*id).or_default();
+        for (prop, css) in pairs {
+            entry.insert(prop.clone(), css.clone());
+        }
+    }
+    {
+        let mut host = state.host.lock().unwrap();
+        for (id, pairs) in &outcome.changed_styles {
+            host.set_computed_styles(*id, pairs.clone());
+        }
+    }
+    for pt in &outcome.pending_transitions {
+        let from = state
+            .current_animated
+            .get(&pt.id)
+            .and_then(|m| m.get(&pt.spec.property))
+            .cloned()
+            .unwrap_or_else(|| pt.from.clone());
+        state
+            .animation_engine
+            .start_transition(pt.id, pt.spec.clone(), from, pt.to.clone(), now);
+    }
+    let ctx = CalcCtx {
+        font_size: 16.0,
+        root_font_size: 16.0,
+        viewport: state.viewport,
+        pct_basis: None,
+    };
+    for pa in &outcome.pending_animations {
+        let base: HashMap<String, AnimatedValue> = pa.base.iter().cloned().collect();
+        state.animation_engine.start_animation(
+            pa.id,
+            pa.spec.clone(),
+            &pa.keyframes,
+            base,
+            &ctx,
+            now,
+        );
+    }
+    {
+        let mut host = state.host.lock().unwrap();
+        for pa in &outcome.pending_animations {
+            host.note_css_animation_started(pa.id, pa.spec.name.clone());
+        }
+    }
+}
+
+/// Advance the animation engine one tick (M6 Phase 3, Rec 11).
+/// Sampled values update `current_animated` + the computed-style
+/// cache and mark the frame dirty (the next layout applies them as
+/// overrides); finished `transitionend` / `animationend` events
+/// dispatch into the realm (a dispatch to a detached target is
+/// dropped, never fatal). While hidden the engine clock freezes —
+/// the tick still runs, but no animation jumps on return.
+fn advance_animations(state: &mut TabState, now: std::time::Instant) {
+    if state.animation_engine.is_empty() {
+        return;
+    }
+    let visible = state
+        .tab_js
+        .as_ref()
+        .map(|js| js.is_visible())
+        .unwrap_or(true);
+    if !visible {
+        state.animation_engine.pause(now);
+        return;
+    }
+    state.animation_engine.resume(now);
+    let outcome = state.animation_engine.advance(now);
+    if outcome.changed.is_empty()
+        && outcome.finished_events.is_empty()
+        && outcome.waapi_finished.is_empty()
+    {
+        return;
+    }
+    for (id, vals) in &outcome.changed {
+        let entry = state.current_animated.entry(*id).or_default();
+        for (prop, val) in vals {
+            entry.insert(prop.clone(), val.clone());
+        }
+        let cache = state.computed_style_cache.entry(*id).or_default();
+        for (prop, val) in vals {
+            cache.insert(prop.clone(), val.to_css());
+        }
+    }
+    {
+        let mut host = state.host.lock().unwrap();
+        for (id, vals) in &outcome.changed {
+            let pairs: Vec<(String, String)> =
+                vals.iter().map(|(p, v)| (p.clone(), v.to_css())).collect();
+            host.set_computed_styles(*id, pairs);
+        }
+        for (id, wid) in &outcome.waapi_finished {
+            host.mark_waapi_finished(*id, *wid);
+        }
+    }
+    if let Some(js) = state.tab_js.as_mut() {
+        for (id, ev) in &outcome.finished_events {
+            js.dispatch_event(*id, ev, false);
+        }
+    }
+    // An `animationend` retires one CSS name: refresh the host's
+    // list from the engine (the finished name drops out, so
+    // `getAnimations` stops reporting it).
+    {
+        let mut host = state.host.lock().unwrap();
+        for (id, ev) in &outcome.finished_events {
+            if *ev == "animationend" {
+                let names = state.animation_engine.running_css_animations(*id);
+                host.set_css_animations(*id, names);
+            }
+        }
+    }
+    if !outcome.changed.is_empty() {
+        state.render_requested.set(true);
+    }
+}
+
 async fn layout_and_submit(
     state: &mut TabState,
     events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
@@ -3643,6 +4326,25 @@ async fn layout_and_submit(
         incremental,
         images,
         images_dirty,
+        theme: state.theme,
+        // M6 Phase 3 (Rec 3): the tree mirrors the viewport
+        // scroll on every layout, so sticky offsets stay current
+        // even when the scroll changed without a scroll frame
+        // (resize / clamp).
+        viewport_scroll: state.viewport_scroll,
+        animation_overrides: state
+            .current_animated
+            .iter()
+            .map(|(id, vals)| {
+                (
+                    *id,
+                    vals.iter()
+                        .map(|(p, v)| (p.clone(), v.clone()))
+                        .collect(),
+                )
+            })
+            .collect(),
+        fonts: std::mem::take(&mut state.pending_fonts),
         reply: tree_tx,
     };
     if state.layout_tx.send(job).is_err() {
@@ -3656,8 +4358,8 @@ async fn layout_and_submit(
     }
     // Stage 12 Rec 3: the actor reports which path the layout
     // took; the frame sample carries it into the histogram.
-    let layout_kind = match tree_rx.await {
-        Ok(kind) => kind,
+    let outcome = match tree_rx.await {
+        Ok(outcome) => outcome,
         Err(_) => {
             return emit_tab(
                 events,
@@ -3668,7 +4370,75 @@ async fn layout_and_submit(
             .await;
         }
     };
+    let layout_kind = outcome.kind;
     state.has_document = true;
+    // M6 Phase 3 (Rec 11): fold the outcome's animation work
+    // into the engine + computed-style cache before any branch —
+    // a `CompositingOnly` outcome carries pending transitions too
+    // (an animated transform change reports them there).
+    process_animation_outcome(state, &outcome, started);
+    // M6 Phase 2 (Rec 9): a transform/opacity-only change takes
+    // the cheap path — no observers, no list rebuild, no submit.
+    // Ask the actor for the changed elements' new compositing
+    // state (the dirty elements plus their descendants, whose
+    // page transforms move with them), send it as a
+    // `CompositingUpdate` against the active list's epoch, patch
+    // the worker's cached list the same way so a later
+    // caret-blink / GIF re-submit does not clobber the update,
+    // and record the frame. The observer steps are skipped: a
+    // transform does not change sizes, and intersection geometry
+    // is re-measured on the next full frame.
+    if layout_kind == RelayoutKind::CompositingOnly {
+        let (state_tx, state_rx) = oneshot::channel();
+        if state
+            .layout_tx
+            .send(LayoutJob::CompositedState {
+                ids: outcome.composited,
+                reply: state_tx,
+            })
+            .is_err()
+        {
+            return emit_tab(
+                events,
+                RendererToBrowser::RendererCrashed {
+                    reason: "layout actor is gone".to_string(),
+                },
+            )
+            .await;
+        }
+        let updates = match state_rx.await {
+            Ok(updates) => updates,
+            Err(_) => {
+                return emit_tab(
+                    events,
+                    RendererToBrowser::RendererCrashed {
+                        reason: "layout actor reply lost".to_string(),
+                    },
+                )
+                .await;
+            }
+        };
+        state.host.lock().unwrap().clear_dirty();
+        if let Some(display) = state.last_display.as_mut() {
+            Arc::make_mut(display).apply_compositing_update(&updates);
+        }
+        let sent = emit_tab(
+            events,
+            RendererToBrowser::CompositingUpdate {
+                epoch: state.epoch,
+                updates,
+            },
+        )
+        .await;
+        state.frame_times.record(FrameSample {
+            total_ms: started.elapsed().as_secs_f32() * 1000.0,
+            layout_ms: layout_started.elapsed().as_secs_f32() * 1000.0,
+            collect_ms: 0.0,
+            submit_ms: 0.0,
+            layout_kind,
+        });
+        return sent;
+    }
     // Follow-up 2 (Stage 10): the viewport scroll mirror goes
     // stale when a resize shrinks the page — re-clamp it to the
     // new page maximum now that the tree has landed, and send the
@@ -3693,6 +4463,22 @@ async fn layout_and_submit(
         .await
         {
             return false;
+        }
+        // M6 Phase 3 (Rec 3): the clamp moved the viewport
+        // scroll without a scroll frame — sync the actor's tree
+        // now (the list is discarded; the collect step below
+        // rebuilds it from the synced tree).
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if state
+            .layout_tx
+            .send(LayoutJob::SetViewportScroll {
+                x: clamped.0,
+                y: clamped.1,
+                reply: reply_tx,
+            })
+            .is_ok()
+        {
+            let _ = reply_rx.await;
         }
     }
     // Stage 10 Rec 7: the layout phase ends when the tree reply
@@ -4477,6 +5263,55 @@ async fn container_max_scroll(state: &TabState, id: NodeId) -> (f32, f32) {
     reply_rx.await.ok().flatten().unwrap_or((0.0, 0.0))
 }
 
+/// Apply a viewport scroll and submit the re-collected display
+/// list (M6 Phase 3, Rec 1/3): the actor's tree learns the new
+/// scroll (sticky offsets are scroll-derived), and the list
+/// submits in the same frame — no layout, no observers, like a
+/// container scroll frame (`apply_scrolls`).
+async fn apply_viewport_scroll(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+) -> bool {
+    let started = std::time::Instant::now();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if state
+        .layout_tx
+        .send(LayoutJob::SetViewportScroll {
+            x: state.viewport_scroll.0,
+            y: state.viewport_scroll.1,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    match reply_rx.await {
+        Ok(Some((display, sticky_moved))) => {
+            // The tree is synced either way — but the list only
+            // submits when a sticky box actually moved. Otherwise
+            // the list is byte-identical to the cached one and a
+            // submit would be a spurious event in the stream (the
+            // shell scrolls its cached list on `ScrollViewport`).
+            if !sticky_moved {
+                return true;
+            }
+            let collect_ms = started.elapsed().as_secs_f32() * 1000.0;
+            state.last_display = Some(Arc::clone(&display));
+            let submit_started = std::time::Instant::now();
+            let submitted = submit(state, events, display).await;
+            state.frame_times.record(FrameSample {
+                total_ms: started.elapsed().as_secs_f32() * 1000.0,
+                layout_ms: 0.0,
+                collect_ms,
+                submit_ms: submit_started.elapsed().as_secs_f32() * 1000.0,
+                layout_kind: RelayoutKind::NothingToDo,
+            });
+            submitted
+        }
+        _ => false,
+    }
+}
+
 /// Apply several container scrolls at once and submit the single
 /// re-collected display list (Stage 8 Rec 9). False when the actor
 /// is gone or holds no tree.
@@ -4576,6 +5411,10 @@ async fn emit_scroll_viewport(
             },
         )
         .await;
+        // M6 Phase 3 (Rec 1/3): the actor's tree learns the new
+        // scroll and the re-collected list submits — sticky
+        // re-positions in the same frame as the scroll.
+        apply_viewport_scroll(state, events).await;
     }
 }
 
@@ -4951,6 +5790,14 @@ async fn resize(
     }
     state.viewport = (width, height);
     state.host.lock().unwrap().set_viewport((width, height));
+    // M6 Phase 3 (Rec 11): the engine resolves viewport units
+    // against the current viewport.
+    state.animation_engine.set_ctx(CalcCtx {
+        font_size: 16.0,
+        root_font_size: 16.0,
+        viewport: (width, height),
+        pct_basis: None,
+    });
     if state.has_document {
         eprintln!("[pluto] worker viewport resized to {width}x{height}, re-layout");
         layout_and_submit(state, events, None, true, std::time::Instant::now()).await;
@@ -7291,11 +8138,12 @@ mod tests {
         let mut hist = FrameTimeHistogram::new();
         assert_eq!(hist.capacity(), 240);
         // The whole histogram is the ring plus four counters and
-        // six per-kind counters (Stage 12 Rec 3): 240 samples ×
-        // 20 bytes, no heap allocation to grow.
+        // seven per-kind counters (Stage 14 Rec 9 adds the
+        // `CompositingOnly` kind to Stage 12 Rec 3's six): 240
+        // samples × 20 bytes, no heap allocation to grow.
         assert_eq!(
             std::mem::size_of::<FrameTimeHistogram>(),
-            FRAME_TIME_SAMPLES * std::mem::size_of::<FrameSample>() + 80
+            FRAME_TIME_SAMPLES * std::mem::size_of::<FrameSample>() + 88
         );
         for v in 0..1000 {
             hist.record(FrameSample {
@@ -7696,5 +8544,54 @@ mod tests {
             std::env::remove_var(crate::renderer_process::TEST_HANG_ENV);
             std::env::remove_var(WATCHDOG_ENV);
         }
+    }
+
+    // M6 Phase 3 (Rec 12): `@font-face` source parsing — the first
+    // `url(...)` wins, `local(...)` is never fetched, empty urls
+    // are skipped.
+    #[test]
+    fn font_src_url_parsing() {
+        assert_eq!(
+            parse_font_src_url("url(fonts/body.woff2) format('woff2')"),
+            Some("fonts/body.woff2".to_string())
+        );
+        assert_eq!(
+            parse_font_src_url(r#"url("fonts/body.woff2")"#),
+            Some("fonts/body.woff2".to_string())
+        );
+        assert_eq!(
+            parse_font_src_url("local('My Font'), url(fallback.woff2)"),
+            Some("fallback.woff2".to_string())
+        );
+        assert_eq!(parse_font_src_url("local('My Font')"), None);
+        assert_eq!(parse_font_src_url("url()"), None);
+        assert_eq!(parse_font_src_url("url(  ) format('woff2')"), None);
+        // An empty first url is skipped, not returned.
+        assert_eq!(
+            parse_font_src_url("url(), url(second.woff2)"),
+            Some("second.woff2".to_string())
+        );
+    }
+
+    #[test]
+    fn font_url_resolution() {
+        assert_eq!(
+            resolve_font_url("https://example.com/css/main.css", "fonts/a.woff2").unwrap(),
+            "https://example.com/css/fonts/a.woff2"
+        );
+        assert_eq!(
+            resolve_font_url("https://example.com/css/main.css", "/fonts/a.woff2").unwrap(),
+            "https://example.com/fonts/a.woff2"
+        );
+        assert_eq!(
+            resolve_font_url("https://example.com/css/main.css", "https://cdn.example.com/a.woff2")
+                .unwrap(),
+            "https://cdn.example.com/a.woff2"
+        );
+        assert_eq!(
+            resolve_font_url("https://example.com/", "data:font/woff2;base64,AAAA").unwrap(),
+            "data:font/woff2;base64,AAAA"
+        );
+        assert!(resolve_font_url("not a url", "fonts/a.woff2").is_err());
     }
 }
