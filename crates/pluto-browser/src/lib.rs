@@ -250,6 +250,24 @@ pub struct PlutoBrowser {
     /// read the real stores: bookmarks from the profile store,
     /// history from the active tab's session history.
     panel: Option<Panel>,
+    /// Vertical tabs on (default) vs the classic top strip (UI
+    /// round, 2026-11-27).
+    vertical_tabs: bool,
+    /// Which edge(s) the vertical strip sits on (default Left).
+    tab_placement: TabPlacement,
+    /// The tab whose flyout is currently shown (or collapsing),
+    /// by strip index — None when no flyout is visible.
+    flyout_tab: Option<usize>,
+    /// The flyout's slide-out progress, 0.0 (collapsed) ..= 1.0
+    /// (fully open). Animated by the hover ticker.
+    flyout_progress: f32,
+    /// The flyout's target progress: 1.0 while a tab is hovered,
+    /// 0.0 while it collapses.
+    flyout_target: f32,
+    /// The vertical scroll offsets of the two tab columns (the
+    /// flyout tracks the hovered tab's on-screen position).
+    left_rail_scroll: f32,
+    right_rail_scroll: f32,
     /// The modifier keys currently held, as of the last key event
     /// (Stage 8 Rec 9): pointer/wheel messages carry no modifiers
     /// of their own, so the shell tracks them here and stamps
@@ -305,6 +323,24 @@ pub enum Message {
     /// Select the tab at this strip index (Stage 11 Rec 4):
     /// clicking its tab-strip button, plus Ctrl+Tab to cycle.
     SelectTab(usize),
+    /// The hamburger menu: flip between vertical and horizontal
+    /// tabs (UI round, 2026-11-27).
+    ToggleTabOrientation,
+    /// The hamburger menu: put the vertical strip on an edge (or
+    /// both). Choosing a placement implies vertical tabs.
+    SetTabPlacement(TabPlacement),
+    /// A vertical tab's chip was hovered (mouse entered): start
+    /// its slide-out flyout.
+    TabHovered(usize),
+    /// The mouse left a vertical tab's chip: collapse its flyout.
+    TabUnhovered(usize),
+    /// One frame of the hover slide-out animation (16 ms ticker
+    /// while a flyout is expanding or collapsing).
+    HoverTick,
+    /// A vertical tab column was scrolled: its new vertical
+    /// offset (the flyout tracks the hovered tab's on-screen
+    /// position).
+    RailScrolled(TabEdge, f32),
     /// A tab's worker subscription started: the tab id and its
     /// command sender.
     RendererReady(u64, CommandSender),
@@ -486,6 +522,23 @@ impl PlutoBrowser {
             self.active_tab -= 1;
         }
         self.sync_window_title();
+    }
+
+    /// Drop any visible flyout (mode switch, tab close, ...):
+    /// strip indices shift when a tab closes, so a stale flyout
+    /// would point at the wrong tab.
+    fn clear_flyout(&mut self) {
+        self.flyout_tab = None;
+        self.flyout_progress = 0.0;
+        self.flyout_target = 0.0;
+    }
+
+    /// Whether the hover slide-out is mid-animation: a flyout is
+    /// shown and its progress has not reached its target yet.
+    /// The ticker subscription runs only while this is true.
+    fn hover_animating(&self) -> bool {
+        self.flyout_tab.is_some()
+            && (self.flyout_progress - self.flyout_target).abs() > f32::EPSILON
     }
 
     /// Post one command to the active tab's worker, if it is
@@ -684,28 +737,335 @@ impl PlutoBrowser {
     /// item (see `menu_items`). It renders in-column below the
     /// nav bar while open — the same list with the same actions
     /// a floating popover would show.
+    /// The hamburger menu (UI round, 2026-11-27): a compact
+    /// 260px dropdown, right-aligned under the hamburger — not
+    /// the half-screen column it was. The four backend items from
+    /// `menu_items()` come first, then the shell-mode switches
+    /// (orientation toggle + the three placement entries), which
+    /// are the only exceptions to the backends-only rule: they
+    /// switch modes the shell really performs.
     fn menu_panel(&self) -> Element<'_, Message> {
-        widget::column([
-            widget::button::text("Bookmarks")
-                .on_press(Message::ShowBookmarks)
+        let mut items: Vec<Element<'_, Message>> = Vec::new();
+        for label in menu_items() {
+            let message = match *label {
+                "Bookmarks" => Message::ShowBookmarks,
+                "History" => Message::ShowHistory,
+                "New Tab" => Message::NewTab,
+                "New Window" => Message::NewWindow,
+                // `menu_items` is the pinned backend list; a new
+                // entry needs a message here too.
+                _ => unreachable!("menu item {label} has no message"),
+            };
+            items.push(
+                widget::button::text(*label)
+                    .class(small_button_style(SmallButtonBase::Text, false))
+                    .on_press(message)
+                    .width(Length::Fill)
+                    .into(),
+            );
+        }
+        items.push(widget::divider::horizontal::default().into());
+        items.push(
+            widget::button::text(orientation_toggle_label(self.vertical_tabs))
+                .class(small_button_style(SmallButtonBase::Text, false))
+                .on_press(Message::ToggleTabOrientation)
                 .width(Length::Fill)
                 .into(),
-            widget::button::text("History")
-                .on_press(Message::ShowHistory)
-                .width(Length::Fill)
-                .into(),
-            widget::button::text("New Tab")
-                .on_press(Message::NewTab)
-                .width(Length::Fill)
-                .into(),
-            widget::button::text("New Window")
-                .on_press(Message::NewWindow)
-                .width(Length::Fill)
-                .into(),
+        );
+        for placement in [TabPlacement::Left, TabPlacement::Right, TabPlacement::Both] {
+            let label = if placement == self.tab_placement {
+                format!("{} ✓", placement_label(placement))
+            } else {
+                placement_label(placement).to_string()
+            };
+            items.push(
+                widget::button::text(label)
+                    .class(small_button_style(SmallButtonBase::Text, false))
+                    .on_press(Message::SetTabPlacement(placement))
+                    .width(Length::Fill)
+                    .into(),
+            );
+        }
+        let panel = widget::column(items).spacing(4).padding(8);
+        let boxed = widget::container(panel)
+            .width(Length::Fixed(MENU_PANEL_WIDTH))
+            .style(panel_container_style);
+        widget::row([
+            cosmic::iced::widget::space().width(Length::Fill).into(),
+            boxed.into(),
         ])
-        .spacing(4)
-        .padding(8)
         .into()
+    }
+
+    /// The classic top tab strip (horizontal mode, as before):
+    /// one button per tab — favicon (when the site has one) plus
+    /// title — the active tab's button is marked selected; every
+    /// tab carries a "×" close button. "+" opens a new tab.
+    fn tab_strip(&self) -> Element<'_, Message> {
+        let mut tab_row: Vec<Element<'_, Message>> = Vec::new();
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let tab_children: Vec<Element<'_, Message>> = vec![
+                self.favicon_element(tab),
+                widget::text(tab.title.clone()).into(),
+                widget::button::text("×")
+                    .class(small_button_style(SmallButtonBase::Text, false))
+                    .on_press(Message::CloseTab(index))
+                    .into(),
+            ];
+            let tab_button = widget::button::custom(widget::row(tab_children).spacing(4))
+                .class(small_button_style(
+                    SmallButtonBase::Standard,
+                    index == self.active_tab,
+                ))
+                .selected(index == self.active_tab)
+                .on_press(Message::SelectTab(index));
+            tab_row.push(tab_button.into());
+        }
+        tab_row.push(
+            widget::button::text("+")
+                .class(small_button_style(SmallButtonBase::Text, false))
+                .on_press(Message::NewTab)
+                .into(),
+        );
+        widget::row(tab_row).spacing(4).padding(4).into()
+    }
+
+    /// The bookmarks bar, directly below the nav bar: one button
+    /// per bookmark, in store order. None when there are no
+    /// bookmarks yet (no dead empty bar).
+    fn bookmarks_bar(&self) -> Option<Element<'_, Message>> {
+        let entries = bookmarks_bar_entries(&self.bookmarks);
+        if entries.is_empty() {
+            return None;
+        }
+        let mut children: Vec<Element<'_, Message>> = Vec::new();
+        for (title, url) in entries {
+            children.push(
+                widget::button::text(ellipsize(&title, 24))
+                    .class(small_button_style(SmallButtonBase::Text, false))
+                    .on_press(Message::NavigateTo(url))
+                    .into(),
+            );
+        }
+        Some(widget::row(children).spacing(4).padding(4).into())
+    }
+
+    /// The vertical-mode content: the web view as the base layer,
+    /// spanning the full width, with the floating tab columns
+    /// layered on top of it (and the hover flyout above those).
+    fn vertical_content<'a>(
+        &'a self,
+        web_view: Element<'a, Message>,
+    ) -> Element<'a, Message> {
+        let capacity = rail_capacity(self.viewport.1);
+        let mut layers: Vec<Element<'_, Message>> = vec![web_view];
+        for edge in tab_strip_edges(self.tab_placement) {
+            let (start, count) =
+                column_range(self.tab_placement, *edge, self.tabs.len(), capacity);
+            if count > 0 {
+                layers.push(self.rail_overlay(*edge, start, count));
+            }
+        }
+        if let Some(flyout) = self.flyout_element() {
+            layers.push(flyout);
+        }
+        cosmic::iced::widget::stack(layers)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// One floating tab column, pinned to its edge over the web
+    /// view: scrollable collapsed chips for tabs
+    /// `start..start + count`, with the "+" button pinned at the
+    /// bottom.
+    fn rail_overlay(&self, edge: TabEdge, start: usize, count: usize) -> Element<'_, Message> {
+        let align = match edge {
+            TabEdge::Left => Alignment::Start,
+            TabEdge::Right => Alignment::End,
+        };
+        let mut tab_children: Vec<Element<'_, Message>> = Vec::new();
+        for (i, tab) in self.tabs.iter().enumerate().skip(start).take(count) {
+            tab_children.push(self.tab_chip(i, tab));
+        }
+        let tab_column = widget::column(tab_children)
+            .spacing(TAB_GAP)
+            .width(Length::Fill)
+            .align_x(align);
+        let scrolled = cosmic::iced::widget::scrollable(tab_column)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+                Default::default(),
+            ))
+            .on_scroll(move |viewport| {
+                Message::RailScrolled(edge, viewport.absolute_offset().y)
+            });
+        let rail = widget::column([scrolled.into(), self.plus_chip()])
+            .spacing(TAB_GAP)
+            .padding(TAB_GAP)
+            .align_x(align)
+            .width(Length::Fixed(RAIL_WIDTH))
+            .height(Length::Fill);
+        match edge {
+            TabEdge::Left => widget::row([
+                rail.into(),
+                cosmic::iced::widget::space().width(Length::Fill).into(),
+            ])
+            .height(Length::Fill)
+            .into(),
+            TabEdge::Right => widget::row([
+                cosmic::iced::widget::space().width(Length::Fill).into(),
+                rail.into(),
+            ])
+            .height(Length::Fill)
+            .into(),
+        }
+    }
+
+    /// One collapsed tab chip: a 32px square showing only the
+    /// favicon (or the site's initial letter when it has none),
+    /// floating on the page as a chip with its own background and
+    /// shadow. Clicking selects the tab; hovering starts the
+    /// slide-out flyout.
+    fn tab_chip(&self, index: usize, tab: &Tab) -> Element<'_, Message> {
+        let active = index == self.active_tab;
+        let content = widget::container(self.favicon_element(tab))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        let button = widget::button::custom(content)
+            .class(cosmic::theme::Button::Transparent)
+            .on_press(Message::SelectTab(index))
+            .width(Length::Fixed(TAB_CHIP))
+            .height(Length::Fixed(TAB_CHIP));
+        let chip = widget::container(button).style(move |theme| tab_chip_style(theme, active));
+        cosmic::iced::widget::mouse_area(chip)
+            .on_enter(Message::TabHovered(index))
+            .on_exit(Message::TabUnhovered(index))
+            .into()
+    }
+
+    /// The "+" new-tab chip, pinned at a column's bottom.
+    fn plus_chip(&self) -> Element<'_, Message> {
+        let content = widget::container(widget::text("+"))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        let button = widget::button::custom(content)
+            .class(cosmic::theme::Button::Transparent)
+            .on_press(Message::NewTab)
+            .width(Length::Fixed(TAB_CHIP))
+            .height(Length::Fixed(TAB_CHIP));
+        widget::container(button)
+            .style(|theme| tab_chip_style(theme, false))
+            .into()
+    }
+
+    /// The hovered tab's slide-out flyout, layered above the
+    /// rails: the chip elongates to 200px, revealing the centered
+    /// title and the close button. None when no flyout is
+    /// visible. The flyout tracks the hovered tab's on-screen
+    /// position (its column, its index in the column, minus the
+    /// column's scroll offset).
+    fn flyout_element(&self) -> Option<Element<'_, Message>> {
+        let index = self.flyout_tab?;
+        if self.flyout_progress <= 0.0 || index >= self.tabs.len() {
+            return None;
+        }
+        let capacity = rail_capacity(self.viewport.1);
+        let (edge, idx_in_column) =
+            flyout_column_position(self.tab_placement, index, self.tabs.len(), capacity)?;
+        let tab = &self.tabs[index];
+        let active = index == self.active_tab;
+        let width = flyout_width(self.flyout_progress);
+        let mut row_children: Vec<Element<'_, Message>> = vec![self.favicon_element(tab)];
+        if flyout_shows_text(self.flyout_progress) {
+            row_children.push(
+                widget::text(ellipsize(&tab.title, 28))
+                    .width(Length::Fill)
+                    .align_x(Alignment::Center)
+                    .into(),
+            );
+            row_children.push(
+                widget::button::text("×")
+                    .class(small_button_style(SmallButtonBase::Text, false))
+                    .on_press(Message::CloseTab(index))
+                    .into(),
+            );
+        }
+        let button = widget::button::custom(widget::row(row_children).spacing(TAB_GAP))
+            .class(cosmic::theme::Button::Transparent)
+            .on_press(Message::SelectTab(index))
+            .width(Length::Fixed(width))
+            .height(Length::Fixed(TAB_CHIP));
+        let chip = widget::container(button).style(move |theme| tab_chip_style(theme, active));
+        let hovered = cosmic::iced::widget::mouse_area(chip)
+            .on_enter(Message::TabHovered(index))
+            .on_exit(Message::TabUnhovered(index));
+        let scroll = match edge {
+            TabEdge::Left => self.left_rail_scroll,
+            TabEdge::Right => self.right_rail_scroll,
+        };
+        let y = (TAB_GAP + idx_in_column as f32 * TAB_PITCH - scroll).max(0.0);
+        let flyout_row = match edge {
+            TabEdge::Left => widget::row([
+                cosmic::iced::widget::space().width(Length::Fixed(TAB_GAP)).into(),
+                hovered.into(),
+                cosmic::iced::widget::space().width(Length::Fill).into(),
+            ]),
+            TabEdge::Right => widget::row([
+                cosmic::iced::widget::space().width(Length::Fill).into(),
+                hovered.into(),
+                cosmic::iced::widget::space().width(Length::Fixed(TAB_GAP)).into(),
+            ]),
+        };
+        Some(
+            widget::column([
+                cosmic::iced::widget::space().height(Length::Fixed(y)).into(),
+                flyout_row.into(),
+            ])
+            .height(Length::Fill)
+            .into(),
+        )
+    }
+
+    /// A tab's favicon as a 16px image, or the site's initial
+    /// letter when it has no favicon yet (the host's initial —
+    /// "example.com" → 'E' — or the title's first character).
+    fn favicon_element(&self, tab: &Tab) -> Element<'_, Message> {
+        if let Some(favicon_id) = tab.favicon_id
+            && let Some(pluto_paint::Resource::Image {
+                width,
+                height,
+                rgba,
+            }) = tab.resources.resources.get(&favicon_id)
+        {
+            // A fresh handle per frame: the favicon is 32x32
+            // (4 KiB), so the re-upload is negligible — but
+            // the atlas never dedups it, by design of
+            // `from_pixels` (a new id per handle).
+            let handle = cosmic::iced::widget::image::Handle::from_rgba(
+                *width,
+                *height,
+                rgba.clone(),
+            );
+            return cosmic::iced::widget::image(handle)
+                .width(Length::Fixed(16.0))
+                .height(Length::Fixed(16.0))
+                .into();
+        }
+        let url = tab
+            .active_url
+            .strip_prefix("https://")
+            .or_else(|| tab.active_url.strip_prefix("http://"))
+            .unwrap_or(&tab.active_url);
+        let host = url.split('/').next().unwrap_or(url);
+        let letter = host
+            .chars()
+            .next()
+            .or_else(|| tab.title.chars().next())
+            .unwrap_or('?')
+            .to_ascii_uppercase();
+        widget::text(letter.to_string()).into()
     }
 
     /// The open Bookmarks/History list panel: a header row plus
@@ -723,6 +1083,7 @@ impl PlutoBrowser {
             widget::row([
                 widget::text(title).into(),
                 widget::button::text("Close")
+                    .class(small_button_style(SmallButtonBase::Text, false))
                     .on_press(Message::ClosePanel)
                     .into(),
             ])
@@ -743,10 +1104,12 @@ impl PlutoBrowser {
                     children.push(
                         widget::row([
                             widget::button::text(bookmark.title.clone())
+                                .class(small_button_style(SmallButtonBase::Text, false))
                                 .on_press(Message::NavigateTo(url.clone()))
                                 .width(Length::Fill)
                                 .into(),
                             widget::button::text("Remove")
+                                .class(small_button_style(SmallButtonBase::Text, false))
                                 .on_press(Message::RemoveBookmark(url))
                                 .into(),
                         ])
@@ -766,6 +1129,7 @@ impl PlutoBrowser {
                 for entry in history.iter().rev().take(HISTORY_PANEL_LIMIT) {
                     children.push(
                         widget::button::text(entry.url.clone())
+                            .class(small_button_style(SmallButtonBase::Text, false))
                             .on_press(Message::NavigateTo(entry.url.clone()))
                             .width(Length::Fill)
                             .into(),
@@ -773,7 +1137,10 @@ impl PlutoBrowser {
                 }
             }
         }
-        widget::column(children).spacing(4).padding(8).into()
+        widget::container(widget::column(children).spacing(4).padding(8))
+            .width(Length::Fill)
+            .style(panel_container_style)
+            .into()
     }
 }
 
@@ -788,6 +1155,404 @@ pub enum Panel {
 /// first): the session history is unbounded in memory, but the
 /// panel is a plain list, so it caps at the newest 50.
 pub const HISTORY_PANEL_LIMIT: usize = 50;
+
+/// The shell's corner radius (UI round, 2026-11-27): squared-off
+/// controls at 4.0px — way less rounded than the theme default,
+/// but not straight squares. Applied per-widget (Custom styles
+/// and container styles); the theme itself is untouched, so the
+/// round nav icons stay round.
+pub const SHELL_RADIUS: f32 = 4.0;
+
+/// The hamburger menu panel's fixed width (Chrome/Firefox-sized,
+/// not half-screen).
+pub const MENU_PANEL_WIDTH: f32 = 260.0;
+
+/// A collapsed vertical tab chip: a 32px square showing only the
+/// favicon (UI round, 2026-11-27).
+pub const TAB_CHIP: f32 = 32.0;
+
+/// A hovered vertical tab's flyout width: favicon + centered title
+/// + close button.
+pub const TAB_FLYOUT: f32 = 200.0;
+
+/// The gap between tabs in a vertical column, and the rail's
+/// padding on every side.
+pub const TAB_GAP: f32 = 4.0;
+
+/// A vertical tab column's width: the 32px chip plus the rail
+/// padding on both sides.
+pub const RAIL_WIDTH: f32 = 44.0;
+
+/// One tab's pitch in a vertical column: chip + gap.
+pub const TAB_PITCH: f32 = TAB_CHIP + TAB_GAP;
+
+/// Vertical tabs on by default (UI round, 2026-11-27).
+pub const DEFAULT_VERTICAL_TABS: bool = true;
+
+/// The default tab placement: the left edge.
+pub const DEFAULT_TAB_PLACEMENT: TabPlacement = TabPlacement::Left;
+
+/// The hover slide-out's frame interval (~60 fps).
+pub const HOVER_TICK: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// One hover tick's progress step: 18 ticks ≈ 0.3 s, the mockup's
+/// slide-out duration.
+pub const HOVER_TICK_STEP: f32 = 1.0 / 18.0;
+
+/// Which edge(s) the vertical tab strip sits on (UI round,
+/// 2026-11-27). Placement and orientation are independent: the
+/// strip can be horizontal (the classic top strip) or vertical on
+/// one edge or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TabPlacement {
+    /// A single column on the left edge (the default).
+    #[default]
+    Left,
+    /// A single column on the right edge.
+    Right,
+    /// Columns on both edges: the left fills first, the overflow
+    /// spills to the right.
+    Both,
+}
+
+/// One edge of the window a vertical tab column can sit on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabEdge {
+    Left,
+    Right,
+}
+
+/// The edges a placement mode puts a tab column on.
+pub fn tab_strip_edges(mode: TabPlacement) -> &'static [TabEdge] {
+    match mode {
+        TabPlacement::Left => &[TabEdge::Left],
+        TabPlacement::Right => &[TabEdge::Right],
+        TabPlacement::Both => &[TabEdge::Left, TabEdge::Right],
+    }
+}
+
+/// How many tabs fit in one vertical column of `height` px: 32px
+/// chips + 4px gaps, 4px rail padding top and bottom, and the 32px
+/// "+" button + one gap at the bottom. At least one — a column
+/// always shows its first tab.
+pub fn rail_capacity(height: f32) -> usize {
+    ((height - 2.0 * TAB_GAP - TAB_CHIP - TAB_GAP) / TAB_PITCH)
+        .floor()
+        .max(1.0) as usize
+}
+
+/// Split the ordered tab list across the two columns in Both mode:
+/// fill the left column first; only the overflow goes right.
+/// Returns (left_count, right_count).
+pub fn distribute_tabs(tab_count: usize, capacity: usize) -> (usize, usize) {
+    let left = tab_count.min(capacity);
+    (left, tab_count - left)
+}
+
+/// Which tabs a column shows: (start index, count) into the one
+/// ordered tab list. Both columns read the same list — the left
+/// takes the first `capacity` tabs, the right the rest; a
+/// single-column mode shows the whole list on its edge.
+pub fn column_range(
+    placement: TabPlacement,
+    edge: TabEdge,
+    tab_count: usize,
+    capacity: usize,
+) -> (usize, usize) {
+    match (placement, edge) {
+        (TabPlacement::Left, TabEdge::Left) | (TabPlacement::Right, TabEdge::Right) => {
+            (0, tab_count)
+        }
+        (TabPlacement::Both, TabEdge::Left) => {
+            let (left, _) = distribute_tabs(tab_count, capacity);
+            (0, left)
+        }
+        (TabPlacement::Both, TabEdge::Right) => {
+            let (left, right) = distribute_tabs(tab_count, capacity);
+            (left, right)
+        }
+        _ => (0, 0),
+    }
+}
+
+/// Where a tab's flyout goes: (edge, index within that column).
+/// None when the tab is not in a visible column.
+pub fn flyout_column_position(
+    placement: TabPlacement,
+    index: usize,
+    tab_count: usize,
+    capacity: usize,
+) -> Option<(TabEdge, usize)> {
+    if index >= tab_count {
+        return None;
+    }
+    match placement {
+        TabPlacement::Left => Some((TabEdge::Left, index)),
+        TabPlacement::Right => Some((TabEdge::Right, index)),
+        TabPlacement::Both => {
+            let (left, _) = distribute_tabs(tab_count, capacity);
+            if index < left {
+                Some((TabEdge::Left, index))
+            } else {
+                Some((TabEdge::Right, index - left))
+            }
+        }
+    }
+}
+
+/// The flyout's width at `progress` (0.0 collapsed ..= 1.0 open):
+/// the 32px chip elongates to the 200px flyout.
+pub fn flyout_width(progress: f32) -> f32 {
+    TAB_CHIP + (TAB_FLYOUT - TAB_CHIP) * progress.clamp(0.0, 1.0)
+}
+
+/// Whether the flyout shows its title and close button yet: only
+/// once it is more than half open, so the text never squeezes
+/// into a half-grown chip.
+pub fn flyout_shows_text(progress: f32) -> bool {
+    progress > 0.5
+}
+
+/// The orientation toggle's label: it names the OTHER mode.
+pub fn orientation_toggle_label(vertical_tabs: bool) -> &'static str {
+    if vertical_tabs {
+        "Horizontal tabs"
+    } else {
+        "Vertical tabs"
+    }
+}
+
+/// A placement entry's label.
+pub fn placement_label(placement: TabPlacement) -> &'static str {
+    match placement {
+        TabPlacement::Left => "Tabs on left",
+        TabPlacement::Right => "Tabs on right",
+        TabPlacement::Both => "Tabs on both sides",
+    }
+}
+
+/// The bookmarks bar's entries, in store order: (title, url).
+/// The bar reads the store, never a hardcoded list.
+pub fn bookmarks_bar_entries(store: &BookmarkStore) -> Vec<(String, String)> {
+    store
+        .bookmarks()
+        .iter()
+        .map(|b| (b.title.clone(), b.url.clone()))
+        .collect()
+}
+
+/// Shorten `s` to at most `max_chars` characters for a bar button
+/// (bookmark titles are URLs, and a long one would push the rest
+/// of the bar off-screen).
+fn ellipsize(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Which theme button a 4.0px-radius shell button is based on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmallButtonBase {
+    /// The plain button (horizontal tab strip tabs).
+    Standard,
+    /// The plain text button (menu items, bookmarks bar, list panels).
+    Text,
+    /// The accent (suggested) button — the nav bar's Go button.
+    Suggested,
+}
+
+impl SmallButtonBase {
+    fn class(self) -> cosmic::theme::Button {
+        match self {
+            SmallButtonBase::Standard => cosmic::theme::Button::Standard,
+            SmallButtonBase::Text => cosmic::theme::Button::Text,
+            SmallButtonBase::Suggested => cosmic::theme::Button::Suggested,
+        }
+    }
+}
+
+/// A `Button::Custom` style that looks exactly like the theme's
+/// `base` button but with the shell's 4.0px radius (UI round,
+/// 2026-11-27). `selected` is baked in — the Custom closures do
+/// not receive it.
+fn small_button_style(base: SmallButtonBase, selected: bool) -> cosmic::theme::Button {
+    use cosmic::iced::core::border::Radius;
+    use cosmic::widget::button::Style as ButtonStyle;
+    let radius = Radius::from(SHELL_RADIUS);
+    cosmic::theme::Button::Custom {
+        active: Box::new(move |focused, theme| {
+            let mut style: ButtonStyle =
+                <cosmic::Theme as cosmic::widget::button::Catalog>::active(
+                    theme,
+                    focused,
+                    selected,
+                    &base.class(),
+                );
+            style.border_radius = radius;
+            style
+        }),
+        disabled: Box::new(move |theme| {
+            let mut style: ButtonStyle =
+                <cosmic::Theme as cosmic::widget::button::Catalog>::disabled(
+                    theme,
+                    &base.class(),
+                );
+            style.border_radius = radius;
+            style
+        }),
+        hovered: Box::new(move |focused, theme| {
+            let mut style: ButtonStyle =
+                <cosmic::Theme as cosmic::widget::button::Catalog>::hovered(
+                    theme,
+                    focused,
+                    selected,
+                    &base.class(),
+                );
+            style.border_radius = radius;
+            style
+        }),
+        pressed: Box::new(move |focused, theme| {
+            let mut style: ButtonStyle =
+                <cosmic::Theme as cosmic::widget::button::Catalog>::pressed(
+                    theme,
+                    focused,
+                    selected,
+                    &base.class(),
+                );
+            style.border_radius = radius;
+            style
+        }),
+    }
+}
+
+/// A `TextInput::Custom` style that looks exactly like the theme's
+/// default input but with the shell's 4.0px radius (UI round,
+/// 2026-11-27): the URL bar.
+fn small_text_input_style() -> cosmic::theme::TextInput {
+    use cosmic::iced::core::border::Radius;
+    use cosmic::widget::text_input::Appearance;
+    let radius = Radius::from(SHELL_RADIUS);
+    cosmic::theme::TextInput::Custom {
+        active: Box::new(move |theme| {
+            let mut appearance: Appearance =
+                <cosmic::Theme as cosmic::widget::text_input::StyleSheet>::active(
+                    theme,
+                    &cosmic::theme::TextInput::Default,
+                );
+            appearance.border_radius = radius;
+            appearance
+        }),
+        error: Box::new(move |theme| {
+            let mut appearance: Appearance =
+                <cosmic::Theme as cosmic::widget::text_input::StyleSheet>::error(
+                    theme,
+                    &cosmic::theme::TextInput::Default,
+                );
+            appearance.border_radius = radius;
+            appearance
+        }),
+        hovered: Box::new(move |theme| {
+            let mut appearance: Appearance =
+                <cosmic::Theme as cosmic::widget::text_input::StyleSheet>::hovered(
+                    theme,
+                    &cosmic::theme::TextInput::Default,
+                );
+            appearance.border_radius = radius;
+            appearance
+        }),
+        focused: Box::new(move |theme| {
+            let mut appearance: Appearance =
+                <cosmic::Theme as cosmic::widget::text_input::StyleSheet>::focused(
+                    theme,
+                    &cosmic::theme::TextInput::Default,
+                );
+            appearance.border_radius = radius;
+            appearance
+        }),
+        disabled: Box::new(move |theme| {
+            let mut appearance: Appearance =
+                <cosmic::Theme as cosmic::widget::text_input::StyleSheet>::disabled(
+                    theme,
+                    &cosmic::theme::TextInput::Default,
+                );
+            appearance.border_radius = radius;
+            appearance
+        }),
+    }
+}
+
+/// A floating tab chip's container style: the theme's component
+/// background, a 4.0px radius, a 1px divider border (2px accent
+/// when active), and a drop shadow so the chip stays readable
+/// floating over any page (UI round, 2026-11-27).
+fn tab_chip_style(theme: &cosmic::Theme, active: bool) -> cosmic::iced::widget::container::Style {
+    use cosmic::iced::core::{Background, Border, Color, Shadow, Vector, border::Radius};
+    let component = &theme.current_container().component;
+    let (background, border_color, border_width) = if active {
+        (
+            Color::from(component.hover),
+            Color::from(theme.cosmic().accent_color()),
+            2.0,
+        )
+    } else {
+        (
+            Color::from(component.base),
+            Color::from(component.divider),
+            1.0,
+        )
+    };
+    cosmic::iced::widget::container::Style {
+        background: Some(Background::Color(background)),
+        border: Border {
+            radius: Radius::from(SHELL_RADIUS),
+            width: border_width,
+            color: border_color,
+        },
+        shadow: Shadow {
+            color: Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.35,
+            },
+            offset: Vector::new(0.0, 2.0),
+            blur_radius: 8.0,
+        },
+        ..Default::default()
+    }
+}
+
+/// A menu / list panel's container style: the theme's component
+/// background, a 4.0px radius, a 1px divider border, and a drop
+/// shadow (UI round, 2026-11-27).
+fn panel_container_style(theme: &cosmic::Theme) -> cosmic::iced::widget::container::Style {
+    use cosmic::iced::core::{Background, Border, Color, Shadow, Vector, border::Radius};
+    let component = &theme.current_container().component;
+    cosmic::iced::widget::container::Style {
+        background: Some(Background::Color(Color::from(component.base))),
+        border: Border {
+            radius: Radius::from(SHELL_RADIUS),
+            width: 1.0,
+            color: Color::from(component.divider),
+        },
+        shadow: Shadow {
+            color: Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.30,
+            },
+            offset: Vector::new(0.0, 4.0),
+            blur_radius: 16.0,
+        },
+        ..Default::default()
+    }
+}
+
 
 /// The hamburger menu's items, in order. The menu lists ONLY
 /// items with a working backend behind them (Joel's rule): each
@@ -1013,6 +1778,13 @@ impl Application for PlutoBrowser {
             bookmarks: load_bookmarks(),
             menu_open: false,
             panel: None,
+            vertical_tabs: DEFAULT_VERTICAL_TABS,
+            tab_placement: DEFAULT_TAB_PLACEMENT,
+            flyout_tab: None,
+            flyout_progress: 0.0,
+            flyout_target: 0.0,
+            left_rail_scroll: 0.0,
+            right_rail_scroll: 0.0,
             modifiers: pluto_ipc::Modifiers::default(),
             buttons_held: 0,
             last_wheel: None,
@@ -1061,6 +1833,14 @@ impl Application for PlutoBrowser {
             .collect();
         subscriptions.push(cosmic::iced::event::listen_with(window_visibility));
         subscriptions.push(cosmic::iced::event::listen_with(keyboard_event));
+        // The hover slide-out's ticker (UI round, 2026-11-27):
+        // only while a flyout is expanding or collapsing, so the
+        // shell is not woken at 60 fps the rest of the time.
+        if self.hover_animating() {
+            subscriptions.push(
+                cosmic::iced::time::every(HOVER_TICK).map(|_| Message::HoverTick),
+            );
+        }
         cosmic::iced::Subscription::batch(subscriptions)
     }
 
@@ -1101,6 +1881,9 @@ impl Application for PlutoBrowser {
             }
             Message::CloseTab(index) => {
                 self.close_tab(index);
+                // Strip indices shift on close: a stale flyout
+                // would point at the wrong tab.
+                self.clear_flyout();
             }
             Message::SelectTab(index) => {
                 if index < self.tabs.len() && index != self.active_tab {
@@ -1944,6 +2727,53 @@ impl Application for PlutoBrowser {
             Message::ClosePanel => {
                 self.panel = None;
             }
+            Message::ToggleTabOrientation => {
+                self.vertical_tabs = !self.vertical_tabs;
+                self.menu_open = false;
+                self.clear_flyout();
+            }
+            Message::SetTabPlacement(placement) => {
+                // Choosing a placement implies vertical tabs: a
+                // placement entry must always visibly do something.
+                self.tab_placement = placement;
+                self.vertical_tabs = true;
+                self.menu_open = false;
+                self.clear_flyout();
+            }
+            Message::TabHovered(index) => {
+                if index < self.tabs.len() {
+                    self.flyout_tab = Some(index);
+                    self.flyout_target = 1.0;
+                }
+            }
+            Message::TabUnhovered(index) => {
+                if self.flyout_tab == Some(index) {
+                    self.flyout_target = 0.0;
+                }
+            }
+            Message::HoverTick => {
+                if self.flyout_tab.is_some() {
+                    if self.flyout_progress < self.flyout_target {
+                        self.flyout_progress =
+                            (self.flyout_progress + HOVER_TICK_STEP).min(self.flyout_target);
+                    } else if self.flyout_progress > self.flyout_target {
+                        self.flyout_progress =
+                            (self.flyout_progress - HOVER_TICK_STEP).max(self.flyout_target);
+                    }
+                    // Fully collapsed: drop the flyout (and the
+                    // ticker with it — see `hover_animating`).
+                    if self.flyout_target < 0.5
+                        && (self.flyout_progress - self.flyout_target).abs()
+                            <= f32::EPSILON
+                    {
+                        self.flyout_tab = None;
+                    }
+                }
+            }
+            Message::RailScrolled(edge, offset) => match edge {
+                TabEdge::Left => self.left_rail_scroll = offset,
+                TabEdge::Right => self.right_rail_scroll = offset,
+            },
             Message::NavigateTo(url) => {
                 self.menu_open = false;
                 self.panel = None;
@@ -1997,55 +2827,6 @@ impl Application for PlutoBrowser {
                 "../assets/icons/star-symbolic.svg"
             )))
         };
-        // The tab strip (Stage 11 Rec 4): one button per tab —
-        // favicon (when the site has one) plus title — the active
-        // tab's button is marked selected; every tab carries a
-        // "×" close button. "+" opens a new tab. Clicking a tab
-        // swaps the active compositor with no re-fetch and no
-        // re-layout.
-        let mut tab_row: Vec<Element<'_, Message>> = Vec::new();
-        for (index, tab) in self.tabs.iter().enumerate() {
-            let mut tab_children: Vec<Element<'_, Message>> = Vec::new();
-            if let Some(favicon_id) = tab.favicon_id
-                && let Some(pluto_paint::Resource::Image {
-                    width,
-                    height,
-                    rgba,
-                }) = tab.resources.resources.get(&favicon_id)
-            {
-                // A fresh handle per frame: the favicon is 32x32
-                // (4 KiB), so the re-upload is negligible — but
-                // the atlas never dedups it, by design of
-                // `from_pixels` (a new id per handle).
-                let handle = cosmic::iced::widget::image::Handle::from_rgba(
-                    *width,
-                    *height,
-                    rgba.clone(),
-                );
-                tab_children.push(
-                    cosmic::iced::widget::image(handle)
-                        .width(Length::Fixed(16.0))
-                        .height(Length::Fixed(16.0))
-                        .into(),
-                );
-            }
-            tab_children.push(widget::text(tab.title.clone()).into());
-            tab_children.push(
-                widget::button::text("×")
-                    .on_press(Message::CloseTab(index))
-                    .into(),
-            );
-            let tab_button = widget::button::custom(widget::row(tab_children).spacing(4))
-                .selected(index == self.active_tab)
-                .on_press(Message::SelectTab(index));
-            tab_row.push(tab_button.into());
-        }
-        tab_row.push(
-            widget::button::text("+")
-                .on_press(Message::NewTab)
-                .into(),
-        );
-        let tab_strip = widget::row(tab_row).spacing(4).padding(4);
         // The bookmark star (filled when the current page is
         // bookmarked) and the hamburger menu, both right after
         // Go. Round icon buttons like the other nav icons; Go
@@ -2069,9 +2850,11 @@ impl Application for PlutoBrowser {
             widget::text_input("Enter URL...", &active.url_input)
                 .on_input(Message::UrlChanged)
                 .on_submit(|_| Message::Navigate)
+                .style(small_text_input_style())
                 .width(Length::Fill)
                 .into(),
             widget::button::suggested("Go")
+                .class(small_button_style(SmallButtonBase::Suggested, false))
                 .on_press(Message::Navigate)
                 .into(),
             star.on_press(Message::ToggleBookmark).into(),
@@ -2117,15 +2900,27 @@ impl Application for PlutoBrowser {
         };
         let status = widget::row([widget::text(status_text).size(12).into()]).padding(4);
 
-        // The menu and list panels render in-column below the
-        // nav bar while open; the web view and status line sit
-        // below them.
-        let mut children: Vec<Element<'_, Self::Message>> = vec![
-            tab_strip.into(),
-            widget::divider::horizontal::default().into(),
-            nav_bar.into(),
-            widget::divider::horizontal::default().into(),
-        ];
+        // The column (UI round, 2026-11-27): the nav bar and the
+        // bookmarks bar span the full window width; in vertical
+        // mode the tab columns start underneath the bookmarks
+        // bar, flanking only the web view (see
+        // `vertical_content`); the status line spans the full
+        // width at the bottom. In horizontal mode the classic
+        // top tab strip sits above the nav bar, as before.
+        let mut children: Vec<Element<'_, Self::Message>> = Vec::new();
+        if !self.vertical_tabs {
+            children.push(self.tab_strip());
+            children.push(widget::divider::horizontal::default().into());
+        }
+        children.push(nav_bar.into());
+        children.push(widget::divider::horizontal::default().into());
+        if self.menu_open {
+            children.push(self.menu_panel());
+            children.push(widget::divider::horizontal::default().into());
+        }
+        if let Some(bar) = self.bookmarks_bar() {
+            children.push(bar);
+        }
         // Stage 11 Rec 9: the thin progress bar under the nav
         // bar, while a document load is in flight. Indeterminate
         // (no Content-Length) shows as a half bar, not a
@@ -2142,15 +2937,15 @@ impl Application for PlutoBrowser {
                 cosmic::iced::widget::progress_bar(0.0..=1.0, fraction).into(),
             );
         }
-        if self.menu_open {
-            children.push(self.menu_panel());
-            children.push(widget::divider::horizontal::default().into());
-        }
         if let Some(panel) = self.panel {
             children.push(self.list_panel(panel));
             children.push(widget::divider::horizontal::default().into());
         }
-        children.push(web_view.into());
+        if self.vertical_tabs {
+            children.push(self.vertical_content(web_view.into()));
+        } else {
+            children.push(web_view.into());
+        }
         children.push(widget::divider::horizontal::default().into());
         children.push(status.into());
         widget::column(children).into()
@@ -2348,5 +3143,183 @@ mod tests {
         assert_eq!(shown.len(), HISTORY_PANEL_LIMIT);
         assert_eq!(shown[0].url, "https://example.com/59");
         assert_eq!(shown[49].url, "https://example.com/10");
+    }
+
+    // UI round (2026-11-27): vertical tabs on by default, on the
+    // left edge; the orientation toggle names the other mode.
+    // The constant pins are the contract — the allow is
+    // deliberate, matching the tree's other constant pins.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn vertical_tabs_default_on_and_left() {
+        assert!(DEFAULT_VERTICAL_TABS);
+        assert_eq!(DEFAULT_TAB_PLACEMENT, TabPlacement::Left);
+        assert_eq!(orientation_toggle_label(true), "Horizontal tabs");
+        assert_eq!(orientation_toggle_label(false), "Vertical tabs");
+        assert_eq!(placement_label(TabPlacement::Left), "Tabs on left");
+        assert_eq!(placement_label(TabPlacement::Right), "Tabs on right");
+        assert_eq!(
+            placement_label(TabPlacement::Both),
+            "Tabs on both sides"
+        );
+    }
+
+    #[test]
+    fn tab_strip_edges_cover_each_mode() {
+        assert_eq!(tab_strip_edges(TabPlacement::Left), &[TabEdge::Left]);
+        assert_eq!(
+            tab_strip_edges(TabPlacement::Right),
+            &[TabEdge::Right]
+        );
+        assert_eq!(
+            tab_strip_edges(TabPlacement::Both),
+            &[TabEdge::Left, TabEdge::Right]
+        );
+    }
+
+    #[test]
+    fn rail_capacity_matches_mockup_geometry() {
+        // The mockup's 648px web view holds 16 tabs; the default
+        // 768px viewport holds 20; a tiny view still holds one.
+        assert_eq!(rail_capacity(648.0), 16);
+        assert_eq!(rail_capacity(768.0), 20);
+        assert_eq!(rail_capacity(100.0), 1);
+        assert_eq!(rail_capacity(0.0), 1);
+    }
+
+    #[test]
+    fn distribute_tabs_fills_left_then_spills_right() {
+        assert_eq!(distribute_tabs(0, 16), (0, 0));
+        assert_eq!(distribute_tabs(5, 16), (5, 0));
+        assert_eq!(distribute_tabs(16, 16), (16, 0));
+        assert_eq!(distribute_tabs(17, 16), (16, 1));
+        assert_eq!(distribute_tabs(22, 16), (16, 6));
+        assert_eq!(distribute_tabs(40, 16), (16, 24));
+    }
+
+    #[test]
+    fn column_ranges_share_one_ordered_list() {
+        // Both mode, 22 tabs, capacity 16: the left takes the
+        // first 16, the right the rest — contiguous, one list,
+        // nothing lost or duplicated.
+        let left = column_range(TabPlacement::Both, TabEdge::Left, 22, 16);
+        let right = column_range(TabPlacement::Both, TabEdge::Right, 22, 16);
+        assert_eq!(left, (0, 16));
+        assert_eq!(right, (16, 6));
+        assert_eq!(left.0 + left.1, right.0);
+        assert_eq!(left.1 + right.1, 22);
+        // Single-column modes show the whole list on their edge.
+        assert_eq!(
+            column_range(TabPlacement::Left, TabEdge::Left, 22, 16),
+            (0, 22)
+        );
+        assert_eq!(
+            column_range(TabPlacement::Left, TabEdge::Right, 22, 16),
+            (0, 0)
+        );
+        assert_eq!(
+            column_range(TabPlacement::Right, TabEdge::Right, 22, 16),
+            (0, 22)
+        );
+        assert_eq!(
+            column_range(TabPlacement::Right, TabEdge::Left, 22, 16),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn closing_a_tab_reflows_the_right_column() {
+        // 17 tabs, capacity 16: 16 left, 1 right. Close one left
+        // tab and the right tab moves left to fill the gap — the
+        // distribution is recomputed from the list, so no tab is
+        // stranded on the right.
+        assert_eq!(distribute_tabs(17, 16), (16, 1));
+        assert_eq!(distribute_tabs(16, 16), (16, 0));
+    }
+
+    #[test]
+    fn flyout_column_position_tracks_distribution() {
+        assert_eq!(
+            flyout_column_position(TabPlacement::Both, 5, 22, 16),
+            Some((TabEdge::Left, 5))
+        );
+        assert_eq!(
+            flyout_column_position(TabPlacement::Both, 16, 22, 16),
+            Some((TabEdge::Right, 0))
+        );
+        assert_eq!(
+            flyout_column_position(TabPlacement::Both, 21, 22, 16),
+            Some((TabEdge::Right, 5))
+        );
+        assert_eq!(flyout_column_position(TabPlacement::Both, 22, 22, 16), None);
+        assert_eq!(
+            flyout_column_position(TabPlacement::Left, 3, 22, 16),
+            Some((TabEdge::Left, 3))
+        );
+        assert_eq!(
+            flyout_column_position(TabPlacement::Right, 3, 22, 16),
+            Some((TabEdge::Right, 3))
+        );
+    }
+
+    #[test]
+    fn flyout_width_interpolates_chip_to_flyout() {
+        assert_eq!(flyout_width(0.0), TAB_CHIP);
+        assert_eq!(flyout_width(0.5), 116.0);
+        assert_eq!(flyout_width(1.0), TAB_FLYOUT);
+        // Out-of-range progress clamps, never overshoots.
+        assert_eq!(flyout_width(-0.5), TAB_CHIP);
+        assert_eq!(flyout_width(1.5), TAB_FLYOUT);
+    }
+
+    #[test]
+    fn flyout_shows_text_only_when_half_open() {
+        assert!(!flyout_shows_text(0.0));
+        assert!(!flyout_shows_text(0.5));
+        assert!(flyout_shows_text(0.51));
+        assert!(flyout_shows_text(1.0));
+    }
+
+    #[test]
+    fn hover_animation_completes_in_eighteen_ticks() {
+        // 16 ms ticks, 1/18 per tick: the slide-out takes ~0.3 s,
+        // the mockup's duration.
+        assert_eq!(HOVER_TICK, std::time::Duration::from_millis(16));
+        let mut progress = 0.0f32;
+        for _ in 0..17 {
+            progress = (progress + HOVER_TICK_STEP).min(1.0);
+        }
+        assert!(progress < 1.0);
+        progress = (progress + HOVER_TICK_STEP).min(1.0);
+        assert_eq!(progress, 1.0);
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn menu_panel_width_is_compact() {
+        // Chrome/Firefox-sized, not half-screen. The `<=` bound
+        // is the contract; the allow is deliberate, as above.
+        assert_eq!(MENU_PANEL_WIDTH, 260.0);
+        assert!(MENU_PANEL_WIDTH <= 320.0);
+    }
+
+    #[test]
+    fn shell_radius_is_small_and_nonzero() {
+        assert_eq!(SHELL_RADIUS, 4.0);
+    }
+
+    #[test]
+    fn bookmarks_bar_entries_reads_the_store_in_order() {
+        let mut store = BookmarkStore::new();
+        assert!(bookmarks_bar_entries(&store).is_empty());
+        assert!(store.add("https://a.example/", "A"));
+        assert!(store.add("https://b.example/", "B"));
+        assert_eq!(
+            bookmarks_bar_entries(&store),
+            vec![
+                ("A".to_string(), "https://a.example/".to_string()),
+                ("B".to_string(), "https://b.example/".to_string()),
+            ]
+        );
     }
 }
