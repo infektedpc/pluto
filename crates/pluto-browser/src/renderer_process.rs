@@ -932,6 +932,13 @@ const ALLOWED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_rename,
     libc::SYS_renameat,
     libc::SYS_renameat2,
+    // fsync/fdatasync: the same atomic writer (`atomic.rs`)
+    // fsyncs the file before the rename and the directory
+    // after it. A navigation commit writes history.json, so
+    // without these the renderer dies on the first page load
+    // (TRAP run, 2026-11-26: seccomp blocked syscall 74).
+    libc::SYS_fsync,
+    libc::SYS_fdatasync,
     libc::SYS_fcntl,
     libc::SYS_dup,
     libc::SYS_dup2,
@@ -1612,6 +1619,22 @@ mod tests {
             assert!(
                 !allowed.contains(&forbidden),
                 "allow-list must never contain syscall {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn seccomp_allow_list_covers_atomic_profile_writes() {
+        // write_file_atomic (atomic.rs) fsyncs the file before
+        // the rename and the directory after it; a navigation
+        // commit writes history.json, so the renderer dies on
+        // the first page load without these. Caught by a TRAP
+        // run on 2026-11-26: seccomp blocked syscall 74 (fsync).
+        let allowed = seccomp_allowed_syscalls();
+        for needed in [libc::SYS_fsync, libc::SYS_fdatasync] {
+            assert!(
+                allowed.contains(&needed),
+                "allow-list is missing syscall {needed}"
             );
         }
     }

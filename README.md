@@ -135,5 +135,5 @@ during bootstrap, verified against the actual sources:
   transport, `ReadableStream` + chunked fetch + `EventSource`,
   IntersectionObserver fix; IPC protocol 10 → 13.
 
-Full workspace suite: 1116 tests, all passing. See `ARCHITECTURE.md`
+Full workspace suite: 1117 tests, all passing. See `ARCHITECTURE.md`
 for the full M1–M12 roadmap.
