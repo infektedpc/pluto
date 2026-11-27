@@ -786,6 +786,10 @@ fn parse_duration_ms(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Result<f32> 
 /// (offset, declarations) steps. Missing offsets are distributed
 /// linearly between the surrounding explicit ones (0 at the start,
 /// 1 at the end), per the Web Animations spec.
+/// A keyframe step before offsets are resolved: the optional explicit
+/// offset plus the property declarations.
+type KeyframeStep = (Option<f32>, Vec<(String, String)>);
+
 fn parse_keyframes(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Result<Vec<WaapiStep>> {
     let Some(arr) = value.as_object() else {
         return Err(throw_type_error(ctx, "keyframes must be an array of objects"));
@@ -793,7 +797,7 @@ fn parse_keyframes(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Result<Vec<Waa
     let len: u32 = arr
         .get("length")
         .map_err(|_| throw_type_error(ctx, "keyframes must be an array of objects"))?;
-    let mut steps: Vec<(Option<f32>, Vec<(String, String)>)> = Vec::new();
+    let mut steps: Vec<KeyframeStep> = Vec::new();
     for i in 0..len {
         let item: Value = arr
             .get(i.to_string())
@@ -827,8 +831,8 @@ fn parse_keyframes(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Result<Vec<Waa
                 let gap = i - p;
                 let start = filled[p];
                 let end = filled[i];
-                for j in (p + 1)..i {
-                    filled[j] = start + (end - start) * ((j - p) as f32 / gap as f32);
+                for (j, slot) in filled.iter_mut().enumerate().take(i).skip(p + 1) {
+                    *slot = start + (end - start) * ((j - p) as f32 / gap as f32);
                 }
             }
             prev_idx = Some(i);
@@ -838,8 +842,8 @@ fn parse_keyframes(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Result<Vec<Waa
         None => {
             // No explicit offset at all: spread evenly (a single
             // step sits at 0 — the engine holds it for the duration).
-            for i in 0..n {
-                filled[i] = if n == 1 { 0.0 } else { i as f32 / (n - 1) as f32 };
+            for (i, slot) in filled.iter_mut().enumerate().take(n) {
+                *slot = if n == 1 { 0.0 } else { i as f32 / (n - 1) as f32 };
             }
         }
         Some(last) => {
@@ -848,8 +852,8 @@ fn parse_keyframes(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Result<Vec<Waa
                     filled[i] = 0.0;
                 }
             }
-            for i in (last + 1)..n {
-                filled[i] = 1.0;
+            for slot in filled.iter_mut().take(n).skip(last + 1) {
+                *slot = 1.0;
             }
         }
     }
@@ -886,26 +890,22 @@ fn parse_animate_options(
     let Some(obj) = value.as_object() else {
         return Err(throw_type_error(ctx, "animate options must be a number or an object"));
     };
-    if let Ok(v) = obj.get::<_, Value>("duration") {
-        if !v.is_undefined() && !v.is_null() {
+    if let Ok(v) = obj.get::<_, Value>("duration")
+        && !v.is_undefined() && !v.is_null() {
             spec.duration_ms = parse_duration_ms(ctx, &v)?;
         }
-    }
-    if let Ok(v) = obj.get::<_, Value>("delay") {
-        if !v.is_undefined() && !v.is_null() {
+    if let Ok(v) = obj.get::<_, Value>("delay")
+        && !v.is_undefined() && !v.is_null() {
             spec.delay_ms = parse_duration_ms(ctx, &v)?;
         }
-    }
     if let Ok(s) = obj.get::<_, String>("easing") {
         spec.easing = s;
     }
-    if let Ok(v) = obj.get::<_, Value>("iterations") {
-        if !v.is_undefined() && !v.is_null() {
-            if let Some(n) = v.as_number() {
+    if let Ok(v) = obj.get::<_, Value>("iterations")
+        && !v.is_undefined() && !v.is_null()
+            && let Some(n) = v.as_number() {
                 spec.iterations = if n.is_infinite() { None } else { Some(n as f32) };
             }
-        }
-    }
     if let Ok(s) = obj.get::<_, String>("direction") {
         spec.direction = s;
     }
@@ -931,11 +931,10 @@ fn animation_object<'js>(
     duration_ms: f32,
 ) -> rquickjs::Result<Object<'js>> {
     let animations = registry_map(ctx, "animations")?;
-    if let Ok(existing) = map_get(ctx, &animations, reg_id) {
-        if let Some(obj) = existing.as_object() {
+    if let Ok(existing) = map_get(ctx, &animations, reg_id)
+        && let Some(obj) = existing.as_object() {
             return Ok(obj.clone());
         }
-    }
     let obj = Object::new(ctx.clone())?;
 
     // playState (live from the local bookkeeping).
@@ -993,22 +992,20 @@ fn animation_object<'js>(
                 let mut state = b.borrow_mut();
                 match op {
                     WaapiOp::Pause => {
-                        if let Some(l) = state.animation_locals.get_mut(&reg_id) {
-                            if l.play_state == "running" {
+                        if let Some(l) = state.animation_locals.get_mut(&reg_id)
+                            && l.play_state == "running" {
                                 l.play_state = "paused".to_string();
                                 l.paused_at = Some(now);
                             }
-                        }
                     }
                     WaapiOp::Play => {
-                        if let Some(l) = state.animation_locals.get_mut(&reg_id) {
-                            if l.play_state == "paused" {
+                        if let Some(l) = state.animation_locals.get_mut(&reg_id)
+                            && l.play_state == "paused" {
                                 if let Some(p) = l.paused_at.take() {
                                     l.paused_total += now.duration_since(p);
                                 }
                                 l.play_state = "running".to_string();
                             }
-                        }
                         // A finished WAAPI animation is gone from
                         // the engine, so `play()` restarts it with
                         // the same spec (a fresh host id; the
@@ -1021,8 +1018,8 @@ fn animation_object<'js>(
                                 .get(&reg_id)
                                 .map(|l| l.play_state == "finished")
                                 .unwrap_or(false);
-                            if finished {
-                                if let Some(spec) = state.animation_specs.get(&reg_id).cloned() {
+                            if finished
+                                && let Some(spec) = state.animation_specs.get(&reg_id).cloned() {
                                     drop(state);
                                     let new_id =
                                         host.borrow_mut().request_animate(key, spec);
@@ -1042,7 +1039,6 @@ fn animation_object<'js>(
                                         }
                                     }
                                 }
-                            }
                         }
                     }
                     WaapiOp::Cancel => {
@@ -1078,6 +1074,7 @@ fn animation_object<'js>(
 
 /// Create the `Animation` object for a freshly started animation
 /// (WAAPI or CSS) and record its local state.
+#[allow(clippy::too_many_arguments)]
 fn new_animation_object<'js>(
     ctx: &Ctx<'js>,
     bindings: &Rc<RefCell<BindingState>>,
@@ -1605,11 +1602,10 @@ fn install_element_methods<'js>(
                 // the host until the tab thread drains the cancel
                 // — the tombstone keeps `getAnimations` from
                 // resurrecting it in between.
-                if let Some(id) = info.id {
-                    if b.borrow().animation_tombstones.contains(&(key, id)) {
+                if let Some(id) = info.id
+                    && b.borrow().animation_tombstones.contains(&(key, id)) {
                         continue;
                     }
-                }
                 let obj = match (info.id, info.name) {
                     (Some(id), _) => {
                         let reg_id = b.borrow().animation_objects.get(&(key, id)).copied();
@@ -1617,13 +1613,12 @@ fn install_element_methods<'js>(
                             Some(reg_id) => {
                                 // Refresh the local playState from
                                 // the host's finished flag.
-                                if info.finished {
-                                    if let Some(l) =
+                                if info.finished
+                                    && let Some(l) =
                                         b.borrow_mut().animation_locals.get_mut(&reg_id)
                                     {
                                         l.play_state = "finished".to_string();
                                     }
-                                }
                                 animation_object(
                                     &ctx, &b, key, Some(id), None, reg_id, false, f32::INFINITY,
                                 )?
@@ -3013,7 +3008,7 @@ pub fn install_dataset_helpers<'js>(
                 let mut i = 0;
                 for name in names {
                     if let Some(camel) = dataset_key_from_attr(&name) {
-                        arr.set(i, Value::from(js(&ctx, camel)))?;
+                        arr.set(i, js(&ctx, camel))?;
                         i += 1;
                     }
                 }
@@ -3994,7 +3989,7 @@ fn install_location<'js>(
             };
             Ok(js(&ctx, value))
         };
-        if !matches!(part, 4 | 5 | 6) {
+        if !matches!(part, 4..=6) {
             location
                 .prop(prop, Accessor::from(get))
                 .map_err(|e| format!("location.{prop}: {e}"))?;
@@ -4133,7 +4128,7 @@ fn navigate_to(ctx: &Ctx<'_>, bindings: &Rc<RefCell<BindingState>>, input: &str,
 /// Stage 12 Rec 10 adds `trace`, `assert`, `count` / `countReset`,
 /// `time` / `timeEnd` / `timeLog`, `dir`, `table`, and
 /// `group` / `groupCollapsed` / `groupEnd` — same routing (tracing
-/// + captured lines). `group` nesting indents every captured line
+/// and captured lines). `group` nesting indents every captured line
 /// by two spaces per level (depth 0 indents nothing, so the
 /// original five methods' output is unchanged outside a group).
 pub fn install_console<'js>(
@@ -4691,11 +4686,10 @@ pub fn install_url<'js>(
             return Ok(());
         };
         let href = to_dom_string(&ctx, &value)?;
-        if Url::parse(&href).is_ok() {
-            if let Some(entry) = b.borrow_mut().url_entries.get_mut(&id) {
+        if Url::parse(&href).is_ok()
+            && let Some(entry) = b.borrow_mut().url_entries.get_mut(&id) {
                 entry.text = href;
             }
-        }
         Ok(())
     };
     url_proto
@@ -5045,7 +5039,7 @@ fn install_search_params_prototype<'js>(
             let mut i = 0;
             for (n, v) in params_of(&b, id) {
                 if n == name.as_str() {
-                    arr.set(i, Value::from(js(&ctx, v)))?;
+                    arr.set(i, js(&ctx, v))?;
                     i += 1;
                 }
             }
@@ -5161,12 +5155,12 @@ fn install_search_params_prototype<'js>(
                 let arr = Array::new(ctx.clone())?;
                 for (i, (n, v)) in params_of(&b, id).into_iter().enumerate() {
                     let item = match which {
-                        0 => Value::from(js(&ctx, n)),
-                        1 => Value::from(js(&ctx, v)),
+                        0 => js(&ctx, n),
+                        1 => js(&ctx, v),
                         _ => {
                             let pair = Array::new(ctx.clone())?;
-                            pair.set(0, Value::from(js(&ctx, n)))?;
-                            pair.set(1, Value::from(js(&ctx, v)))?;
+                            pair.set(0, js(&ctx, n))?;
+                            pair.set(1, js(&ctx, v))?;
                             Value::from(pair)
                         }
                     };
@@ -5201,7 +5195,7 @@ fn install_search_params_prototype<'js>(
         .set("urlSearchParams", proto.clone())
         .map_err(|e| format!("prototypes urlSearchParams: {e}"))?;
     // `for (const [k, v] of params)`: the default iterator is `entries`.
-    super::install_entries_iterator(&ctx, &proto)
+    super::install_entries_iterator(ctx, &proto)
         .map_err(|e| format!("URLSearchParams iterator: {e}"))?;
     Ok(())
 }

@@ -363,7 +363,7 @@ impl Canvas2d {
     /// Returns `None` when the bitmap would exceed
     /// [`MAX_RASTER_PIXELS`] (the caller keeps the old canvas).
     pub fn new(width: u32, height: u32) -> Option<Self> {
-        if (width as usize).checked_mul(height as usize).unwrap_or(usize::MAX)
+        if (width as usize).saturating_mul(height as usize)
             > MAX_RASTER_PIXELS
         {
             return None;
@@ -445,7 +445,7 @@ impl Canvas2d {
     /// [`MAX_RASTER_PIXELS`]. A zero width or height is a legal
     /// empty canvas (no bitmap — drawing is a no-op).
     pub fn resize(&mut self, width: u32, height: u32) -> bool {
-        if (width as usize).checked_mul(height as usize).unwrap_or(usize::MAX)
+        if (width as usize).saturating_mul(height as usize)
             > MAX_RASTER_PIXELS
         {
             return false;
@@ -1192,8 +1192,8 @@ impl Canvas2d {
             if out_a <= 0.0 {
                 continue;
             }
-            for j in 0..3 {
-                let sc = c[j].clamp(0.0, 1.0);
+            for (j, &sc) in c.iter().enumerate().take(3) {
+                let sc = sc.clamp(0.0, 1.0);
                 let dc = self.rgba[idx + j] as f32 / 255.0;
                 let out = (sc * sa + dc * da * (1.0 - sa)) / out_a;
                 self.rgba[idx + j] = (out.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -1609,7 +1609,7 @@ mod tests {
         c.set_fill(CanvasPaint::Solid([10, 20, 30, 255]));
         c.fill_rect(1.0, 1.0, 2.0, 2.0);
         let img = c.get_image_data(0, 0, 4, 4).unwrap();
-        assert_eq!(img.rgba[(1 * 4 + 1) * 4], 10);
+        assert_eq!(img.rgba[(4 + 1) * 4], 10);
         assert_eq!(img.rgba[0], 0, "outside the rect is transparent");
         // Put a green pixel at (3, 3) via ImageData.
         let data = DecodedImage {
@@ -1637,7 +1637,7 @@ mod tests {
         c.set_fill(CanvasPaint::Solid([0, 0, 0, 255]));
         c.set_font("16px sans-serif");
         c.fill_text("Hi", 2.0, 16.0, false);
-        let painted = c.rgba.chunks_exact(4).any(|p| p[3] > 0);
+        let painted = c.rgba.as_chunks::<4>().0.iter().any(|p| p[3] > 0);
         assert!(painted, "fillText must paint some pixels");
     }
 

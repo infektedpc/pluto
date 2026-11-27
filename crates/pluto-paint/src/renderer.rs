@@ -737,8 +737,8 @@ pub fn erf_approx(x: f32) -> f32 {
     let ax = x.abs();
     let t = 1.0 / (1.0 + 0.3275911 * ax);
     let y = 1.0
-        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
-            + 0.254829592)
+        - (((((1.061_405_4 * t - 1.453_152_1) * t) + 1.421_413_8) * t - 0.284_496_72) * t
+            + 0.254_829_6)
             * t
             * (-ax * ax).exp();
     sign * y
@@ -791,7 +791,7 @@ pub fn shadow_coverage(
     pad: [f32; 4],
     pad_radii: ResolvedCorners,
 ) -> f32 {
-    const SQRT_2: f32 = 1.41421356;
+    const SQRT_2: f32 = std::f32::consts::SQRT_2;
     let smoothstep = |edge0: f32, edge1: f32, x: f32| {
         let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
@@ -885,11 +885,14 @@ fn rounded_vertices_for(
 /// The quad a shadow item draws, plus the shape + padding box the
 /// fragment evaluates against. Outer shadows cover the shape (the
 /// box expanded by spread, translated by the offset) inflated by
+/// (quad, shape, shape radii, pad, pad radii) of a shadow.
+type ShadowGeometry = ([f32; 4], [f32; 4], ResolvedCorners, [f32; 4], ResolvedCorners);
+
 /// `~3σ` of blur falloff; inset shadows cover exactly the padding
 /// box. Pure: unit-tested.
 fn shadow_geometry(
     item: &DisplayItem,
-) -> Option<([f32; 4], [f32; 4], ResolvedCorners, [f32; 4], ResolvedCorners)> {
+) -> Option<ShadowGeometry> {
     let DisplayItem::BoxShadow {
         x,
         y,
@@ -1395,9 +1398,7 @@ impl GlyphAtlas {
         // Evict least-recently-used glyphs, one at a time, until
         // the new block fits or nothing evictable remains.
         loop {
-            if self.evict_one().is_none() {
-                return None;
-            }
+            self.evict_one()?;
             if let Some(rect) = self.try_allocate(bw, bh) {
                 let rect = AtlasRect { w, h, ..rect };
                 self.map.insert(
@@ -1579,6 +1580,12 @@ impl GlyphAtlas {
                 break;
             }
         }
+    }
+}
+
+impl Default for GlyphAtlas {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -2146,6 +2153,10 @@ fn glyph_quad(glyph: &PaintGlyph, placement: cosmic_text::Placement) -> (f32, f3
     )
 }
 
+/// Identity of a `prepare` call for the clean-skip check:
+/// (list address, viewport, scroll).
+type PreparedIdentity = (usize, (f32, f32), (f32, f32));
+
 pub struct PaintRenderer {
     rect_pipeline: wgpu::RenderPipeline,
     /// Vector-triangle pipeline (Stage 15, M7 Phase 2, Rec 4):
@@ -2216,7 +2227,7 @@ pub struct PaintRenderer {
     /// Identity of the last list `prepare` built for: (list
     /// address, viewport, scroll). A repeat `prepare` with the
     /// same identity is a clean skip — no rebuild, no re-encode.
-    last_prepared: Option<(usize, (f32, f32), (f32, f32))>,
+    last_prepared: Option<PreparedIdentity>,
     viewport: (f32, f32),
     /// The scroll offset last written to the uniform (page
     /// coordinates): the vertex shaders subtract it, so the content
@@ -3758,7 +3769,7 @@ impl PaintRenderer {
             counters.items_culled = culled;
             counters.atlas_uploads = atlas_uploads;
             counters.atlas_evictions =
-                (self.mask_atlas.evictions() + self.colour_atlas.evictions()) as u64;
+                self.mask_atlas.evictions() + self.colour_atlas.evictions();
             counters.atlas_growths =
                 (self.mask_atlas.growths() + self.colour_atlas.growths()) as u64;
             counters.colour_atlas_uploads = colour_uploads;
@@ -4216,7 +4227,6 @@ mod tests {
         // plain LRU: the oldest page image goes.
         let evicted = cache.evict_for(50, 150);
         assert_eq!(evicted, vec![ResourceId(1)]);
-        assert!(VIDEO_BLOB_ID_BASE == 0x7000_0000);
     }
 
     #[test]

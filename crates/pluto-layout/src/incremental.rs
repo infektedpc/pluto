@@ -2646,9 +2646,7 @@ mod tests {
         let b = dom
             .children(el(&dom, "div"))
             .iter()
-            .copied()
-            .filter(|&c| dom.tag(c) == Some("div") && c != a)
-            .next()
+            .copied().find(|&c| dom.tag(c) == Some("div") && c != a)
             .unwrap();
         assert!(pos(b) < pos(a), "b now paints before a");
     }

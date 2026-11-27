@@ -57,7 +57,7 @@
 //!   treats noscript content as raw text while the scanner may
 //!   over-fetch from it. Wasted bandwidth, not a correctness bug.
 
-use crate::builder::{NS_HTML, NS_MATHML, NS_SVG};
+use crate::builder::{NS_HTML, NS_SVG};
 use crate::tokenizer::{Token, Tokenizer};
 
 /// What kind of resource a discovery is asking for.
@@ -404,11 +404,10 @@ pub fn select_srcset(
         let source_size = eval_sizes(sizes, viewport_width);
         let mut best: Option<(u32, &str)> = None;
         for (w, url) in &widths {
-            if (*w as f32) >= source_size {
-                if best.is_none_or(|(bw, _)| *w < bw) {
+            if (*w as f32) >= source_size
+                && best.is_none_or(|(bw, _)| *w < bw) {
                     best = Some((*w, url));
                 }
-            }
         }
         if let Some((_, url)) = best {
             return Some(url.to_string());
@@ -644,8 +643,8 @@ pub fn classify_element(
             // inert — its `src` must never become a `Script`
             // discovery, or the page could make the browser request
             // a URL that can never execute.
-            if namespace.is_empty() || namespace == NS_HTML {
-                if let Some(src) = attr(attrs, "src")
+            if (namespace.is_empty() || namespace == NS_HTML)
+                && let Some(src) = attr(attrs, "src")
                     && !src.trim().is_empty()
                     && !src.trim_start().starts_with("data:")
                 {
@@ -664,7 +663,6 @@ pub fn classify_element(
                         is_module,
                     });
                 }
-            }
         }
         "image" => {
             // Stage 15 (M7 Phase 3, Rec 10): `<svg><image>` fetches
@@ -673,8 +671,8 @@ pub fn classify_element(
             // regardless of which element made it). `href` is the
             // SVG2 spelling, `xlink:href` the legacy one; a
             // fragment-only href (`#id`) is not a fetch.
-            if namespace == NS_SVG {
-                if let Some(href) = attr(attrs, "href")
+            if namespace == NS_SVG
+                && let Some(href) = attr(attrs, "href")
                     .or_else(|| attr(attrs, "xlink:href"))
                     && !href.trim().is_empty()
                     && !href.trim_start().starts_with('#')
@@ -689,7 +687,6 @@ pub fn classify_element(
                         is_module: false,
                     });
                 }
-            }
         }
         "img" => {
             // Stage 11 Rec 10: an <img> inside a <picture> emits
@@ -722,8 +719,8 @@ pub fn classify_element(
                         integrity: integrity.clone(),
                     is_module: false,
                     });
-                } else if let Some(src) = attr(attrs, "src") {
-                    if !src.trim().is_empty() && !src.trim_start().starts_with("data:") {
+                } else if let Some(src) = attr(attrs, "src")
+                    && !src.trim().is_empty() && !src.trim_start().starts_with("data:") {
                         out.push(RawDiscovery {
                             url: src.to_string(),
                             destination: Destination::Image,
@@ -733,9 +730,8 @@ pub fn classify_element(
                         is_module: false,
                         });
                     }
-                }
-            } else if let Some(src) = attr(attrs, "src") {
-                if !src.trim().is_empty() && !src.trim_start().starts_with("data:") {
+            } else if let Some(src) = attr(attrs, "src")
+                && !src.trim().is_empty() && !src.trim_start().starts_with("data:") {
                     out.push(RawDiscovery {
                         url: src.to_string(),
                         destination: Destination::Image,
@@ -745,12 +741,11 @@ pub fn classify_element(
                     is_module: false,
                     });
                 }
-            }
         }
         "source" => {
             if media_tag.is_some() && !in_picture {
-                if let Some(src) = attr(attrs, "src") {
-                    if !src.trim().is_empty() {
+                if let Some(src) = attr(attrs, "src")
+                    && !src.trim().is_empty() {
                         out.push(RawDiscovery {
                             url: src.to_string(),
                             destination: match media_tag {
@@ -763,7 +758,6 @@ pub fn classify_element(
                         is_module: false,
                         });
                     }
-                }
             } else if in_picture {
                 // Stage 11 Rec 10: a `<source>` inside a
                 // `<picture>` is consumed by the `<img>`'s
@@ -771,8 +765,8 @@ pub fn classify_element(
                 // srcset selection) — it emits nothing on its own,
                 // or every picture would fetch every source.
             } else {
-                if let Some(src) = attr(attrs, "src") {
-                    if !src.trim().is_empty() {
+                if let Some(src) = attr(attrs, "src")
+                    && !src.trim().is_empty() {
                         out.push(RawDiscovery {
                             url: src.to_string(),
                             destination: Destination::Image,
@@ -786,7 +780,6 @@ pub fn classify_element(
                         is_module: false,
                         });
                     }
-                }
                 if let Some(srcset) = attr(attrs, "srcset") {
                     for url in srcset_urls(srcset) {
                         out.push(RawDiscovery {
@@ -805,8 +798,8 @@ pub fn classify_element(
             let rel = attr(attrs, "rel").unwrap_or("");
             let rel_lc = rel.to_ascii_lowercase();
             let rels: Vec<&str> = rel_lc.split_whitespace().collect();
-            if let Some(href) = attr(attrs, "href") {
-                if !href.trim().is_empty() && !href.trim_start().starts_with("data:") {
+            if let Some(href) = attr(attrs, "href")
+                && !href.trim().is_empty() && !href.trim_start().starts_with("data:") {
                     if rels.contains(&"stylesheet") {
                         out.push(RawDiscovery {
                             url: href.to_string(),
@@ -883,7 +876,6 @@ pub fn classify_element(
                     // discovery. manifest / alternate / canonical:
                     // not subresources the parser needs early.
                 }
-            }
         }
         "video" => {
             // Stage 16 (M8 Phase 2, Rec 4): the element's own
@@ -906,8 +898,8 @@ pub fn classify_element(
                     is_module: false,
                 });
             }
-            if let Some(poster) = attr(attrs, "poster") {
-                if !poster.trim().is_empty() && !poster.trim_start().starts_with("data:") {
+            if let Some(poster) = attr(attrs, "poster")
+                && !poster.trim().is_empty() && !poster.trim_start().starts_with("data:") {
                     out.push(RawDiscovery {
                         url: poster.to_string(),
                         destination: Destination::Image,
@@ -917,7 +909,6 @@ pub fn classify_element(
                     is_module: false,
                     });
                 }
-            }
         }
         "audio" => {
             // Stage 16 (M8 Phase 2, Rec 4): as `video[src]`
@@ -943,8 +934,8 @@ pub fn classify_element(
         // arbitrary URLs whose bytes are never rendered). Re-add an
         // `iframe` arm here when iframes render, and only then.
         "embed" => {
-            if let Some(src) = attr(attrs, "src") {
-                if !src.trim().is_empty() {
+            if let Some(src) = attr(attrs, "src")
+                && !src.trim().is_empty() {
                     out.push(RawDiscovery {
                         url: src.to_string(),
                         destination: Destination::Other,
@@ -954,11 +945,10 @@ pub fn classify_element(
                     is_module: false,
                     });
                 }
-            }
         }
         "object" => {
-            if let Some(data) = attr(attrs, "data") {
-                if !data.trim().is_empty() {
+            if let Some(data) = attr(attrs, "data")
+                && !data.trim().is_empty() {
                     out.push(RawDiscovery {
                         url: data.to_string(),
                         destination: Destination::Other,
@@ -968,12 +958,11 @@ pub fn classify_element(
                     is_module: false,
                     });
                 }
-            }
         }
         "input" => {
-            if attr(attrs, "type").is_some_and(|t| t.eq_ignore_ascii_case("image")) {
-                if let Some(src) = attr(attrs, "src") {
-                    if !src.trim().is_empty() {
+            if attr(attrs, "type").is_some_and(|t| t.eq_ignore_ascii_case("image"))
+                && let Some(src) = attr(attrs, "src")
+                    && !src.trim().is_empty() {
                         out.push(RawDiscovery {
                             url: src.to_string(),
                             destination: Destination::Image,
@@ -983,8 +972,6 @@ pub fn classify_element(
                         is_module: false,
                         });
                     }
-                }
-            }
         }
         _ => {}
     }
@@ -1110,13 +1097,11 @@ pub fn scan_with_viewport(
                     _ => {}
                 }
                 if name == "base" {
-                    if base.is_none() {
-                        if let Some(href) = attr(&tag.attrs, "href") {
-                            if !href.trim().is_empty() {
+                    if base.is_none()
+                        && let Some(href) = attr(&tag.attrs, "href")
+                            && !href.trim().is_empty() {
                                 base = Some(resolve_url(document_url, href));
                             }
-                        }
-                    }
                     continue;
                 }
                 if template_depth == 0 {
@@ -1213,6 +1198,10 @@ pub fn scan_with_viewport(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // NS_MATHML is used only by the tests below (the top-level
+    // import was removed as unused by clippy); keep it here so the
+    // lib target stays clean.
+    use crate::builder::NS_MATHML;
 
     const DOC: &str = "https://example.com/dir/page.html";
 

@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use pluto_css::{Affine, Selector, Stylesheet};
+use pluto_css::{Selector, Stylesheet};
 use pluto_html::observers::{MutationObserverOptions, ObserverMutationRecord};
 use pluto_html::{
     Dom, NodeId, NodeKind, Parser, QueuedScript, ScriptPaused, parse_fragment,
@@ -45,7 +45,6 @@ use pluto_js::{
     FetchResponse, Geometry, JsError, RealmConfig, ResponseType, TabJs,
 };
 use pluto_layout::{ElementState, selector_matches};
-use pluto_net::ResourceLoader;
 use pluto_paint::perf;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -251,6 +250,14 @@ pub struct BrowserDomHost {
     /// case.
     canvas_image_pixels: std::collections::HashMap<DomKey, (u32, u32, Vec<u8>, bool)>,
 }
+
+/// Pending JS history requests (Stage 16 Phase 3, Rec 8):
+/// `(pushes, replaces, traversals)`.
+type PendingHistory = (
+    Vec<(String, Option<String>)>,
+    Vec<(String, Option<String>)>,
+    Vec<i32>,
+);
 
 impl BrowserDomHost {
     /// Create a host over `dom` (the parser's shared `Dom` at
@@ -500,6 +507,9 @@ impl BrowserDomHost {
     }
 
     /// Whether a WAAPI animation on an element has finished.
+    // Reader for `mark_waapi_finished`; `getAnimations` does not
+    // consult it yet.
+    #[allow(dead_code)]
     pub fn waapi_is_finished(&self, id: DomKey, anim_id: u64) -> bool {
         self.waapi_finished.contains(&(id, anim_id))
     }
@@ -514,11 +524,7 @@ impl BrowserDomHost {
     /// Phase 3, Rec 8): `(pushes, replaces, traversals)`.
     pub fn take_pending_history(
         &mut self,
-    ) -> (
-        Vec<(String, Option<String>)>,
-        Vec<(String, Option<String>)>,
-        Vec<i32>,
-    ) {
+    ) -> PendingHistory {
         (
             std::mem::take(&mut self.pending_history_push),
             std::mem::take(&mut self.pending_history_replace),
@@ -532,6 +538,9 @@ impl BrowserDomHost {
     /// fallback). `None` when neither exists — the navigation
     /// still updates the URL and fires `hashchange`, it just does
     /// not scroll.
+    // Anchor lookup for same-document navigation; the scroll step
+    // uses `get_element_by_id` directly for now.
+    #[allow(dead_code)]
     pub fn anchor_element(&self, fragment: &str) -> Option<DomKey> {
         let dom = self.dom.lock().unwrap();
         let root = dom.root()?;
@@ -660,9 +669,9 @@ impl BrowserDomHost {
     /// executed. Unlike `clone_from` (fragment `Dom` → live
     /// `Dom`), both sides here are the one live arena.
     fn clone_within(&self, dom: &mut Dom, key: DomKey, deep: bool) -> Option<DomKey> {
-        let (kind, attrs, ns) = match dom.get(key) {
-            Some(n) => (n.kind.clone(), n.attrs.clone(), n.ns.clone()),
-            None => return None,
+        let (kind, attrs, ns) = {
+            let n = dom.get(key)?;
+            (n.kind.clone(), n.attrs.clone(), n.ns.clone())
         };
         let new_key = match &kind {
             // Stage 15 (M7 Phase 1, Rec 1): a clone keeps its
@@ -1516,9 +1525,7 @@ impl DomHost for BrowserDomHost {
 
     fn clone_node(&mut self, key: DomKey, deep: bool) -> Option<DomKey> {
         let mut dom = self.dom.lock().unwrap();
-        if dom.get(key).is_none() {
-            return None;
-        }
+        dom.get(key)?;
         // The clone is detached: no dirty bits, no render
         // request — nothing lays out until it is inserted.
         self.clone_within(&mut dom, key, deep)
@@ -2897,6 +2904,7 @@ impl PlutoFetchBackend {
     /// origin). No caller yet — iframes render no nested browsing
     /// context — but the seam is here so the iframe work does not
     /// have to re-derive the rule.
+    #[allow(dead_code)]
     pub fn set_base_url_with_creator(
         &self,
         url: &str,
@@ -2908,6 +2916,7 @@ impl PlutoFetchBackend {
     }
 
     /// The document origin the gate checks against.
+    #[allow(dead_code)]
     pub fn document_origin(&self) -> Origin {
         self.origin.lock().unwrap().clone()
     }
@@ -3707,6 +3716,9 @@ impl ScriptExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only: the top-level import was removed by `cargo clippy --fix`
+    // (unused in lib code) but the fetch-gate tests below need it.
+    use pluto_net::ResourceLoader;
     use crate::renderer::{layout_thread, LayoutJob};
     use pluto_ipc::CredentialsMode;
     use pluto_js::{JsValue, RealmConfig, TabJs};

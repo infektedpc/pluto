@@ -656,7 +656,7 @@ pub fn arc_to_cubic(
 
 /// The kappa constant for approximating a quarter circle/ellipse
 /// with one cubic bezier (4/3 * tan(pi/8)).
-const KAPPA: f32 = 0.5522847498;
+const KAPPA: f32 = 0.552_284_8;
 
 /// Build a path from a `<rect>` (x, y, width, height, optional
 /// corner radii rx/ry). A zero-size rect is an empty path. Corner
@@ -988,7 +988,7 @@ pub fn clip_colored_triangles(
     let [rx, ry, rw, rh] = rect;
     let (x0, y0, x1, y1) = (rx, ry, rx + rw, ry + rh);
     let mut out = Vec::with_capacity(vertices.len());
-    for tri in vertices.chunks_exact(3) {
+    for tri in vertices.as_chunks::<3>().0 {
         let mut poly: Vec<VectorVertex> = tri.to_vec();
         for (axis, bound, keep_above) in [
             (0usize, x0, true),
@@ -1409,7 +1409,7 @@ mod tests {
         // the strip is a hexagon fan, not a quad — still exact,
         // still inside the rect.
         let tris = linear_gradient_quad(0.0, 0.0, 100.0, 100.0, &two(45.0));
-        assert!(!tris.is_empty() && tris.len() % 3 == 0, "45deg");
+        assert!(!tris.is_empty() && tris.len().is_multiple_of(3), "45deg");
         for v in &tris {
             assert!(v.position[0] >= -1e-4 && v.position[0] <= 100.0 + 1e-4);
             assert!(v.position[1] >= -1e-4 && v.position[1] <= 100.0 + 1e-4);

@@ -493,7 +493,7 @@ impl Blocker {
                 PatternKind::Regex(_) => self.regexes.push(idx),
             }
             if rule.info.exception
-                && rule.types.map_or(false, |t| t & T_DOCUMENT != 0)
+                && rule.types.is_some_and(|t| t & T_DOCUMENT != 0)
             {
                 self.document_exceptions.push(idx);
             }
@@ -525,9 +525,7 @@ impl Blocker {
         if self.rules.is_empty() {
             return None;
         }
-        let Some(host) = url_host(url) else {
-            return None;
-        };
+        let host = url_host(url)?;
         let page_host = url_host(top_level_site).unwrap_or_default();
         let third_party = is_third_party(&host, &page_host);
         let dest_bit = destination_bit(destination);
@@ -552,6 +550,7 @@ impl Blocker {
         // each precedence class. Expanded inline by the macro
         // below (a closure cannot hold the matched `&Rule` past
         // its own call — E0521).
+        #[allow(clippy::too_many_arguments)]
         fn classify<'r>(
             rule: &'r Rule,
             url_lower: &str,
@@ -888,16 +887,14 @@ fn is_separator(c: char) -> bool {
 /// restrictions admit this request? (Pattern matching is
 /// separate, in [`rule_pattern_matches`].)
 fn rule_applies(rule: &Rule, dest_bit: u32, third_party: bool, page_host: &str) -> bool {
-    if let Some(types) = rule.types {
-        if types & dest_bit == 0 {
+    if let Some(types) = rule.types
+        && types & dest_bit == 0 {
             return false;
         }
-    }
-    if let Some(only_third_party) = rule.third_party {
-        if only_third_party != third_party {
+    if let Some(only_third_party) = rule.third_party
+        && only_third_party != third_party {
             return false;
         }
-    }
     if !rule.domains.is_empty() {
         let mut has_positive = false;
         let mut positive_hit = false;
@@ -973,11 +970,7 @@ fn rule_pattern_matches(
 fn host_domain_offset(host: &str, domain: &str) -> Option<usize> {
     if host == domain {
         Some(0)
-    } else if let Some(rest) = host.strip_suffix(&format!(".{domain}")) {
-        Some(rest.len() + 1)
-    } else {
-        None
-    }
+    } else { host.strip_suffix(&format!(".{domain}")).map(|rest| rest.len() + 1) }
 }
 
 /// Wildcard match over tokens: `Lit` matches one equal char,
@@ -1085,15 +1078,15 @@ fn parse_rule(source: ListSource, line_no: usize, line: &str, regex_count: usize
     let opts = parse_options(options);
     let match_case = opts.match_case;
 
-    let kind = if pattern.starts_with("||") {
-        match parse_domain_rule(&pattern, match_case) {
+    let kind = if let Some(stripped) = pattern.strip_prefix("||") {
+        match parse_domain_rule(pattern, match_case) {
             Some(kind) => Some(kind),
             // `*` in the domain part (e.g. `||*.example.com^`)
             // or an empty domain: fall back to a generic
             // substring match on the remainder. Slightly
             // over-broad (it can match in a path too), but it
             // preserves coverage for a rare shape.
-            None => parse_generic_rule(&pattern[2..], match_case),
+            None => parse_generic_rule(stripped, match_case),
         }
     } else if pattern.starts_with('/') {
         // A `/regex/` rule (options already split off).
@@ -1111,7 +1104,7 @@ fn parse_rule(source: ListSource, line_no: usize, line: &str, regex_count: usize
             Err(_) => return ParseOutcome::Skip, // e.g. look-around: unsupported, skip
         }
     } else {
-        parse_generic_rule(&pattern, match_case)
+        parse_generic_rule(pattern, match_case)
     };
 
     let Some(kind) = kind else {
@@ -1274,7 +1267,7 @@ fn parse_domain_rule(pattern: &str, match_case: bool) -> Option<PatternKind> {
     let after = &pattern[2..];
     // The domain runs up to the first `/`, `^`, or `*`.
     let end = after
-        .find(|c| c == '/' || c == '^' || c == '*')
+        .find(['/', '^', '*'])
         .unwrap_or(after.len());
     let domain = after[..end].to_lowercase();
     if domain.is_empty() {
@@ -1369,16 +1362,14 @@ async fn fetch_list(
         .uri(url)
         .header(header::USER_AGENT, format!("Pluto/{}", env!("CARGO_PKG_VERSION")));
     let mut headers = HeaderMap::new();
-    if let Some(etag) = etag {
-        if let Ok(value) = header::HeaderValue::from_str(etag) {
+    if let Some(etag) = etag
+        && let Ok(value) = header::HeaderValue::from_str(etag) {
             headers.insert(header::IF_NONE_MATCH, value);
         }
-    }
-    if let Some(last_modified) = last_modified {
-        if let Ok(value) = header::HeaderValue::from_str(last_modified) {
+    if let Some(last_modified) = last_modified
+        && let Ok(value) = header::HeaderValue::from_str(last_modified) {
             headers.insert(header::IF_MODIFIED_SINCE, value);
         }
-    }
     for (name, value) in headers.iter() {
         builder = builder.header(name, value);
     }
@@ -1412,11 +1403,9 @@ async fn fetch_list(
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok())
-    {
-        if len > MAX_LIST_BYTES {
+        && len > MAX_LIST_BYTES {
             return FetchOutcome::Failed(format!("list body too large ({len} bytes)"));
         }
-    }
     let etag = response
         .headers()
         .get(header::ETAG)
@@ -1984,9 +1973,9 @@ mod tests {
             .collect();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
         let mut handles = Vec::new();
-        for w in 0..4 {
+        for doc in docs.iter() {
             let dir = dir.clone();
-            let doc = docs[w].clone();
+            let doc = doc.clone();
             let barrier = std::sync::Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || -> std::io::Result<()> {
                 barrier.wait();

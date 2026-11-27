@@ -80,7 +80,7 @@ impl PermissionEntry {
                 .unwrap_or(false)
     }
 
-    fn to_json(&self) -> String {
+    fn to_json(self) -> String {
         format!(
             "{{\"state\":{},\"granted_at\":{},\"last_visit\":{}}}",
             json_escape(self.state.as_str()),
@@ -236,6 +236,7 @@ impl PermissionStore {
 
     /// Drop expired grants (housekeeping; `query_at` already
     /// treats them as `prompt` without this).
+    #[allow(dead_code)]
     pub fn prune_expired(&mut self, now: SystemTime) {
         self.entries.retain(|_, entry| !entry.is_expired(now));
     }
@@ -342,6 +343,7 @@ impl PlutoPermissionsBackend {
     }
 
     /// The shared store (for saving after a change).
+    #[allow(dead_code)]
     pub fn store(&self) -> Arc<Mutex<PermissionStore>> {
         Arc::clone(&self.store)
     }

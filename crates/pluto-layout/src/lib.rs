@@ -1369,6 +1369,7 @@ impl LayoutTree {
     /// Like [`build_with_state_reusing_font_system`](Self::build_with_state_reusing_font_system),
     /// but with the images decoded so far (Stage 11, M3) — the
     /// entry the worker uses for image-arrival rebuilds.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_with_state_reusing_font_system_and_images(
         dom: &Dom,
         sheet: &Stylesheet,
@@ -1391,6 +1392,7 @@ impl LayoutTree {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_with_state_and_font_system(
         dom: &Dom,
         sheet: &Stylesheet,
@@ -2673,11 +2675,10 @@ impl<'a, 't> Builder<'a, 't> {
             }
         };
         let mut taffy_style = to_taffy_style(style, self.viewport);
-        if w > 0.0 && h > 0.0 {
-            if let Some(r) = ratio {
+        if w > 0.0 && h > 0.0
+            && let Some(r) = ratio {
                 taffy_style.aspect_ratio = Some(r);
             }
-        }
         if style.width.is_none() && style.height.is_none() {
             taffy_style.size.width = Dimension::length(w);
             taffy_style.size.height = Dimension::length(h);
@@ -2843,8 +2844,8 @@ impl<'a, 't> Builder<'a, 't> {
             // with alt text renders as a text leaf (the alt text,
             // in the image's style); broken without alt is a
             // zero-size leaf, as before.
-            if self.images.broken.contains(&id) {
-                if let Some(alt) = self.dom.attr(id, "alt").filter(|a| !a.trim().is_empty()) {
+            if self.images.broken.contains(&id)
+                && let Some(alt) = self.dom.attr(id, "alt").filter(|a| !a.trim().is_empty()) {
                     let leaf = LeafText {
                         spans: vec![TextSpan {
                             text: alt.to_string(),
@@ -2872,7 +2873,6 @@ impl<'a, 't> Builder<'a, 't> {
                     self.leaves.push(node);
                     return Some(node);
                 }
-            }
             // Intrinsic size (decoded) or the 300x150 default when
             // the image has not arrived yet; width/height
             // attributes override one axis and scale the other by
@@ -3422,16 +3422,14 @@ fn preshape_leaves(
     // node contexts (both must agree — measure reads the context).
     for (ids, shaped) in shaped {
         for id in ids {
-            if let Some(m) = meta.get_mut(&id) {
-                if let Some(leaf) = m.text.as_mut() {
+            if let Some(m) = meta.get_mut(&id)
+                && let Some(leaf) = m.text.as_mut() {
                     leaf.shaped = Some(shaped.clone());
                 }
-            }
-            if let Some(ctx) = taffy.get_node_context_mut(id) {
-                if let Some(leaf) = ctx.as_mut() {
+            if let Some(ctx) = taffy.get_node_context_mut(id)
+                && let Some(leaf) = ctx.as_mut() {
                     leaf.shaped = Some(shaped.clone());
                 }
-            }
         }
     }
 }
@@ -4039,11 +4037,10 @@ impl<'a> RuleIndex<'a> {
     /// the index only narrows the candidate set.
     fn candidates(&self, dom: &Dom, id: DomId) -> Vec<&IndexedRule<'a>> {
         let mut out: Vec<&IndexedRule<'a>> = Vec::new();
-        if let Some(want) = dom.attr(id, "id") {
-            if let Some(bucket) = self.by_id.get(want) {
+        if let Some(want) = dom.attr(id, "id")
+            && let Some(bucket) = self.by_id.get(want) {
                 out.extend(bucket.iter());
             }
-        }
         if let Some(classes) = dom.attr(id, "class") {
             for class in classes.split_whitespace() {
                 if let Some(bucket) = self.by_class.get(class) {
@@ -4051,11 +4048,10 @@ impl<'a> RuleIndex<'a> {
                 }
             }
         }
-        if let Some(tag) = dom.tag(id) {
-            if let Some(bucket) = self.by_tag.get(tag) {
+        if let Some(tag) = dom.tag(id)
+            && let Some(bucket) = self.by_tag.get(tag) {
                 out.extend(bucket.iter());
             }
-        }
         out.extend(self.other.iter());
         out
     }
@@ -4066,16 +4062,14 @@ impl<'a> RuleIndex<'a> {
 /// (a query that cannot be judged does not apply) — documented M2
 /// choice; `@supports` unknown values likewise skip the rule.
 fn rule_applies(rule: &Rule, viewport: (f32, f32), theme: Theme) -> bool {
-    if let Some(media) = &rule.media {
-        if media.eval(viewport.0, viewport.1, theme) != Some(true) {
+    if let Some(media) = &rule.media
+        && media.eval(viewport.0, viewport.1, theme) != Some(true) {
             return false;
         }
-    }
-    if let Some(supports) = &rule.supports {
-        if SupportsCondition::parse(supports).eval() != Some(true) {
+    if let Some(supports) = &rule.supports
+        && SupportsCondition::parse(supports).eval() != Some(true) {
             return false;
         }
-    }
     true
 }
 
@@ -4106,6 +4100,7 @@ struct StyleCtx<'a> {
 /// 16.0 for a whole-document pass, and the seed only ever applies
 /// at level 0 — a deeper level's parent must be in the map being
 /// built, or the levels are malformed.
+#[allow(clippy::too_many_arguments)]
 fn resolve_styles(
     dom: &Dom,
     index: &RuleIndex,
@@ -4243,6 +4238,7 @@ fn resolve_document_styles(
 /// pointer clones; the resolution/matching work is what is skipped)
 /// — so every caller that reads the whole map keeps working
 /// unchanged.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_subtree_styles(
     dom: &Dom,
     ua: &Stylesheet,
@@ -4566,18 +4562,14 @@ fn match_pseudo_class(
         PseudoClass::FirstOfType => {
             let tag = dom.tag(id);
             element_siblings(dom, id)
-                .iter()
-                .filter(|&&s| dom.tag(s) == tag)
-                .next()
+                .iter().find(|&&s| dom.tag(s) == tag)
                 .copied()
                 == Some(id)
         }
         PseudoClass::LastOfType => {
             let tag = dom.tag(id);
             element_siblings(dom, id)
-                .iter()
-                .filter(|&&s| dom.tag(s) == tag)
-                .next_back()
+                .iter().rfind(|&&s| dom.tag(s) == tag)
                 .copied()
                 == Some(id)
         }
@@ -4680,8 +4672,8 @@ fn flags_for_selector(sel: &Selector) -> SelectorFlags {
     let mut flags = SelectorFlags::default();
     for compound in &sel.compounds {
         for part in &compound.parts {
-            if let SimpleSelector::PseudoClass(pc) = part {
-                if matches!(
+            if let SimpleSelector::PseudoClass(pc) = part
+                && matches!(
                     pc,
                     PseudoClass::Hover
                         | PseudoClass::Active
@@ -4701,7 +4693,6 @@ fn flags_for_selector(sel: &Selector) -> SelectorFlags {
                 ) {
                     flags.has_dynamic_pseudo = true;
                 }
-            }
         }
     }
     for comb in &sel.combinators {
@@ -4816,8 +4807,8 @@ fn resolve_style(
     // Inline `style=""`: parsed as declarations of a dummy rule.
     // Inline beats all rule-based declarations of the same
     // origin/importance (the `inline` flag in the sort key).
-    if let Some(attr) = dom.attr(id, "style") {
-        if !attr.trim().is_empty() {
+    if let Some(attr) = dom.attr(id, "style")
+        && !attr.trim().is_empty() {
             let inline_sheet = Stylesheet::parse(&format!("* {{ {attr} }}"));
             for rule in &inline_sheet.rules {
                 for decl in &rule.declarations {
@@ -4840,7 +4831,6 @@ fn resolve_style(
                 }
             }
         }
-    }
     // Presentation attributes (Stage 15, M7 Phase 1, Rec 6): an
     // SVG element's `fill` / `stroke` / `stroke-width` /
     // `stop-color` attributes are author-level declarations with
@@ -5147,13 +5137,12 @@ fn apply_decl(
             }
         }
         "margin" => {
-            if let Value::Raw(raw) = value {
-                if let Some(sides) =
+            if let Value::Raw(raw) = value
+                && let Some(sides) =
                     parse_shorthand(raw, style.font_size, root_font_size, viewport)
                 {
                     style.margin = sides;
                 }
-            }
         }
         "padding-top" => {
             if let Some(s) = spacing_value(value, style.font_size, root_font_size, viewport) {
@@ -5176,13 +5165,12 @@ fn apply_decl(
             }
         }
         "padding" => {
-            if let Value::Raw(raw) = value {
-                if let Some(sides) =
+            if let Value::Raw(raw) = value
+                && let Some(sides) =
                     parse_shorthand(raw, style.font_size, root_font_size, viewport)
                 {
                     style.padding = sides;
                 }
-            }
         }
         "font-size" => match value {
             Value::Length(v) => style.font_size = *v,
@@ -5515,48 +5503,42 @@ fn apply_decl(
             style.contain_layout = has_layout;
         }
         "overflow" => {
-            if let Value::Keyword(k) = value {
-                if let Some(o) = overflow_kind(k) {
+            if let Value::Keyword(k) = value
+                && let Some(o) = overflow_kind(k) {
                     style.overflow_x = o;
                     style.overflow_y = o;
                 }
-            }
         }
         "overflow-x" => {
-            if let Value::Keyword(k) = value {
-                if let Some(o) = overflow_kind(k) {
+            if let Value::Keyword(k) = value
+                && let Some(o) = overflow_kind(k) {
                     style.overflow_x = o;
                 }
-            }
         }
         "overflow-y" => {
-            if let Value::Keyword(k) = value {
-                if let Some(o) = overflow_kind(k) {
+            if let Value::Keyword(k) = value
+                && let Some(o) = overflow_kind(k) {
                     style.overflow_y = o;
                 }
-            }
         }
         "overscroll-behavior" => {
-            if let Value::Keyword(k) = value {
-                if let Some(o) = overscroll_behavior(k) {
+            if let Value::Keyword(k) = value
+                && let Some(o) = overscroll_behavior(k) {
                     style.overscroll_behavior_x = o;
                     style.overscroll_behavior_y = o;
                 }
-            }
         }
         "overscroll-behavior-x" => {
-            if let Value::Keyword(k) = value {
-                if let Some(o) = overscroll_behavior(k) {
+            if let Value::Keyword(k) = value
+                && let Some(o) = overscroll_behavior(k) {
                     style.overscroll_behavior_x = o;
                 }
-            }
         }
         "overscroll-behavior-y" => {
-            if let Value::Keyword(k) = value {
-                if let Some(o) = overscroll_behavior(k) {
+            if let Value::Keyword(k) = value
+                && let Some(o) = overscroll_behavior(k) {
                     style.overscroll_behavior_y = o;
                 }
-            }
         }
         "box-sizing" => {
             if let Value::Keyword(k) = value {
@@ -5696,10 +5678,7 @@ fn apply_decl(
                 Value::Raw(raw) => raw.as_str(),
                 _ => return,
             };
-            match parse_grid_auto_flow(raw) {
-                Some(flow) => style.grid_auto_flow = flow,
-                None => return,
-            }
+            if let Some(flow) = parse_grid_auto_flow(raw) { style.grid_auto_flow = flow }
         }
         // M6 Phase 1: stacking / transform / transition / animation
         // model (paint order, the animation engine and the
@@ -6445,27 +6424,29 @@ fn parse_grid_placement(raw: &str) -> (GridPlace, GridPlace) {
 /// `%` resolves against the containing block inside taffy; `vh`/`vw`
 /// resolve here against the viewport; `em`/`rem` are already px.
 fn to_taffy_style(style: &ComputedStyle, viewport: (f32, f32)) -> Style {
-    let mut s = Style::default();
-    s.display = match style.display {
-        DisplayKind::Block | DisplayKind::Inline => Display::Block,
-        DisplayKind::Flex => Display::Flex,
-        DisplayKind::Grid => Display::Grid,
-        DisplayKind::FlowRoot => Display::FlowRoot,
-        DisplayKind::InlineBlock => Display::Block,
-        DisplayKind::None => Display::None,
-    };
-    s.position = match style.position {
-        PositionKind::Static => Position::Static,
-        PositionKind::Relative => Position::Relative,
-        // Taffy has no `fixed`: absolute is the closest layout
-        // behaviour; the shell re-anchors fixed boxes to the viewport.
-        PositionKind::Absolute | PositionKind::Fixed => Position::Absolute,
-        // No sticky in taffy: relative is the closest behaviour.
-        PositionKind::Sticky => Position::Relative,
-    };
-    s.box_sizing = match style.box_sizing {
-        BoxSizingKind::ContentBox => BoxSizing::ContentBox,
-        BoxSizingKind::BorderBox => BoxSizing::BorderBox,
+    let mut s = Style {
+        display: match style.display {
+            DisplayKind::Block | DisplayKind::Inline => Display::Block,
+            DisplayKind::Flex => Display::Flex,
+            DisplayKind::Grid => Display::Grid,
+            DisplayKind::FlowRoot => Display::FlowRoot,
+            DisplayKind::InlineBlock => Display::Block,
+            DisplayKind::None => Display::None,
+        },
+        position: match style.position {
+            PositionKind::Static => Position::Static,
+            PositionKind::Relative => Position::Relative,
+            // Taffy has no `fixed`: absolute is the closest layout
+            // behaviour; the shell re-anchors fixed boxes to the viewport.
+            PositionKind::Absolute | PositionKind::Fixed => Position::Absolute,
+            // No sticky in taffy: relative is the closest behaviour.
+            PositionKind::Sticky => Position::Relative,
+        },
+        box_sizing: match style.box_sizing {
+            BoxSizingKind::ContentBox => BoxSizing::ContentBox,
+            BoxSizingKind::BorderBox => BoxSizing::BorderBox,
+        },
+        ..Default::default()
     };
     let dim = |d: Dim| match d {
         Dim::Px(v) => Dimension::length(v),
@@ -8116,7 +8097,7 @@ mod tests {
         );
         let tree = LayoutTree::build(&dom, &sheet, 800.0, 600.0, Theme::Light).expect("layout builds");
         let root = dom.root().unwrap();
-        let (a, b, c) = (
+        let (a, _b, _c) = (
             find_by_class(&dom, root, "a").unwrap(),
             find_by_class(&dom, root, "b").unwrap(),
             find_by_class(&dom, root, "c").unwrap(),

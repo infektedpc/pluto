@@ -21,7 +21,7 @@
 
 use pluto_html::{Dom, NodeId};
 use pluto_js::{ComputedIntersection, ObservedSizes, RootMargin};
-use pluto_layout::{LayoutTree, OverflowKind, Spacing, Theme};
+use pluto_layout::{LayoutTree, OverflowKind, Spacing};
 
 /// Resolve one padding edge to px. `containing_width` is the
 /// approximation for `%` padding (see the module docs).

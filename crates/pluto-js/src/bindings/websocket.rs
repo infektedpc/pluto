@@ -192,7 +192,7 @@ fn websocket_new<'js>(
     // `SyntaxError`, and a non-`ws:`/`wss:` scheme is a
     // `SyntaxError` too (spec: the URL must use a WebSocket
     // scheme).
-    let host = host_of(bindings).map_err(|e| throw_type_error(&ctx, &e))?;
+    let host = host_of(bindings).map_err(|e| throw_type_error(ctx, &e))?;
     let base = host
         .borrow()
         .document_url()
@@ -200,10 +200,10 @@ fn websocket_new<'js>(
     let parsed = url::Url::parse(&url_str)
         .ok()
         .or_else(|| url::Url::parse(&base).ok()?.join(&url_str).ok())
-        .ok_or_else(|| throw_dom(&ctx, "SyntaxError", "WebSocket: the URL could not be parsed"))?;
+        .ok_or_else(|| throw_dom(ctx, "SyntaxError", "WebSocket: the URL could not be parsed"))?;
     if !matches!(parsed.scheme(), "ws" | "wss") {
         return Err(throw_dom(
-            &ctx,
+            ctx,
             "SyntaxError",
             "WebSocket: the URL scheme must be ws: or wss:",
         ));
@@ -224,7 +224,7 @@ fn websocket_new<'js>(
                 let s = to_dom_string(ctx, &item)?;
                 if subprotocols.contains(&s) {
                     return Err(throw_dom(
-                        &ctx,
+                        ctx,
                         "SyntaxError",
                         "WebSocket: duplicate subprotocol",
                     ));
@@ -233,7 +233,7 @@ fn websocket_new<'js>(
             }
         } else {
             return Err(throw_type_error(
-                &ctx,
+                ctx,
                 "WebSocket: protocols must be a string or an array of strings",
             ));
         }
@@ -242,7 +242,7 @@ fn websocket_new<'js>(
         .borrow()
         .ws_backend
         .clone()
-        .ok_or_else(|| throw_type_error(&ctx, "WebSocket: no WebSocket backend attached"))?;
+        .ok_or_else(|| throw_type_error(ctx, "WebSocket: no WebSocket backend attached"))?;
     let doc_origin = host.borrow().document_url().unwrap_or_default();
     let origin = pluto_ipc::Origin::from_url(&doc_origin).serialize();
     let id = {
@@ -274,7 +274,7 @@ fn websocket_new<'js>(
     map_set(ctx, &sockets, id, Value::from(obj.clone()))?;
     for name in ["open", "message", "error", "close"] {
         install_event_handler_property(ctx, bindings, &obj, target_id, name)
-            .map_err(|e| throw_type_error(&ctx, &e))?;
+            .map_err(|e| throw_type_error(ctx, &e))?;
     }
     // `url`: the resolved URL, as a plain data property.
     obj.prop(
@@ -518,7 +518,7 @@ fn ws_message_bytes<'js>(ctx: &Ctx<'js>, data: &Value<'js>) -> rquickjs::Result<
         return Ok((unsafe { buf.as_bytes() }.unwrap_or_default().to_vec(), true));
     }
     Err(throw_type_error(
-        &ctx,
+        ctx,
         "WebSocket.send: data must be a string, ArrayBuffer, or typed array",
     ))
 }
@@ -567,7 +567,7 @@ pub fn resolve_ws_event<'js>(
                     uint8.into_value()
                 }
             } else {
-                js(&ctx, String::from_utf8_lossy(&data).into_owned())
+                js(ctx, String::from_utf8_lossy(&data).into_owned())
             };
             event_obj.set("data", payload)?;
             dispatch_to_target(ctx, bindings, target_id, &event_obj, "message")?;

@@ -1178,11 +1178,10 @@ impl Dom {
         if !self.is_form_control(id) {
             return None;
         }
-        if !self.form_states.contains_key(&id) {
-            if let Some(seed) = self.compute_form_defaults(id) {
+        if !self.form_states.contains_key(&id)
+            && let Some(seed) = self.compute_form_defaults(id) {
                 self.form_states.insert(id, seed);
             }
-        }
         self.form_states.get_mut(&id)
     }
 
@@ -1456,8 +1455,8 @@ impl Dom {
         }
         // Controls outside the subtree whose `form` attribute names
         // this form: scan the whole document in order.
-        if let Some(form_id_attr) = self.attr(form_id, "id").map(|s| s.to_string()) {
-            if let Some(root) = self.root() {
+        if let Some(form_id_attr) = self.attr(form_id, "id").map(|s| s.to_string())
+            && let Some(root) = self.root() {
                 let mut all: Vec<NodeId> = Vec::new();
                 let mut s = vec![root];
                 while let Some(n) = s.pop() {
@@ -1476,7 +1475,6 @@ impl Dom {
                     }
                 }
             }
-        }
         out
     }
 
@@ -1549,17 +1547,16 @@ impl Dom {
                     ));
                 }
                 Some("select") => {
-                    if let Some(idx) = self.form_selected_index(control) {
-                        if idx >= 0 {
+                    if let Some(idx) = self.form_selected_index(control)
+                        && idx >= 0 {
                             out.push((
                                 name.to_string(),
                                 self.form_value(control).unwrap_or_default(),
                             ));
                         }
-                    }
                 }
-                Some("button") => {
-                    if Some(control) == submitter {
+                Some("button")
+                    if Some(control) == submitter => {
                         let ty = self
                             .attr(control, "type")
                             .map(|t| t.to_ascii_lowercase())
@@ -1571,7 +1568,6 @@ impl Dom {
                             ));
                         }
                     }
-                }
                 _ => {}
             }
         }
@@ -1818,7 +1814,7 @@ mod tests {
 
     #[test]
     fn form_state_seeded_from_attributes() {
-        let mut dom = parse(
+        let dom = parse(
             r#"<form><input name="q" value="hello"><input type="checkbox" name="c" checked><textarea name="t">dflt</textarea></form>"#,
         );
         let root = dom.root().unwrap();
@@ -1883,7 +1879,7 @@ mod tests {
 
     #[test]
     fn form_entries_successful_controls_only() {
-        let mut dom = parse(
+        let dom = parse(
             r#"<form><input name="a" value="1"><input name="b" value="2" disabled><input name="c"><input type="checkbox" name="d" value="yes" checked><input type="checkbox" name="e" value="yes"><input type="submit" name="go" value="Go"></form>"#,
         );
         let root = dom.root().unwrap();

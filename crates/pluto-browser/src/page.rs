@@ -84,7 +84,6 @@ use pluto_ipc::{
 };
 use pluto_js::ModuleSources;
 use pluto_layout::{ElementState, LayoutTree, Theme};
-use pluto_net::ResourceLoader;
 use pluto_net::csp::{PolicySet, inline_style_allowed};
 use pluto_paint::DisplayList;
 use std::collections::{HashMap, HashSet};
@@ -115,6 +114,7 @@ pub struct LoadSinks {
 
 impl LoadSinks {
     /// No sinks: the load behaves as before Stage 11.
+    #[allow(dead_code)]
     pub fn none() -> Self {
         Self::default()
     }
@@ -329,6 +329,7 @@ fn next_request_id() -> u64 {
 /// scanner-discovered and parser-discovered fetches of one URL into
 /// a single download (dedup key: URL + destination + credentials +
 /// top-level site).
+#[allow(clippy::too_many_arguments)]
 fn subresource_request(
     url: &str,
     destination: Destination,
@@ -542,6 +543,7 @@ pub struct PostBody {
 /// arrival, defer scripts after the parse, and `DOMContentLoaded`
 /// fires once the defer queue drains. `None` keeps the old
 /// behaviour (scripts fetched and held, never executed).
+#[allow(clippy::too_many_arguments)]
 pub async fn load_page_cancellable_with_hooks(
     fetch: &crate::broker::FetchSource,
     url: String,
@@ -801,12 +803,13 @@ pub async fn load_page_cancellable_with_hooks(
 /// belt). The scan runs at the tab's real viewport (Stage 11 Rec
 /// 10), so a srcset candidate is selected for the actual page
 /// width, not the 1024 px default.
+#[allow(clippy::too_many_arguments)]
 fn fire_preloads(
     fetch: &crate::broker::FetchSource,
     body: &[u8],
     base_url: &str,
     cancel: CancellationToken,
-    sinks: &LoadSinks,
+    _sinks: &LoadSinks,
     tab_id: u64,
     epoch: u64,
     viewport: (f32, f32),
@@ -938,6 +941,7 @@ struct StreamingLoad<'h> {
 }
 
 impl<'h> StreamingLoad<'h> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         fetch: crate::broker::FetchSource,
         cancel: CancellationToken,
@@ -1518,6 +1522,9 @@ pub fn parse_document_with_base(html: &str, base_url: &str) -> Document {
 /// an empty viewport. The returned [`LayoutTree`] is `!Send` (it owns
 /// a `FontSystem`), so it never crosses an await: the renderer's
 /// layout-actor thread owns it (see renderer.rs).
+// The convenience entry point; the renderer drives layout through
+// the layout-actor thread instead, so only tests call this.
+#[allow(dead_code)]
 pub fn layout_document_with_state(
     doc: &Document,
     viewport: (f32, f32),
@@ -1874,6 +1881,9 @@ fn escape_html(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only: the top-level import was removed by `cargo clippy --fix`
+    // (unused in lib code) but the tests below need it.
+    use pluto_net::ResourceLoader;
     use pluto_paint::DisplayItem;
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

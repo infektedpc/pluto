@@ -34,7 +34,7 @@
 //! load falls back to defaults (empty HSTS store, HTTPS-only on,
 //! no exceptions) and logs to stderr.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use pluto_net::{HstsStore, HttpsOnly, ResourceLoader};
 
@@ -50,14 +50,14 @@ pub fn profile_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".config").join("pluto"))
 }
 
-fn read_file(dir: &PathBuf, name: &str) -> Option<String> {
+fn read_file(dir: &Path, name: &str) -> Option<String> {
     std::fs::read_to_string(dir.join(name)).ok()
 }
 
 /// Write a file atomically: the shared writer in
 /// [`crate::atomic`] (Stage 13 Rec 9 / trap 14 — one copy for the
 /// whole browser crate, with `fsync` + a startup temp sweep).
-fn write_file_atomic(dir: &PathBuf, name: &str, contents: &str) -> std::io::Result<()> {
+fn write_file_atomic(dir: &Path, name: &str, contents: &str) -> std::io::Result<()> {
     crate::atomic::write_file_atomic(dir, name, contents)
 }
 
@@ -295,9 +295,9 @@ mod tests {
             .collect();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
         let mut handles = Vec::new();
-        for w in 0..4 {
+        for doc in docs.iter() {
             let dir = dir.clone();
-            let doc = docs[w].clone();
+            let doc = doc.clone();
             let barrier = std::sync::Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || -> std::io::Result<()> {
                 barrier.wait();

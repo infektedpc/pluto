@@ -35,7 +35,7 @@ where
         return;
     }
     let cross = |ax: f32, ay: f32, bx: f32, by: f32| ax * by - ay * bx;
-    for tri in vertices.chunks_exact(3) {
+    for tri in vertices.as_chunks::<3>().0 {
         let (a, mut b, mut c) = (tri[0], tri[1], tri[2]);
         // Normalise winding so the signed area is positive; the
         // edge functions below then have the interior on their
@@ -138,8 +138,8 @@ pub fn rasterize_triangles_into(
     let w = width as usize;
     for_each_covered_pixel(vertices, width, height, |x, y, tri, wa, wb, wc| {
         let mut srgb = [0.0f32; 4];
-        for i in 0..4 {
-            srgb[i] = wa * tri[0].color[i] + wb * tri[1].color[i] + wc * tri[2].color[i];
+        for (i, s) in srgb.iter_mut().enumerate() {
+            *s = wa * tri[0].color[i] + wb * tri[1].color[i] + wc * tri[2].color[i];
         }
         let idx = (y * w + x) * 4;
         let sa = srgb[3].clamp(0.0, 1.0);

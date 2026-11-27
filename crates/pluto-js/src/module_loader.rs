@@ -303,23 +303,20 @@ pub fn scan_module_imports(source: &str) -> Vec<String> {
     }
 
     while i < bytes.len() {
-        match frames.last() {
-            Some(Frame::Template) => {
-                match bytes[i] {
-                    b'\\' => i += 2,
-                    b'`' => {
-                        frames.pop();
-                        i += 1;
-                    }
-                    b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'{' => {
-                        frames.push(Frame::Code { brace_depth: 0 });
-                        i += 2;
-                    }
-                    _ => i += 1,
+        if let Some(Frame::Template) = frames.last() {
+            match bytes[i] {
+                b'\\' => i += 2,
+                b'`' => {
+                    frames.pop();
+                    i += 1;
                 }
-                continue;
+                b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'{' => {
+                    frames.push(Frame::Code { brace_depth: 0 });
+                    i += 2;
+                }
+                _ => i += 1,
             }
-            _ => {}
+            continue;
         }
         // Top frame is Code.
         let b = bytes[i];
@@ -376,13 +373,12 @@ pub fn scan_module_imports(source: &str) -> Vec<String> {
                         // Dynamic import(): only a string literal
                         // can be pre-fetched.
                         j = skip_ws_comments(bytes, j + 1);
-                        if j < bytes.len() && (bytes[j] == b'\'' || bytes[j] == b'"') {
-                            if let Some((spec, after)) = scan_string(source, j, bytes[j]) {
+                        if j < bytes.len() && (bytes[j] == b'\'' || bytes[j] == b'"')
+                            && let Some((spec, after)) = scan_string(source, j, bytes[j]) {
                                 push_spec(&mut out, spec);
                                 i = after;
                                 continue;
                             }
-                        }
                         i = next;
                         continue;
                     }
@@ -447,9 +443,9 @@ impl Loader for PlutoLoader {
         name: &str,
         attributes: Option<ImportAttributes<'js>>,
     ) -> rquickjs::Result<Module<'js, rquickjs::module::Declared>> {
-        if let Some(attrs) = &attributes {
-            if let Ok(Some(t)) = attrs.get_type() {
-                if t != "javascript" {
+        if let Some(attrs) = &attributes
+            && let Ok(Some(t)) = attrs.get_type()
+                && t != "javascript" {
                     return Err(Error::new_loading_message(
                         name,
                         format!(
@@ -457,8 +453,6 @@ impl Loader for PlutoLoader {
                         ),
                     ));
                 }
-            }
-        }
         let Some(source) = self.sources.get(name) else {
             return Err(Error::new_loading_message(
                 name,

@@ -436,24 +436,21 @@ impl TreeBuilder {
     /// the synthetic `<html>`, insertions go under the context
     /// element instead.
     fn adjusted_current_node(&self) -> Option<NodeId> {
-        if self.fragment && !self.fragment_detached {
-            if let Some(html) = self.fragment_html {
-                if self.stack.len() == 1 && self.stack[0] == html {
+        if self.fragment && !self.fragment_detached
+            && let Some(html) = self.fragment_html
+                && self.stack.len() == 1 && self.stack[0] == html {
                     return self.fragment_ctx;
                 }
-            }
-        }
         self.current_node()
     }
 
     /// True when the stack is back to just the synthetic html
     /// element of a fragment parse.
     fn at_fragment_root(&self) -> bool {
-        if self.fragment && !self.fragment_detached {
-            if let Some(html) = self.fragment_html {
+        if self.fragment && !self.fragment_detached
+            && let Some(html) = self.fragment_html {
                 return self.stack.len() == 1 && self.stack[0] == html;
             }
-        }
         false
     }
 
@@ -495,15 +492,12 @@ impl TreeBuilder {
         };
         self.names.insert(id, qname);
         self.full_attrs.insert(id, full);
-        if tag == "base" {
-            if self.base_href.is_none() {
-                if let Some((_, href)) = attrs.iter().find(|(n, _)| n == "href") {
-                    if !href.trim().is_empty() {
+        if tag == "base"
+            && self.base_href.is_none()
+                && let Some((_, href)) = attrs.iter().find(|(n, _)| n == "href")
+                    && !href.trim().is_empty() {
                         self.base_href = Some(href.clone());
                     }
-                }
-            }
-        }
         self.events.push(DomEvent::ElementCreated {
             node: id,
             tag: tag.to_string(),
@@ -580,13 +574,11 @@ impl TreeBuilder {
             .stack
             .iter()
             .rposition(|&n| self.tag_of(n).as_deref() == Some("table"));
-        if let Some(tpos) = last_template {
-            if last_table.is_none_or(|tb| tpos > tb) {
-                if let Some(&contents) = self.template_contents.get(&self.stack[tpos]) {
+        if let Some(tpos) = last_template
+            && last_table.is_none_or(|tb| tpos > tb)
+                && let Some(&contents) = self.template_contents.get(&self.stack[tpos]) {
                     return (contents, None);
                 }
-            }
-        }
         let table = self
             .stack
             .iter()
@@ -600,11 +592,10 @@ impl TreeBuilder {
             // it as the stack bottom), whatever its tag — unless
             // the fragment is detached, in which case the context
             // subtree is gone and the node falls outside it.
-            if self.fragment && !self.fragment_detached {
-                if let Some(ctx) = self.fragment_ctx {
+            if self.fragment && !self.fragment_detached
+                && let Some(ctx) = self.fragment_ctx {
                     return (ctx, None);
                 }
-            }
             return (self.dom.lock().unwrap().root().unwrap(), None);
         };
         if let Some(parent) = self.parent_of(table) {
@@ -851,8 +842,7 @@ impl TreeBuilder {
     /// Pop elements until `tag` (inclusive) is popped; the `<html>`
     /// element is never popped.
     fn pop_until_tag(&mut self, tag: &str) {
-        loop {
-            let Some(cur) = self.current_node() else { break };
+        while let Some(cur) = self.current_node() {
             // ASCII case-insensitive: a foreign element's stored
             // tag can be camelCase ("foreignObject") while the
             // token name is lowercased ("foreignobject").
@@ -877,8 +867,7 @@ impl TreeBuilder {
     /// open (namespace-sensitivity #0: `</td>` in a cell stopped at
     /// an SVG <td> and the following text landed inside the svg).
     fn pop_until_html_tag(&mut self, tag: &str) {
-        loop {
-            let Some(cur) = self.current_node() else { break };
+        while let Some(cur) = self.current_node() {
             let html = self.is_html_ns(cur);
             if html
                 && self
@@ -998,8 +987,7 @@ impl TreeBuilder {
     // -- implied end tags ------------------------------------------------------
 
     fn generate_implied_end_tags(&mut self, except: Option<&str>) {
-        loop {
-            let Some(cur) = self.current_node() else { break };
+        while let Some(cur) = self.current_node() {
             let t = self.tag_of(cur).unwrap_or_default();
             if Some(t.as_str()) == except {
                 break;
@@ -1016,8 +1004,7 @@ impl TreeBuilder {
     }
 
     fn generate_implied_end_tags_thoroughly(&mut self) {
-        loop {
-            let Some(cur) = self.current_node() else { break };
+        while let Some(cur) = self.current_node() {
             let t = self.tag_of(cur).unwrap_or_default();
             if matches!(
                 t.as_str(),
@@ -1161,11 +1148,8 @@ impl TreeBuilder {
             }
             i -= 1;
         }
-        loop {
-            let entry = match self.afe.get(i) {
-                Some(AfeEntry::Element(n)) => *n,
-                _ => break,
-            };
+        while let Some(AfeEntry::Element(n)) = self.afe.get(i) {
+            let entry = *n;
             let clone = self.clone_element(entry);
             self.insert_node(clone);
             self.stack.push(clone);
@@ -1228,15 +1212,14 @@ impl TreeBuilder {
         // nested <b>s, four </b>s — the fourth closes the outermost
         // b, which the Ark removed from the list on the fourth
         // insertion).
-        if let Some(cur) = self.current_node() {
-            if self.tag_of(cur).as_deref() == Some(subject)
+        if let Some(cur) = self.current_node()
+            && self.tag_of(cur).as_deref() == Some(subject)
                 && self.is_html_ns(cur)
                 && !self.afe_contains(cur)
             {
                 self.pop();
                 return;
             }
-        }
         for _outer in 0..8 {
             let mut fmt_idx: Option<usize> = None;
             for (i, e) in self.afe.iter().enumerate().rev() {
@@ -1461,11 +1444,10 @@ impl TreeBuilder {
             attrs: Vec::new(),
             self_closing: false,
         });
-        if let Some(h) = self.head_node {
-            if let Some(p) = self.stack.iter().position(|&n| n == h) {
+        if let Some(h) = self.head_node
+            && let Some(p) = self.stack.iter().position(|&n| n == h) {
                 self.stack.remove(p);
             }
-        }
         let id = self.create_element(tag, "");
         self.insert_node(id);
         self.stack.push(id);
@@ -1591,19 +1573,16 @@ impl TreeBuilder {
         // and the document-like cascade creates the head and body
         // that are reparented under it (tests_innerHTML_1 #80: an
         // empty html-context fragment yields <head> and <body>).
-        if let Token::Eof = token {
-            if let Some(ctx) = self.fragment_ctx {
-                if self.tag_of(ctx).as_deref() != Some("html") {
+        if let Token::Eof = token
+            && let Some(ctx) = self.fragment_ctx
+                && self.tag_of(ctx).as_deref() != Some("html") {
                     return ProcessOutcome::Continue;
                 }
-            }
-        }
-        if let Token::StartTag(_) = &token {
-            if self.stack.len() >= MAX_DEPTH {
+        if let Token::StartTag(_) = &token
+            && self.stack.len() >= MAX_DEPTH {
                 self.error("nesting depth cap reached");
                 return ProcessOutcome::Continue;
             }
-        }
         let mut token = token;
         // Foreign content (SVG/MathML) is dispatched before the
         // insertion mode, for every mode except Text (whose tokens
@@ -1615,14 +1594,12 @@ impl TreeBuilder {
                 Token::Character(_) | Token::StartTag(_) | Token::EndTag(_) | Token::Comment(_)
             )
             && self.in_foreign_content_for(&token)
-        {
-            if let Some(action) = self.foreign_dispatch(token.clone(), tokenizer) {
+            && let Some(action) = self.foreign_dispatch(token.clone(), tokenizer) {
                 return match action {
                     ModeAction::Done(o) => o,
                     ModeAction::Reprocess(t) => self.process(t, tokenizer),
                 };
             }
-        }
         if self.skip_newline {
             self.skip_newline = false;
             if let Token::Character(ref mut data) = token {
@@ -2019,13 +1996,12 @@ impl TreeBuilder {
     }
 
     fn pop_head(&mut self) {
-        if let Some(h) = self.head_node {
-            if let Some(p) = self.stack.iter().position(|&n| n == h) {
+        if let Some(h) = self.head_node
+            && let Some(p) = self.stack.iter().position(|&n| n == h) {
                 while self.stack.len() > p {
                     self.pop();
                 }
             }
-        }
     }
 
     fn mode_in_head_noscript(&mut self, token: Token, tz: &mut Tokenizer) -> ModeAction {
@@ -2159,11 +2135,10 @@ impl TreeBuilder {
                 self.mode = Mode::InHead;
                 let out = self.mode_in_head(token, tz);
                 self.delegate_mode = None;
-                if let Some(h) = self.head_node {
-                    if let Some(p) = self.stack.iter().position(|&n| n == h) {
+                if let Some(h) = self.head_node
+                    && let Some(p) = self.stack.iter().position(|&n| n == h) {
                         self.stack.remove(p);
                     }
-                }
                 if self.mode == Mode::InHead {
                     self.mode = Mode::AfterHead;
                 }
@@ -2262,8 +2237,7 @@ impl TreeBuilder {
             return;
         }
         self.generate_implied_end_tags_thoroughly();
-        loop {
-            let Some(cur) = self.current_node() else { break };
+        while let Some(cur) = self.current_node() {
             let is_template =
                 self.tag_of(cur).as_deref() == Some("template") && self.is_html_ns(cur);
             self.pop();
@@ -2302,11 +2276,10 @@ impl TreeBuilder {
                     && cur_ns.as_deref().is_some_and(|ns| ns.is_empty() || ns == NS_HTML);
                 self.pop();
                 self.mode = self.original_mode;
-                if is_script {
-                    if let Some(n) = script_node {
+                if is_script
+                    && let Some(n) = script_node {
                         return ModeAction::Done(ProcessOutcome::Script(n));
                     }
-                }
                 ModeAction::Done(ProcessOutcome::Continue)
             }
             Token::Eof => {
@@ -2314,11 +2287,10 @@ impl TreeBuilder {
                 // and reprocess EOF in the original mode (which
                 // creates the implied <body>). Unlike the end-tag
                 // case, there is no script-pause to report at EOF.
-                if let Some(cur) = self.current_node() {
-                    if self.tag_of(cur).as_deref() != Some("html") {
+                if let Some(cur) = self.current_node()
+                    && self.tag_of(cur).as_deref() != Some("html") {
                         self.pop();
                     }
-                }
                 self.mode = self.original_mode;
                 ModeAction::Reprocess(Token::Eof)
             }
@@ -2405,11 +2377,10 @@ fn limited_quirks_public_id(pub_id: &str) -> bool {
 
 impl TreeBuilder {
     fn mode_in_body(&mut self, token: Token, tz: &mut Tokenizer) -> ModeAction {
-        if self.in_foreign_content_for(&token) {
-            if let Some(action) = self.foreign_dispatch(token.clone(), tz) {
+        if self.in_foreign_content_for(&token)
+            && let Some(action) = self.foreign_dispatch(token.clone(), tz) {
                 return action;
             }
-        }
         match token {
             Token::Character(data) => {
                 self.reconstruct_afe();
@@ -2448,11 +2419,10 @@ impl TreeBuilder {
                 while self.stack.len() > 1 {
                     self.pop();
                 }
-                if let Some(cur) = self.current_node() {
-                    if self.tag_of(cur).as_deref() != Some("html") {
+                if let Some(cur) = self.current_node()
+                    && self.tag_of(cur).as_deref() != Some("html") {
                         self.pop();
                     }
-                }
                 self.mode = Mode::AfterBody;
                 ModeAction::Done(ProcessOutcome::Continue)
             }
@@ -2477,8 +2447,7 @@ impl TreeBuilder {
         self.template_modes.pop();
         self.template_contents_stack.pop();
         self.clear_afe_to_marker();
-        loop {
-            let Some(cur) = self.current_node() else { break };
+        while let Some(cur) = self.current_node() {
             let is_template =
                 self.tag_of(cur).as_deref() == Some("template") && self.is_html_ns(cur);
             self.pop();
@@ -2500,11 +2469,10 @@ impl TreeBuilder {
                 // attributes onto the document element only when
                 // no template element is open; inside template
                 // contents the token is ignored outright.
-                if !self.has_open_template() {
-                    if let Some(h) = self.html_node {
+                if !self.has_open_template()
+                    && let Some(h) = self.html_node {
                         self.merge_attrs(h, &tag.attrs);
                     }
-                }
                 ModeAction::Done(ProcessOutcome::Continue)
             }
             "base" | "basefont" | "bgsound" | "link" | "meta" | "noframes" | "script"
@@ -2833,11 +2801,10 @@ impl TreeBuilder {
                 ModeAction::Done(ProcessOutcome::Continue)
             }
             "optgroup" | "option" => {
-                if let Some(cur) = self.current_node() {
-                    if self.tag_of(cur).as_deref() == Some("option") {
+                if let Some(cur) = self.current_node()
+                    && self.tag_of(cur).as_deref() == Some("option") {
                         self.pop();
                     }
-                }
                 self.reconstruct_afe();
                 self.insert_element(&tag, "");
                 ModeAction::Done(ProcessOutcome::Continue)
@@ -2935,11 +2902,10 @@ impl TreeBuilder {
                     self.generate_implied_end_tags(None);
                     if in_template {
                         self.pop_until_tag("form");
-                    } else if let Some(f) = form {
-                        if let Some(pos) = self.stack.iter().position(|&n| n == f) {
+                    } else if let Some(f) = form
+                        && let Some(pos) = self.stack.iter().position(|&n| n == f) {
                             self.stack.remove(pos);
                         }
-                    }
                 }
                 ModeAction::Done(ProcessOutcome::Continue)
             }
@@ -3071,17 +3037,14 @@ impl TreeBuilder {
         // the svg element in the SVG namespace (tests10 #51/#52/#53).
         // parse5's shouldProcessStartTagTokenInForeignContent
         // returns false for exactly this case.
-        if let Token::StartTag(t) = token {
-            if t.name == "svg" {
-                if let Some(cur) = self.adjusted_current_node() {
-                    if self.tag_of(cur).as_deref() == Some("annotation-xml")
+        if let Token::StartTag(t) = token
+            && t.name == "svg"
+                && let Some(cur) = self.adjusted_current_node()
+                    && self.tag_of(cur).as_deref() == Some("annotation-xml")
                         && self.ns_of(cur) == NS_MATHML
                     {
                         return false;
                     }
-                }
-            }
-        }
         if self.in_foreign_content() {
             return true;
         }
@@ -3094,20 +3057,16 @@ impl TreeBuilder {
         // inside an SVG title is ignored by the in-body generic
         // end-tag walk (the title is special) and the svg never
         // closes (webkit02 #20).
-        if let Token::EndTag(_) = token {
-            if let Some(cur) = self.adjusted_current_node() {
-                if !self.is_html_ns(cur) {
+        if let Token::EndTag(_) = token
+            && let Some(cur) = self.adjusted_current_node()
+                && !self.is_html_ns(cur) {
                     return true;
                 }
-            }
-        }
-        if let Token::StartTag(t) = token {
-            if matches!(t.name.as_str(), "mglyph" | "malignmark") {
-                if let Some(cur) = self.adjusted_current_node() {
+        if let Token::StartTag(t) = token
+            && matches!(t.name.as_str(), "mglyph" | "malignmark")
+                && let Some(cur) = self.adjusted_current_node() {
                     return self.is_mathml_text_integration_point(cur);
                 }
-            }
-        }
         false
     }
 
@@ -3213,7 +3172,7 @@ impl TreeBuilder {
                 // phase replaces a lone NUL without touching the
                 // flag, via its if/elif).
                 let cur = self.current_node();
-                let integration = cur.map_or(false, |n| {
+                let integration = cur.is_some_and(|n| {
                     self.is_html_integration_point(n)
                         || self.is_mathml_text_integration_point(n)
                 });
@@ -3490,9 +3449,11 @@ fn adjust_mathml_attributes(t: &mut TagToken) {
     }
 }
 
+type ForeignAttrs = (Vec<(String, String)>, Vec<(QName, String)>);
+
 /// Split foreign attributes into plain (local, value) pairs for the
 /// Dom and qualified (QName, value) pairs for the side map.
-fn foreign_attrs(t: &TagToken) -> (Vec<(String, String)>, Vec<(QName, String)>) {
+fn foreign_attrs(t: &TagToken) -> ForeignAttrs {
     let mut plain = Vec::new();
     let mut full = Vec::new();
     for (name, value) in &t.attrs {
@@ -3818,8 +3779,7 @@ impl TreeBuilder {
 
     fn clear_stack_to_table_context(&mut self, contexts: &[&str]) {
         let before = self.stack.len();
-        loop {
-            let Some(cur) = self.current_node() else { break };
+        while let Some(cur) = self.current_node() {
             let t = self.tag_of(cur).unwrap_or_default();
             if contexts.contains(&t.as_str()) || t == "html" || t == "template" {
                 break;
@@ -3917,8 +3877,8 @@ impl TreeBuilder {
             _ => {
                 // Caption contents are body content, except table
                 // end tags handled above.
-                if let Token::EndTag(ref tag) = token {
-                    if matches!(
+                if let Token::EndTag(ref tag) = token
+                    && matches!(
                         tag.name.as_str(),
                         "body" | "col" | "colgroup" | "html" | "tbody" | "td" | "tfoot"
                             | "th" | "thead" | "tr"
@@ -3926,7 +3886,6 @@ impl TreeBuilder {
                         self.error("end tag in caption ignored");
                         return ModeAction::Done(ProcessOutcome::Continue);
                     }
-                }
                 self.mode_in_body(token, tz)
             }
         }
@@ -4157,14 +4116,13 @@ impl TreeBuilder {
                     "tbody" | "tfoot" | "thead"
                 ) =>
             {
-                if self.has_in_scope(tag.name.as_str(), Scope::Table) {
-                    if self.has_in_scope("tr", Scope::Table) {
+                if self.has_in_scope(tag.name.as_str(), Scope::Table)
+                    && self.has_in_scope("tr", Scope::Table) {
                         self.clear_stack_to_table_context(&["tr"]);
                         self.pop();
                         self.mode = Mode::InTableBody;
                         return ModeAction::Reprocess(token);
                     }
-                }
                 ModeAction::Done(ProcessOutcome::Continue)
             }
             _ => self.mode_in_table(token, tz),
@@ -4225,8 +4183,7 @@ impl TreeBuilder {
         // cell and the svg open, and following text lands inside
         // the svg instead of being foster-parented
         // (namespace-sensitivity #0).
-        loop {
-            let Some(cur) = self.current_node() else { break };
+        while let Some(cur) = self.current_node() {
             let t = self.tag_of(cur).unwrap_or_default();
             let html = self.is_html_ns(cur);
             self.pop();
@@ -4266,11 +4223,10 @@ impl TreeBuilder {
             }
             Token::StartTag(ref tag) if tag.name == "html" => self.mode_in_body(token, tz),
             Token::StartTag(ref tag) if tag.name == "option" => {
-                if let Some(cur) = self.current_node() {
-                    if self.tag_of(cur).as_deref() == Some("option") {
+                if let Some(cur) = self.current_node()
+                    && self.tag_of(cur).as_deref() == Some("option") {
                         self.pop();
                     }
-                }
                 // Reconstruct the active formatting elements first:
                 // an <option> after an early-closed <i> goes inside
                 // a clone of it (webkit02 #35).
@@ -4279,16 +4235,14 @@ impl TreeBuilder {
                 ModeAction::Done(ProcessOutcome::Continue)
             }
             Token::StartTag(ref tag) if tag.name == "optgroup" => {
-                if let Some(cur) = self.current_node() {
-                    if self.tag_of(cur).as_deref() == Some("option") {
+                if let Some(cur) = self.current_node()
+                    && self.tag_of(cur).as_deref() == Some("option") {
                         self.pop();
                     }
-                }
-                if let Some(cur) = self.current_node() {
-                    if self.tag_of(cur).as_deref() == Some("optgroup") {
+                if let Some(cur) = self.current_node()
+                    && self.tag_of(cur).as_deref() == Some("optgroup") {
                         self.pop();
                     }
-                }
                 self.reconstruct_afe();
                 self.insert_element(tag, "");
                 ModeAction::Done(ProcessOutcome::Continue)
@@ -4302,16 +4256,14 @@ impl TreeBuilder {
                 ModeAction::Done(ProcessOutcome::Continue)
             }
             Token::StartTag(ref tag) if tag.name == "hr" => {
-                if let Some(cur) = self.current_node() {
-                    if self.tag_of(cur).as_deref() == Some("option") {
+                if let Some(cur) = self.current_node()
+                    && self.tag_of(cur).as_deref() == Some("option") {
                         self.pop();
                     }
-                }
-                if let Some(cur) = self.current_node() {
-                    if self.tag_of(cur).as_deref() == Some("optgroup") {
+                if let Some(cur) = self.current_node()
+                    && self.tag_of(cur).as_deref() == Some("optgroup") {
                         self.pop();
                     }
-                }
                 let id = self.create_element(tag, "");
                 self.insert_node(id);
                 // <selectedcontent> clone on explicit </option> is
@@ -4365,8 +4317,8 @@ impl TreeBuilder {
                 ModeAction::Done(ProcessOutcome::Continue)
             }
             Token::EndTag(ref tag) if tag.name == "option" => {
-                if let Some(cur) = self.current_node() {
-                    if self.tag_of(cur).as_deref() == Some("option") {
+                if let Some(cur) = self.current_node()
+                    && self.tag_of(cur).as_deref() == Some("option") {
                         // <selectedcontent> cloning on explicit
                         // </option>: if the select has a
                         // <selectedcontent> child... (deferred: the
@@ -4375,7 +4327,6 @@ impl TreeBuilder {
                         // final report.)
                         self.pop();
                     }
-                }
                 ModeAction::Done(ProcessOutcome::Continue)
             }
             Token::EndTag(ref tag) if tag.name == "select" => {

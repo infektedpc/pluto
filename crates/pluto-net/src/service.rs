@@ -714,6 +714,7 @@ async fn run_fetch(
 ///   autoupgraded"); parse-and-ignore at most, never enforce;
 /// * no report sending — `Violation` records are console-report
 ///   only in v1 (no `report-uri` / `report-to` network sends).
+///
 /// Stage 16 Phase 3 (Rec 11): `pub(crate)` so the WebSocket
 /// connect path (`websocket.rs`) can run the same pre-request CSP
 /// check as the fetch path — one gate, not two copies.

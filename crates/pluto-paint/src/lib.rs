@@ -981,11 +981,10 @@ impl DisplayList {
             let mut cur = Some(bi);
             while let Some(i) = cur {
                 let bx = &boxes[i];
-                if bx.style.opacity < 1.0 {
-                    if let Some(dom) = bx.dom {
+                if bx.style.opacity < 1.0
+                    && let Some(dom) = bx.dom {
                         chain.push((LayoutTree::dom_key(dom), bx.style.opacity));
                     }
-                }
                 cur = bx.parent.and_then(|p| by_dom.get(&p).copied());
             }
             chain.reverse();
@@ -1203,8 +1202,8 @@ impl DisplayList {
             // box already paints its gradient. Rounded boxes clip
             // the gradient to the padding box, like the
             // background-image tiles above.
-            if bx.dom.is_some() {
-                if let Some(gradient) = &bx.style.background_gradient {
+            if bx.dom.is_some()
+                && let Some(gradient) = &bx.style.background_gradient {
                     let needs_clip = !bx.radii.is_zero();
                     if needs_clip {
                         let clip_rect =
@@ -1240,7 +1239,7 @@ impl DisplayList {
                                 Self::emit_radial_background(
                                     &mut list,
                                     &mut new_blobs,
-                                    &mut **cache,
+                                    cache,
                                     dom_id,
                                     bx,
                                     gradient,
@@ -1252,7 +1251,6 @@ impl DisplayList {
                         list.0.push(DisplayItem::PopClip);
                     }
                 }
-            }
             // Stage 16 (M8 Phase 2, Rec 5): the poster (`bx.image`)
             // is skipped while the video is live — the frame Blob
             // below replaces it. When the video is not live the
@@ -1274,20 +1272,19 @@ impl DisplayList {
             // gradients), clipped to the box. Needs the DOM +
             // raster cache, so plain `build()` paints nothing
             // for an svg box (its background still paints).
-            if bx.svg_canvas == Some(SvgCanvasKind::Svg) {
-                if let (Some(svg_id), Some((dom, cache))) = (bx.dom, svg.as_mut()) {
+            if bx.svg_canvas == Some(SvgCanvasKind::Svg)
+                && let (Some(svg_id), Some((dom, cache))) = (bx.dom, svg.as_mut()) {
                     Self::emit_svg(
                         &mut list,
                         &mut new_blobs,
                         layout,
-                        *dom,
-                        &mut **cache,
+                        dom,
+                        cache,
                         svg_id,
                         bx,
                         svg_images,
                     );
                 }
-            }
             // Stage 15 (M7 Phase 3, Rec 8): a `<canvas>` with a
             // live bitmap paints it as a Blob at the box's rect.
             // The Blob is emitted whenever the canvas is live
@@ -1295,8 +1292,8 @@ impl DisplayList {
             // shell already holds the pixels); a fresh bitmap
             // rides `new_blobs` only when it is in `canvas_new`
             // (dirty canvases only — see `build_with_svg_and_canvas`).
-            if bx.svg_canvas == Some(SvgCanvasKind::Canvas) {
-                if let Some(canvas_id) = bx.dom
+            if bx.svg_canvas == Some(SvgCanvasKind::Canvas)
+                && let Some(canvas_id) = bx.dom
                     && canvas_live.contains(&canvas_id)
                 {
                     let id = canvas_blob_id(canvas_id);
@@ -1313,7 +1310,6 @@ impl DisplayList {
                         height: bx.height,
                     });
                 }
-            }
             // Stage 16 (M8 Phase 2, Rec 5): a `<video>` box paints
             // its current frame as a Blob at the box's rect when
             // live (the shell holds the latest frame under the
@@ -1452,6 +1448,7 @@ impl DisplayList {
     /// the vector route, which paints the shapes it can express
     /// and skips the rest — a shape whose tessellation fails is
     /// skipped individually, never the whole svg.
+    #[allow(clippy::too_many_arguments)]
     fn emit_svg(
         list: &mut DisplayList,
         new_blobs: &mut Vec<(ResourceId, Resource)>,
@@ -1522,6 +1519,7 @@ impl DisplayList {
     /// rebuild names the id the shell already holds and no
     /// `ResourceReady` is sent twice — a fresh bitmap is
     /// returned in `new_blobs` only on a cache miss.
+    #[allow(clippy::too_many_arguments)]
     fn emit_svg_raster(
         list: &mut DisplayList,
         new_blobs: &mut Vec<(ResourceId, Resource)>,
@@ -1614,10 +1612,10 @@ impl DisplayList {
     }
 
     /// Raster route for one radial CSS gradient background: one
-    /// Blob at the box's used size, cached by element id + size
-    /// + gradient fingerprint (see `emit_svg_raster` for the
-    /// deterministic-id contract). Oversize bitmaps paint
-    /// nothing — the box keeps its background fill.
+    /// Blob at the box's used size, cached by element id,
+    /// size, and gradient fingerprint (see `emit_svg_raster`
+    /// for the deterministic-id contract). Oversize bitmaps
+    /// paint nothing — the box keeps its background fill.
     fn emit_radial_background(
         list: &mut DisplayList,
         new_blobs: &mut Vec<(ResourceId, Resource)>,
@@ -1630,7 +1628,7 @@ impl DisplayList {
         let h = bx.height.round().max(0.0) as u32;
         if w == 0
             || h == 0
-            || (w as usize).checked_mul(h as usize).unwrap_or(usize::MAX) > MAX_RASTER_PIXELS
+            || (w as usize).saturating_mul(h as usize) > MAX_RASTER_PIXELS
         {
             return;
         }

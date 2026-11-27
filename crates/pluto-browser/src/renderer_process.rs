@@ -372,7 +372,7 @@ fn install_namespaces() -> io::Result<()> {
         Ok(())
     } else {
         Err(first_err.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "all namespace unshares failed")
+            io::Error::other("all namespace unshares failed")
         }))
     }
 }
@@ -484,44 +484,39 @@ fn install_chroot() -> io::Result<()> {
     bind_mount_ro("/usr/share/fonts", &format!("{root}/usr/share/fonts"))?;
     bind_mount_ro("/etc/fonts", &format!("{root}/etc/fonts"))?;
     for dir in ["/usr/local/share/fonts", "/usr/share/fontconfig"] {
-        if Path::new(dir).is_dir() {
-            if let Err(e) = bind_mount_ro(dir, &format!("{root}{dir}")) {
+        if Path::new(dir).is_dir()
+            && let Err(e) = bind_mount_ro(dir, &format!("{root}{dir}")) {
                 sandbox_warn(&format!("optional font bind-mount failed: {dir}: {e}"));
             }
-        }
     }
     if let Ok(home) = std::env::var("HOME") {
         for rel in [".fonts", ".local/share/fonts", ".config/fontconfig"] {
             let src = format!("{home}/{rel}");
-            if Path::new(&src).is_dir() {
-                if let Err(e) = bind_mount_ro(&src, &format!("{root}{src}")) {
+            if Path::new(&src).is_dir()
+                && let Err(e) = bind_mount_ro(&src, &format!("{root}{src}")) {
                     sandbox_warn(&format!("optional home font bind-mount failed: {src}: {e}"));
                 }
-            }
         }
     }
     // DNS files (glibc resolver; files, not dirs).
     for file in ["/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf"] {
-        if Path::new(file).exists() {
-            if let Err(e) = bind_mount_file_ro(file, &format!("{root}{file}")) {
+        if Path::new(file).exists()
+            && let Err(e) = bind_mount_file_ro(file, &format!("{root}{file}")) {
                 sandbox_warn(&format!("optional DNS bind-mount failed: {file}: {e}"));
             }
-        }
     }
     // Shared-library dirs + loader cache: glibc dlopens NSS
     // modules lazily on first DNS lookup (see the doc above).
     for dir in ["/lib", "/lib64", "/usr/lib", "/usr/lib64"] {
-        if Path::new(dir).is_dir() {
-            if let Err(e) = bind_mount_ro(dir, &format!("{root}{dir}")) {
+        if Path::new(dir).is_dir()
+            && let Err(e) = bind_mount_ro(dir, &format!("{root}{dir}")) {
                 sandbox_warn(&format!("optional lib bind-mount failed: {dir}: {e}"));
             }
-        }
     }
-    if Path::new("/etc/ld.so.cache").exists() {
-        if let Err(e) = bind_mount_file_ro("/etc/ld.so.cache", &format!("{root}/etc/ld.so.cache")) {
+    if Path::new("/etc/ld.so.cache").exists()
+        && let Err(e) = bind_mount_file_ro("/etc/ld.so.cache", &format!("{root}/etc/ld.so.cache")) {
             sandbox_warn(&format!("optional ld.so.cache bind-mount failed: {e}"));
         }
-    }
     // chroot, then move the cwd inside (a cwd outside the new root
     // would be unreachable afterwards).
     let root_c = cstr(&root)?;
@@ -611,6 +606,7 @@ fn bind_mount_file_ro(src: &str, dst: &str) -> io::Result<()> {
     std::fs::OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(false)
         .open(dst)?;
     mount_ptr(src, dst, None, libc::MS_BIND, None)?;
     mount_ptr(
@@ -740,13 +736,13 @@ fn set_rlimit_capped(resource: u32, target: u64) -> io::Result<()> {
     if unsafe { libc::getrlimit(resource, &mut cur) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let hard = cur.rlim_max as u64;
-    let target = if hard == libc::RLIM_INFINITY as u64 {
+    let hard = cur.rlim_max;
+    let target = if hard == libc::RLIM_INFINITY {
         target
     } else {
         target.min(hard)
     };
-    if cur.rlim_cur as u64 == target && cur.rlim_max as u64 == target {
+    if cur.rlim_cur == target && cur.rlim_max == target {
         return Ok(());
     }
     let lim = libc::rlimit {
@@ -771,7 +767,7 @@ fn lower_rlimit_toward(resource: u32, target: u64) -> io::Result<()> {
     if unsafe { libc::getrlimit(resource, &mut cur) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    if (cur.rlim_cur as u64) <= target {
+    if cur.rlim_cur <= target {
         return Ok(());
     }
     set_rlimit_capped(resource, target)
@@ -1651,6 +1647,9 @@ mod tests {
     }
 
     #[test]
+    // This test exists to pin the constants, so the
+    // assertions-on-constants lint is silenced deliberately.
+    #[allow(clippy::assertions_on_constants)]
     fn sandbox_rlimits_are_generous() {
         assert!(SANDBOX_RLIMIT_AS >= 1 << 30, "address-space cap is generous");
         assert!(SANDBOX_RLIMIT_CPU_SECS >= 60, "CPU cap is generous");

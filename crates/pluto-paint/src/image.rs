@@ -276,11 +276,7 @@ fn collect_frames<'a>(
             rgba,
         });
         let (numer, denom) = frame.delay().numer_denom_ms();
-        let delay = if denom == 0 {
-            0
-        } else {
-            numer / denom
-        };
+        let delay = numer.checked_div(denom).unwrap_or(0);
         delays_ms.push(delay.max(MIN_FRAME_DELAY_MS));
         if frames.len() > MAX_ANIMATED_FRAMES {
             return Err(ImageError::AnimatedTooLarge(format!(
@@ -349,8 +345,8 @@ pub fn downscale_rgba(image: &DecodedImage) -> DecodedImage {
                     let (sx, sy) = (x * 2 + dx, y * 2 + dy);
                     if sx < w && sy < h {
                         let off = ((sy as usize) * (w as usize) + (sx as usize)) * 4;
-                        for c in 0..4 {
-                            sum[c] += image.rgba[off + c] as u32;
+                        for (c, s) in sum.iter_mut().enumerate() {
+                            *s += image.rgba[off + c] as u32;
                         }
                         count += 1;
                     }
@@ -399,8 +395,8 @@ pub fn resize_rgba(image: &DecodedImage, width: u32, height: u32) -> DecodedImag
             for sy in y0..y1 {
                 for sx in x0..x1 {
                     let off = (sy * w as usize + sx) * 4;
-                    for c in 0..4 {
-                        sum[c] += image.rgba[off + c] as u32;
+                    for (c, s) in sum.iter_mut().enumerate() {
+                        *s += image.rgba[off + c] as u32;
                     }
                     count += 1;
                 }
@@ -427,7 +423,7 @@ pub fn build_mip_chain(image: &DecodedImage) -> Vec<DecodedImage> {
     let mut chain = vec![image.clone()];
     while chain
         .last()
-        .map_or(false, |last| last.width > 1 || last.height > 1)
+        .is_some_and(|last| last.width > 1 || last.height > 1)
     {
         let next = downscale_rgba(chain.last().expect("non-empty chain"));
         chain.push(next);
@@ -795,9 +791,7 @@ impl ImageCache {
 
     /// Like [`get`], but counts as use for LRU purposes.
     pub fn get_touch(&mut self, id: ResourceId) -> Option<&Resource> {
-        if self.table.get(id).is_none() {
-            return None;
-        }
+        self.table.get(id)?;
         self.touch(id);
         self.table.get(id)
     }
@@ -845,16 +839,14 @@ impl ImageCache {
         if let Some(Resource::Image { rgba, .. }) = self.table.resources.remove(&id) {
             self.bytes_used = self.bytes_used.saturating_sub(rgba.len());
         }
-        if let Some(hash) = self.pixel_hash.remove(&id) {
-            if self.by_pixels.get(&hash) == Some(&id) {
+        if let Some(hash) = self.pixel_hash.remove(&id)
+            && self.by_pixels.get(&hash) == Some(&id) {
                 self.by_pixels.remove(&hash);
             }
-        }
-        if let Some(hash) = self.source_hash.remove(&id) {
-            if self.by_source.get(&hash) == Some(&id) {
+        if let Some(hash) = self.source_hash.remove(&id)
+            && self.by_source.get(&hash) == Some(&id) {
                 self.by_source.remove(&hash);
             }
-        }
         self.animated.remove(&id);
         self.frame_dirty.remove(&id);
     }
@@ -1039,7 +1031,7 @@ mod tests {
         // 4x4 quadrants: red / green / blue / white; the 2x2 level
         // keeps the quadrant colours, the 1x1 level is their mean.
         let rgba: Vec<u8> = (0..16)
-            .map(|i| {
+            .flat_map(|i| {
                 let (x, y) = (i % 4, i / 4);
                 match (x < 2, y < 2) {
                     (true, true) => [255, 0, 0, 255],
@@ -1048,7 +1040,6 @@ mod tests {
                     (false, false) => [255, 255, 255, 255],
                 }
             })
-            .flatten()
             .collect();
         let image = DecodedImage {
             width: 4,
@@ -1361,8 +1352,8 @@ mod tests {
         assert_eq!(animated.frames.len(), 2);
         assert_eq!(animated.delays_ms, vec![100, 250]);
         assert_eq!(animated.loop_count, None, "infinite loop");
-        assert_eq!(animated.frames[0].rgba, vec![255, 0, 0, 255].repeat(4));
-        assert_eq!(animated.frames[1].rgba, vec![0, 255, 0, 255].repeat(4));
+        assert_eq!(animated.frames[0].rgba, [255, 0, 0, 255].repeat(4));
+        assert_eq!(animated.frames[1].rgba, [0, 255, 0, 255].repeat(4));
         // And the plain decode of the same GIF gives frame 0.
         let still = decode_image(&bytes).expect("GIF decodes as a still");
         assert_eq!(still.rgba, animated.frames[0].rgba);
@@ -1390,7 +1381,7 @@ mod tests {
         // Quadrant colours average correctly on a downscale to
         // 1x1 (the mean of the four quadrants).
         let rgba: Vec<u8> = (0..16)
-            .map(|i| {
+            .flat_map(|i| {
                 let (x, y) = (i % 4, i / 4);
                 match (x < 2, y < 2) {
                     (true, true) => [255, 0, 0, 255],
@@ -1399,7 +1390,6 @@ mod tests {
                     (false, false) => [255, 255, 255, 255],
                 }
             })
-            .flatten()
             .collect();
         let quadrants = DecodedImage {
             width: 4,

@@ -451,21 +451,19 @@ impl ResourceLoader {
         };
         // HSTS first: an `http` URL for a Known HSTS Host warms
         // the `https` endpoint instead.
-        if uri.scheme_str() == Some("http") {
-            if let Some(host) = uri.host() {
+        if uri.scheme_str() == Some("http")
+            && let Some(host) = uri.host() {
                 let known = self
                     .scheduler
                     .hsts_store()
                     .lock()
                     .unwrap()
                     .is_known(host, std::time::SystemTime::now());
-                if known {
-                    if let Some(upgraded) = crate::hsts::upgrade_http_uri(&uri) {
+                if known
+                    && let Some(upgraded) = crate::hsts::upgrade_http_uri(&uri) {
                         uri = upgraded;
                     }
-                }
             }
-        }
         match uri.scheme_str() {
             Some("http") | Some("https") => {}
             _ => return false,

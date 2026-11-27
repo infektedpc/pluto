@@ -877,14 +877,14 @@ impl AnimationEngine {
                     AnimationDirection::Normal => frac,
                     AnimationDirection::Reverse => 1.0 - frac,
                     AnimationDirection::Alternate => {
-                        if (iteration as u64) % 2 == 0 {
+                        if (iteration as u64).is_multiple_of(2) {
                             frac
                         } else {
                             1.0 - frac
                         }
                     }
                     AnimationDirection::AlternateReverse => {
-                        if (iteration as u64) % 2 == 0 {
+                        if (iteration as u64).is_multiple_of(2) {
                             1.0 - frac
                         } else {
                             frac

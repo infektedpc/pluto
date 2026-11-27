@@ -743,7 +743,7 @@ fn install_intersection_observer<'js>(
             };
             b.borrow_mut()
                 .intersection_registry
-                .configure_observer(id as u64, root, root_margin, thresholds);
+                .configure_observer(id, root, root_margin, thresholds);
             let map = registry_map(&ctx, "intersectionObservers")?;
             map_set(&ctx, &map, id, js(&ctx, cb))?;
             let instances = registry_map(&ctx, "intersectionObserverInstances")?;

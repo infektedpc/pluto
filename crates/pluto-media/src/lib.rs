@@ -29,7 +29,7 @@
 //!   the offline registry holds no `rav1d`, `dav1d`, or
 //!   `libvpx` crate (only `rav1e`, an encoder). WebM/VP9
 //!   reports unsupported (`canPlayType` `""`, an `error` event
-//!   + `NETWORK_NO_SOURCE`, fall through to the next
+//!   and `NETWORK_NO_SOURCE`, fall through to the next
 //!   `<source>`), never a fake frame. See `canplay`.
 //! * **No audio sink here** — the sink lives in
 //!   [`sink`](crate::sink) (cpal device, null fallback) and
@@ -99,11 +99,11 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
         }
     }
     let clean: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    if clean.len() % 4 != 0 {
+    if !clean.len().is_multiple_of(4) {
         return Err("base64 length not a multiple of 4".to_string());
     }
     let mut out = Vec::with_capacity(clean.len() * 3 / 4);
-    for chunk in clean.chunks_exact(4) {
+    for chunk in clean.as_chunks::<4>().0 {
         let pad = chunk.iter().rev().take_while(|&&b| b == b'=').count();
         let n = ((val(chunk[0])? as u32) << 18)
             | ((val(chunk[1])? as u32) << 12)

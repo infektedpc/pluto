@@ -362,7 +362,7 @@ pub fn install_fetch<'js>(
 
 /// The fetch gate (Stage 9 Rec 2): intentionally a pass-through.
 /// The browser-side backend (`PlutoFetchBackend` in pluto-browser)
-/// + the CORS engine in `pluto-net` are authoritative: the CORS
+/// and the CORS engine in `pluto-net` are authoritative: the CORS
 /// preflight / safelist check, opaque filtering, and the
 /// credentials rules all run there, never in the realm — script
 /// must never receive the internal response object. Relative URLs
@@ -423,7 +423,7 @@ fn fetch_impl<'js>(
     let url = if let Some(s) = input.as_string() {
         s.to_string().unwrap_or_default()
     } else if let Some(obj) = input.as_object() {
-        if let Some(req_id) = request_id_of(&ctx, obj) {
+        if let Some(req_id) = request_id_of(ctx, obj) {
             let stored = match bindings.borrow().requests.get(&req_id).cloned() {
                 Some(s) => s,
                 None => {
@@ -484,11 +484,11 @@ fn fetch_impl<'js>(
                 method = m.to_ascii_uppercase();
             }
             if let Ok(h) = obj.get::<_, Value>("headers") {
-                headers = parse_headers_init(&ctx, bindings, &h)?;
+                headers = parse_headers_init(ctx, bindings, &h)?;
             }
             if let Ok(b) = obj.get::<_, Value>("body")
                 && !b.is_null() && !b.is_undefined() {
-                    body = Some(to_dom_string(&ctx, &b)?.into_bytes());
+                    body = Some(to_dom_string(ctx, &b)?.into_bytes());
                 }
             if let Ok(m) = obj.get::<_, String>("mode") {
                 mode = match m.as_str() {
@@ -521,7 +521,7 @@ fn fetch_impl<'js>(
             }
             if let Ok(s) = obj.get::<_, Value>("signal")
                 && !s.is_null() && !s.is_undefined() {
-                    match s.as_object().and_then(|o| abort_signal_id_of(&ctx, o)) {
+                    match s.as_object().and_then(|o| abort_signal_id_of(ctx, o)) {
                         Some(id) => signal_id = Some(id),
                         None => {
                             reject_with(ctx, "fetch: signal is not an AbortSignal")?;
@@ -539,7 +539,7 @@ fn fetch_impl<'js>(
             .get(&id)
             .is_some_and(|s| s.aborted)
     {
-        let reason = make_dom_error(&ctx, "AbortError", "The user aborted a request.")?;
+        let reason = make_dom_error(ctx, "AbortError", "The user aborted a request.")?;
         let _: Value = reject.call((reason,))?;
         return Ok(promise.into_value());
     }
@@ -816,7 +816,7 @@ pub fn resolve_stream_event<'js>(
                         }
                     }
                 }
-                Some(body_id) => {
+                Some(_body_id) => {
                     // The error finishes the source body and every
                     // tee of it (see `finish_stream_fetch`).
                     finish_stream_fetch(ctx, bindings, id, Some(&error.to_string()))?;
@@ -955,8 +955,9 @@ fn push_body_chunk<'js>(
 }
 
 /// Build a `Response` for a `Headers` event: an empty body buffer
-/// + a live `ReadableStream` (fed by later `Chunk` events, closed
+/// and a live `ReadableStream` (fed by later `Chunk` events, closed
 /// by `Done`). The fetch promise resolves with this object.
+#[allow(clippy::too_many_arguments)]
 pub fn make_streaming_response<'js>(
     ctx: &Ctx<'js>,
     bindings: &Rc<RefCell<BindingState>>,
@@ -1026,7 +1027,7 @@ fn resolve_body_waiters<'js>(
 /// Reject every body waiter for `body_id` with a `TypeError`.
 fn reject_body_waiters<'js>(
     ctx: &Ctx<'js>,
-    bindings: &Rc<RefCell<BindingState>>,
+    _bindings: &Rc<RefCell<BindingState>>,
     body_id: u64,
     msg: &str,
 ) -> rquickjs::Result<()> {
@@ -1237,7 +1238,7 @@ pub fn abort_signal<'js>(
         if let Some(entry_obj) = entry.as_object()
             && let Ok(reject_fn) = entry_obj.get::<_, Function>("reject")
         {
-            let reason = make_dom_error(&ctx, "AbortError", "The user aborted a request.")?;
+            let reason = make_dom_error(ctx, "AbortError", "The user aborted a request.")?;
             let result: rquickjs::Result<Value> = reject_fn.call((reason,));
             if let Err(e) = result {
                 bindings
@@ -1342,6 +1343,7 @@ pub fn make_response_live<'js>(
 /// `body` stream (when one was built — every `Response` has one;
 /// a streamed response's is live, a buffered response's is a
 /// closed pre-loaded stream).
+#[allow(clippy::too_many_arguments)]
 fn response_object<'js>(
     ctx: &Ctx<'js>,
     bindings: &Rc<RefCell<BindingState>>,
@@ -1715,8 +1717,8 @@ fn install_response_prototype<'js>(
                 .is_some_and(|id| !b.borrow().response_complete.contains(&id));
             let clone_obj =
                 make_response_live(&ctx, &b, &response, &url, redirected, live)?;
-            if live {
-                if let (Some(source_id), Some(clone_id)) = (
+            if live
+                && let (Some(source_id), Some(clone_id)) = (
                     body_id,
                     body_id_of(&ctx, &clone_obj, RESPONSE_SYMBOL),
                 ) {
@@ -1726,7 +1728,6 @@ fn install_response_prototype<'js>(
                         .or_default()
                         .push(clone_id);
                 }
-            }
             Ok(Value::from(clone_obj))
         },
     )
@@ -1928,12 +1929,12 @@ fn install_headers_prototype<'js>(
                 let arr = Array::new(ctx.clone())?;
                 for (i, (n, v)) in normalized_headers(&headers).into_iter().enumerate() {
                     let item = match which {
-                        0 => Value::from(js(&ctx, n)),
-                        1 => Value::from(js(&ctx, v)),
+                        0 => js(&ctx, n),
+                        1 => js(&ctx, v),
                         _ => {
                             let pair = Array::new(ctx.clone())?;
-                            pair.set(0, Value::from(js(&ctx, n)))?;
-                            pair.set(1, Value::from(js(&ctx, v)))?;
+                            pair.set(0, js(&ctx, n))?;
+                            pair.set(1, js(&ctx, v))?;
                             Value::from(pair)
                         }
                     };
@@ -1975,7 +1976,7 @@ fn install_headers_prototype<'js>(
     // `for (const [k, v] of headers)`: the default iterator is
     // `entries` (via a real `{ next() }` iterator — see
     // `install_entries_iterator`).
-    super::install_entries_iterator(&ctx, &proto)
+    super::install_entries_iterator(ctx, &proto)
         .map_err(|e| format!("Headers iterator: {e}"))?;
 
     protos

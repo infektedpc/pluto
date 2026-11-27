@@ -391,8 +391,6 @@ impl Tokenizer {
             Some((value, had_semi)) => {
                 if !had_semi && in_attr {
                     // The character after the matched name decides.
-                    let matched_len = if value.is_empty() { 0 } else { 0 };
-                    let _ = matched_len;
                     // Find how many name chars were consumed: the
                     // candidate that matched.
                     let consumed = candidates
@@ -401,11 +399,10 @@ impl Tokenizer {
                         .map(|c| c.len())
                         .unwrap_or(0);
                     let after = self.input.get(self.pos + 1 + consumed).copied();
-                    if let Some(a) = after {
-                        if a == '=' || a.is_ascii_alphanumeric() {
+                    if let Some(a) = after
+                        && (a == '=' || a.is_ascii_alphanumeric()) {
                             return None;
                         }
-                    }
                 }
                 let consumed = candidates
                     .iter()
@@ -453,7 +450,7 @@ impl Tokenizer {
         let value = if hex {
             u32::from_str_radix(&digits, 16).unwrap_or(0x110000)
         } else {
-            u32::from_str_radix(&digits, 10).unwrap_or(0x110000)
+            digits.parse::<u32>().unwrap_or(0x110000)
         };
         if !has_semi {
             self.error("numeric character reference without semicolon");
@@ -1533,17 +1530,11 @@ impl Tokenizer {
                 return None;
             }
             self.consume_str_ignore_case("system");
-            match self.read_doctype_id() {
-                None => None,
-                Some((id, q)) => Some((Some(id), q)),
-            }
+            self.read_doctype_id().map(|(id, q)| (Some(id), q))
         } else if matches!(self.peek(), Some('"') | Some('\'')) {
             // The system identifier may follow the public identifier
             // without a SYSTEM keyword.
-            match self.read_doctype_id() {
-                None => None,
-                Some((id, q)) => Some((Some(id), q)),
-            }
+            self.read_doctype_id().map(|(id, q)| (Some(id), q))
         } else {
             Some((None, false))
         }
@@ -1875,12 +1866,11 @@ impl Tokenizer {
                             text.push_str(&raw_name);
                             self.pos += 2 + name_len;
                             // Consume the terminator as text too.
-                            if let Some(c) = self.peek() {
-                                if c.is_ascii_whitespace() || c == '/' || c == '>' {
+                            if let Some(c) = self.peek()
+                                && (c.is_ascii_whitespace() || c == '/' || c == '>') {
                                     text.push(c);
                                     self.pos += 1;
                                 }
-                            }
                             self.state = State::ScriptDataEscaped;
                             return Some(Token::Character(text));
                         }

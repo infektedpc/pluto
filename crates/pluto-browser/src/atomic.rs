@@ -16,7 +16,7 @@
 //! `pluto-browser`, and the blocker writer is owned by the fetch
 //! layer. A fourth browser-crate writer must use this module.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Write `contents` to `dir/name` atomically (temp-file + rename),
 /// creating `dir` if needed. The temp name is unique per write
@@ -93,11 +93,10 @@ pub fn sweep_stale_temps(dir: &Path) -> usize {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name.starts_with('.') && name.ends_with(".tmp") && name.matches('.').count() >= 3 {
-            if std::fs::remove_file(entry.path()).is_ok() {
+        if name.starts_with('.') && name.ends_with(".tmp") && name.matches('.').count() >= 3
+            && std::fs::remove_file(entry.path()).is_ok() {
                 removed += 1;
             }
-        }
     }
     removed
 }

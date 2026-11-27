@@ -94,13 +94,12 @@ pub fn validity_of(host: &dyn DomHost, key: DomKey) -> Validity {
     if !will_validate(host, key) {
         return v;
     }
-    if let Some(custom) = host.custom_validity(key) {
-        if !custom.is_empty() {
+    if let Some(custom) = host.custom_validity(key)
+        && !custom.is_empty() {
             v.custom_error = true;
             v.message = custom;
             return v;
         }
-    }
     let tag = host.tag_name(key).unwrap_or_default();
     let ty = host.input_type(key).unwrap_or_else(|| "text".to_string());
     let required = host.get_attribute(key, "required").is_some();
@@ -147,60 +146,50 @@ pub fn validity_of(host: &dyn DomHost, key: DomKey) -> Validity {
         }
     }
     // patternMismatch (full match).
-    if let Some(pattern) = host.get_attribute(key, "pattern") {
-        if let Ok(re) = regex::Regex::new(&format!("^(?:{pattern})$")) {
-            if !re.is_match(&value) {
+    if let Some(pattern) = host.get_attribute(key, "pattern")
+        && let Ok(re) = regex::Regex::new(&format!("^(?:{pattern})$"))
+            && !re.is_match(&value) {
                 v.pattern_mismatch = true;
                 v.message = "Please match the requested format.".to_string();
                 return v;
             }
-        }
-    }
     // tooLong / tooShort (char counts).
     let len = value.chars().count();
     if let Some(max) = host
         .get_attribute(key, "maxlength")
         .and_then(|m| m.parse::<usize>().ok())
-    {
-        if len > max {
+        && len > max {
             v.too_long = true;
             v.message = format!("Please shorten this text to {max} characters or less.");
             return v;
         }
-    }
     if let Some(min) = host
         .get_attribute(key, "minlength")
         .and_then(|m| m.parse::<usize>().ok())
-    {
-        if len < min {
+        && len < min {
             v.too_short = true;
             v.message = format!("Please lengthen this text to {min} characters or more.");
             return v;
         }
-    }
     // rangeUnderflow / rangeOverflow / stepMismatch (numbers).
     if tag == "input" && (ty == "number" || ty == "range") {
         if let Ok(num) = value.parse::<f64>() {
             if let Some(min) = host
                 .get_attribute(key, "min")
                 .and_then(|m| m.parse::<f64>().ok())
-            {
-                if num < min {
+                && num < min {
                     v.range_underflow = true;
                     v.message = format!("Value must be {min} or more.");
                     return v;
                 }
-            }
             if let Some(max) = host
                 .get_attribute(key, "max")
                 .and_then(|m| m.parse::<f64>().ok())
-            {
-                if num > max {
+                && num > max {
                     v.range_overflow = true;
                     v.message = format!("Value must be {max} or less.");
                     return v;
                 }
-            }
             if let Some(step) = host
                 .get_attribute(key, "step")
                 .and_then(|s| s.parse::<f64>().ok())
@@ -225,20 +214,18 @@ pub fn validity_of(host: &dyn DomHost, key: DomKey) -> Validity {
     }
     // Dates compare lexicographically (ISO-8601).
     if tag == "input" && matches!(ty.as_str(), "date" | "month" | "time" | "datetime-local") {
-        if let Some(min) = host.get_attribute(key, "min") {
-            if value.as_str() < min.as_str() {
+        if let Some(min) = host.get_attribute(key, "min")
+            && value.as_str() < min.as_str() {
                 v.range_underflow = true;
                 v.message = format!("Value must be {min} or later.");
                 return v;
             }
-        }
-        if let Some(max) = host.get_attribute(key, "max") {
-            if value.as_str() > max.as_str() {
+        if let Some(max) = host.get_attribute(key, "max")
+            && value.as_str() > max.as_str() {
                 v.range_overflow = true;
                 v.message = format!("Value must be {max} or earlier.");
                 return v;
             }
-        }
     }
     v
 }
@@ -295,21 +282,6 @@ fn validity_object<'js>(
 
 // ------------------------------------------------------------------ helpers
 
-fn tag_of<'js>(
-    ctx: &Ctx<'js>,
-    b: &Rc<RefCell<BindingState>>,
-    this: &Object<'js>,
-) -> rquickjs::Result<Option<String>> {
-    let Some(key) = dom_key_of_this_opt(ctx, b, this)? else {
-        return Ok(None);
-    };
-    let host = match host_of(b) {
-        Ok(h) => h,
-        Err(_) => return Ok(None),
-    };
-    Ok(host.borrow().tag_name(key))
-}
-
 fn is_control_tag(tag: Option<&str>) -> bool {
     matches!(tag, Some("input" | "textarea" | "select"))
 }
@@ -364,7 +336,7 @@ pub fn install_form_methods<'js>(
             let options = host.borrow().form_options(key);
             let mut found: Option<i64> = None;
             for (i, opt) in options.iter().enumerate() {
-                if option_value_of((&*host.borrow()).as_ref(), *opt) == text {
+                if option_value_of((*host.borrow()).as_ref(), *opt) == text {
                     found = Some(i as i64);
                     break;
                 }
@@ -800,14 +772,14 @@ pub fn install_form_methods<'js>(
             Ok(h) => h,
             Err(_) => return Ok(js_null(&ctx)),
         };
-        if !will_validate((&*host.borrow()).as_ref(), key) && host.borrow().tag_name(key).as_deref() != Some("form") {
+        if !will_validate((*host.borrow()).as_ref(), key) && host.borrow().tag_name(key).as_deref() != Some("form") {
             // Non-validatable elements have no `validity` object;
             // controls always do.
             if !is_control_tag(host.borrow().tag_name(key).as_deref()) {
                 return Ok(js_null(&ctx));
             }
         }
-        Ok(Value::from(validity_object(&ctx, (&*host.borrow()).as_ref(), key)?))
+        Ok(Value::from(validity_object(&ctx, (*host.borrow()).as_ref(), key)?))
     })?;
 
     let b = Rc::clone(bindings);
@@ -819,7 +791,7 @@ pub fn install_form_methods<'js>(
             Ok(h) => h,
             Err(_) => return Ok(js(&ctx, "")),
         };
-        Ok(js(&ctx, validity_of((&*host.borrow()).as_ref(), key).message))
+        Ok(js(&ctx, validity_of((*host.borrow()).as_ref(), key).message))
     })?;
 
     let b = Rc::clone(bindings);
@@ -831,7 +803,7 @@ pub fn install_form_methods<'js>(
             Ok(h) => h,
             Err(_) => return Ok(js(&ctx, false)),
         };
-        Ok(js(&ctx, will_validate((&*host.borrow()).as_ref(), key)))
+        Ok(js(&ctx, will_validate((*host.borrow()).as_ref(), key)))
     })?;
 
     let b = Rc::clone(bindings);
@@ -855,9 +827,9 @@ pub fn install_form_methods<'js>(
             let host = host_of(&b).map_err(|e| throw_type_error(&ctx, &e))?;
             let host = host.borrow();
             if host.tag_name(key).as_deref() == Some("form") {
-                return Ok(first_invalid_control((&*host).as_ref(), key).is_none());
+                return Ok(first_invalid_control((*host).as_ref(), key).is_none());
             }
-            Ok(validity_of((&*host).as_ref(), key).valid())
+            Ok(validity_of((*host).as_ref(), key).valid())
         },
     )
     .map_err(|e| format!("checkValidity: {e}"))?;
@@ -871,13 +843,13 @@ pub fn install_form_methods<'js>(
             let host = host_of(&b).map_err(|e| throw_type_error(&ctx, &e))?;
             let host = host.borrow();
             if host.tag_name(key).as_deref() == Some("form") {
-                if let Some(bad) = first_invalid_control((&*host).as_ref(), key) {
+                if let Some(bad) = first_invalid_control((*host).as_ref(), key) {
                     let _ = dispatch_plain(&ctx, &b, bad, "invalid", false, true);
                     return Ok(false);
                 }
                 return Ok(true);
             }
-            let valid = validity_of((&*host).as_ref(), key).valid();
+            let valid = validity_of((*host).as_ref(), key).valid();
             if !valid {
                 let _ = dispatch_plain(&ctx, &b, key, "invalid", false, true);
             }
@@ -945,7 +917,7 @@ pub fn install_form_methods<'js>(
             };
             // Validation first: an invalid form reports validity
             // on the first invalid control and never fires `submit`.
-            if let Some(bad) = first_invalid_control((&*host.borrow()).as_ref(), key) {
+            if let Some(bad) = first_invalid_control((*host.borrow()).as_ref(), key) {
                 let _ = dispatch_plain(&ctx, &b, bad, "invalid", false, true);
                 return Ok(());
             }

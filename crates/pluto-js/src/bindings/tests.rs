@@ -19,7 +19,7 @@ use crate::bindings::fetch::{
 };
 use crate::bindings::websocket::{WebSocketBackend, WsConnectRequest, WsEvent};
 use crate::bindings::events::TypedEventKind;
-use crate::host::{CanvasCall, DomHost};
+use crate::host::DomHost;
 use crate::bindings::test_host::{TestHost, TestHostLog};
 use crate::engine::JsValue;
 use crate::observers::ComputedIntersection;
@@ -1176,7 +1176,7 @@ fn resize_observer_loop_error_when_sizes_keep_changing() {
     // A host whose geometry grows on every read: the callback can
     // never settle, so the step must stop with the resize-loop
     // error instead of looping forever.
-    let mut host = TestHost::from_html(DOC);
+    let host = TestHost::from_html(DOC);
     host.geometry_growth.set(10.0);
     let mut tab = TabJs::new(&RealmConfig::default()).unwrap();
     tab.set_dom_host(Box::new(host));
@@ -2411,10 +2411,15 @@ impl FetchBackend for ChunkedBackend {
 /// A fake `WebSocket` backend: opens at once (negotiating
 /// `"chat"`), echoes every `send()` back as a message, and closes
 /// cleanly on `close()`.
+/// A recorded `WebSocket.send()` call: connection id, payload, binary flag.
+type WsSendRecord = (u64, Vec<u8>, bool);
+/// A recorded `WebSocket.close()` call: connection id, code, reason.
+type WsCloseRecord = (u64, Option<u16>, String);
+
 struct FakeWsBackend {
     connects: Arc<Mutex<Vec<WsConnectRequest>>>,
-    sends: Arc<Mutex<Vec<(u64, Vec<u8>, bool)>>>,
-    closes: Arc<Mutex<Vec<(u64, Option<u16>, String)>>>,
+    sends: Arc<Mutex<Vec<WsSendRecord>>>,
+    closes: Arc<Mutex<Vec<WsCloseRecord>>>,
     senders: Arc<Mutex<HashMap<u64, mpsc::Sender<WsEvent>>>>,
 }
 

@@ -217,8 +217,8 @@ impl CpalSink {
         // Prefer a config at the media's own rate (no resample);
         // fall back to the device default.
         let mut config = device.default_output_config().ok()?;
-        if config.sample_rate().0 != media_rate {
-            if let Ok(mut configs) = device.supported_output_configs() {
+        if config.sample_rate().0 != media_rate
+            && let Ok(mut configs) = device.supported_output_configs() {
                 for range in configs.by_ref() {
                     if range.channels() == channels
                         && range.min_sample_rate().0 <= media_rate
@@ -229,7 +229,6 @@ impl CpalSink {
                     }
                 }
             }
-        }
         let device_rate = config.sample_rate().0;
         let state = SharedAudioState::new();
         let stream = match config.sample_format() {
@@ -496,11 +495,10 @@ impl MediaClock {
         if self.paused {
             return self.anchor_media;
         }
-        if self.audio_master {
-            if let Some(sink) = audio {
+        if self.audio_master
+            && let Some(sink) = audio {
                 return self.anchor_media + sink.position_secs();
             }
-        }
         self.anchor_media + self.anchor_wall.elapsed().as_secs_f64()
     }
 

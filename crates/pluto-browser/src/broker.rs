@@ -318,11 +318,10 @@ impl BrokerHandle {
             | ResourceEvent::Cancelled { request_id } => *request_id,
         };
         let sender = self.pending.lock().await.get(&request_id).cloned();
-        if let Some(sender) = sender {
-            if sender.send(event).await.is_err() {
+        if let Some(sender) = sender
+            && sender.send(event).await.is_err() {
                 self.pending.lock().await.remove(&request_id);
             }
-        }
     }
 
     /// Stream one request through the broker (Stage 16 Phase 3,

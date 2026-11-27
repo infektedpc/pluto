@@ -92,13 +92,11 @@ pub fn parse_sts_header(value: &str) -> Option<StsDirectives> {
             if max_age.is_some() {
                 return None; // duplicate directive: non-conforming
             }
-            let digits = match val {
-                Some(v) => {
-                    // The value may be quoted per §6.1.
-                    let v = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(v);
-                    v
-                }
-                None => return None,
+            let digits = {
+                let v = val?;
+                // The value may be quoted per §6.1.
+                
+                v.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(v)
             };
             if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
                 return None;

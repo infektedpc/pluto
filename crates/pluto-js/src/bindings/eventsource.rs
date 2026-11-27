@@ -104,10 +104,7 @@ impl SseParser {
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
-        loop {
-            let Some((line, consumed)) = take_line(&self.buf) else {
-                break;
-            };
+        while let Some((line, consumed)) = take_line(&self.buf) {
             self.buf.drain(..consumed);
             if let Some(event) = self.handle_line(line) {
                 out.push(event);
@@ -153,11 +150,10 @@ impl SseParser {
                     self.last_event_id = Some(value.to_string());
                 }
             }
-            "retry" => {
-                if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+            "retry"
+                if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
                     self.retry = value.parse().ok();
                 }
-            }
             _ => {}
         }
         None
@@ -281,7 +277,7 @@ fn event_source_new<'js>(
     init: Option<Value<'js>>,
 ) -> rquickjs::Result<Value<'js>> {
     let url_str = to_dom_string(ctx, &url)?;
-    let host = host_of(bindings).map_err(|e| throw_type_error(&ctx, &e))?;
+    let host = host_of(bindings).map_err(|e| throw_type_error(ctx, &e))?;
     let base = host
         .borrow()
         .document_url()
@@ -289,10 +285,10 @@ fn event_source_new<'js>(
     let parsed = url::Url::parse(&url_str)
         .ok()
         .or_else(|| url::Url::parse(&base).ok()?.join(&url_str).ok())
-        .ok_or_else(|| throw_dom(&ctx, "SyntaxError", "EventSource: the URL could not be parsed"))?;
+        .ok_or_else(|| throw_dom(ctx, "SyntaxError", "EventSource: the URL could not be parsed"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(throw_dom(
-            &ctx,
+            ctx,
             "SyntaxError",
             "EventSource: the URL scheme must be http: or https:",
         ));
@@ -300,7 +296,7 @@ fn event_source_new<'js>(
     let with_credentials = match init {
         Some(value) if value.is_object() => {
             let obj: Object = value.as_object().cloned().ok_or_else(|| {
-                throw_type_error(&ctx, "EventSource: init must be an object")
+                throw_type_error(ctx, "EventSource: init must be an object")
             })?;
             obj.get::<_, bool>("withCredentials").unwrap_or(false)
         }
@@ -308,7 +304,7 @@ fn event_source_new<'js>(
         // missing `init` arrives as `undefined` — that is no init.
         Some(value) if value.is_null() || value.is_undefined() => false,
         Some(_) => {
-            return Err(throw_type_error(&ctx, "EventSource: init must be an object"));
+            return Err(throw_type_error(ctx, "EventSource: init must be an object"));
         }
         None => false,
     };
@@ -342,7 +338,7 @@ fn event_source_new<'js>(
     map_set(ctx, &sources, id, Value::from(obj.clone()))?;
     for name in ["open", "message", "error"] {
         install_event_handler_property(ctx, bindings, &obj, target_id, name)
-            .map_err(|e| throw_type_error(&ctx, &e))?;
+            .map_err(|e| throw_type_error(ctx, &e))?;
     }
     obj.prop(
         "url",
@@ -364,7 +360,7 @@ fn event_source_new<'js>(
     )?;
     obj.set("__pluto_reconnect", reconnect_fn)?;
     start_event_source_stream(ctx, bindings, stream_tx, id)
-        .map_err(|e| throw_type_error(&ctx, &e.to_string()))?;
+        .map_err(|e| throw_type_error(ctx, &e.to_string()))?;
     Ok(Value::from(obj))
 }
 

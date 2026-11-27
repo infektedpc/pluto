@@ -406,12 +406,22 @@ async fn report_renderer_crash(
 /// hang — the worker always awaits with the reply channel, and the
 /// actor exits when the job channel closes (worker end / `Stop`).
 ///
+/// A collected display list plus the resources it references.
+type CollectedDisplayList = (Arc<DisplayList>, Vec<(ResourceId, Resource)>);
+/// A collected display list for a viewport scroll, plus whether the
+/// scroll re-collect changed anything.
+type ScrolledDisplayList = (Arc<DisplayList>, bool, Vec<(ResourceId, Resource)>);
+
 /// Wave 2b adds the geometry jobs (`Geometry` / `FlushGeometry`):
 /// the JS host's forced synchronous layout flush (the only
 /// sanctioned synchronous cross-thread call in the design) and the
 /// click hit-test (`HitTest`). They reply over `std` channels /
 /// oneshots the tab thread blocks on, because the tab thread is a
 /// plain OS thread, not an async task.
+/// `Mp4Video` carries the demuxer, track index, and decoder, so it is
+/// inherently far larger than the other variants; boxing it would churn
+/// every construction and match site for no behavior gain.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum LayoutJob {
     /// (Re-)lay out at `viewport` with `state`, re-applying the
     /// retained `offsets` after the rebuild — but build NO display
@@ -510,7 +520,7 @@ pub(crate) enum LayoutJob {
         canvas_live: Vec<NodeId>,
         canvas_new: Vec<(NodeId, Resource)>,
         svg_images: HashMap<NodeId, ResourceId>,
-        reply: oneshot::Sender<(Arc<DisplayList>, Vec<(ResourceId, Resource)>)>,
+        reply: oneshot::Sender<CollectedDisplayList>,
     },
     /// Sizes + DOM depths for observed targets, from the retained
     /// tree + document (Stage 8 Rec 8). `None` size = unrendered.
@@ -555,7 +565,7 @@ pub(crate) enum LayoutJob {
         canvas_live: Vec<NodeId>,
         canvas_new: Vec<(NodeId, Resource)>,
         svg_images: HashMap<NodeId, ResourceId>,
-        reply: oneshot::Sender<Option<(Arc<DisplayList>, Vec<(ResourceId, Resource)>)>>,
+        reply: oneshot::Sender<Option<CollectedDisplayList>>,
     },
     /// Hit-test a click (page coordinates) and resolve the nearest
     /// enclosing `<a href>` against the document base URL. `None`
@@ -646,7 +656,7 @@ pub(crate) enum LayoutJob {
         canvas_live: Vec<NodeId>,
         canvas_new: Vec<(NodeId, Resource)>,
         svg_images: HashMap<NodeId, ResourceId>,
-        reply: oneshot::Sender<Option<(Arc<DisplayList>, bool, Vec<(ResourceId, Resource)>)>>,
+        reply: oneshot::Sender<Option<ScrolledDisplayList>>,
     },
 }
 
@@ -1292,7 +1302,7 @@ pub(crate) const FRAME_TIME_SAMPLES: usize = 240;
 /// layout-actor round trip (restyle + layout tree build);
 /// `collect` is the ResizeObserver / IntersectionObserver steps
 /// plus the display-list collect; `submit` is the postcard encode
-/// + send. Wheel scrolls re-collect without re-laying out, so
+/// and send. Wheel scrolls re-collect without re-laying out, so
 /// their samples carry `layout_ms: 0.0` and
 /// `layout_kind: NothingToDo` — a scroll frame's cost is its
 /// collect, which is exactly the hot spot to watch. `layout_kind`
@@ -1416,11 +1426,13 @@ impl FrameTimeHistogram {
     }
 
     /// Samples currently held (at most `capacity()`).
+    #[allow(dead_code)]
     pub(crate) fn count(&self) -> usize {
         self.len
     }
 
     /// The fixed ring capacity — the storage never grows past this.
+    #[allow(dead_code)]
     pub(crate) fn capacity(&self) -> usize {
         FRAME_TIME_SAMPLES
     }
@@ -1432,6 +1444,7 @@ impl FrameTimeHistogram {
     }
 
     /// Frames in the ring that missed the 16.67 ms budget.
+    #[allow(dead_code)]
     pub(crate) fn over_budget(&self) -> u64 {
         self.over_budget
     }
@@ -2006,6 +2019,8 @@ impl TabState {
     /// The frame-time histogram for this tab (Stage 10 Rec 7):
     /// p50/p95 per phase plus the sample count, for tests and
     /// the tick's periodic log line.
+    // The tick logs via `summary()` on the field directly.
+    #[allow(dead_code)]
     pub(crate) fn frame_times(&self) -> &FrameTimeHistogram {
         &self.frame_times
     }
@@ -2334,7 +2349,7 @@ async fn tab_main(
                 // never per tick, never on idle ticks. The
                 // line is the shell-visible surface for the
                 // histogram (stderr, like the perf summary).
-                if state.tick_count % 600 == 0
+                if state.tick_count.is_multiple_of(600)
                     && state.frame_times.total_recorded() > state.last_frame_log_total
                 {
                     state.last_frame_log_total = state.frame_times.total_recorded();
@@ -3033,8 +3048,14 @@ async fn navigate_same_document(
     // the top.
     let fragment = new_url.split('#').nth(1).unwrap_or("");
     let mut target = (0.0, 0.0);
-    if !fragment.is_empty() {
-        if let Some(id) = state.host.lock().unwrap().get_element_by_id(fragment) {
+    // Resolve the anchor id first so the host lock is released
+    // before the layout round trip below awaits.
+    let anchor_id = if fragment.is_empty() {
+        None
+    } else {
+        state.host.lock().unwrap().get_element_by_id(fragment)
+    };
+    if let Some(id) = anchor_id {
             let (reply_tx, reply_rx) = oneshot::channel();
             if state
                 .layout_tx
@@ -3045,7 +3066,6 @@ async fn navigate_same_document(
                 target = (geometry.x as f32, geometry.y as f32);
             }
         }
-    }
     let (max_x, max_y) = page_max_scroll(state).await;
     let clamped = (target.0.clamp(0.0, max_x), target.1.clamp(0.0, max_y));
     if clamped != state.viewport_scroll {
@@ -3202,7 +3222,7 @@ pub async fn run_worker(
 }
 
 /// The channels to a freshly spawned tab-thread pair (layout actor
-/// + tab thread), shared by the in-process worker ([`run_worker`])
+/// and tab thread), shared by the in-process worker ([`run_worker`])
 /// and the cross-process renderer child ([`run_worker_transport`]).
 /// The layout actor owns the `!Send` tree/document on its thread;
 /// dropping the tab command sender (worker end) ends the actor.
@@ -3324,12 +3344,6 @@ pub(crate) async fn run_worker_transport<T: Transport>(mut transport: T, tab_id:
     }
 }
 
-/// Start a navigation: cancel the previous load (its token and its
-/// task — a slow fetch no longer blocks the command loop), get a
-/// fresh realm for the new document, then spawn the load as a
-/// `spawn_local` task on the tab thread's runtime. The old page
-/// stays visible until the new list lands; a stale outcome is
-/// discarded by epoch in `handle_nav_outcome`.
 // ------------------------------------------------------------------
 // Stage 13 (M5 forms): focus, keys, editing, submission, caret.
 // ------------------------------------------------------------------
@@ -3402,21 +3416,19 @@ async fn set_focus(
     if old == new {
         return;
     }
-    if let Some(old_id) = old {
-        if let Some(js) = state.tab_js.as_mut() {
+    if let Some(old_id) = old
+        && let Some(js) = state.tab_js.as_mut() {
             let _ = js.dispatch_event_sync(old_id, "blur", false);
         }
-    }
     state.focused = new;
     state.element_state.focus = new.into_iter().collect();
     state.host.lock().unwrap().set_focused(new);
     state.caret_blink_epoch = std::time::Instant::now();
     state.caret_blink_on = true;
-    if let Some(new_id) = new {
-        if let Some(js) = state.tab_js.as_mut() {
+    if let Some(new_id) = new
+        && let Some(js) = state.tab_js.as_mut() {
             let _ = js.dispatch_event_sync(new_id, "focus", false);
         }
-    }
     let mut changed: Vec<NodeId> = Vec::new();
     if let Some(old_id) = old {
         changed.push(old_id);
@@ -3684,14 +3696,8 @@ fn encode_text_plain(entries: &[(String, String)]) -> Vec<u8> {
 fn first_invalid_control(state: &TabState, form: NodeId) -> Option<NodeId> {
     let shared = crate::js_host::SharedHost(Rc::clone(&state.host));
     let host: &dyn pluto_js::DomHost = &shared;
-    for control in host.form_controls(form) {
-        if pluto_js::bindings::forms::will_validate(host, control)
-            && !pluto_js::bindings::forms::validity_of(host, control).valid()
-        {
-            return Some(control);
-        }
-    }
-    None
+    host.form_controls(form).into_iter().find(|&control| pluto_js::bindings::forms::will_validate(host, control)
+            && !pluto_js::bindings::forms::validity_of(host, control).valid())
 }
 
 /// Submit a form (Stage 13 Rec 6/7/8): validation gate first
@@ -3880,7 +3886,7 @@ async fn submit_on_enter(
 /// Whether the caret blink is currently in its visible half
 /// (~530 ms on / ~530 ms off, from the last focus change or edit).
 fn caret_blink_on(state: &TabState) -> bool {
-    state.caret_blink_epoch.elapsed().as_millis() / 530 % 2 == 0
+    (state.caret_blink_epoch.elapsed().as_millis() / 530).is_multiple_of(2)
 }
 
 /// Caret + selection paint items for the focused text control
@@ -3967,6 +3973,12 @@ fn with_caret(state: &mut TabState, base: Arc<DisplayList>) -> Arc<DisplayList> 
     Arc::new(list)
 }
 
+/// Start a navigation: cancel the previous load (its token and its
+/// task — a slow fetch no longer blocks the command loop), get a
+/// fresh realm for the new document, then spawn the load as a
+/// `spawn_local` task on the tab thread's runtime. The old page
+/// stays visible until the new list lands; a stale outcome is
+/// discarded by epoch in `handle_nav_outcome`.
 fn start_navigation(state: &mut TabState, url: String) {
     start_navigation_with_body(state, url, None, false, None, false, (0.0, 0.0));
 }
@@ -4248,11 +4260,10 @@ async fn handle_nav_outcome(
             // A failed traversal load fires none (the error page
             // has no realm state to report); a stale outcome never
             // reaches here (the epoch guard above returns first).
-            if let Some(state_json) = state.pending_popstate.take() {
-                if let Some(js) = state.tab_js.as_mut() {
+            if let Some(state_json) = state.pending_popstate.take()
+                && let Some(js) = state.tab_js.as_mut() {
                     js.dispatch_popstate(state_json);
                 }
-            }
         }
         LoadOutcome::Failed { url, reason, .. } => {
             eprintln!("[pluto] worker fetch failed: {reason}");
@@ -4344,7 +4355,7 @@ fn maybe_request_font_faces(state: &mut TabState) {
         let cancel = state
             .nav_cancel
             .clone()
-            .unwrap_or_else(CancellationToken::new);
+            .unwrap_or_default();
         let epoch = state.nav_epoch;
         let tx = state.font_outcome_tx.clone();
         tokio::task::spawn(async move {
@@ -4374,13 +4385,9 @@ fn parse_font_src_url(src: &str) -> Option<String> {
     let mut rest = src;
     loop {
         let lower = rest.to_ascii_lowercase();
-        let Some(pos) = lower.find("url(") else {
-            return None;
-        };
+        let pos = lower.find("url(")?;
         let after = &rest[pos + 4..];
-        let Some(end) = after.find(')') else {
-            return None;
-        };
+        let end = after.find(')')?;
         let inner = after[..end]
             .trim()
             .trim_matches(|c| c == '"' || c == '\'');
@@ -4441,7 +4448,7 @@ fn spawn_image_fetch(state: &mut TabState, req: ImageRequest) {
     let cancel = state
         .nav_cancel
         .clone()
-        .unwrap_or_else(CancellationToken::new);
+        .unwrap_or_default();
     ImageStore::spawn_fetch(
         state.fetch_source.clone(),
         req,
@@ -4600,7 +4607,7 @@ fn handle_js_media_request(state: &mut TabState, req: MediaRequest) {
     let cancel = state
         .nav_cancel
         .clone()
-        .unwrap_or_else(CancellationToken::new);
+        .unwrap_or_default();
     let outcome_tx = state.media_outcome_tx.clone();
     let key = req.key;
     let epoch = state.nav_epoch;
@@ -4659,7 +4666,7 @@ fn handle_js_track_request(state: &mut TabState, req: TrackRequest) {
     let cancel = state
         .nav_cancel
         .clone()
-        .unwrap_or_else(CancellationToken::new);
+        .unwrap_or_default();
     let outcome_tx = state.media_outcome_tx.clone();
     let key = req.key;
     let track_idx = req.track_idx;
@@ -5005,13 +5012,17 @@ async fn emit(
 /// canvas costs nothing per frame. The drain clears the hosts'
 /// dirty flags, so a second call in the same tick finds nothing
 /// new.
-fn collect_canvas_state(
-    state: &mut TabState,
-) -> (
+/// What `collect_canvas_state` returns: live canvas keys, new/changed
+/// canvas bitmaps, and the svg-image resource map.
+type CanvasState = (
     Vec<NodeId>,
     Vec<(NodeId, Resource)>,
     HashMap<NodeId, ResourceId>,
-) {
+);
+
+fn collect_canvas_state(
+    state: &mut TabState,
+) -> CanvasState {
     let (live, dirty) = {
         let mut host = state.host.lock().unwrap();
         (host.canvas_live_keys(), host.canvas_take_dirty())
@@ -5965,20 +5976,19 @@ fn restyle_dirty_set(
     reach: pluto_css::PseudoReach,
 ) -> Vec<NodeId> {
     let mut dirty: HashSet<NodeId> = changed.iter().copied().collect();
-    if reach.descendants || reach.siblings || reach.ancestors {
-        if let Some(doc) = state.document.as_ref() {
+    if (reach.descendants || reach.siblings || reach.ancestors)
+        && let Some(doc) = state.document.as_ref() {
             let dom = doc.dom();
             for &id in changed {
                 if reach.descendants {
                     collect_descendants(dom, id, &mut dirty);
                 }
-                if reach.siblings {
-                    if let Some(parent) = dom.get(id).and_then(|n| n.parent) {
+                if reach.siblings
+                    && let Some(parent) = dom.get(id).and_then(|n| n.parent) {
                         for &sib in dom.children(parent) {
                             dirty.insert(sib);
                         }
                     }
-                }
                 if reach.ancestors {
                     let mut cur = dom.get(id).and_then(|n| n.parent);
                     while let Some(parent) = cur {
@@ -5988,7 +5998,6 @@ fn restyle_dirty_set(
                 }
             }
         }
-    }
     // Stage 10 Rec 4: `:has()` anchors are ancestors of the changed
     // element, so they belong in this same expansion. The re-check
     // is still stubbed (returns no nodes — `:has()` matching is not
@@ -6191,13 +6200,11 @@ async fn handle_pointer_down(
     // Stage 13 Rec 3: a pointer press moves focus to the hit
     // element BEFORE the click dispatch (the click itself lands
     // on pointer-up) — a click on an input focuses it first.
-    if state.focused != Some(target) {
-        if let Some(doc) = state.document.as_ref() {
-            if is_focusable(doc.dom(), target) {
+    if state.focused != Some(target)
+        && let Some(doc) = state.document.as_ref()
+            && is_focusable(doc.dom(), target) {
                 set_focus(state, events, Some(target)).await;
             }
-        }
-    }
     if button == Some(0) {
         state.pointer_down_target = Some(target);
     }
@@ -6503,6 +6510,7 @@ async fn emit_scroll_viewport(
 /// maximum, the leftover chains onward, and the viewport takes the
 /// rest (via `ScrollViewport`, which the shell clamps to `[0, page
 /// max]` — the same clamp the worker's mirror applies).
+#[allow(clippy::too_many_arguments)]
 async fn handle_wheel(
     state: &mut TabState,
     events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
@@ -6611,8 +6619,8 @@ async fn handle_key(
     }
     if !pressed {
         // A real `keyup` on the focused element (Stage 13 Rec 2).
-        if let Some(focused) = state.focused {
-            if let Some(js) = state.tab_js.as_mut() {
+        if let Some(focused) = state.focused
+            && let Some(js) = state.tab_js.as_mut() {
                 let _ = js.dispatch_typed_event_sync(
                     focused,
                     "keyup",
@@ -6623,7 +6631,6 @@ async fn handle_key(
                     },
                 );
             }
-        }
         return;
     }
     // Cancelable `keydown` on the focused element: a prevented
@@ -6654,13 +6661,12 @@ async fn handle_key(
         return;
     }
     // Enter on a focused control submits / resets its form.
-    if key == "Enter" {
-        if let Some(focused) = state.focused
+    if key == "Enter"
+        && let Some(focused) = state.focused
             && submit_on_enter(state, events, focused).await
         {
             return;
         }
-    }
     match key {
         "Tab" => move_focus(state, events, !modifiers.shift).await,
         "Enter" | " " => activate_focused(state, events, key).await,

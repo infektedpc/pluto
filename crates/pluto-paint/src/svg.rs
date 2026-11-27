@@ -369,11 +369,10 @@ pub fn parse_svg_transform(value: &str) -> Affine {
             }
             pos += 1;
         }
-        if !cur.is_empty() {
-            if let Ok(v) = cur.parse::<f32>() {
+        if !cur.is_empty()
+            && let Ok(v) = cur.parse::<f32>() {
                 nums.push(v);
             }
-        }
         if pos < bytes.len() {
             pos += 1; // ')'
         }
@@ -657,7 +656,7 @@ fn parse_gradient_def(
         // present, the style is the fallback.
         let color = dom
             .attr(child, "stop-color")
-            .and_then(|v| parse_css_color(v))
+            .and_then(parse_css_color)
             .or_else(|| {
                 styles
                     .get(child)
@@ -829,13 +828,11 @@ fn collect_gradients(
     styles: &SparseSecondaryMap<DomId, NodeStyle>,
     out: &mut HashMap<String, GradientDef>,
 ) {
-    if matches!(dom.tag(id), Some("linearGradient" | "radialGradient")) {
-        if let Some(name) = dom.attr(id, "id") {
-            if let Some(def) = parse_gradient_def(dom, id, styles) {
+    if matches!(dom.tag(id), Some("linearGradient" | "radialGradient"))
+        && let Some(name) = dom.attr(id, "id")
+            && let Some(def) = parse_gradient_def(dom, id, styles) {
                 out.entry(name.to_string()).or_insert(def);
             }
-        }
-    }
     for &child in dom.children(id) {
         collect_gradients(dom, child, styles, out);
     }
@@ -862,6 +859,7 @@ const NON_RENDERING: &[&str] = &[
     "foreignObject",
 ];
 
+#[allow(clippy::too_many_arguments)]
 fn walk_shapes(
     dom: &Dom,
     id: DomId,
@@ -1156,8 +1154,8 @@ fn shape_gradient_color(
 /// colours (exact for two-stop linear gradients). A shape whose
 /// paint is a gradient the vector path cannot express (radial,
 /// >2 stops) is skipped here — the caller rasterises those.
-/// Any tessellation error aborts the whole svg (the caller falls
-/// back to the rasteriser, which tessellates with the same cap).
+/// > Any tessellation error aborts the whole svg (the caller falls
+/// > back to the rasteriser, which tessellates with the same cap).
 pub fn tessellate_svg_shapes(content: &SvgContent) -> Result<Vec<VectorVertex>, PathError> {
     let mut out = Vec::new();
     for shape in &content.shapes {
@@ -1172,8 +1170,8 @@ pub fn tessellate_svg_shapes(content: &SvgContent) -> Result<Vec<VectorVertex>, 
 /// colours (exact for two-stop linear gradients). A shape whose
 /// paint is a gradient the vector path cannot express (radial,
 /// >2 stops) contributes nothing here — the caller rasterises
-/// those. Any tessellation error aborts this shape (the caller
-/// skips it and keeps the rest).
+/// > those. Any tessellation error aborts this shape (the caller
+/// > skips it and keeps the rest).
 pub fn tessellate_svg_shape(
     shape: &SvgShape,
     viewport: (f32, f32),
@@ -1481,7 +1479,7 @@ pub fn decode_svg_image(bytes: &[u8]) -> Result<DecodedImage, crate::image::Imag
         .or_else(|| view_box.map(|vb| vb[3]))
         .unwrap_or(150.0);
     let (w, h) = (w.round().max(1.0) as u32, h.round().max(1.0) as u32);
-    if (w as usize).checked_mul(h as usize).unwrap_or(usize::MAX) > MAX_RASTER_PIXELS {
+    if (w as usize).saturating_mul(h as usize) > MAX_RASTER_PIXELS {
         return Err(ImageError::TooLarge(
             (w as usize) * (h as usize) * 4,
         ));
@@ -1856,7 +1854,7 @@ mod tests {
         assert!(dot[0] > 200 && dot[3] == 255, "red dot: {dot:?}");
         assert_eq!(px(0, 0)[3], 0, "corner is transparent");
         // Non-empty: a real icon has both painted and clear pixels.
-        let painted = img.rgba.chunks_exact(4).filter(|p| p[3] > 0).count();
+        let painted = img.rgba.as_chunks::<4>().0.iter().filter(|p| p[3] > 0).count();
         assert!(painted > 10 && painted < 256, "painted pixels: {painted}");
     }
 

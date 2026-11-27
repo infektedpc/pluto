@@ -502,13 +502,12 @@ impl PlutoBrowser {
 
     /// Post one command to one tab's worker, by id.
     fn send_command_to(&mut self, tab_id: u64, command: BrowserToRenderer) {
-        if let Some(tab) = self.tab_mut(tab_id) {
-            if let Some(tx) = &tab.renderer_tx
+        if let Some(tab) = self.tab_mut(tab_id)
+            && let Some(tx) = &tab.renderer_tx
                 && tx.send(command).is_err()
             {
                 tab.renderer_tx = None;
             }
-        }
     }
     /// Tell a tab's worker the shell's session-history length and
     /// index (Stage 16 Phase 3, Rec 8 — finisher): the worker's
@@ -516,14 +515,13 @@ impl PlutoBrowser {
     /// guard agree with the shell after every push / replace /
     /// traversal. No-op when the tab has no renderer yet.
     fn send_history_sync(&mut self, tab_id: u64) {
-        if let Some(tab) = self.tab_mut(tab_id) {
-            if let Some(tx) = &tab.renderer_tx {
+        if let Some(tab) = self.tab_mut(tab_id)
+            && let Some(tx) = &tab.renderer_tx {
                 let _ = tx.send(BrowserToRenderer::HistorySync {
                     length: tab.history.len(),
                     index: tab.history_index,
                 });
             }
-        }
     }
 
     /// Record a theme change and forward it to every tab's worker
@@ -1260,7 +1258,6 @@ impl Application for PlutoBrowser {
                                 save_history(&urls);
                             }
                             let tab_id = tab.id;
-                            drop(tab);
                             self.send_history_sync(tab_id);
                         }
                         if is_active {
@@ -1551,7 +1548,7 @@ impl Application for PlutoBrowser {
                                 }
                                 Message::BrokerServeDone
                             },
-                            |message| cosmic::Action::App(message),
+                            cosmic::Action::App,
                         );
                     }
                     RendererToBrowser::HistoryPush { url, state_json } => {
@@ -1702,7 +1699,7 @@ impl Application for PlutoBrowser {
                                 }
                                 Message::WebSocketDone(socket_id)
                             },
-                            |message| cosmic::Action::App(message),
+                            cosmic::Action::App,
                         );
                     }
                     RendererToBrowser::WebSocketSend {

@@ -280,11 +280,10 @@ fn make_reader<'js>(
     let release_fn = Function::new(
         ctx.clone(),
         move |ctx: Ctx<'js>, This(this): This<Object<'js>>| -> rquickjs::Result<()> {
-            if let Some(id) = stream_id_of(&ctx, &this) {
-                if let Some(state) = b.borrow_mut().stream_states.get_mut(&id) {
+            if let Some(id) = stream_id_of(&ctx, &this)
+                && let Some(state) = b.borrow_mut().stream_states.get_mut(&id) {
                     state.locked = false;
                 }
-            }
             Ok(())
         },
     )
@@ -614,6 +613,6 @@ pub fn drop_stream<'js>(
     bindings.borrow_mut().stream_states.remove(&stream_id);
     let streams = registry_map(ctx, "streams")?;
     map_delete(ctx, &streams, stream_id);
-    let _ = stream_error(ctx, bindings, stream_id, "stream dropped")?;
+    stream_error(ctx, bindings, stream_id, "stream dropped")?;
     Ok(())
 }

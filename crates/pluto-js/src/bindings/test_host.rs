@@ -284,9 +284,9 @@ impl TestHost {
         // Clone the kind + attributes first: creating the new node
         // mutates the arena, so no borrow of the old node may live
         // across the match.
-        let (kind, attrs, ns) = match self.dom.get(id) {
-            Some(n) => (n.kind.clone(), n.attrs.clone(), n.ns.clone()),
-            None => return None,
+        let (kind, attrs, ns) = {
+            let n = self.dom.get(id)?;
+            (n.kind.clone(), n.attrs.clone(), n.ns.clone())
         };
         let new_key = match &kind {
             // Stage 15 (M7 Phase 1, Rec 1): a clone keeps its
@@ -1051,9 +1051,7 @@ impl DomHost for TestHost {
     }
 
     fn clone_node(&mut self, key: DomKey, deep: bool) -> Option<DomKey> {
-        if self.dom.get(key).is_none() {
-            return None;
-        }
+        self.dom.get(key)?;
         self.clone_within(key, deep)
     }
 
@@ -1134,11 +1132,10 @@ impl DomHost for TestHost {
             .unwrap()
             .css_controls
             .push((key, name.to_string(), op));
-        if op == WaapiOp::Cancel {
-            if let Some(names) = self.css_animations.get_mut(&key) {
+        if op == WaapiOp::Cancel
+            && let Some(names) = self.css_animations.get_mut(&key) {
                 names.retain(|n| n != name);
             }
-        }
     }
 
     fn request_image(&mut self, url: &str, base_url: &str) {

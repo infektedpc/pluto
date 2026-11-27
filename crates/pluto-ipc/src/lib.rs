@@ -366,7 +366,7 @@ pub enum RendererToBrowser {
     /// planes for one `<video>` element, sent by the renderer as
     /// soon as the decode thread produces it — NOT through
     /// `ResourceReady`/`Blob`. The M7 canvas drain (hash-compare
-    /// + dirty flag, full-RGBA clone per frame) is the 498 MB/s
+    /// and dirty flag, full-RGBA clone per frame) is the 498 MB/s
     /// trap for video: a video frame differs every frame, so the
     /// hash never skips. YUV420 is 1.5 bytes/px against RGBA's 4
     /// (1080p: ~3.1 MB/frame vs ~8.3 MB), and the shell uploads
@@ -801,7 +801,7 @@ pub enum Destination {
 /// `origin_clean` is the per-frame tainting decision (Rec 3):
 /// same-origin or `data:` media is clean; cross-origin media is
 /// clean ONLY when its fetch was CORS-approved (`crossorigin`
-/// + a passing CORS check — the approval is recorded on the
+/// and a passing CORS check — the approval is recorded on the
 /// fetch, unlike `<img>` today, where no approval is recorded
 /// and every cross-origin image taints). A tainted frame still
 /// paints — it only blocks `drawImage(video)` readback

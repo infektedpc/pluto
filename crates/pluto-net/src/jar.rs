@@ -241,7 +241,7 @@ impl CookieJar {
         let Ok(request_url) = Url::parse(url) else {
             return Vec::new();
         };
-        let Some(host) = request_url.host_str() else {
+        let Some(_host) = request_url.host_str() else {
             return Vec::new();
         };
         let key = partition_key(top_level_site);
@@ -326,16 +326,12 @@ impl CookieJar {
         let Ok(request_url) = Url::parse(url) else {
             return None;
         };
-        if request_url.host_str().is_none() {
-            return None;
-        }
+        request_url.host_str()?;
         let same_site = is_same_site(&request_url, top_level_site);
         self.seq += 1;
         let now = self.seq;
         let key = partition_key(top_level_site);
-        let Some(partition) = self.partitions.get_mut(&key) else {
-            return None;
-        };
+        let partition = self.partitions.get_mut(&key)?;
         partition.retain(|e| !e.cookie.is_expired());
         let mut indices: Vec<usize> = Vec::new();
         for (i, e) in partition.iter().enumerate() {
@@ -1419,8 +1415,8 @@ mod tests {
                         .and_then(|r| r.as_str())
                         .map(|s| s.contains("live=1"))
                         .unwrap_or(false);
-                    if is_live {
-                        if let Some(exp) = entry
+                    if is_live
+                        && let Some(exp) = entry
                             .get_mut("cookie")
                             .and_then(|c| c.get_mut("expires"))
                             .and_then(|e| e.get_mut("AtUtc"))
@@ -1430,7 +1426,6 @@ mod tests {
                             );
                             edited = true;
                         }
-                    }
                 }
             }
         }

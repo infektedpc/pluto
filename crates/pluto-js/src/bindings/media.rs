@@ -115,6 +115,12 @@ impl MediaState {
     }
 }
 
+impl Default for MediaState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The JS-visible `MediaError` code for a failed source
 /// selection (kept in sync with `pluto_media::MEDIA_ERR_*`).
 fn error_code(state: &MediaState) -> Option<(u32, String)> {
@@ -861,7 +867,7 @@ pub fn start_media_load(
     };
     {
         let mut s = state.borrow_mut();
-        let ms = s.media_states.entry(key).or_insert_with(MediaState::new);
+        let ms = s.media_states.entry(key).or_default();
         ms.candidates = candidates;
         ms.candidate_idx = None;
         ms.current_src = String::new();
@@ -1141,11 +1147,10 @@ pub fn register_media_elements(
         let mut found = Vec::new();
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
-            if let Some(tag) = host.tag_name(id) {
-                if tag == "video" || tag == "audio" {
+            if let Some(tag) = host.tag_name(id)
+                && (tag == "video" || tag == "audio") {
                     found.push(id);
                 }
-            }
             stack.extend(host.children(id));
         }
         found
@@ -1167,7 +1172,7 @@ pub fn register_media_elements(
         };
         {
             let mut s = state.borrow_mut();
-            let ms = s.media_states.entry(key).or_insert_with(MediaState::new);
+            let ms = s.media_states.entry(key).or_default();
             ms.session.set_element_id(dom_key_u64(key));
             ms.preload = preload;
             ms.autoplay = autoplay;
@@ -1203,7 +1208,7 @@ pub fn register_media_elements(
         for (track_key, kind, label, language, src) in tracks {
             let idx = {
                 let mut s = state.borrow_mut();
-                let ms = s.media_states.entry(key).or_insert_with(MediaState::new);
+                let ms = s.media_states.entry(key).or_default();
                 ms.track_elements
                     .push((track_key, kind.clone(), label.clone(), language.clone()));
                 ms.track_elements.len() - 1

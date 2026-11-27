@@ -4609,21 +4609,19 @@ pub fn parse_value(raw: &str) -> Value {
     // `var()` / `calc()` / `clamp()` / transform functions, before
     // the keyword fallthrough (they all contain parens, so the
     // keyword arm below would never claim them — but `Raw` would).
-    if lower.starts_with("var(") && lower.ends_with(')') {
-        if let Some(v) = parse_var_value(&s[4..s.len() - 1]) {
+    if lower.starts_with("var(") && lower.ends_with(')')
+        && let Some(v) = parse_var_value(&s[4..s.len() - 1]) {
             return v;
         }
-    }
-    if lower.starts_with("calc(") && lower.ends_with(')') {
-        if let Some(e) = parse_calc_str(&s[5..s.len() - 1]) {
+    if lower.starts_with("calc(") && lower.ends_with(')')
+        && let Some(e) = parse_calc_str(&s[5..s.len() - 1]) {
             return Value::Calc(e);
         }
-    }
     if lower.starts_with("clamp(") && lower.ends_with(')') {
         let inner = &s[6..s.len() - 1];
         let parts = split_top_level(inner, ',');
-        if parts.len() == 3 {
-            if let (Some(min), Some(val), Some(max)) = (
+        if parts.len() == 3
+            && let (Some(min), Some(val), Some(max)) = (
                 parse_calc_str(parts[0]),
                 parse_calc_str(parts[1]),
                 parse_calc_str(parts[2]),
@@ -4634,27 +4632,23 @@ pub fn parse_value(raw: &str) -> Value {
                     max: Box::new(max),
                 };
             }
-        }
     }
     // CSS gradients (Stage 15, M7 Phase 2, Rec 7): parse before
     // the generic function branch below — `linear-gradient(`
     // contains a paren, so `parse_transform_list` would claim it
     // first. An unparseable gradient falls through to `Raw`.
-    if lower.starts_with("linear-gradient(") && lower.ends_with(')') {
-        if let Some(g) = parse_gradient(&s[16..s.len() - 1], true) {
+    if lower.starts_with("linear-gradient(") && lower.ends_with(')')
+        && let Some(g) = parse_gradient(&s[16..s.len() - 1], true) {
             return Value::Gradient(g);
         }
-    }
-    if lower.starts_with("radial-gradient(") && lower.ends_with(')') {
-        if let Some(g) = parse_gradient(&s[16..s.len() - 1], false) {
+    if lower.starts_with("radial-gradient(") && lower.ends_with(')')
+        && let Some(g) = parse_gradient(&s[16..s.len() - 1], false) {
             return Value::Gradient(g);
         }
-    }
-    if s.contains('(') {
-        if let Some(list) = parse_transform_list(s) {
+    if s.contains('(')
+        && let Some(list) = parse_transform_list(s) {
             return Value::Transform(list);
         }
-    }
     if s.split_whitespace().count() == 1
         && s.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
     {
@@ -4722,13 +4716,10 @@ fn parse_gradient(inner: &str, linear: bool) -> Option<Gradient> {
             if let Some(angle) = parse_angle_value(first) {
                 kind = GradientKind::Linear { angle_deg: angle };
                 rest = &parts[1..];
-            } else if let Some(angle) = parse_to_direction(first) {
+            } else {
+                let angle = parse_to_direction(first)?;
                 kind = GradientKind::Linear { angle_deg: angle };
                 rest = &parts[1..];
-            } else {
-                // Unrecognised first part: not a gradient we
-                // understand — fail rather than paint wrong.
-                return None;
             }
         } else {
             let lower = first.to_ascii_lowercase();
@@ -4981,9 +4972,7 @@ fn parse_transform_list(s: &str) -> Option<TransformList> {
             }
             j += 1;
         }
-        let Some(end) = end else {
-            return None;
-        };
+        let end = end?;
         let args_raw = &s[i + 1..end];
         let args: Vec<&str> = args_raw
             .split(|c: char| c == ',' || c.is_whitespace())

@@ -28,8 +28,8 @@
 //! to the viewport). The offset is clamped to `[0, max]` on both
 //! axes (Stage 10 Rec 2): the maximum comes from the submitted
 //! display list — item 0 is the canvas fill over the viewport, and
-//! the list's damage reaches `max(viewport, content)`, so `damage
-//! - canvas` is the page's `content - viewport`, per axis. Until
+//! the list's damage reaches `max(viewport, content)`, so damage
+//! minus `canvas` is the page's `content - viewport`, per axis. Until
 //! a list lands the maximum is unbounded (no page yet); a list
 //! that carries no canvas or damage leaves the previous maximum
 //! in place.
@@ -224,6 +224,9 @@ impl Compositor {
     /// two are always read as a pair, display first, in `view()`),
     /// but without counting a deadline miss — `display()` already
     /// counted this frame's, if any.
+    // Read only by tests (display + resources as a pair); the
+    // shell reads `display()` alone.
+    #[allow(dead_code)]
     pub fn resources(&self) -> Arc<ResourceTable> {
         self.activate_inner(false);
         Arc::clone(&self.active.borrow().resources)

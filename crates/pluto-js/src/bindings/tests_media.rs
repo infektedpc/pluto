@@ -39,7 +39,7 @@ fn decode_base64(input: &str) -> Vec<u8> {
     }
     let clean: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     let mut out = Vec::with_capacity(clean.len() * 3 / 4);
-    for chunk in clean.chunks_exact(4) {
+    for chunk in clean.as_chunks::<4>().0 {
         let pad = chunk.iter().rev().take_while(|&&b| b == b'=').count();
         let n = ((val(chunk[0]) as u32) << 18)
             | ((val(chunk[1]) as u32) << 12)

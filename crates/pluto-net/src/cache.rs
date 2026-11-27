@@ -316,6 +316,7 @@ impl HttpCache {
     /// (non-redirect, non-opaque, CORS/SRI-passing) response;
     /// this re-checks every storeability rule so a caller bug
     /// cannot smuggle an uncacheable response in.
+    #[allow(clippy::too_many_arguments)]
     pub fn store(
         &mut self,
         partition: &str,
@@ -362,8 +363,8 @@ impl HttpCache {
         };
         // Replace an existing variant with the same full key:
         // its bytes leave the total, its LRU slot is reused.
-        if let Some(variants) = self.entries.get_mut(&base) {
-            if let Some(pos) = variants.iter().position(|e| e.key == key) {
+        if let Some(variants) = self.entries.get_mut(&base)
+            && let Some(pos) = variants.iter().position(|e| e.key == key) {
                 self.total_bytes = self
                     .total_bytes
                     .saturating_sub(variants[pos].body.len());
@@ -374,7 +375,6 @@ impl HttpCache {
                 self.evict_while_over_cap();
                 return true;
             }
-        }
         self.entries.entry(base).or_default().push(entry);
         self.order.push_back(key);
         self.total_bytes += body.len();
@@ -591,7 +591,7 @@ fn freshness_lifetime(entry: &CachedEntry) -> Option<Duration> {
         .and_then(parse_http_date)
         .unwrap_or(entry.stored_at);
     let since = date.duration_since(last_modified).unwrap_or(Duration::ZERO);
-    Some((since / HEURISTIC_FRACTION as u32).min(MAX_HEURISTIC_FRESHNESS))
+    Some((since / HEURISTIC_FRACTION).min(MAX_HEURISTIC_FRESHNESS))
 }
 
 /// The entry's current age (RFC 9111 §5.1, simplified for a

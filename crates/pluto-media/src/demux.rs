@@ -153,8 +153,8 @@ fn try_avcc(avcc: &[u8], len_size: usize, out: &mut Vec<u8>) -> bool {
             return false;
         }
         let mut n = 0usize;
-        for i in 0..len_size {
-            n = (n << 8) | rest[i] as usize;
+        for &b in rest.iter().take(len_size) {
+            n = (n << 8) | b as usize;
         }
         rest = &rest[len_size..];
         if n == 0 || rest.len() < n {

@@ -780,10 +780,7 @@ impl Parser {
         self.tokenizer.set_eof();
         // Drain any remaining tokens.
         let mut queued_events = Vec::new();
-        loop {
-            let Some(token) = self.tokenizer.next_token() else {
-                break;
-            };
+        while let Some(token) = self.tokenizer.next_token() {
             if matches!(token, Token::Eof) {
                 break;
             }
@@ -823,6 +820,12 @@ impl Parser {
     }
 }
 
+impl Default for Parser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Extract a referrer policy from a `<meta name="referrer">`
 /// element's attributes (`name="referrer"`, `content="<policy>"`).
 /// Returns `None` when the element is not a referrer meta or its
@@ -834,11 +837,10 @@ fn meta_referrer(attrs: &[(String, String)]) -> Option<ReferrerPolicy> {
             .find(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
     };
-    if get("name").is_some_and(|n| n.eq_ignore_ascii_case("referrer")) {
-        if let Some(content) = get("content") {
+    if get("name").is_some_and(|n| n.eq_ignore_ascii_case("referrer"))
+        && let Some(content) = get("content") {
             return ReferrerPolicy::parse(content);
         }
-    }
     None
 }
 
@@ -858,8 +860,8 @@ fn meta_charset(attrs: &[(String, String)]) -> Option<String> {
             return Some(cs.to_string());
         }
     }
-    if get("http-equiv").is_some_and(|h| h.eq_ignore_ascii_case("content-type")) {
-        if let Some(content) = get("content") {
+    if get("http-equiv").is_some_and(|h| h.eq_ignore_ascii_case("content-type"))
+        && let Some(content) = get("content") {
             for part in content.split(';') {
                 let part = part.trim();
                 if let Some(rest) = part.strip_prefix("charset=") {
@@ -877,7 +879,6 @@ fn meta_charset(attrs: &[(String, String)]) -> Option<String> {
                 }
             }
         }
-    }
     None
 }
 

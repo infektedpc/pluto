@@ -49,7 +49,7 @@
 //! # Interim limits (honest, not hidden)
 //!
 //! * Audio-only files decode fully at `load` (exact duration
-//!   + instant seek); a long file pays a load-time decode.
+//!   and instant seek); a long file pays a load-time decode.
 //!   Streaming decode is Rec 12 work.
 //! * MP4 video+audio decodes audio incrementally in
 //!   `advance()`; after a seek the audio catches up by
@@ -206,6 +206,10 @@ pub struct MediaSession {
     primed: bool,
 }
 
+/// `Mp4Video` carries the demuxer, track index, and decoder, so it is
+/// inherently far larger than `AudioOnly`; boxing it would churn every
+/// construction and match site for no behavior gain.
+#[allow(clippy::large_enum_variant)]
 enum Source {
     Mp4Video {
         demux: Mp4Demux,
@@ -702,7 +706,7 @@ impl MediaSession {
         })?;
         let Some(track) = demux.video_track() else {
             // MP4 without video: audio-only (AAC in MP4).
-            let audio = AudioStream::open(shared, true).map_err(|e| error_of(e))?;
+            let audio = AudioStream::open(shared, true).map_err(error_of)?;
             self.duration = Some(audio.pcm_duration());
             self.kind = MediaKind::AudioOnly;
             self.source = Some(Source::AudioOnly { audio });
@@ -734,8 +738,8 @@ impl MediaSession {
         self.duration = Some(duration_ms / 1000.0);
         let prefix = demux
             .parameter_sets_annexb(track.track_id)
-            .map_err(|e| error_of(e))?;
-        let decoder = H264Decoder::new().map_err(|e| error_of(e))?;
+            .map_err(error_of)?;
+        let decoder = H264Decoder::new().map_err(error_of)?;
         // Audio track (best effort): a failure here must not
         // kill the video — it is recorded, not fatal.
         let audio = match AudioStream::open(shared, false) {
@@ -760,7 +764,7 @@ impl MediaSession {
     }
 
     fn load_webm(&mut self, bytes: Vec<u8>) -> Result<(), (u32, String)> {
-        let demux = WebmDemux::open(bytes).map_err(|e| error_of(e))?;
+        let demux = WebmDemux::open(bytes).map_err(error_of)?;
         let tracks = demux.tracks();
         if let Some(video) = tracks.iter().find(|t| t.kind == WebmTrackKind::Video) {
             // The VP9 decision (see `canplay`): demuxed but not
@@ -798,7 +802,7 @@ impl MediaSession {
     }
 
     fn load_audio_only(&mut self, bytes: Arc<Vec<u8>>) -> Result<(), (u32, String)> {
-        let audio = AudioStream::open(bytes, true).map_err(|e| error_of(e))?;
+        let audio = AudioStream::open(bytes, true).map_err(error_of)?;
         self.duration = Some(audio.pcm_duration());
         self.kind = MediaKind::AudioOnly;
         self.source = Some(Source::AudioOnly { audio });
@@ -1216,13 +1220,11 @@ impl MediaSession {
             }
         };
         match self.source.as_mut() {
-            Some(Source::Mp4Video { audio, .. }) => {
-                if let Some(audio) = audio {
-                    push(audio, sink);
-                }
-            }
+            Some(Source::Mp4Video {
+                audio: Some(audio), ..
+            }) => push(audio, sink),
             Some(Source::AudioOnly { audio }) => push(audio, sink),
-            None => {}
+            _ => {}
         }
     }
 

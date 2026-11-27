@@ -61,10 +61,9 @@ pub fn numeric_char(value: u32) -> char {
     if value == 0 || value > 0x10FFFF || (0xD800..0xE000).contains(&value) {
         return '\u{FFFD}';
     }
-    if (0x80..=0x9F).contains(&value) {
-        if let Some(c) = C1_REPLACEMENTS[(value - 0x80) as usize] {
+    if (0x80..=0x9F).contains(&value)
+        && let Some(c) = C1_REPLACEMENTS[(value - 0x80) as usize] {
             return c;
         }
-    }
     char::from_u32(value).unwrap_or('\u{FFFD}')
 }

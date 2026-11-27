@@ -33,7 +33,6 @@ use crate::bindings::dom::host_of;
 use crate::bindings::{
     BindingState, js_null, throw_dom, throw_type_error, to_dom_string,
 };
-use crate::host::DomHost;
 
 /// Install `window.history` on the global object.
 pub fn install_history<'js>(
@@ -152,7 +151,7 @@ fn history_push_replace<'js>(
     url: Option<Value<'js>>,
     replace: bool,
 ) -> rquickjs::Result<()> {
-    let host = host_of(bindings).map_err(|e| throw_type_error(&ctx, &e))?;
+    let host = host_of(bindings).map_err(|e| throw_type_error(ctx, &e))?;
     let current = host
         .borrow()
         .document_url()
@@ -165,29 +164,29 @@ fn history_push_replace<'js>(
         Some(value) => {
             let input = to_dom_string(ctx, &value)?;
             let base = url::Url::parse(&current).map_err(|_| {
-                throw_dom(&ctx, "SecurityError", "history: current URL is not parseable")
+                throw_dom(ctx, "SecurityError", "history: current URL is not parseable")
             })?;
             base.join(&input).map_err(|_| {
                 throw_dom(
-                    &ctx,
+                    ctx,
                     "SecurityError",
                     "history: the URL could not be resolved",
                 )
             })?
         }
         None => url::Url::parse(&current).map_err(|_| {
-            throw_dom(&ctx, "SecurityError", "history: current URL is not parseable")
+            throw_dom(ctx, "SecurityError", "history: current URL is not parseable")
         })?,
     };
     // Same-origin check (spec: the URL's origin must equal the
     // document's, else `SecurityError`). Compared as parsed
     // origins (scheme + host + port), never as strings.
     let current_url = url::Url::parse(&current).map_err(|_| {
-        throw_dom(&ctx, "SecurityError", "history: current URL is not parseable")
+        throw_dom(ctx, "SecurityError", "history: current URL is not parseable")
     })?;
     if target.origin() != current_url.origin() {
         return Err(throw_dom(
-            &ctx,
+            ctx,
             "SecurityError",
             "history: a cross-origin URL cannot be pushed",
         ));

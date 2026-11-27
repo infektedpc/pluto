@@ -872,7 +872,7 @@ pub fn dispatch_storage_event<'js>(
 /// `undefined` removes it; any other value is ignored (WebIDL:
 /// a non-callable handler is treated as `null`).
 pub fn install_event_handler_property<'js>(
-    ctx: &Ctx<'js>,
+    _ctx: &Ctx<'js>,
     bindings: &Rc<RefCell<BindingState>>,
     obj: &Object<'js>,
     target_id: u64,
@@ -1014,9 +1014,9 @@ pub fn dispatch_popstate_event<'js>(
             let parse: Function = json_obj.get("parse")?;
             parse
                 .call::<_, Value>((json,))
-                .unwrap_or_else(|_| js_null(&ctx))
+                .unwrap_or_else(|_| js_null(ctx))
         }
-        None => js_null(&ctx),
+        None => js_null(ctx),
     };
     event.set("state", state_value)?;
     dispatch_to_target(ctx, state, WINDOW_TARGET_ID, &event, "popstate")?;

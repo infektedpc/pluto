@@ -264,8 +264,8 @@ pub fn payload_needs_keep(
     ) {
         return true;
     }
-    if let Some(mime) = mime_essence(content_type) {
-        if matches!(
+    if let Some(mime) = mime_essence(content_type)
+        && matches!(
             mime.as_str(),
             "application/x-executable"
                 | "application/x-elf"
@@ -284,7 +284,6 @@ pub fn payload_needs_keep(
         ) {
             return true;
         }
-    }
     let lower = filename.to_ascii_lowercase();
     let ext = lower.rsplit('.').next().unwrap_or("");
     // Only an extension after a real dot counts: a bare name with

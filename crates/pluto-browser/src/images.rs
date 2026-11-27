@@ -40,7 +40,6 @@ use pluto_html::{Dom, NodeId, select_img_url_from_dom};
 use pluto_ipc::transport::MAX_FRAME_BYTES;
 use pluto_ipc::{CredentialsMode, Destination, Priority, RequestMode, ResourceRequest, origin_of};
 use pluto_layout::{ImageInfo, ImageMap};
-use pluto_net::ResourceLoader;
 use pluto_paint::{
     AnimatedFrames, ImageCache, Resource, ResourceId, decode_animated, resize_rgba,
 };
@@ -93,6 +92,9 @@ pub enum ImageOutcome {
 /// size layout needs. `animated` means the cache holds more
 /// frames behind this id (`advance_animated` swaps them in).
 #[derive(Debug, Clone)]
+// `url` / `animated` are recorded for diagnostics and future use;
+// nothing reads them yet.
+#[allow(dead_code)]
 pub struct AppliedImage {
     pub url: String,
     pub id: ResourceId,
@@ -359,10 +361,7 @@ impl ImageStore {
                         .insert_animated(frames.frames, frames.delays_ms.clone())
                 } else {
                     let first = frames.frames.into_iter().next()?;
-                    match self.cache.insert_decoded(first) {
-                        Ok(id) => Some(id),
-                        Err(_) => None,
-                    }
+                    self.cache.insert_decoded(first).ok()
                 };
                 let Some(id) = id else {
                     // Over the cache cap (or uninsertable): broken.
@@ -571,18 +570,15 @@ impl ImageStore {
             // paint draws black instead).
             if let Some(poster) = dom.attr(id, "poster") {
                 let resolved = pluto_html::resolve_url(base_url, poster);
-                match self.by_url.get(&resolved) {
-                    Some(ImageState::Ready { id: rid, width, height }) => {
-                        map.by_node.insert(
-                            id,
-                            ImageInfo {
-                                resource: rid.0,
-                                width: *width,
-                                height: *height,
-                            },
-                        );
-                    }
-                    _ => {}
+                if let Some(ImageState::Ready { id: rid, width, height }) = self.by_url.get(&resolved) {
+                    map.by_node.insert(
+                        id,
+                        ImageInfo {
+                            resource: rid.0,
+                            width: *width,
+                            height: *height,
+                        },
+                    );
                 }
             }
         } else if dom.tag(id) == Some("image") {
@@ -1009,6 +1005,9 @@ mod tests {
     }
 
     #[test]
+    // This test exists to pin the constants, so the
+    // assertions-on-constants lint is silenced deliberately.
+    #[allow(clippy::assertions_on_constants)]
     fn animation_rate_constants_hold() {
         // The driver never advances faster than the decoded
         // delays allow (≥ 10 ms per frame) and the tab tick

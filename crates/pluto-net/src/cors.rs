@@ -252,11 +252,10 @@ pub fn classify_request_headers(
         if is_safelisted_header_name(&lower) {
             safelisted_total += value.len();
             safelisted_names.push(lower.clone());
-            if content_type_count > 1 || !is_safelisted_header_value(&lower, value) {
-                if !unsafe_headers.contains(&lower) {
+            if (content_type_count > 1 || !is_safelisted_header_value(&lower, value))
+                && !unsafe_headers.contains(&lower) {
                     unsafe_headers.push(lower);
                 }
-            }
         } else if !unsafe_headers.contains(&lower) {
             unsafe_headers.push(lower);
         }
@@ -613,6 +612,17 @@ impl PreflightCache {
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.lock().unwrap().is_empty()
+    }
+}
+
+impl Default for PreflightCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

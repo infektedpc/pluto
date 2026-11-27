@@ -34,7 +34,7 @@
 //! documented there.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use pluto_ipc::Origin;
@@ -370,7 +370,7 @@ pub fn parse_json(input: &str) -> Result<JsonValue, String> {
 /// whole browser crate, with `fsync` + a startup temp sweep).
 /// Kept as a `pub` shim: `bookmarks` / `permissions` / tests call
 /// it through this module.
-pub fn write_file_atomic(dir: &PathBuf, name: &str, contents: &str) -> std::io::Result<()> {
+pub fn write_file_atomic(dir: &Path, name: &str, contents: &str) -> std::io::Result<()> {
     crate::atomic::write_file_atomic(dir, name, contents)
 }
 
@@ -642,6 +642,7 @@ impl LocalStorageStore {
     }
 
     /// Whether the store has unsaved changes.
+    #[allow(dead_code)]
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -674,6 +675,7 @@ impl LocalStorageStore {
 
     /// Write the store now if it is dirty (tab close / explicit
     /// flush always writes, whatever the debounce says).
+    #[allow(dead_code)]
     pub fn flush(&mut self) {
         if self.dirty {
             save_local_storage(self);
@@ -825,6 +827,7 @@ impl SessionStorageStore {
 
     /// Drop every bucket (the tab-close clear; also what dropping
     /// the store does implicitly).
+    #[allow(dead_code)]
     pub fn clear_all(&mut self) {
         self.buckets.clear();
     }
@@ -910,6 +913,7 @@ impl PlutoStorageBackend {
     }
 
     /// The shared local store (for saving after a write).
+    #[allow(dead_code)]
     pub fn local_store(&self) -> Arc<Mutex<LocalStorageStore>> {
         Arc::clone(&self.local)
     }
@@ -1349,9 +1353,9 @@ mod tests {
             (reads, None)
         });
         let mut handles = Vec::new();
-        for w in 0..8 {
+        for doc in docs.iter() {
             let dir = dir.clone();
-            let doc = docs[w].clone();
+            let doc = doc.clone();
             let barrier = std::sync::Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || -> std::io::Result<()> {
                 barrier.wait();
@@ -1493,7 +1497,24 @@ mod tests {
         store.flush();
         assert!(!store.is_dirty());
         let flushed = load_local_storage();
-        assert_eq!(flushed.get_item(&key, "b").unwrap().as_deref(), Some("2"));
+        // CI run 46031419304 (head 958b406c) failed here once
+        // with `None` instead of `Some("2")`, and the failure
+        // never reproduced locally (32 runs: 12 default threads,
+        // 20 with --test-threads=16, plus two full gates). The
+        // flush above is synchronous and fsync'd, and this test
+        // holds TEST_HOME_LOCK, so a bare `None` says nothing
+        // about why. If it ever fails again, print the on-disk
+        // file: a stale file (no "b") means another writer
+        // clobbered it between flush and reload; a missing or
+        // corrupt file means the write or the read path broke.
+        assert_eq!(
+            flushed.get_item(&key, "b").unwrap().as_deref(),
+            Some("2"),
+            "flushed store lost 'b'; on-disk {} was: {}",
+            dir.join(LOCAL_STORAGE_FILE).display(),
+            std::fs::read_to_string(dir.join(LOCAL_STORAGE_FILE))
+                .unwrap_or_else(|e| format!("<unreadable: {e}>")),
+        );
         let _ = std::fs::remove_dir_all(&home);
         restore_home(old);
     }

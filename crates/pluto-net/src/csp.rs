@@ -91,7 +91,7 @@ impl HashAlgorithm {
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
@@ -247,14 +247,13 @@ impl SourceExpr {
             if let Some(dash) = inner.find('-') {
                 let (algo_name, value) = inner.split_at(dash);
                 let value = &value[1..];
-                if let Some(algorithm) = HashAlgorithm::parse(algo_name) {
-                    if !value.is_empty() {
+                if let Some(algorithm) = HashAlgorithm::parse(algo_name)
+                    && !value.is_empty() {
                         return SourceExpr::Hash {
                             algorithm,
                             value: value.to_string(),
                         };
                     }
-                }
                 return SourceExpr::Unknown(token.to_string());
             }
             return SourceExpr::Unknown(token.to_string());
@@ -316,19 +315,16 @@ impl HostSource {
         // Split host and port. An IPv6 literal keeps its brackets
         // until the closing `]`; anything after it must be `:port`.
         let (host, port) = if let Some(bracketed) = hostport.strip_prefix('[') {
-            match bracketed.find(']') {
-                Some(end) => {
-                    let host = &bracketed[..end];
-                    let after = &bracketed[end + 1..];
-                    if after.is_empty() {
-                        (host.to_string(), None)
-                    } else if let Some(port_str) = after.strip_prefix(':') {
-                        (host.to_string(), Some(port_str.parse::<u16>().ok()?))
-                    } else {
-                        return None;
-                    }
+            {
+                let end = bracketed.find(']')?;
+                let host = &bracketed[..end];
+                let after = &bracketed[end + 1..];
+                if after.is_empty() {
+                    (host.to_string(), None)
+                } else {
+                    let port_str = after.strip_prefix(':')?;
+                    (host.to_string(), Some(port_str.parse::<u16>().ok()?))
                 }
-                None => return None,
             }
         } else {
             match hostport.rfind(':') {
@@ -911,16 +907,14 @@ fn host_source_matches_url(url: &url::Url, host: &HostSource) -> bool {
     if !host_matches(&host.host, host.wildcard_subdomain, url_host) {
         return false;
     }
-    if let Some(port) = host.port {
-        if effective_port(url) != Some(port) {
+    if let Some(port) = host.port
+        && effective_port(url) != Some(port) {
             return false;
         }
-    }
-    if let Some(path) = &host.path {
-        if !url.path().starts_with(path.as_str()) {
+    if let Some(path) = &host.path
+        && !url.path().starts_with(path.as_str()) {
             return false;
         }
-    }
     true
 }
 
@@ -1105,25 +1099,22 @@ fn inline_source_list_allows(
         .any(|e| matches!(e, SourceExpr::UnsafeHashes));
 
     // A matching nonce allows the block (nonce matching is exact).
-    if let Some(nonce) = nonce {
-        if exprs
+    if let Some(nonce) = nonce
+        && exprs
             .iter()
             .any(|e| matches!(e, SourceExpr::Nonce(n) if n == nonce))
         {
             return true;
         }
-    }
     // A matching content hash allows the block — for event handlers
     // and style attributes only when `'unsafe-hashes'` is present.
     if !kind.hash_needs_unsafe_hashes() || unsafe_hashes {
         for expr in exprs {
-            if let SourceExpr::Hash { algorithm, value } = expr {
-                if let Some(expected) = base64_decode(value) {
-                    if algorithm.hash(content) == expected {
+            if let SourceExpr::Hash { algorithm, value } = expr
+                && let Some(expected) = base64_decode(value)
+                    && algorithm.hash(content) == expected {
                         return true;
                     }
-                }
-            }
         }
     }
     // `'unsafe-inline'` allows the block, unless a nonce or hash
@@ -1548,14 +1539,14 @@ mod tests {
         let p = set(&["frame-ancestors 'self'"], &[]);
         // Top-level (no ancestors) always passes.
         assert!(p.frame_ancestors_allows(&o, &[]));
-        assert!(p.frame_ancestors_allows(&o, &[o.clone()]));
+        assert!(p.frame_ancestors_allows(&o, std::slice::from_ref(&o)));
         assert!(!p.frame_ancestors_allows(&o, &[origin("https://evil.com/")]));
         // Every ancestor must match.
         assert!(!p.frame_ancestors_allows(&o, &[o.clone(), origin("https://evil.com/")]));
         // 'none' blocks all framing.
         let p = set(&["frame-ancestors 'none'"], &[]);
         assert!(p.frame_ancestors_allows(&o, &[]));
-        assert!(!p.frame_ancestors_allows(&o, &[o.clone()]));
+        assert!(!p.frame_ancestors_allows(&o, std::slice::from_ref(&o)));
         // Host list.
         let p = set(&["frame-ancestors https://example.com https://trusted.com"], &[]);
         assert!(p.frame_ancestors_allows(&o, &[origin("https://trusted.com/")]));
