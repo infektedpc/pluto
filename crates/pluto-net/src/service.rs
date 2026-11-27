@@ -437,6 +437,7 @@ impl Scheduler {
         request: ResourceRequest,
         cancel: CancellationToken,
     ) -> mpsc::Receiver<ResourceEvent> {
+        eprintln!("[pluto-broker] scheduler submit id={} url={}", request.request_id, request.url);
         let (reply_tx, reply_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
         let key = dedup_key(&request);
         let mut state = self.state.lock().await;
@@ -642,6 +643,7 @@ async fn run_fetch(
     request: &ResourceRequest,
     cancel: &CancellationToken,
 ) {
+    eprintln!("[pluto-broker] run_fetch start id={} url={}", request.request_id, request.url);
     let total = total_timeout(request.destination);
     let outcome = tokio::time::timeout(total, execute_fetch(scheduler, request, cancel)).await;
     match outcome {

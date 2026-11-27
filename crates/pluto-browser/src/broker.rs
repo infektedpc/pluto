@@ -62,6 +62,7 @@ impl NetworkBroker {
     /// Afterwards the cookie jar is persisted — a `Set-Cookie`
     /// taken in during this fetch survives a crash.
     pub async fn serve(&self, request: ResourceRequest, events: mpsc::Sender<ResourceEvent>) {
+        eprintln!("[pluto-broker] serve start id={} url={}", request.request_id, request.url);
         let cancel = CancellationToken::new();
         let request_id = request.request_id;
         self.pending

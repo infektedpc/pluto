@@ -1518,6 +1518,7 @@ impl Application for PlutoBrowser {
                         self.tabs[tab_index].compositor.scroll_by(dx, dy);
                     }
                     RendererToBrowser::RequestResource(request) => {
+                        eprintln!("[pluto-broker] shell got RequestResource id={} url={}", request.request_id, request.url);
                         // Stage 13 Rec 11: serve the request on the
                         // broker and forward its events to the tab as
                         // they arrive. The future runs serve + the
