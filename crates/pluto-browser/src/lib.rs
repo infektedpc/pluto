@@ -34,10 +34,13 @@ mod viewport;
 pub(crate) static TEST_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use bookmarks::{
-    Bookmark, BookmarkStore, delete_bookmark_favicon, load_bookmark_favicon,
-    load_bookmarks, save_bookmark_favicon, save_bookmarks,
+    Bookmark, BookmarkEntry, BookmarkStore, bookmark_favicon_file_name,
+    delete_bookmark_favicon, load_bookmark_favicon, load_bookmarks, save_bookmark_favicon,
+    save_bookmarks,
 };
 use history::{load_history, save_history};
+use crate::js_host::storage::{JsonValue, parse_json, write_file_atomic};
+use crate::security::profile_dir;
 use compositor::Compositor;
 use cosmic::app::{Core, Task};
 use cosmic::iced::{Alignment, Length};
@@ -219,16 +222,26 @@ impl Tab {
 }
 
 /// The bookmark dialog's draft state (follow-up UI work,
-/// 2026-11-27): the star opens this instead of toggling. The
+/// 2026-11-27; Firefox-style restyle, bookmarks round
+/// 2026-11-28): the star opens this instead of toggling. The
 /// name is editable; the favicon is clickable to pick a custom
 /// image. Nothing is written to the store until Save.
 #[derive(Debug, Clone)]
 struct BookmarkDialog {
-    /// The page URL being bookmarked (never edited).
+    /// The page URL as opened (the bookmark's identity — the
+    /// editable `url` below may differ from it).
+    original_url: String,
+    /// The editable bookmark URL, prefilled with the page URL.
     url: String,
     /// The editable bookmark name, prefilled with the page title
     /// (or the stored title when editing).
     name: String,
+    /// The editable tags field, as typed: comma-separated.
+    tags: String,
+    /// The editable keyword field, as typed: a single word.
+    keyword: String,
+    /// Whether the tags chevron dropdown is open.
+    show_tags: bool,
     /// The custom favicon picked in this dialog, if any: decoded
     /// pixels for display plus the raw file bytes to persist on
     /// Save. `None` means "keep whatever favicon the bookmark
@@ -244,20 +257,61 @@ struct BookmarkDialog {
 impl BookmarkDialog {
     /// Open the dialog for `url`: prefill the name with the
     /// stored title when the page is already bookmarked
-    /// (`existing`), else with the current page `title`.
+    /// (`existing`), else with the current page `title`; tags
+    /// and keyword prefill from the stored bookmark when
+    /// editing, else empty.
     fn new(url: &str, title: &str, existing: Option<&Bookmark>) -> Self {
-        let (name, editing) = match existing {
-            Some(bookmark) => (bookmark.title.clone(), true),
-            None => (title.to_string(), false),
+        let (name, tags, keyword, editing) = match existing {
+            Some(bookmark) => (
+                bookmark.title.clone(),
+                bookmark.tags.join(", "),
+                bookmark.keyword.clone().unwrap_or_default(),
+                true,
+            ),
+            None => (title.to_string(), String::new(), String::new(), false),
         };
         Self {
+            original_url: url.to_string(),
             url: url.to_string(),
             name,
+            tags,
+            keyword,
+            show_tags: false,
             custom_favicon: None,
             editing,
             error: None,
         }
     }
+}
+
+/// The new-folder dialog's draft state (bookmarks round,
+/// 2026-11-28): just a name, prefilled "New folder". Nothing
+/// is written until Save.
+#[derive(Debug, Clone)]
+struct FolderDialog {
+    name: String,
+}
+
+/// Which bookmarks-bar context menu is open, if any
+/// (bookmarks round, 2026-11-28): the generic bar menu, or the
+/// menu for one bookmark chip / folder chip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BarContextMenu {
+    /// Right-click on empty bar space (or the pencil).
+    Bar,
+    /// Right-click on a bookmark chip.
+    Bookmark { url: String },
+    /// Right-click on a folder chip.
+    Folder { id: String },
+}
+
+/// One entry in the bookmarks bar, in store order (bookmarks
+/// round, 2026-11-28): a bookmark chip or a folder chip. The
+/// bar reads the store, never a hardcoded list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BarEntry {
+    Bookmark { title: String, url: String },
+    Folder { id: String, name: String },
 }
 
 pub struct PlutoBrowser {
@@ -296,6 +350,33 @@ pub struct PlutoBrowser {
     /// The open bookmark dialog, if any (follow-up UI work,
     /// 2026-11-27): the star opens this instead of toggling.
     bookmark_dialog: Option<BookmarkDialog>,
+    /// Whether the bookmarks bar is shown (bookmarks round,
+    /// 2026-11-28): toggled by the hamburger menu's "Bookmarks
+    /// bar" checkbox, persisted in `preferences.json`.
+    show_bookmarks_bar: bool,
+    /// Whether the bookmarks bar is in edit mode (bookmarks
+    /// round, 2026-11-28): toggled by the pencil at the bar's
+    /// far left; chips show a × to remove them, and chip clicks
+    /// do not navigate.
+    bookmarks_edit_mode: bool,
+    /// The open bookmarks-bar context menu, if any (bookmarks
+    /// round, 2026-11-28).
+    bar_context_menu: Option<BarContextMenu>,
+    /// The nested-MouseArea flag (bookmarks round, 2026-11-28):
+    /// the bar's right-click area wraps each chip's own
+    /// right-click area, and iced delivers the inner message
+    /// before the outer one — so a chip right-click sets this
+    /// flag, and the outer (background) handler sees it, clears
+    /// it, and leaves the chip menu standing. A background
+    /// right-click finds it clear and opens the generic menu.
+    bar_context_chip: bool,
+    /// The open folder dropdown, if any (bookmarks round,
+    /// 2026-11-28): the id of the folder whose bookmarks are
+    /// listed under the bar.
+    open_folder: Option<String>,
+    /// The open new-folder dialog, if any (bookmarks round,
+    /// 2026-11-28).
+    folder_dialog: Option<FolderDialog>,
     /// Whether the hamburger menu is open. Opening a list panel
     /// closes the menu; the menu never shows alongside a panel.
     menu_open: bool,
@@ -303,9 +384,6 @@ pub struct PlutoBrowser {
     /// read the real stores: bookmarks from the profile store,
     /// history from the active tab's session history.
     panel: Option<Panel>,
-    /// Vertical tabs on (default) vs the classic top strip (UI
-    /// round, 2026-11-27).
-    vertical_tabs: bool,
     /// Which edge(s) the vertical strip sits on (default Left).
     tab_placement: TabPlacement,
     /// The tab whose flyout is currently shown (or collapsing),
@@ -375,6 +453,61 @@ pub enum Message {
     /// The bookmark dialog's Remove button (editing only):
     /// delete the bookmark and its custom favicon, then close.
     BookmarkDialogRemove,
+    /// The bookmark dialog's URL field changed.
+    BookmarkDialogUrlChanged(String),
+    /// The bookmark dialog's tags field changed.
+    BookmarkDialogTagsChanged(String),
+    /// The bookmark dialog's keyword field changed.
+    BookmarkDialogKeywordChanged(String),
+    /// The bookmark dialog's tags chevron: show/hide the
+    /// existing-tags dropdown.
+    BookmarkDialogToggleTags,
+    /// A tag in the dialog's tags dropdown was clicked: toggle
+    /// it into/out of the tags field.
+    BookmarkDialogTagToggle(String),
+    /// The hamburger menu's "Bookmarks bar" checkbox: show or
+    /// hide the bar (persisted).
+    ToggleBookmarksBar,
+    /// The bookmarks bar's pencil: enter/leave edit mode.
+    ToggleBookmarksEditMode,
+    /// Right-click on a bookmark chip in the bar: open its
+    /// context menu.
+    BarContextMenuBookmark(String),
+    /// Right-click on a folder chip in the bar: open its
+    /// context menu.
+    BarContextMenuFolder(String),
+    /// Right-click on the bar's background: open the generic
+    /// bar menu — unless a chip menu was just opened (see
+    /// `bar_context_chip`).
+    BarContextMenuBar,
+    /// Context menu: add the current page as a bookmark, title
+    /// as the name, no dialog.
+    BarAddBookmark,
+    /// Context menu: open the new-folder dialog.
+    BarAddFolder,
+    /// Context menu (folder chip): add the current page into
+    /// that folder, title as the name.
+    BarAddBookmarkHere(String),
+    /// Context menu: enter bookmarks edit mode.
+    BarEditBookmarks,
+    /// Context menu: hide the bookmarks bar (unchecks the menu
+    /// item too).
+    BarHideBookmarksBar,
+    /// Context menu (bookmark chip): open the bookmark dialog
+    /// for that bookmark.
+    BarEditBookmark(String),
+    /// Remove the folder (and its bookmarks) — the × in edit
+    /// mode and the folder chip's context menu.
+    BarRemoveFolder(String),
+    /// A folder chip was clicked: open/close its dropdown under
+    /// the bar.
+    ToggleFolderPopup(String),
+    /// The new-folder dialog's name field changed.
+    FolderDialogNameChanged(String),
+    /// The new-folder dialog's Save: create the folder.
+    FolderDialogSave,
+    /// The new-folder dialog's Cancel: close without creating.
+    FolderDialogCancel,
     /// The hamburger button: open/close the menu.
     ToggleMenu,
     /// Menu: open the Bookmarks list panel.
@@ -399,11 +532,8 @@ pub enum Message {
     /// Select the tab at this strip index (Stage 11 Rec 4):
     /// clicking its tab-strip button, plus Ctrl+Tab to cycle.
     SelectTab(usize),
-    /// The hamburger menu: flip between vertical and horizontal
-    /// tabs (UI round, 2026-11-27).
-    ToggleTabOrientation,
     /// The hamburger menu: put the vertical strip on an edge (or
-    /// both). Choosing a placement implies vertical tabs.
+    /// both).
     SetTabPlacement(TabPlacement),
     /// A vertical tab's chip was hovered (mouse entered): start
     /// its slide-out flyout.
@@ -816,10 +946,10 @@ impl PlutoBrowser {
     /// The hamburger menu (UI round, 2026-11-27): a compact
     /// 260px dropdown, right-aligned under the hamburger — not
     /// the half-screen column it was. The four backend items from
-    /// `menu_items()` come first, then the shell-mode switches
-    /// (orientation toggle + the three placement entries), which
-    /// are the only exceptions to the backends-only rule: they
-    /// switch modes the shell really performs.
+    /// `menu_items()` come first, then the placement entries
+    /// (left/right/both), which are the only exceptions to the
+    /// backends-only rule: they switch modes the shell really
+    /// performs.
     fn menu_panel(&self) -> Element<'_, Message> {
         let mut items: Vec<Element<'_, Message>> = Vec::new();
         for label in menu_items() {
@@ -841,13 +971,6 @@ impl PlutoBrowser {
             );
         }
         items.push(widget::divider::horizontal::default().into());
-        items.push(
-            widget::button::text(orientation_toggle_label(self.vertical_tabs))
-                .class(small_button_style(SmallButtonBase::Text, false))
-                .on_press(Message::ToggleTabOrientation)
-                .width(Length::Fill)
-                .into(),
-        );
         for placement in [TabPlacement::Left, TabPlacement::Right, TabPlacement::Both] {
             let label = if placement == self.tab_placement {
                 format!("{} ✓", placement_label(placement))
@@ -862,6 +985,24 @@ impl PlutoBrowser {
                     .into(),
             );
         }
+        // The bookmarks-bar checkbox (bookmarks round,
+        // 2026-11-28): a view option, so it sits with the other
+        // view options — the placement entries — not in
+        // `menu_items` (that list is pinned to working
+        // backends). Checked = the bar is visible; clicking
+        // toggles it and persists the choice.
+        let bar_label = if self.show_bookmarks_bar {
+            "Bookmarks bar ✓"
+        } else {
+            "Bookmarks bar"
+        };
+        items.push(
+            widget::button::text(bar_label)
+                .class(small_button_style(SmallButtonBase::Text, false))
+                .on_press(Message::ToggleBookmarksBar)
+                .width(Length::Fill)
+                .into(),
+        );
         let panel = widget::column(items).spacing(4).padding(8);
         let boxed = widget::container(panel)
             .width(Length::Fixed(MENU_PANEL_WIDTH))
@@ -873,77 +1014,51 @@ impl PlutoBrowser {
         .into()
     }
 
-    /// The classic top tab strip (horizontal mode, as before):
-    /// one button per tab — favicon (when the site has one) plus
-    /// title — the active tab's button is marked selected; every
-    /// tab carries a "×" close button. "+" opens a new tab.
-    fn tab_strip(&self) -> Element<'_, Message> {
-        let mut tab_row: Vec<Element<'_, Message>> = Vec::new();
-        for (index, tab) in self.tabs.iter().enumerate() {
-            let tab_children: Vec<Element<'_, Message>> = vec![
-                self.favicon_element(tab),
-                widget::text(tab.title.clone()).into(),
-                widget::button::text("×")
-                    .class(small_button_style(SmallButtonBase::Text, false))
-                    .on_press(Message::CloseTab(index))
-                    .into(),
-            ];
-            let tab_button = widget::button::custom(widget::row(tab_children).spacing(4))
-                .class(small_button_style(
-                    SmallButtonBase::Standard,
-                    index == self.active_tab,
-                ))
-                .selected(index == self.active_tab)
-                .on_press(Message::SelectTab(index));
-            tab_row.push(tab_button.into());
-        }
-        tab_row.push(
-            widget::button::text("+")
-                .class(small_button_style(SmallButtonBase::Text, false))
-                .on_press(Message::NewTab)
-                .into(),
-        );
-        widget::row(tab_row).spacing(4).padding(4).into()
-    }
-
-    /// The bookmarks bar, directly below the nav bar: one button
-    /// per bookmark, in store order, with the bookmark's custom
-    /// favicon when it has one. Always visible, even with no
-    /// bookmarks yet — then it shows a hint instead of a dead
-    /// empty bar (follow-up UI work, 2026-11-27).
-    /// The bookmarks bar, like the mockup (UI round, 2026-11-27):
-    /// a flat 30px strip with the theme's component background,
-    /// 8px side padding, 4px gaps, 12px chip text, and a 16px
-    /// favicon when one is set — the bottom divider in `view`
-    /// is the strip's lower edge.
+    /// The bookmarks bar, directly below the nav bar (UI round,
+    /// 2026-11-27): a flat 30px strip with the theme's
+    /// component background, 8px side padding, 4px gaps, 12px
+    /// chip text, and a 16px favicon when one is set — the
+    /// bottom divider in `view` is the strip's lower edge.
+    /// The pencil at the far left (bookmarks round, 2026-11-28)
+    /// toggles edit mode: every chip gets a × that removes it,
+    /// and chip clicks stop navigating. Right-click anywhere on
+    /// the bar — empty space, pencil, or a chip — opens the
+    /// bar's context menu (see `bar_context_menu_overlay`).
     fn bookmarks_bar(&self) -> Element<'_, Message> {
         let entries = bookmarks_bar_entries(&self.bookmarks);
-        let inner: Element<'_, Message> = if entries.is_empty() {
-            widget::row([
+        let mut children: Vec<Element<'_, Message>> = Vec::new();
+        // The pencil, always first: the edit-mode toggle.
+        let pencil = widget::button::custom(
+            widget::icon(bundled_icon(PENCIL_ICON_SVG)).size(16),
+        )
+        .class(small_button_style(
+            SmallButtonBase::Text,
+            self.bookmarks_edit_mode,
+        ))
+        .on_press(Message::ToggleBookmarksEditMode)
+        .into();
+        children.push(pencil);
+        if entries.is_empty() {
+            children.push(
                 widget::text("No bookmarks yet — use the star to save this page.")
                     .size(12)
                     .into(),
-            ])
-            .spacing(4)
-            .into()
+            );
         } else {
-            let mut children: Vec<Element<'_, Message>> = Vec::new();
-            for (title, url) in entries {
-                let mut row_children: Vec<Element<'_, Message>> = Vec::new();
-                if let Some(image) = self.bookmark_favicons.get(&url) {
-                    row_children.push(Self::decoded_image_element(image.clone(), 16.0));
-                }
-                row_children.push(widget::text(ellipsize(&title, 24)).size(12).into());
-                children.push(
-                    widget::button::custom(widget::row(row_children).spacing(4))
-                        .class(small_button_style(SmallButtonBase::Text, false))
-                        .on_press(Message::NavigateTo(url))
-                        .into(),
-                );
+            for entry in entries {
+                children.push(self.bar_chip(entry));
             }
-            widget::row(children).spacing(4).into()
-        };
-        widget::container(inner)
+        }
+        let row = widget::row(children).spacing(4);
+        // The bar's own right-click area wraps the whole row:
+        // right-click on empty space (or the pencil) opens the
+        // generic bar menu. Chips carry their own right-click
+        // area (see `bar_chip`), which reports first and makes
+        // this outer handler a no-op for that click (see
+        // `bar_context_chip`).
+        let area = cosmic::iced::widget::mouse_area(row)
+            .on_right_press(Message::BarContextMenuBar);
+        widget::container(area)
             .style(bookmarks_bar_style)
             .width(Length::Fill)
             .height(Length::Fixed(30.0))
@@ -955,6 +1070,264 @@ impl PlutoBrowser {
             })
             .align_y(Alignment::Center)
             .into()
+    }
+
+    /// One bookmarks-bar chip (bookmarks round, 2026-11-28): a
+    /// bookmark (favicon + title) or a folder (folder icon +
+    /// name). In edit mode the chip is not a button — only its ×
+    /// acts, so a click on the chip body does nothing. Otherwise
+    /// a bookmark chip navigates and a folder chip opens its
+    /// dropdown. A right-click area wraps the chip and reports
+    /// its own menu before the bar's area sees the click.
+    fn bar_chip(&self, entry: BarEntry) -> Element<'_, Message> {
+        let (is_folder, label, url, folder_id) = match entry {
+            BarEntry::Bookmark { title, url } => {
+                (false, ellipsize(&title, 24), Some(url), None)
+            }
+            BarEntry::Folder { id, name } => (true, ellipsize(&name, 24), None, Some(id)),
+        };
+        let mut row_children: Vec<Element<'_, Message>> = Vec::new();
+        if is_folder {
+            let icon: Element<'_, Message> =
+                widget::icon(bundled_icon(FOLDER_ICON_SVG)).size(16).into();
+            row_children.push(icon);
+        } else if let Some(image) = url
+            .as_ref()
+            .and_then(|url| self.bookmark_favicons.get(url))
+        {
+            row_children.push(Self::decoded_image_element(image.clone(), 16.0));
+        }
+        row_children.push(widget::text(label).size(12).into());
+        let chip: Element<'_, Message> = if self.bookmarks_edit_mode {
+            // Edit mode: the × removes; the chip body is inert
+            // (a plain row, not a button, so nothing navigates).
+            let mut remove_children = row_children;
+            let message = if is_folder {
+                Message::BarRemoveFolder(folder_id.clone().unwrap_or_default())
+            } else {
+                Message::RemoveBookmark(url.clone().unwrap_or_default())
+            };
+            remove_children.push(
+                widget::button::text("×")
+                    .class(small_button_style(SmallButtonBase::Text, false))
+                    .on_press(message)
+                    .into(),
+            );
+            widget::row(remove_children).spacing(4).into()
+        } else if is_folder {
+            let id = folder_id.clone().unwrap_or_default();
+            widget::button::custom(widget::row(row_children).spacing(4))
+                .class(small_button_style(
+                    SmallButtonBase::Text,
+                    self.open_folder.as_deref() == Some(id.as_str()),
+                ))
+                .on_press(Message::ToggleFolderPopup(id))
+                .into()
+        } else {
+            widget::button::custom(widget::row(row_children).spacing(4))
+                .class(small_button_style(SmallButtonBase::Text, false))
+                .on_press(Message::NavigateTo(url.clone().unwrap_or_default()))
+                .into()
+        };
+        // The chip's own right-click area: reports its menu
+        // before the bar's area, and sets the flag that makes
+        // the bar's handler a no-op for this same click.
+        let right_message = if is_folder {
+            Message::BarContextMenuFolder(folder_id.clone().unwrap_or_default())
+        } else {
+            Message::BarContextMenuBookmark(url.clone().unwrap_or_default())
+        };
+        cosmic::iced::widget::mouse_area(chip)
+            .on_right_press(right_message)
+            .into()
+    }
+
+    /// The bookmarks-bar context menu (bookmarks round,
+    /// 2026-11-28): a small popup below the bar, left-aligned
+    /// (a fixed position — the right-click area reports no
+    /// cursor position, so the menu sits at the bar's left
+    /// edge). Closes on any item click.
+    fn bar_context_menu_overlay(&self) -> Option<Element<'_, Message>> {
+        let menu = self.bar_context_menu.as_ref()?;
+        let mut items: Vec<Element<'_, Message>> = Vec::new();
+        match menu {
+            BarContextMenu::Bar => {
+                items.push(
+                    widget::button::text("Add bookmark")
+                        .class(small_button_style(SmallButtonBase::Text, false))
+                        .on_press(Message::BarAddBookmark)
+                        .width(Length::Fill)
+                        .into(),
+                );
+                items.push(
+                    widget::button::text("Add folder")
+                        .class(small_button_style(SmallButtonBase::Text, false))
+                        .on_press(Message::BarAddFolder)
+                        .width(Length::Fill)
+                        .into(),
+                );
+                items.push(
+                    widget::button::text("Edit bookmarks")
+                        .class(small_button_style(SmallButtonBase::Text, false))
+                        .on_press(Message::BarEditBookmarks)
+                        .width(Length::Fill)
+                        .into(),
+                );
+                items.push(
+                    widget::button::text("Hide bookmarks bar")
+                        .class(small_button_style(SmallButtonBase::Text, false))
+                        .on_press(Message::BarHideBookmarksBar)
+                        .width(Length::Fill)
+                        .into(),
+                );
+            }
+            BarContextMenu::Bookmark { url } => {
+                items.push(
+                    widget::button::text("Edit")
+                        .class(small_button_style(SmallButtonBase::Text, false))
+                        .on_press(Message::BarEditBookmark(url.clone()))
+                        .width(Length::Fill)
+                        .into(),
+                );
+                items.push(
+                    widget::button::text("Remove")
+                        .class(small_button_style(SmallButtonBase::Text, false))
+                        .on_press(Message::RemoveBookmark(url.clone()))
+                        .width(Length::Fill)
+                        .into(),
+                );
+            }
+            BarContextMenu::Folder { id } => {
+                items.push(
+                    widget::button::text("Add bookmark here")
+                        .class(small_button_style(SmallButtonBase::Text, false))
+                        .on_press(Message::BarAddBookmarkHere(id.clone()))
+                        .width(Length::Fill)
+                        .into(),
+                );
+                items.push(
+                    widget::button::text("Remove")
+                        .class(small_button_style(SmallButtonBase::Text, false))
+                        .on_press(Message::BarRemoveFolder(id.clone()))
+                        .width(Length::Fill)
+                        .into(),
+                );
+            }
+        }
+        let panel = widget::column(items).spacing(4).padding(8);
+        let boxed = widget::container(panel)
+            .width(Length::Fixed(BAR_POPUP_WIDTH))
+            .style(panel_container_style);
+        Some(
+            widget::column([
+                cosmic::iced::widget::space()
+                    .height(Length::Fixed(BAR_POPUP_TOP))
+                    .into(),
+                widget::row([
+                    boxed.into(),
+                    cosmic::iced::widget::space().width(Length::Fill).into(),
+                ])
+                .into(),
+            ])
+            .into(),
+        )
+    }
+
+    /// A folder's dropdown under the bookmarks bar (bookmarks
+    /// round, 2026-11-28): the folder's bookmarks, one click to
+    /// navigate; an empty folder says so instead of showing a
+    /// bare empty popup. Closes on any click.
+    fn folder_popup_overlay(&self) -> Option<Element<'_, Message>> {
+        let id = self.open_folder.as_ref()?;
+        let folder = self.bookmarks.folder(id)?;
+        let mut items: Vec<Element<'_, Message>> = Vec::new();
+        if folder.bookmarks.is_empty() {
+            items.push(widget::text("Empty folder").size(12).into());
+        } else {
+            for bookmark in &folder.bookmarks {
+                let mut row_children: Vec<Element<'_, Message>> = Vec::new();
+                if let Some(image) = self.bookmark_favicons.get(&bookmark.url) {
+                    row_children.push(Self::decoded_image_element(image.clone(), 16.0));
+                }
+                row_children.push(
+                    widget::text(ellipsize(&bookmark.title, 24))
+                        .size(12)
+                        .into(),
+                );
+                items.push(
+                    widget::button::custom(widget::row(row_children).spacing(4))
+                        .class(small_button_style(SmallButtonBase::Text, false))
+                        .on_press(Message::NavigateTo(bookmark.url.clone()))
+                        .width(Length::Fill)
+                        .into(),
+                );
+            }
+        }
+        let panel = widget::column(items).spacing(4).padding(8);
+        let boxed = widget::container(panel)
+            .width(Length::Fixed(BAR_POPUP_WIDTH))
+            .style(panel_container_style);
+        Some(
+            widget::column([
+                cosmic::iced::widget::space()
+                    .height(Length::Fixed(BAR_POPUP_TOP))
+                    .into(),
+                widget::row([
+                    boxed.into(),
+                    cosmic::iced::widget::space().width(Length::Fill).into(),
+                ])
+                .into(),
+            ])
+            .into(),
+        )
+    }
+
+    /// The new-folder dialog (bookmarks round, 2026-11-28): a
+    /// small centered overlay asking for the folder name,
+    /// prefilled "New folder". Save creates the folder at the
+    /// bar's end; Cancel creates nothing.
+    fn folder_dialog_overlay(&self) -> Option<Element<'_, Message>> {
+        let dialog = self.folder_dialog.as_ref()?;
+        let input = widget::text_input("Folder name", &dialog.name)
+            .on_input(Message::FolderDialogNameChanged)
+            .on_submit(|_| Message::FolderDialogSave)
+            .padding(8);
+        let buttons = widget::row([
+            cosmic::iced::widget::space().width(Length::Fill).into(),
+            widget::button::text("Cancel")
+                .class(small_button_style(SmallButtonBase::Text, false))
+                .on_press(Message::FolderDialogCancel)
+                .into(),
+            widget::button::text("Save")
+                .class(small_button_style(SmallButtonBase::Suggested, false))
+                .on_press(Message::FolderDialogSave)
+                .into(),
+        ])
+        .spacing(8);
+        let content = widget::column([
+            widget::text("New folder").size(16).into(),
+            input.into(),
+            buttons.into(),
+        ])
+        .spacing(8)
+        .padding(16);
+        let boxed = widget::container(content)
+            .width(Length::Fixed(FOLDER_DIALOG_WIDTH))
+            .style(panel_container_style);
+        Some(
+            widget::container(
+                widget::row([
+                    cosmic::iced::widget::space().width(Length::Fill).into(),
+                    boxed.into(),
+                    cosmic::iced::widget::space().width(Length::Fill).into(),
+                ])
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_y(Alignment::Center)
+            .into(),
+        )
     }
 
     /// The vertical-mode content: the web view as the base layer,
@@ -1148,6 +1521,35 @@ impl PlutoBrowser {
         }
     }
 
+    /// Remove a folder and every bookmark inside it, with each
+    /// bookmark's custom favicon file, then persist (bookmarks
+    /// round, 2026-11-28). A folder's open dropdown closes too.
+    fn remove_folder(&mut self, id: &str) {
+        if let Some(folder) = self.bookmarks.folder(id) {
+            for bookmark in &folder.bookmarks {
+                delete_bookmark_favicon(&bookmark.url);
+                self.bookmark_favicons.remove(&bookmark.url);
+            }
+        }
+        if self.bookmarks.remove_folder(id) {
+            if self.open_folder.as_deref() == Some(id) {
+                self.open_folder = None;
+            }
+            save_bookmarks(&self.bookmarks);
+        }
+    }
+
+    /// Close every bookmarks-bar popup (bookmarks round,
+    /// 2026-11-28): the context menu, any open folder dropdown,
+    /// and the new-folder dialog. Navigation, menu opens, panel
+    /// opens, and dialog opens all close them — a popup never
+    /// outlives the action that superseded it.
+    fn close_bar_popups(&mut self) {
+        self.bar_context_menu = None;
+        self.open_folder = None;
+        self.folder_dialog = None;
+    }
+
     /// The active tab's site favicon as decoded pixels, if the
     /// site has one (the tab's resource table holds it as RGBA).
     fn active_site_favicon(&self) -> Option<pluto_paint::DecodedImage> {
@@ -1192,7 +1594,9 @@ impl PlutoBrowser {
     /// 2026-11-27): the custom image picked in this dialog, else
     /// the bookmark's stored custom favicon, else the active
     /// tab's site favicon, else the host's initial letter. The
-    /// caller wraps it in the clickable button.
+    /// caller wraps it in the clickable button. Looked up by the
+    /// bookmark's original URL — the editable URL may differ
+    /// from it while the dialog is open.
     fn dialog_favicon_element<'a>(
         &'a self,
         dialog: &'a BookmarkDialog,
@@ -1200,13 +1604,13 @@ impl PlutoBrowser {
         if let Some((decoded, _)) = &dialog.custom_favicon {
             return Self::decoded_image_element(decoded.clone(), 32.0);
         }
-        if let Some(decoded) = self.bookmark_favicons.get(&dialog.url) {
+        if let Some(decoded) = self.bookmark_favicons.get(&dialog.original_url) {
             return Self::decoded_image_element(decoded.clone(), 32.0);
         }
         if let Some(site) = self.active_site_favicon() {
             return Self::decoded_image_element(site, 32.0);
         }
-        widget::text(initial_letter(&dialog.url, &dialog.name).to_string())
+        widget::text(initial_letter(&dialog.original_url, &dialog.name).to_string())
             .size(20)
             .into()
     }
@@ -1223,7 +1627,7 @@ impl PlutoBrowser {
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(cosmic::iced::core::Padding {
-                top: menu_overlay_top_offset(self.vertical_tabs),
+                top: menu_overlay_top_offset(),
                 right: 8.0,
                 bottom: 0.0,
                 left: 0.0,
@@ -1236,49 +1640,107 @@ impl PlutoBrowser {
     /// menu — it hovers over the page without moving anything.
     /// The favicon is a button: clicking it opens the file
     /// chooser for a custom favicon image.
+    /// Restyled like Firefox's "Add bookmark" dialog
+    /// (bookmarks round, 2026-11-28): a star + title row, then
+    /// labelled Name / URL / Tags / Keyword fields, helper text
+    /// under Tags and Keyword, and Cancel + Save bottom-right
+    /// (Save in the accent color). The name is selected on open
+    /// (see `BookmarkDialogNameChanged`'s select-all task in
+    /// `update`). The tags chevron lists every tag on every
+    /// bookmark — clicking one toggles it into the tags field.
     fn bookmark_dialog_overlay<'a>(
         &'a self,
         dialog: &'a BookmarkDialog,
     ) -> Element<'a, Message> {
+        let title_star: Element<'_, Message> =
+            widget::icon(bundled_icon(STAR_ICON_SVG)).size(16).into();
         let favicon_button = widget::button::custom(self.dialog_favicon_element(dialog))
             .class(small_button_style(SmallButtonBase::Standard, false))
             .on_press(Message::BookmarkDialogPickFavicon);
-        let name_input = widget::text_input("Bookmark name", &dialog.name)
+        let name_input = widget::text_input("Name", &dialog.name)
+            .id("bookmark-dialog-name".into())
             .on_input(Message::BookmarkDialogNameChanged)
+            .on_submit(|_| Message::BookmarkDialogSave)
+            .style(small_text_input_style())
+            .width(Length::Fill);
+        let url_input = widget::text_input("URL", &dialog.url)
+            .on_input(Message::BookmarkDialogUrlChanged)
+            .on_submit(|_| Message::BookmarkDialogSave)
+            .style(small_text_input_style())
+            .width(Length::Fill);
+        let tags_input = widget::text_input("Separate tags with commas", &dialog.tags)
+            .on_input(Message::BookmarkDialogTagsChanged)
+            .on_submit(|_| Message::BookmarkDialogSave)
+            .style(small_text_input_style())
+            .width(Length::Fill);
+        let tags_chevron = widget::button::text("▾")
+            .class(small_button_style(SmallButtonBase::Text, false))
+            .on_press(Message::BookmarkDialogToggleTags);
+        let keyword_input = widget::text_input("Keyword", &dialog.keyword)
+            .on_input(Message::BookmarkDialogKeywordChanged)
+            .on_submit(|_| Message::BookmarkDialogSave)
             .style(small_text_input_style())
             .width(Length::Fill);
         let mut children: Vec<Element<'_, Message>> = vec![
-            widget::text(if dialog.editing {
-                "Edit bookmark"
-            } else {
-                "Bookmark this page"
-            })
+            widget::row([
+                title_star,
+                widget::text(if dialog.editing {
+                    "Edit bookmark"
+                } else {
+                    "Add bookmark"
+                })
+                .size(16)
+                .into(),
+            ])
+            .spacing(8)
+            .align_y(Alignment::Center)
             .into(),
+            widget::text("Name").size(12).into(),
             widget::row([favicon_button.into(), name_input.into()])
                 .spacing(8)
                 .align_y(Alignment::Center)
                 .into(),
-            widget::text("Click the icon to choose your own favicon.")
+            widget::text("URL").size(12).into(),
+            url_input.into(),
+            widget::text("Tags").size(12).into(),
+            widget::row([tags_input.into(), tags_chevron.into()])
+                .spacing(4)
+                .align_y(Alignment::Center)
+                .into(),
+            widget::text("Use tags to organize and search for bookmarks from the address bar")
+                .size(12)
+                .into(),
+            widget::text("Keyword").size(12).into(),
+            keyword_input.into(),
+            widget::text("Use a single keyword to open bookmarks directly from the address bar")
                 .size(12)
                 .into(),
         ];
+        if dialog.show_tags {
+            let mut tag_items: Vec<Element<'_, Message>> = Vec::new();
+            for tag in self.bookmarks.all_tags() {
+                let marked = if parse_tags(&dialog.tags).contains(&tag) {
+                    format!("✓ {tag}")
+                } else {
+                    tag.clone()
+                };
+                tag_items.push(
+                    widget::button::text(marked)
+                        .class(small_button_style(SmallButtonBase::Text, false))
+                        .on_press(Message::BookmarkDialogTagToggle(tag))
+                        .width(Length::Fill)
+                        .into(),
+                );
+            }
+            if tag_items.is_empty() {
+                tag_items.push(widget::text("No tags yet").size(12).into());
+            }
+            children.push(widget::column(tag_items).spacing(4).into());
+        }
         if let Some(error) = &dialog.error {
             children.push(widget::text(error.clone()).size(12).into());
         }
-        let mut buttons: Vec<Element<'_, Message>> = vec![
-            widget::button::suggested(if dialog.editing {
-                "Save"
-            } else {
-                "Add bookmark"
-            })
-            .class(small_button_style(SmallButtonBase::Suggested, false))
-            .on_press(Message::BookmarkDialogSave)
-            .into(),
-            widget::button::text("Cancel")
-                .class(small_button_style(SmallButtonBase::Text, false))
-                .on_press(Message::BookmarkDialogCancel)
-                .into(),
-        ];
+        let mut buttons: Vec<Element<'_, Message>> = Vec::new();
         if dialog.editing {
             buttons.push(
                 widget::button::text("Remove")
@@ -1287,6 +1749,21 @@ impl PlutoBrowser {
                     .into(),
             );
         }
+        buttons.push(
+            cosmic::iced::widget::space().width(Length::Fill).into(),
+        );
+        buttons.push(
+            widget::button::text("Cancel")
+                .class(small_button_style(SmallButtonBase::Text, false))
+                .on_press(Message::BookmarkDialogCancel)
+                .into(),
+        );
+        buttons.push(
+            widget::button::text("Save")
+                .class(small_button_style(SmallButtonBase::Suggested, false))
+                .on_press(Message::BookmarkDialogSave)
+                .into(),
+        );
         children.push(widget::row(buttons).spacing(8).into());
         let panel = widget::column(children).spacing(8).padding(12);
         let boxed = widget::container(panel)
@@ -1429,28 +1906,57 @@ pub const SHELL_RADIUS: f32 = 4.0;
 pub const MENU_PANEL_WIDTH: f32 = 260.0;
 
 /// The bookmark dialog's fixed width (follow-up UI work,
-/// 2026-11-27): a name field + favicon + buttons, Chrome-sized.
-pub const BOOKMARK_DIALOG_WIDTH: f32 = 360.0;
+/// 2026-11-27; widened to 400 in the bookmarks round,
+/// 2026-11-28, for the Firefox-style Name / URL / Tags /
+/// Keyword rows).
+pub const BOOKMARK_DIALOG_WIDTH: f32 = 400.0;
+
+/// The bookmarks-bar popups' (context menu, folder dropdown)
+/// top offset (bookmarks round, 2026-11-28): they hang just
+/// below the bar — the nav bar (~48px + divider) + the 30px
+/// bar + a divider. Approximate by design, like
+/// `MENU_OVERLAY_TOP`.
+pub const BAR_POPUP_TOP: f32 = MENU_OVERLAY_TOP + 32.0;
+
+/// The bookmarks-bar popups' fixed width (bookmarks round,
+/// 2026-11-28): a little narrower than the menu panel, sized
+/// for a chip's worth of text.
+pub const BAR_POPUP_WIDTH: f32 = 220.0;
+
+/// The new-folder dialog's fixed width (bookmarks round,
+/// 2026-11-28): one name field + two buttons.
+pub const FOLDER_DIALOG_WIDTH: f32 = 320.0;
+
+/// The bookmarks bar's folder glyph (bookmarks round,
+/// 2026-11-28): a built-in 16×16 SVG, the same shape as the
+/// other bundled icons (own drawing, filled with the theme's
+/// icon color via `symbolic(true)` — no file needed, folders
+/// have no favicon to load).
+pub const FOLDER_ICON_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path d="M2 4.5V4a1 1 0 0 1 1-1h3l1.5 2H13a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V4.5z" fill="#232323"/></svg>"##;
+
+/// The bookmarks bar's pencil glyph (bookmarks round,
+/// 2026-11-28): a built-in 16×16 SVG, same treatment as the
+/// folder glyph — the edit-mode toggle at the bar's far left.
+pub const PENCIL_ICON_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path d="M11 2.5a1.77 1.77 0 0 1 2.5 0l0 0a1.77 1.77 0 0 1 0 2.5L6 12.5 2.5 13.5 3.5 10 11 2.5z" fill="#232323"/></svg>"##;
+
+/// The bookmark dialog's star glyph (bookmarks round,
+/// 2026-11-28): a built-in 16×16 SVG, same treatment as the
+/// folder glyph — the title row's star, matching Firefox's
+/// dialog (the nav star is a text glyph; the dialog uses the
+/// icon so it renders in both themes).
+pub const STAR_ICON_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path d="M8 1.5l2.1 4.2 4.6.7-3.3 3.2.8 4.6L8 12l-4.2 2.2.8-4.6-3.3-3.2 4.6-.7L8 1.5z" fill="#232323"/></svg>"##;
 
 /// The floating menu overlay's top offset (follow-up UI work,
 /// 2026-11-27): how far below the window top the popup hangs, so
 /// it clears the hamburger button it drops from. The nav bar is
-/// ~48px + a divider; horizontal mode adds the ~40px tab strip
-/// above it. Approximate by design — the panel has its own
-/// background and shadow, so a few px either way is cosmetic —
+/// ~48px + a divider. Approximate by design — the panel has its
+/// own background and shadow, so a few px either way is cosmetic —
 /// but it must stay below the nav bar, never over the button.
-pub const MENU_OVERLAY_TOP_VERTICAL: f32 = 56.0;
-pub const MENU_OVERLAY_TOP_HORIZONTAL: f32 = 96.0;
+pub const MENU_OVERLAY_TOP: f32 = 56.0;
 
-/// The menu overlay's top offset for the current orientation:
-/// the tab strip's height is only above the nav bar in
-/// horizontal mode.
-pub fn menu_overlay_top_offset(vertical_tabs: bool) -> f32 {
-    if vertical_tabs {
-        MENU_OVERLAY_TOP_VERTICAL
-    } else {
-        MENU_OVERLAY_TOP_HORIZONTAL
-    }
+/// The menu overlay's top offset: it clears the nav bar.
+pub fn menu_overlay_top_offset() -> f32 {
+    MENU_OVERLAY_TOP
 }
 
 /// A collapsed vertical tab chip: a 32px square showing only the
@@ -1472,9 +1978,6 @@ pub const RAIL_WIDTH: f32 = 44.0;
 /// One tab's pitch in a vertical column: chip + gap.
 pub const TAB_PITCH: f32 = TAB_CHIP + TAB_GAP;
 
-/// Vertical tabs on by default (UI round, 2026-11-27).
-pub const DEFAULT_VERTICAL_TABS: bool = true;
-
 /// The default tab placement: the left edge.
 pub const DEFAULT_TAB_PLACEMENT: TabPlacement = TabPlacement::Left;
 
@@ -1485,10 +1988,8 @@ pub const HOVER_TICK: std::time::Duration = std::time::Duration::from_millis(16)
 /// slide-out duration.
 pub const HOVER_TICK_STEP: f32 = 1.0 / 18.0;
 
-/// Which edge(s) the vertical tab strip sits on (UI round,
-/// 2026-11-27). Placement and orientation are independent: the
-/// strip can be horizontal (the classic top strip) or vertical on
-/// one edge or both.
+/// Which edge(s) the tab strip sits on (UI round, 2026-11-27):
+/// one edge or both. Tabs are always vertical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TabPlacement {
     /// A single column on the left edge (the default).
@@ -1599,15 +2100,6 @@ pub fn flyout_shows_text(progress: f32) -> bool {
     progress > 0.5
 }
 
-/// The orientation toggle's label: it names the OTHER mode.
-pub fn orientation_toggle_label(vertical_tabs: bool) -> &'static str {
-    if vertical_tabs {
-        "Horizontal tabs"
-    } else {
-        "Vertical tabs"
-    }
-}
-
 /// A placement entry's label.
 pub fn placement_label(placement: TabPlacement) -> &'static str {
     match placement {
@@ -1658,12 +2150,51 @@ async fn pick_favicon_file() -> Option<Result<(Vec<u8>, pluto_paint::DecodedImag
     }
 }
 
-pub fn bookmarks_bar_entries(store: &BookmarkStore) -> Vec<(String, String)> {
+/// The bookmarks bar's entries, in store order (follow-up UI
+/// work, 2026-11-27): a bookmark chip or a folder chip per
+/// entry. The bar reads the store, never a hardcoded list.
+pub fn bookmarks_bar_entries(store: &BookmarkStore) -> Vec<BarEntry> {
     store
-        .bookmarks()
+        .entries()
         .iter()
-        .map(|b| (b.title.clone(), b.url.clone()))
+        .map(|entry| match entry {
+            BookmarkEntry::Bookmark(bookmark) => BarEntry::Bookmark {
+                title: bookmark.title.clone(),
+                url: bookmark.url.clone(),
+            },
+            BookmarkEntry::Folder(folder) => BarEntry::Folder {
+                id: folder.id.clone(),
+                name: folder.name.clone(),
+            },
+        })
         .collect()
+}
+
+/// Parse the dialog's tags field: split on commas, trim each
+/// tag, drop empties, dedupe preserving first-seen order
+/// (bookmarks round, 2026-11-28).
+pub fn parse_tags(text: &str) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    for part in text.split(',') {
+        let tag = part.trim().to_string();
+        if !tag.is_empty() && !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
+    tags
+}
+
+/// Toggle one tag in the dialog's tags field: append it when
+/// absent, remove it when present, keeping the field a
+/// comma-separated list (bookmarks round, 2026-11-28).
+fn toggle_tag_in_text(text: &str, tag: &str) -> String {
+    let mut tags = parse_tags(text);
+    if let Some(pos) = tags.iter().position(|t| t == tag) {
+        tags.remove(pos);
+    } else {
+        tags.push(tag.to_string());
+    }
+    tags.join(", ")
 }
 
 /// Shorten `s` to at most `max_chars` characters for a bar button
@@ -1682,7 +2213,7 @@ fn ellipsize(s: &str, max_chars: usize) -> String {
 /// Which theme button a 4.0px-radius shell button is based on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SmallButtonBase {
-    /// The plain button (horizontal tab strip tabs).
+    /// The plain button (the bookmark dialog's favicon button).
     Standard,
     /// The plain text button (menu items, bookmarks bar, list panels).
     Text,
@@ -1924,6 +2455,69 @@ pub fn menu_items() -> &'static [&'static str] {
     &["Bookmarks", "History", "New Tab", "New Window"]
 }
 
+/// The shell's small preferences: which parts of the shell are
+/// visible, persisted across restarts in `preferences.json` in
+/// the profile dir (bookmarks round, 2026-11-28). The file is
+/// read on startup and rewritten whenever a preference changes;
+/// a missing or corrupt file means defaults (everything
+/// visible), never a failed launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShellPrefs {
+    show_bookmarks_bar: bool,
+}
+
+impl Default for ShellPrefs {
+    fn default() -> Self {
+        Self {
+            show_bookmarks_bar: true,
+        }
+    }
+}
+
+/// The profile dir's `preferences.json` (same profile dir the
+/// bookmark store and history live in). `None` when there is no
+/// profile dir (no HOME) — the caller falls back to defaults.
+fn shell_prefs_file() -> Option<std::path::PathBuf> {
+    profile_dir().map(|dir| dir.join(PREFS_FILE))
+}
+
+/// The preferences file's name in the profile dir.
+const PREFS_FILE: &str = "preferences.json";
+
+/// Load the shell preferences (missing/corrupt → defaults).
+fn load_shell_prefs() -> ShellPrefs {
+    let Some(path) = shell_prefs_file() else {
+        return ShellPrefs::default();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return ShellPrefs::default();
+    };
+    let Ok(parsed) = parse_json(&text) else {
+        eprintln!("[pluto] corrupt preferences; using defaults");
+        return ShellPrefs::default();
+    };
+    let mut prefs = ShellPrefs::default();
+    if let Some(JsonValue::Bool(show)) = parsed.get("show_bookmarks_bar") {
+        prefs.show_bookmarks_bar = *show;
+    }
+    prefs
+}
+
+/// Save the shell preferences (a failure is logged, not fatal —
+/// the in-memory value still applies for this run).
+fn save_shell_prefs(prefs: ShellPrefs) {
+    let Some(dir) = profile_dir() else {
+        return;
+    };
+    let text = format!(
+        "{{\"version\":1,\"show_bookmarks_bar\":{}}}",
+        prefs.show_bookmarks_bar
+    );
+    if let Err(e) = write_file_atomic(&dir, PREFS_FILE, &text) {
+        eprintln!("[pluto] failed to save preferences ({e})");
+    }
+}
+
 /// The command a New Window spawns: this executable, with no
 /// arguments — a bare launch opens the default start page in its
 /// own window. A separate process is a real second window, not a
@@ -2156,9 +2750,18 @@ impl Application for PlutoBrowser {
             bookmarks,
             bookmark_favicons,
             bookmark_dialog: None,
+            // Bookmarks round (2026-11-28): the bar's visibility
+            // comes from the persisted preferences; edit mode,
+            // the context menu, the folder dropdown, and the
+            // folder dialog all start closed.
+            show_bookmarks_bar: load_shell_prefs().show_bookmarks_bar,
+            bookmarks_edit_mode: false,
+            bar_context_menu: None,
+            bar_context_chip: false,
+            open_folder: None,
+            folder_dialog: None,
             menu_open: false,
             panel: None,
-            vertical_tabs: DEFAULT_VERTICAL_TABS,
             tab_placement: DEFAULT_TAB_PLACEMENT,
             flyout_tab: None,
             flyout_progress: 0.0,
@@ -2229,6 +2832,13 @@ impl Application for PlutoBrowser {
             Message::UrlChanged(val) => self.active_mut().url_input = val,
             Message::Navigate => {
                 let input = self.active().url_input.clone();
+                // Bookmarks round (2026-11-28): a bookmark
+                // keyword wins over URL/search handling — typing
+                // one in the address bar opens that bookmark.
+                if let Some(bookmark) = self.bookmarks.find_by_keyword(&input) {
+                    self.commit(bookmark.url.clone());
+                    return Task::none();
+                }
                 match page::normalize_url(&input) {
                     Ok(url) => self.commit(url),
                     Err(reason) => {
@@ -3156,20 +3766,51 @@ impl Application for PlutoBrowser {
                 let url = self.active().active_url.clone();
                 if !url.is_empty() {
                     let title = self.active().title.clone();
-                    let existing = self
-                        .bookmarks
-                        .bookmarks()
-                        .iter()
-                        .find(|b| b.url == url);
+                    let existing = self.bookmarks.bookmark(&url);
                     self.bookmark_dialog =
                         Some(BookmarkDialog::new(&url, &title, existing));
                     self.menu_open = false;
                     self.panel = None;
+                    self.close_bar_popups();
+                    // The name is selected on open (Firefox does
+                    // this too): focus the name field, then select
+                    // all of it, so typing replaces the prefill.
+                    return cosmic::iced::widget::operation::focus::<
+                        cosmic::Action<Message>,
+                    >("bookmark-dialog-name")
+                    .chain(cosmic::iced::widget::operation::select_all(
+                        "bookmark-dialog-name",
+                    ));
                 }
             }
             Message::BookmarkDialogNameChanged(name) => {
                 if let Some(dialog) = self.bookmark_dialog.as_mut() {
                     dialog.name = name;
+                }
+            }
+            Message::BookmarkDialogUrlChanged(url) => {
+                if let Some(dialog) = self.bookmark_dialog.as_mut() {
+                    dialog.url = url;
+                }
+            }
+            Message::BookmarkDialogTagsChanged(tags) => {
+                if let Some(dialog) = self.bookmark_dialog.as_mut() {
+                    dialog.tags = tags;
+                }
+            }
+            Message::BookmarkDialogKeywordChanged(keyword) => {
+                if let Some(dialog) = self.bookmark_dialog.as_mut() {
+                    dialog.keyword = keyword;
+                }
+            }
+            Message::BookmarkDialogToggleTags => {
+                if let Some(dialog) = self.bookmark_dialog.as_mut() {
+                    dialog.show_tags = !dialog.show_tags;
+                }
+            }
+            Message::BookmarkDialogTagToggle(tag) => {
+                if let Some(dialog) = self.bookmark_dialog.as_mut() {
+                    dialog.tags = toggle_tag_in_text(&dialog.tags, &tag);
                 }
             }
             Message::BookmarkDialogPickFavicon => {
@@ -3206,27 +3847,56 @@ impl Application for PlutoBrowser {
                 let Some(dialog) = self.bookmark_dialog.take() else {
                     return Task::none();
                 };
-                // An empty name falls back to the URL — a
-                // bookmark always has something to show.
-                let title = if dialog.name.trim().is_empty() {
-                    dialog.url.clone()
+                // The edited URL wins, trimmed; an emptied URL
+                // falls back to the original. An empty name falls
+                // back to the (new) URL — a bookmark always has
+                // something to show.
+                let url = if dialog.url.trim().is_empty() {
+                    dialog.original_url.clone()
                 } else {
-                    dialog.name.clone()
+                    dialog.url.trim().to_string()
+                };
+                let title = if dialog.name.trim().is_empty() {
+                    url.clone()
+                } else {
+                    dialog.name.trim().to_string()
+                };
+                let tags = parse_tags(&dialog.tags);
+                let keyword = {
+                    let keyword = dialog.keyword.trim().to_string();
+                    if keyword.is_empty() {
+                        None
+                    } else {
+                        Some(keyword)
+                    }
+                };
+                // When editing and the URL moved onto one that is
+                // already bookmarked elsewhere, keep the original
+                // URL and save the rest in place — never silently
+                // merge two bookmarks.
+                let target = if dialog.editing
+                    && url != dialog.original_url
+                    && self.bookmarks.is_bookmarked(&url)
+                {
+                    dialog.original_url.clone()
+                } else {
+                    url.clone()
                 };
                 // A fresh pick replaces the stored favicon; no
                 // pick keeps the bookmark's existing one
                 // (editing) or none (new). A failed favicon
                 // write logs and keeps the bookmark — the title
-                // still saves.
+                // still saves. When the URL moved, the stored
+                // favicon file moves with it (the old file is
+                // deleted); a fresh pick replaces it and the old
+                // file is deleted too.
                 let mut favicon = self
                     .bookmarks
-                    .bookmarks()
-                    .iter()
-                    .find(|b| b.url == dialog.url)
+                    .bookmark(&dialog.original_url)
                     .and_then(|b| b.favicon.clone());
                 let mut decoded = None;
                 if let Some((picked, bytes)) = dialog.custom_favicon {
-                    match save_bookmark_favicon(&dialog.url, &bytes) {
+                    match save_bookmark_favicon(&target, &bytes) {
                         Ok(name) => {
                             favicon = Some(name);
                             decoded = Some(picked);
@@ -3235,16 +3905,41 @@ impl Application for PlutoBrowser {
                             eprintln!("[pluto] could not save custom favicon: {e}");
                         }
                     }
-                }
-                if dialog.editing {
-                    self.bookmarks.set_title(&dialog.url, &title);
-                    self.bookmarks.set_favicon(&dialog.url, favicon);
-                } else {
-                    self.bookmarks
-                        .add_with_favicon(&dialog.url, &title, favicon);
+                } else if target != dialog.original_url && favicon.is_some() {
+                    // The favicon file is named by the URL's
+                    // hash, so a moved bookmark needs its file
+                    // re-saved under the new URL.
+                    if let Some(bytes) = load_bookmark_favicon(&dialog.original_url) {
+                        if save_bookmark_favicon(&target, &bytes).is_ok() {
+                            favicon = Some(bookmark_favicon_file_name(&target));
+                        }
+                        delete_bookmark_favicon(&dialog.original_url);
+                    }
                 }
                 if let Some(decoded) = decoded {
-                    self.bookmark_favicons.insert(dialog.url.clone(), decoded);
+                    self.bookmark_favicons.insert(target.clone(), decoded);
+                } else if target != dialog.original_url {
+                    // No fresh pick: carry the decoded icon to
+                    // the new URL, or drop it when there was
+                    // none to carry.
+                    if let Some(decoded) = self
+                        .bookmark_favicons
+                        .remove(&dialog.original_url)
+                    {
+                        self.bookmark_favicons.insert(target.clone(), decoded);
+                    }
+                }
+                if dialog.editing {
+                    if target != dialog.original_url {
+                        self.bookmarks.set_url(&dialog.original_url, &target);
+                    }
+                    self.bookmarks.set_title(&target, &title);
+                    self.bookmarks.set_favicon(&target, favicon);
+                    self.bookmarks.set_tags(&target, tags);
+                    self.bookmarks.set_keyword(&target, keyword);
+                } else {
+                    self.bookmarks
+                        .add_full(&target, &title, favicon, tags, keyword);
                 }
                 save_bookmarks(&self.bookmarks);
             }
@@ -3253,37 +3948,34 @@ impl Application for PlutoBrowser {
             }
             Message::BookmarkDialogRemove => {
                 if let Some(dialog) = self.bookmark_dialog.take() {
-                    self.remove_bookmark(&dialog.url);
+                    self.remove_bookmark(&dialog.original_url);
                 }
             }
             Message::ToggleMenu => {
                 self.menu_open = !self.menu_open;
                 if self.menu_open {
                     self.panel = None;
+                    self.close_bar_popups();
                 }
             }
             Message::ShowBookmarks => {
                 self.menu_open = false;
                 self.panel = Some(Panel::Bookmarks);
+                self.close_bar_popups();
             }
             Message::ShowHistory => {
                 self.menu_open = false;
                 self.panel = Some(Panel::History);
+                self.close_bar_popups();
             }
             Message::ClosePanel => {
                 self.panel = None;
-            }
-            Message::ToggleTabOrientation => {
-                self.vertical_tabs = !self.vertical_tabs;
-                self.menu_open = false;
-                self.clear_flyout();
+                self.close_bar_popups();
             }
             Message::SetTabPlacement(placement) => {
-                // Choosing a placement implies vertical tabs: a
-                // placement entry must always visibly do something.
                 self.tab_placement = placement;
-                self.vertical_tabs = true;
                 self.menu_open = false;
+                self.close_bar_popups();
                 self.clear_flyout();
             }
             Message::TabHovered(index) => {
@@ -3323,6 +4015,7 @@ impl Application for PlutoBrowser {
             Message::NavigateTo(url) => {
                 self.menu_open = false;
                 self.panel = None;
+                self.close_bar_popups();
                 // A History-panel click is a traversal to that entry
                 // when it is one (state + scroll restore, `popstate`
                 // after the commit); a bookmark click is a fresh
@@ -3341,6 +4034,127 @@ impl Application for PlutoBrowser {
             }
             Message::RemoveBookmark(url) => {
                 self.remove_bookmark(&url);
+                self.close_bar_popups();
+            }
+            Message::ToggleBookmarksBar => {
+                self.show_bookmarks_bar = !self.show_bookmarks_bar;
+                save_shell_prefs(ShellPrefs {
+                    show_bookmarks_bar: self.show_bookmarks_bar,
+                });
+                self.menu_open = false;
+                if !self.show_bookmarks_bar {
+                    // A hidden bar shows no pencil and no chips —
+                    // edit mode and the folder dropdown go with it.
+                    self.bookmarks_edit_mode = false;
+                    self.close_bar_popups();
+                }
+            }
+            Message::ToggleBookmarksEditMode => {
+                self.bookmarks_edit_mode = !self.bookmarks_edit_mode;
+                self.close_bar_popups();
+            }
+            Message::BarContextMenuBookmark(url) => {
+                // The chip's right-click area reports before the
+                // bar's (see `bar_context_chip`): this menu
+                // stands, and the bar's handler for the same
+                // click becomes a no-op.
+                self.bar_context_menu = Some(BarContextMenu::Bookmark { url });
+                self.bar_context_chip = true;
+            }
+            Message::BarContextMenuFolder(id) => {
+                self.bar_context_menu = Some(BarContextMenu::Folder { id });
+                self.bar_context_chip = true;
+            }
+            Message::BarContextMenuBar => {
+                if self.bar_context_chip {
+                    // A chip right-clicked first — its menu is
+                    // already open; this background event belongs
+                    // to the same click, so it does nothing.
+                    self.bar_context_chip = false;
+                } else {
+                    self.bar_context_menu = Some(BarContextMenu::Bar);
+                }
+            }
+            Message::BarAddBookmark => {
+                self.close_bar_popups();
+                let url = self.active().active_url.clone();
+                if !url.is_empty() {
+                    let title = self.active().title.clone();
+                    if self.bookmarks.add(&url, &title) {
+                        save_bookmarks(&self.bookmarks);
+                    }
+                }
+            }
+            Message::BarAddFolder => {
+                self.bar_context_menu = None;
+                self.folder_dialog = Some(FolderDialog {
+                    name: "New folder".to_string(),
+                });
+            }
+            Message::BarAddBookmarkHere(folder_id) => {
+                self.close_bar_popups();
+                let url = self.active().active_url.clone();
+                if !url.is_empty() {
+                    let title = self.active().title.clone();
+                    if self.bookmarks.add_to_folder(&folder_id, &url, &title) {
+                        save_bookmarks(&self.bookmarks);
+                    }
+                }
+            }
+            Message::BarEditBookmarks => {
+                self.bookmarks_edit_mode = true;
+                self.close_bar_popups();
+            }
+            Message::BarHideBookmarksBar => {
+                self.show_bookmarks_bar = false;
+                save_shell_prefs(ShellPrefs {
+                    show_bookmarks_bar: false,
+                });
+                self.bookmarks_edit_mode = false;
+                self.close_bar_popups();
+            }
+            Message::BarEditBookmark(url) => {
+                self.close_bar_popups();
+                let title = self
+                    .bookmarks
+                    .bookmark(&url)
+                    .map(|bookmark| bookmark.title.clone())
+                    .unwrap_or_else(|| url.clone());
+                let existing = self.bookmarks.bookmark(&url);
+                self.bookmark_dialog =
+                    Some(BookmarkDialog::new(&url, &title, existing));
+                return cosmic::iced::widget::operation::focus::<
+                    cosmic::Action<Message>,
+                >("bookmark-dialog-name")
+                .chain(cosmic::iced::widget::operation::select_all(
+                    "bookmark-dialog-name",
+                ));
+            }
+            Message::BarRemoveFolder(id) => {
+                self.remove_folder(&id);
+                self.close_bar_popups();
+            }
+            Message::ToggleFolderPopup(id) => {
+                self.bar_context_menu = None;
+                self.open_folder = if self.open_folder.as_deref() == Some(id.as_str()) {
+                    None
+                } else {
+                    Some(id)
+                };
+            }
+            Message::FolderDialogNameChanged(name) => {
+                if let Some(dialog) = self.folder_dialog.as_mut() {
+                    dialog.name = name;
+                }
+            }
+            Message::FolderDialogSave => {
+                if let Some(dialog) = self.folder_dialog.take() {
+                    self.bookmarks.add_folder(&dialog.name);
+                    save_bookmarks(&self.bookmarks);
+                }
+            }
+            Message::FolderDialogCancel => {
+                self.folder_dialog = None;
             }
             Message::NewWindow => {
                 self.menu_open = false;
@@ -3445,21 +4259,21 @@ impl Application for PlutoBrowser {
         let status = widget::row([widget::text(status_text).size(12).into()]).padding(4);
 
         // The column (UI round, 2026-11-27): the nav bar and the
-        // bookmarks bar span the full window width; in vertical
-        // mode the tab columns start underneath the bookmarks
-        // bar, flanking only the web view (see
-        // `vertical_content`); the status line spans the full
-        // width at the bottom. In horizontal mode the classic
-        // top tab strip sits above the nav bar, as before.
-        let mut children: Vec<Element<'_, Self::Message>> = Vec::new();
-        if !self.vertical_tabs {
-            children.push(self.tab_strip());
+        // bookmarks bar span the full window width; the tab
+        // columns start underneath the bookmarks bar, flanking
+        // only the web view (see `vertical_content`); the status
+        // line spans the full width at the bottom.
+        // Bookmarks round (2026-11-28): a hidden bar takes no
+        // space at all — bar and divider both go, and the web
+        // view takes the space.
+        let mut children: Vec<Element<'_, Self::Message>> = vec![
+            nav_bar.into(),
+            widget::divider::horizontal::default().into(),
+        ];
+        if self.show_bookmarks_bar {
+            children.push(self.bookmarks_bar());
             children.push(widget::divider::horizontal::default().into());
         }
-        children.push(nav_bar.into());
-        children.push(widget::divider::horizontal::default().into());
-        children.push(self.bookmarks_bar());
-        children.push(widget::divider::horizontal::default().into());
         // Stage 11 Rec 9: the thin progress bar under the nav
         // bar, while a document load is in flight. Indeterminate
         // (no Content-Length) shows as a half bar, not a
@@ -3480,11 +4294,7 @@ impl Application for PlutoBrowser {
             children.push(self.list_panel(panel));
             children.push(widget::divider::horizontal::default().into());
         }
-        if self.vertical_tabs {
-            children.push(self.vertical_content(web_view.into()));
-        } else {
-            children.push(web_view.into());
-        }
+        children.push(self.vertical_content(web_view.into()));
         children.push(widget::divider::horizontal::default().into());
         children.push(status.into());
         // The shell column is the base layer; the menu and the
@@ -3500,6 +4310,20 @@ impl Application for PlutoBrowser {
         }
         if let Some(dialog) = &self.bookmark_dialog {
             layers.push(self.bookmark_dialog_overlay(dialog));
+        }
+        // Bookmarks round (2026-11-28): the bar's context menu,
+        // a folder's dropdown, and the new-folder dialog ride
+        // on top too — above the dialog, so the menu is usable
+        // while the dialog is open (it never is, but the layer
+        // order is the safe one).
+        if let Some(menu) = self.bar_context_menu_overlay() {
+            layers.push(menu);
+        }
+        if let Some(popup) = self.folder_popup_overlay() {
+            layers.push(popup);
+        }
+        if let Some(folder_dialog) = self.folder_dialog_overlay() {
+            layers.push(folder_dialog);
         }
         cosmic::iced::widget::stack(layers).into()
     }
@@ -3698,17 +4522,11 @@ mod tests {
         assert_eq!(shown[49].url, "https://example.com/10");
     }
 
-    // UI round (2026-11-27): vertical tabs on by default, on the
-    // left edge; the orientation toggle names the other mode.
-    // The constant pins are the contract — the allow is
-    // deliberate, matching the tree's other constant pins.
+    // UI round (2026-11-27): tabs are vertical only, on the
+    // left edge by default. The constant pin is the contract.
     #[test]
-    #[allow(clippy::assertions_on_constants)]
-    fn vertical_tabs_default_on_and_left() {
-        assert!(DEFAULT_VERTICAL_TABS);
+    fn tabs_default_on_left() {
         assert_eq!(DEFAULT_TAB_PLACEMENT, TabPlacement::Left);
-        assert_eq!(orientation_toggle_label(true), "Horizontal tabs");
-        assert_eq!(orientation_toggle_label(false), "Vertical tabs");
         assert_eq!(placement_label(TabPlacement::Left), "Tabs on left");
         assert_eq!(placement_label(TabPlacement::Right), "Tabs on right");
         assert_eq!(
@@ -3866,12 +4684,23 @@ mod tests {
         let mut store = BookmarkStore::new();
         assert!(bookmarks_bar_entries(&store).is_empty());
         assert!(store.add("https://a.example/", "A"));
+        let folder = store.add_folder("News");
         assert!(store.add("https://b.example/", "B"));
         assert_eq!(
             bookmarks_bar_entries(&store),
             vec![
-                ("A".to_string(), "https://a.example/".to_string()),
-                ("B".to_string(), "https://b.example/".to_string()),
+                BarEntry::Bookmark {
+                    title: "A".to_string(),
+                    url: "https://a.example/".to_string(),
+                },
+                BarEntry::Folder {
+                    id: folder,
+                    name: "News".to_string(),
+                },
+                BarEntry::Bookmark {
+                    title: "B".to_string(),
+                    url: "https://b.example/".to_string(),
+                },
             ]
         );
     }
@@ -3880,17 +4709,25 @@ mod tests {
     fn bookmark_dialog_prefill_new_and_editing() {
         let url = "https://example.com/";
         let fresh = BookmarkDialog::new(url, "Example Domain", None);
+        assert_eq!(fresh.url, url);
+        assert_eq!(fresh.original_url, url);
         assert_eq!(fresh.name, "Example Domain");
         assert!(!fresh.editing);
+        assert!(fresh.tags.is_empty());
+        assert!(fresh.keyword.is_empty());
         assert!(fresh.custom_favicon.is_none());
         assert!(fresh.error.is_none());
         let stored = Bookmark {
             url: url.to_string(),
             title: "My Name".to_string(),
             favicon: None,
+            tags: vec!["rust".to_string(), "news".to_string()],
+            keyword: Some("ex".to_string()),
         };
         let editing = BookmarkDialog::new(url, "Example Domain", Some(&stored));
         assert_eq!(editing.name, "My Name");
+        assert_eq!(editing.tags, "rust, news");
+        assert_eq!(editing.keyword, "ex");
         assert!(editing.editing);
     }
 
@@ -3905,18 +4742,9 @@ mod tests {
 
     #[test]
     fn menu_overlay_top_offset_clears_the_nav_bar() {
-        assert_eq!(
-            menu_overlay_top_offset(true),
-            MENU_OVERLAY_TOP_VERTICAL
-        );
-        assert_eq!(
-            menu_overlay_top_offset(false),
-            MENU_OVERLAY_TOP_HORIZONTAL
-        );
-        // Both clear the ~48px nav bar (+ divider); horizontal
-        // adds the ~40px tab strip above it.
-        assert_eq!(MENU_OVERLAY_TOP_VERTICAL, 56.0);
-        assert_eq!(MENU_OVERLAY_TOP_HORIZONTAL, 96.0);
+        assert_eq!(menu_overlay_top_offset(), MENU_OVERLAY_TOP);
+        // It clears the ~48px nav bar (+ divider).
+        assert_eq!(MENU_OVERLAY_TOP, 56.0);
     }
 
     /// A temp HOME guard, mirroring the one in `bookmarks::tests`:
@@ -4048,7 +4876,8 @@ mod tests {
             .custom_favicon
             .is_some());
         let _ = app.update(Message::BookmarkDialogSave);
-        let bookmark = &app.bookmarks.bookmarks()[0];
+        let bookmarks = app.bookmarks.bookmarks();
+        let bookmark = bookmarks.first().expect("one bookmark saved");
         assert!(bookmark.favicon.is_some());
         assert_eq!(app.bookmark_favicons.get(&url), Some(&decoded));
         // The bytes round-trip through the profile file.
@@ -4088,7 +4917,6 @@ mod tests {
         let (dir, home, mut app) = test_shell("menu-geometry");
         let viewport_before = app.viewport;
         let tabs_before = app.tabs.len();
-        let vertical_before = app.vertical_tabs;
         // The whole shell renders with the menu closed (base
         // layer only)...
         let _ = app.view();
@@ -4099,8 +4927,297 @@ mod tests {
         // geometry inputs are unchanged.
         assert_eq!(app.viewport, viewport_before);
         assert_eq!(app.tabs.len(), tabs_before);
-        assert_eq!(app.vertical_tabs, vertical_before);
         let _ = app.view();
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn parse_tags_splits_trims_and_dedupes() {
+        assert_eq!(
+            parse_tags("rust, news , ,rust,docs "),
+            vec!["rust".to_string(), "news".to_string(), "docs".to_string()]
+        );
+        assert!(parse_tags("").is_empty());
+        assert!(parse_tags(" , , ").is_empty());
+        assert_eq!(parse_tags("solo"), vec!["solo".to_string()]);
+    }
+
+    #[test]
+    fn toggle_tag_in_text_adds_and_removes() {
+        assert_eq!(toggle_tag_in_text("", "rust"), "rust");
+        assert_eq!(toggle_tag_in_text("rust, news", "docs"), "rust, news, docs");
+        assert_eq!(toggle_tag_in_text("rust, news", "rust"), "news");
+        assert_eq!(toggle_tag_in_text("rust", "rust"), "");
+    }
+
+    #[test]
+    fn prefs_default_visible_and_round_trip() {
+        let (dir, home, _app) = test_shell("prefs-default");
+        // Nothing was saved yet in this temp HOME: the default is
+        // visible.
+        assert_eq!(load_shell_prefs(), ShellPrefs::default());
+        assert!(ShellPrefs::default().show_bookmarks_bar);
+        save_shell_prefs(ShellPrefs {
+            show_bookmarks_bar: false,
+        });
+        assert!(!load_shell_prefs().show_bookmarks_bar);
+        save_shell_prefs(ShellPrefs {
+            show_bookmarks_bar: true,
+        });
+        assert!(load_shell_prefs().show_bookmarks_bar);
+        // A corrupt file falls back to the default, not an error.
+        std::fs::write(
+            shell_prefs_file().expect("temp HOME has a profile dir"),
+            "{not json",
+        )
+        .unwrap();
+        assert!(load_shell_prefs().show_bookmarks_bar);
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn menu_toggle_hides_bar_and_persists() {
+        let (dir, home, mut app) = test_shell("menu-bar-toggle");
+        assert!(app.show_bookmarks_bar);
+        let _ = app.update(Message::ToggleBookmarksBar);
+        assert!(!app.show_bookmarks_bar);
+        assert!(!app.menu_open);
+        assert!(!load_shell_prefs().show_bookmarks_bar);
+        // The new shell in the same temp HOME reads it back.
+        let (mut app2, _) = PlutoBrowser::init(Core::default(), false);
+        assert!(!app2.show_bookmarks_bar);
+        let _ = app2.update(Message::ToggleBookmarksBar);
+        assert!(app2.show_bookmarks_bar);
+        assert!(load_shell_prefs().show_bookmarks_bar);
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn keyword_in_address_bar_navigates_to_bookmark() {
+        let (dir, home, mut app) = test_shell("keyword-nav");
+        let url = "https://github.com/";
+        assert!(app.bookmarks.add_full(
+            url,
+            "GitHub",
+            None,
+            Vec::new(),
+            Some("gh".to_string()),
+        ));
+        app.active_mut().url_input = "GH".to_string();
+        let _ = app.update(Message::Navigate);
+        assert_eq!(app.active().active_url, url);
+        // A non-keyword still goes through normal URL handling.
+        app.active_mut().url_input = "example.com".to_string();
+        let _ = app.update(Message::Navigate);
+        assert_eq!(app.active().active_url, "https://example.com");
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn context_menu_chip_beats_background() {
+        let (dir, home, mut app) = test_shell("context-order");
+        let url = app.active().active_url.clone();
+        assert!(app.bookmarks.add(&url, "Example"));
+        // A chip right-click opens the bookmark menu and sets
+        // the flag; the background handler for the same click
+        // consumes the flag and leaves the chip menu standing.
+        let _ = app.update(Message::BarContextMenuBookmark(url.clone()));
+        assert_eq!(
+            app.bar_context_menu,
+            Some(BarContextMenu::Bookmark { url: url.clone() })
+        );
+        assert!(app.bar_context_chip);
+        let _ = app.update(Message::BarContextMenuBar);
+        assert_eq!(
+            app.bar_context_menu,
+            Some(BarContextMenu::Bookmark { url })
+        );
+        assert!(!app.bar_context_chip);
+        // A plain background right-click opens the generic menu.
+        let _ = app.update(Message::BarContextMenuBar);
+        assert_eq!(app.bar_context_menu, Some(BarContextMenu::Bar));
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn context_menu_add_bookmark_saves_current_page() {
+        let (dir, home, mut app) = test_shell("context-add");
+        let url = app.active().active_url.clone();
+        let _ = app.update(Message::BarContextMenuBar);
+        assert_eq!(app.bar_context_menu, Some(BarContextMenu::Bar));
+        let _ = app.update(Message::BarAddBookmark);
+        assert!(app.bar_context_menu.is_none());
+        assert!(app.bookmarks.is_bookmarked(&url));
+        assert_eq!(app.bookmarks.bookmarks()[0].title, "Example Domain");
+        // Adding the same page again is a no-op (dedup).
+        let _ = app.update(Message::BarAddBookmark);
+        assert_eq!(app.bookmarks.bookmarks().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn edit_mode_x_removes_bookmark_and_folder() {
+        let (dir, home, mut app) = test_shell("edit-mode-x");
+        let url = app.active().active_url.clone();
+        assert!(app.bookmarks.add(&url, "Example"));
+        let folder = app.bookmarks.add_folder("News");
+        assert!(app
+            .bookmarks
+            .add_to_folder(&folder, "https://news.example/", "News"));
+        // The pencil enters edit mode; the × on a bookmark
+        // removes it, and the × on a folder removes the folder
+        // and its contents.
+        let _ = app.update(Message::ToggleBookmarksEditMode);
+        assert!(app.bookmarks_edit_mode);
+        let _ = app.update(Message::RemoveBookmark(url.clone()));
+        assert!(!app.bookmarks.is_bookmarked(&url));
+        let _ = app.update(Message::BarRemoveFolder(folder.clone()));
+        assert!(app.bookmarks.folder(&folder).is_none());
+        assert!(!app.bookmarks.is_bookmarked("https://news.example/"));
+        // Clicking the pencil again exits edit mode.
+        let _ = app.update(Message::ToggleBookmarksEditMode);
+        assert!(!app.bookmarks_edit_mode);
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn folder_dialog_creates_folder_and_cancel_leaves_none() {
+        let (dir, home, mut app) = test_shell("folder-dialog");
+        let _ = app.update(Message::BarAddFolder);
+        assert!(app.folder_dialog.is_some());
+        assert_eq!(app.folder_dialog.as_ref().unwrap().name, "New folder");
+        let _ = app.update(Message::FolderDialogCancel);
+        assert!(app.folder_dialog.is_none());
+        assert!(app.bookmarks.entries().is_empty());
+        let _ = app.update(Message::BarAddFolder);
+        let _ = app.update(Message::FolderDialogNameChanged("Read".to_string()));
+        let _ = app.update(Message::FolderDialogSave);
+        assert!(app.folder_dialog.is_none());
+        assert_eq!(app.bookmarks.entries().len(), 1);
+        assert!(matches!(
+            &app.bookmarks.entries()[0],
+            BookmarkEntry::Folder(folder) if folder.name == "Read"
+        ));
+        // The folder survives a save/load round-trip.
+        let reloaded = BookmarkStore::from_json(&app.bookmarks.to_json());
+        assert_eq!(reloaded.entries().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn folder_popup_open_close_and_empty_line() {
+        let (dir, home, mut app) = test_shell("folder-popup");
+        let folder = app.bookmarks.add_folder("Empty");
+        // Clicking the folder chip opens its dropdown; clicking
+        // again closes it.
+        let _ = app.update(Message::ToggleFolderPopup(folder.clone()));
+        assert_eq!(app.open_folder.as_deref(), Some(folder.as_str()));
+        assert!(app.folder_popup_overlay().is_some());
+        let _ = app.update(Message::ToggleFolderPopup(folder.clone()));
+        assert!(app.open_folder.is_none());
+        // Navigation closes the dropdown too.
+        let _ = app.update(Message::ToggleFolderPopup(folder.clone()));
+        let _ = app.update(Message::NavigateTo("https://example.com/".to_string()));
+        assert!(app.open_folder.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn dialog_save_persists_tags_and_keyword() {
+        let (dir, home, mut app) = test_shell("dialog-tags");
+        let url = app.active().active_url.clone();
+        let _ = app.update(Message::ToggleBookmark);
+        let _ = app.update(Message::BookmarkDialogTagsChanged(
+            "rust, news".to_string(),
+        ));
+        let _ = app.update(Message::BookmarkDialogKeywordChanged("ex".to_string()));
+        let _ = app.update(Message::BookmarkDialogSave);
+        let bookmark = app.bookmarks.bookmark(&url).expect("saved");
+        assert_eq!(
+            bookmark.tags,
+            vec!["rust".to_string(), "news".to_string()]
+        );
+        assert_eq!(bookmark.keyword.as_deref(), Some("ex"));
+        // Reopening the dialog prefills both, and the keyword
+        // now navigates from the address bar.
+        let _ = app.update(Message::ToggleBookmark);
+        let dialog = app.bookmark_dialog.as_ref().unwrap();
+        assert_eq!(dialog.tags, "rust, news");
+        assert_eq!(dialog.keyword, "ex");
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn dialog_save_with_moved_url_keeps_original_when_taken() {
+        let (dir, home, mut app) = test_shell("dialog-url-move");
+        let url_a = app.active().active_url.clone();
+        let url_b = "https://other.example/";
+        assert!(app.bookmarks.add(url_b, "Other"));
+        let _ = app.update(Message::ToggleBookmark);
+        let _ = app.update(Message::BookmarkDialogSave);
+        assert!(app.bookmarks.is_bookmarked(&url_a));
+        // Edit the first bookmark, move its URL onto the
+        // second's: the original URL is kept, the rest saves.
+        let _ = app.update(Message::ToggleBookmark);
+        let _ = app.update(Message::BookmarkDialogUrlChanged(url_b.to_string()));
+        let _ = app.update(Message::BookmarkDialogNameChanged("Renamed".to_string()));
+        let _ = app.update(Message::BookmarkDialogSave);
+        assert!(app.bookmarks.is_bookmarked(&url_a));
+        assert!(app.bookmarks.is_bookmarked(url_b));
+        assert_eq!(app.bookmarks.bookmark(&url_a).unwrap().title, "Renamed");
+        assert_eq!(app.bookmarks.bookmark(url_b).unwrap().title, "Other");
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn bar_context_menu_overlay_builds_for_each_target() {
+        let (dir, home, mut app) = test_shell("context-overlay");
+        let url = app.active().active_url.clone();
+        assert!(app.bookmarks.add(&url, "Example"));
+        let folder = app.bookmarks.add_folder("News");
+        let _ = app.update(Message::BarContextMenuBar);
+        assert!(app.bar_context_menu_overlay().is_some());
+        let _ = app.update(Message::BarContextMenuBookmark(url));
+        assert!(app.bar_context_menu_overlay().is_some());
+        let _ = app.update(Message::BarContextMenuFolder(folder));
+        assert!(app.bar_context_menu_overlay().is_some());
+        // Hiding the bar closes the menu.
+        let _ = app.update(Message::BarHideBookmarksBar);
+        assert!(!app.show_bookmarks_bar);
+        assert!(app.bar_context_menu.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn dialog_tag_chevron_toggles_tags_into_field() {
+        let (dir, home, mut app) = test_shell("tag-chevron");
+        // A stored tag exists from another bookmark.
+        assert!(app.bookmarks.add_full(
+            "https://rust.example/",
+            "Rust",
+            None,
+            vec!["rust".to_string()],
+            None,
+        ));
+        let _ = app.update(Message::ToggleBookmark);
+        let _ = app.update(Message::BookmarkDialogToggleTags);
+        assert!(app.bookmark_dialog.as_ref().unwrap().show_tags);
+        let _ = app.update(Message::BookmarkDialogTagToggle("rust".to_string()));
+        assert_eq!(app.bookmark_dialog.as_ref().unwrap().tags, "rust");
+        let _ = app.update(Message::BookmarkDialogTagToggle("rust".to_string()));
+        assert_eq!(app.bookmark_dialog.as_ref().unwrap().tags, "");
         let _ = std::fs::remove_dir_all(&dir);
         restore_test_home(home);
     }
