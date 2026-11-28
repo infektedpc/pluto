@@ -4253,6 +4253,26 @@ pub(crate) fn resolve_subtree_styles(
     HashMap<DomId, Arc<ComputedStyle>>,
     SparseSecondaryMap<DomId, NodeStyle>,
 ) {
+    // The restyle root must have a resolvable parent style: the
+    // seed for level 0 comes from the retained map, but the dirty
+    // LCA's parent may itself have been inserted after the last
+    // layout — parser insertions never mark dirty (the tree
+    // builder suppresses records for the whole parse), so the
+    // retained map has no style for it, and the seed lookup would
+    // come back empty (google.com, 2026-11-28: the layout actor
+    // panicked in `resolve_styles` on exactly this). Walk up from
+    // the root while its parent is unstyled; the widened root's
+    // parent is then either in the retained map or absent (the
+    // document root), so the seed always exists. The widened
+    // subtree is a superset of the dirty one, so every caller
+    // reading the merged maps keeps working unchanged.
+    let mut root = root;
+    while let Some(p) = parent_element(dom, root) {
+        if retained.get(p).is_some() {
+            break;
+        }
+        root = p;
+    }
     // The root's parent style seeds level 0 (its parent sits above
     // the subtree); a root with no element parent resolves against
     // the initial style, as in the document pass.

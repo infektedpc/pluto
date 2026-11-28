@@ -3217,6 +3217,55 @@ mod tests {
     }
 
     #[test]
+    fn incremental_restyles_under_parser_inserted_parent() {
+        // Regression test (google.com, 2026-11-28): the layout
+        // actor panicked in `resolve_styles` ("parent style
+        // resolved in an earlier level") when the dirty LCA's
+        // parent was inserted by the parser after the last layout.
+        // Parser insertions never mark dirty — the tree builder
+        // suppresses records for the whole parse — so the
+        // retained map has no style for them; a JS mutation
+        // (which marks its parent dirty explicitly) can then make
+        // the dirty LCA a node whose parent is unstyled, and the
+        // subtree restyle's seed lookup found nothing.
+        //
+        // Simulate the worker sequence: cold build on a DOM whose
+        // body is still empty, clear the dirty set, grow the body
+        // the way the parser does (insertions invisible to the
+        // dirty set — wiped here, as the parse suppresses them),
+        // then a script-side mutation marks a parser-inserted
+        // element dirty.
+        let (mut dom, sheet, mut tree) = build(
+            r#"<html><head><title>t</title></head><body></body></html>"#,
+            "",
+        );
+        dom.clear_dirty();
+        let body = el(&dom, "body");
+        let outer = dom.create_element("div");
+        dom.append_child(body, outer);
+        let inner = dom.create_element("div");
+        dom.append_child(outer, inner);
+        let p = dom.create_element("p");
+        let text = dom.create_text("hello");
+        dom.append_child(p, text);
+        dom.append_child(inner, p);
+        dom.clear_dirty();
+        // A script appends into `inner`: the host marks the parent
+        // dirty explicitly, so the dirty LCA is `inner` — whose
+        // parent `outer` was never styled.
+        dom.mark_dirty(inner);
+        let _out = relayout(&mut tree, &mut dom, &sheet);
+        // Must not panic; the new nodes get boxes and the result
+        // matches a cold layout of the same DOM.
+        assert!(tree.boxes.iter().any(|b| {
+            b.text
+                .as_ref()
+                .is_some_and(|t| t.spans.iter().any(|s| s.text.contains("hello")))
+        }));
+        assert_same_geometry(&tree, &cold(&dom, &sheet));
+    }
+
+    #[test]
     fn incremental_subtree_remove() {
         let (mut dom, sheet, mut tree) = build(
             r#"<div class="box"><p>one</p><p>two</p></div>"#,

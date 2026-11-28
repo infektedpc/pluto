@@ -163,8 +163,21 @@ impl Transport for ChannelTransport {
 /// The cross-process transport: a Unix stream socket, one end in
 /// the browser process and one inherited by the `--renderer` child.
 /// Frames are `[length: u32 LE][payload]`; see the module docs.
+///
+/// `recv_frame` is cancellation-safe: both transport loops
+/// `select!` it against another channel, so a read is routinely
+/// dropped mid-frame, and bytes a dropped future had already
+/// buffered would desync the stream. Every byte read from the
+/// socket therefore lands in [`SocketTransport::buf`] — the
+/// transport itself, never a future local — and bytes are only
+/// drained from it once a complete frame is present, in one
+/// synchronous step with no await in between.
 pub struct SocketTransport {
     stream: UnixStream,
+    /// Bytes already read from the socket but not yet consumed
+    /// into a frame. A `recv_frame` dropped at any await leaves a
+    /// frame prefix here, and the next call resumes from it.
+    buf: Vec<u8>,
 }
 
 impl SocketTransport {
@@ -176,7 +189,21 @@ impl SocketTransport {
         stream.set_nonblocking(true)?;
         Ok(Self {
             stream: UnixStream::from_std(stream)?,
+            buf: Vec::new(),
         })
+    }
+
+    /// Read one chunk from the socket into [`SocketTransport::buf`].
+    /// Returns false on a clean EOF. Bytes land in `buf` — never
+    /// in a future local — so cancelling the read loses nothing.
+    async fn fill_buf(&mut self) -> io::Result<bool> {
+        let mut chunk = [0u8; 8192];
+        let n = self.stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(false);
+        }
+        self.buf.extend_from_slice(&chunk[..n]);
+        Ok(true)
     }
 
     /// Create a connected pair of socket transports (used by tests;
@@ -236,20 +263,26 @@ impl Transport for SocketTransport {
     }
 
     async fn recv_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
-        // Read the first length byte with a plain `read`: 0 bytes
-        // is a clean EOF at a frame boundary; any bytes at all mean
-        // a frame is starting, and a short read after that is a
-        // truncation, not an EOF (`read_exact` below reports it).
-        let mut first = [0u8; 1];
-        if self.stream.read(&mut first).await? == 0 {
-            return Ok(None);
+        // Cancellation-safe: bytes are only ever removed from
+        // `self.buf` once a complete frame is present, in one
+        // synchronous drain with no await in between — a future
+        // dropped at any await leaves a frame prefix in `buf`
+        // and the next call resumes from it, so the stream can
+        // never desync (example.com, 2026-11-28: a dropped
+        // `read_exact` discarded a partial frame and the next
+        // read decoded payload bytes as a protocol version).
+        while self.buf.len() < 4 {
+            if !self.fill_buf().await? {
+                if self.buf.is_empty() {
+                    return Ok(None);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "IPC frame truncated at EOF inside the length prefix",
+                ));
+            }
         }
-        let mut rest = [0u8; 3];
-        self.stream.read_exact(&mut rest).await?;
-        let mut len_buf = [0u8; 4];
-        len_buf[0] = first[0];
-        len_buf[1..].copy_from_slice(&rest);
-        let len = u32::from_le_bytes(len_buf) as usize;
+        let len = u32::from_le_bytes(self.buf[..4].try_into().expect("4 bytes")) as usize;
         if len > MAX_FRAME_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -258,8 +291,16 @@ impl Transport for SocketTransport {
                 ),
             ));
         }
-        let mut payload = vec![0u8; len];
-        self.stream.read_exact(&mut payload).await?;
+        while self.buf.len() < 4 + len {
+            if !self.fill_buf().await? {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "IPC frame truncated at EOF inside the payload",
+                ));
+            }
+        }
+        let payload = self.buf[4..4 + len].to_vec();
+        self.buf.drain(..4 + len);
         Ok(Some(payload))
     }
 }
@@ -313,6 +354,7 @@ mod tests {
     use crate::{
         CredentialsMode, Destination, Priority, RequestMode, ResourceRequest,
     };
+    use std::time::Duration;
     use pluto_css::Stylesheet;
     use pluto_html::parse as parse_html;
     use pluto_layout::{LayoutTree, Theme};
@@ -465,6 +507,56 @@ mod tests {
         // Closing one end is a clean EOF for the other.
         drop(renderer);
         assert_eq!(browser.recv_frame().await.expect("recv ok"), None);
+    }
+
+    #[tokio::test]
+    async fn socket_recv_frame_survives_cancellation_mid_frame() {
+        // Regression test (example.com, 2026-11-28): the renderer
+        // died with "unsupported protocol version 1073741826" — a
+        // garbage version read from a misaligned frame. Both
+        // transport loops `select!` a `recv_frame` against another
+        // channel (the renderer's tab events, the bridge's shell
+        // commands); when the other arm won while a frame was only
+        // partly read, dropping the `recv_frame` future discarded
+        // the bytes `read_exact` had already buffered, so the next
+        // read started mid-frame and decoded payload bytes as a
+        // version. `recv_frame` must keep every byte it reads from
+        // the socket in the transport itself, so a cancelled read
+        // resumes cleanly.
+        let (mut transport, mut fake_peer) = {
+            let (a, b) = StdUnixStream::pair().expect("socketpair");
+            b.set_nonblocking(true).expect("peer non-blocking");
+            (
+                SocketTransport::from_std(a).expect("transport"),
+                UnixStream::from_std(b).expect("peer"),
+            )
+        };
+        let payload = b"0123456789".to_vec();
+        let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(&payload);
+        // The length + the first half of the payload, then a
+        // `select!`-style race: the recv consumes the partial
+        // frame and blocks for the rest, and the other arm wins.
+        fake_peer
+            .write_all(&frame[..9])
+            .await
+            .expect("peer writes partial frame");
+        tokio::select! {
+            _ = transport.recv_frame() => panic!("frame cannot complete yet"),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        // The rest of the frame; a fresh recv must return the
+        // whole frame, not bytes read from the middle of it.
+        fake_peer
+            .write_all(&frame[9..])
+            .await
+            .expect("peer writes rest of frame");
+        let back = tokio::time::timeout(Duration::from_secs(5), transport.recv_frame())
+            .await
+            .expect("recv completes in time")
+            .expect("recv succeeds")
+            .expect("a frame arrives");
+        assert_eq!(back, payload);
     }
 
     #[tokio::test]

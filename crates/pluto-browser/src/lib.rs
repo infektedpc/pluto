@@ -356,7 +356,7 @@ pub struct PlutoBrowser {
     show_bookmarks_bar: bool,
     /// Whether the bookmarks bar is in edit mode (bookmarks
     /// round, 2026-11-28): toggled by the pencil at the bar's
-    /// far left; chips show a × to remove them, and chip clicks
+    /// far right; chips show a × to remove them, and chip clicks
     /// do not navigate.
     bookmarks_edit_mode: bool,
     /// The open bookmarks-bar context menu, if any (bookmarks
@@ -1019,7 +1019,7 @@ impl PlutoBrowser {
     /// component background, 8px side padding, 4px gaps, 12px
     /// chip text, and a 16px favicon when one is set — the
     /// bottom divider in `view` is the strip's lower edge.
-    /// The pencil at the far left (bookmarks round, 2026-11-28)
+    /// The pencil at the far right (bookmarks round, 2026-11-28)
     /// toggles edit mode: every chip gets a × that removes it,
     /// and chip clicks stop navigating. Right-click anywhere on
     /// the bar — empty space, pencil, or a chip — opens the
@@ -1027,17 +1027,6 @@ impl PlutoBrowser {
     fn bookmarks_bar(&self) -> Element<'_, Message> {
         let entries = bookmarks_bar_entries(&self.bookmarks);
         let mut children: Vec<Element<'_, Message>> = Vec::new();
-        // The pencil, always first: the edit-mode toggle.
-        let pencil = widget::button::custom(
-            widget::icon(bundled_icon(PENCIL_ICON_SVG)).size(16),
-        )
-        .class(small_button_style(
-            SmallButtonBase::Text,
-            self.bookmarks_edit_mode,
-        ))
-        .on_press(Message::ToggleBookmarksEditMode)
-        .into();
-        children.push(pencil);
         if entries.is_empty() {
             children.push(
                 widget::text("No bookmarks yet — use the star to save this page.")
@@ -1049,6 +1038,19 @@ impl PlutoBrowser {
                 children.push(self.bar_chip(entry));
             }
         }
+        // The pencil, always last: the edit-mode toggle, pinned
+        // to the bar's far right by the fill space before it.
+        children.push(cosmic::iced::widget::space().width(Length::Fill).into());
+        let pencil = widget::button::custom(
+            widget::icon(bundled_icon(PENCIL_ICON_SVG)).size(16),
+        )
+        .class(small_button_style(
+            SmallButtonBase::Text,
+            self.bookmarks_edit_mode,
+        ))
+        .on_press(Message::ToggleBookmarksEditMode)
+        .into();
+        children.push(pencil);
         let row = widget::row(children).spacing(4);
         // The bar's own right-click area wraps the whole row:
         // right-click on empty space (or the pencil) opens the
@@ -1936,7 +1938,7 @@ pub const FOLDER_ICON_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" 
 
 /// The bookmarks bar's pencil glyph (bookmarks round,
 /// 2026-11-28): a built-in 16×16 SVG, same treatment as the
-/// folder glyph — the edit-mode toggle at the bar's far left.
+/// folder glyph — the edit-mode toggle at the bar's far right.
 pub const PENCIL_ICON_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path d="M11 2.5a1.77 1.77 0 0 1 2.5 0l0 0a1.77 1.77 0 0 1 0 2.5L6 12.5 2.5 13.5 3.5 10 11 2.5z" fill="#232323"/></svg>"##;
 
 /// The bookmark dialog's star glyph (bookmarks round,
@@ -3237,7 +3239,8 @@ impl Application for PlutoBrowser {
                         // Restart policy: three crashes in 60 s
                         // makes the tab dead — only Reload may
                         // navigate it until the user reloads.
-                        if tab.crash_times.len() >= 3 {
+                        let dead = tab.crash_times.len() >= 3;
+                        if dead {
                             tab.dead = true;
                             tab.status = "Renderer crashed repeatedly — press Reload to retry"
                                 .to_string();
@@ -3246,6 +3249,20 @@ impl Application for PlutoBrowser {
                                 format!("Renderer crashed: {reason} — press Reload to retry");
                         }
                         tab.progress = None;
+                        if dead {
+                            // A dead tab takes no further navigation
+                            // — not even the crash page. A renderer
+                            // whose layout thread died but whose
+                            // process survived crashes every
+                            // about:crashed load the same way
+                            // ("layout actor is gone"), so
+                            // re-navigating here spins forever
+                            // (epochs 3–121+ on google.com,
+                            // 2026-11-28) instead of leaving the
+                            // tab dead for Reload. The stale list
+                            // stays visible with the status above.
+                            return Task::none();
+                        }
                         // Show the crash page: the bridge respawns
                         // a fresh renderer for this navigation, and
                         // the worker renders `about:crashed`
