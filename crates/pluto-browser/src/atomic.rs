@@ -26,6 +26,18 @@ use std::path::Path;
 /// rename and the directory is `fsync`ed after it, so the write is
 /// durable, not merely atomic.
 pub fn write_file_atomic(dir: &Path, name: &str, contents: &str) -> std::io::Result<()> {
+    write_file_atomic_bytes(dir, name, contents.as_bytes())
+}
+
+/// The binary twin of [`write_file_atomic`]: the same temp-file +
+/// rename + fsync dance for raw bytes (follow-up UI work,
+/// 2026-11-27 — the bookmark dialog's custom favicon files are
+/// image bytes, not text).
+pub fn write_file_atomic_bytes(
+    dir: &Path,
+    name: &str,
+    contents: &[u8],
+) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let target = dir.join(name);
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -41,7 +53,7 @@ pub fn write_file_atomic(dir: &Path, name: &str, contents: &str) -> std::io::Res
             Ok(mut file) => {
                 use std::io::Write;
                 let result = file
-                    .write_all(contents.as_bytes())
+                    .write_all(contents)
                     .and_then(|()| file.sync_all())
                     .and_then(|()| {
                         drop(file);

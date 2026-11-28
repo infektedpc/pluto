@@ -36,6 +36,9 @@ http.workspace = true
 # Stage 11 Rec 1: the shared rayon pool decodes images on the
 # worker (never the tab thread, never the UI thread).
 rayon.workspace = true
+# Follow-up UI work (2026-11-27): `rfd` for the bookmark dialog's
+# favicon file chooser (async dialog, driven via `Task::perform`).
+rfd.workspace = true
 # M6 Phase 3 (Rec 12): `url` resolves relative `@font-face` URLs
 # against the document base (already in the workspace lock).
 url.workspace = true

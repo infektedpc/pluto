@@ -136,9 +136,10 @@ pub enum ImageError {
     AnimatedTooLarge(String),
 }
 
-/// Decode one image's bytes (PNG, JPEG, GIF, WebP — the formats the
-/// workspace `image` dependency enables) to RGBA8. Pure and
-/// thread-safe: call it on the rayon pool, never on the UI thread.
+/// Decode one image's bytes (PNG, JPEG, GIF, WebP, ICO, BMP —
+/// the formats the workspace `image` dependency enables) to
+/// RGBA8. Pure and thread-safe: call it on the rayon pool, never
+/// on the UI thread.
 ///
 /// Decodes through [`image::ImageReader`] with the strict
 /// [`decode_limits`] (Stage 11 Rec 12): a header claiming more

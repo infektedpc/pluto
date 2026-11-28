@@ -154,22 +154,33 @@ impl Service<Name> for CachedResolver {
         let host = name.as_str().to_string();
         Box::pin(async move {
             match cache.get(&host) {
-                Some(Ok(addrs)) => Ok(addrs.into_iter()),
-                Some(Err(())) => Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("cached DNS failure for {host}"),
-                )),
-                None => match inner.call(name).await {
-                    Ok(addrs) => {
-                        let addrs: Vec<SocketAddr> = addrs.collect();
-                        cache.insert_positive(&host, addrs.clone());
-                        Ok(addrs.into_iter())
+                Some(Ok(addrs)) => {
+                    eprintln!("[pluto-broker] dns cache hit host={} addrs={}", host, addrs.len());
+                    Ok(addrs.into_iter())
+                }
+                Some(Err(())) => {
+                    eprintln!("[pluto-broker] dns cache negative host={}", host);
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("cached DNS failure for {host}"),
+                    ))
+                }
+                None => {
+                    eprintln!("[pluto-broker] dns resolve start host={}", host);
+                    match inner.call(name).await {
+                        Ok(addrs) => {
+                            let addrs: Vec<SocketAddr> = addrs.collect();
+                            cache.insert_positive(&host, addrs.clone());
+                            eprintln!("[pluto-broker] dns resolve ok host={} addrs={}", host, addrs.len());
+                            Ok(addrs.into_iter())
+                        }
+                        Err(e) => {
+                            cache.insert_negative(&host);
+                            eprintln!("[pluto-broker] dns resolve err host={} err={}", host, e);
+                            Err(e)
+                        }
                     }
-                    Err(e) => {
-                        cache.insert_negative(&host);
-                        Err(e)
-                    }
-                },
+                }
             }
         })
     }

@@ -157,7 +157,13 @@ rayon = "1"
 # Image decoding (Stage 4 #6; the <img> pipeline itself is M3).
 # M3 formats only — the full default set pulls decoders Pluto never
 # uses. image 0.25 is already in the lock via iced/libcosmic.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "ico", "bmp"] }
+# Follow-up UI work (2026-11-27): the bookmark dialog's favicon
+# picker — `rfd` 0.17.2 is already in the offline registry cache
+# with its whole dependency closure (ashpd, zbus, wayland-*), and
+# its default `xdg-portal` feature is the right backend for a KDE
+# desktop (portal-based, works on X11 and Wayland alike).
+rfd = "0.17"
 # Stage 15 (M7 Phase 2, Rec 3/4): lyon 1.0 is the path tessellator
 # (fill + stroke) for inline SVG. Verified present in the offline
 # registry cache (lyon 1.0.19, lyon_tessellation 1.0.23,

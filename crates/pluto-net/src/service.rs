@@ -650,7 +650,7 @@ async fn run_fetch(
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             if matches!(e, NetError::Cancelled) {
-                scheduler
+                let delivered = scheduler
                     .emit(
                         request.request_id,
                         ResourceEvent::Cancelled {
@@ -658,21 +658,26 @@ async fn run_fetch(
                         },
                     )
                     .await;
+                eprintln!("[pluto-broker] run_fetch error emit id={} cancelled delivered={}", request.request_id, delivered);
             } else {
-                scheduler
+                let code = e.code().to_string();
+                let reason = e.to_string();
+                let delivered = scheduler
                     .emit(
                         request.request_id,
                         ResourceEvent::Error {
                             request_id: request.request_id,
-                            code: e.code().to_string(),
-                            reason: e.to_string(),
+                            code: code.clone(),
+                            reason,
                         },
                     )
                     .await;
+                eprintln!("[pluto-broker] run_fetch error emit id={} code={} delivered={}", request.request_id, code, delivered);
             }
         }
         Err(_) => {
-            scheduler
+            eprintln!("[pluto-broker] run_fetch timeout id={} after {:?}", request.request_id, total);
+            let delivered = scheduler
                 .emit(
                     request.request_id,
                     ResourceEvent::Error {
@@ -682,6 +687,7 @@ async fn run_fetch(
                     },
                 )
                 .await;
+            eprintln!("[pluto-broker] run_fetch timeout emit id={} delivered={}", request.request_id, delivered);
         }
     }
 }
@@ -862,6 +868,7 @@ async fn execute_fetch(
     // URL was rewritten by HTTPS-only, so a later failure of a
     // top-level navigation maps to `HttpsOnlyFailed`.
     let mut https_only_rewrote = scheduler.apply_secure_upgrade(&mut current);
+    eprintln!("[pluto-broker] gate hsts ok id={} url={}", request.request_id, current);
     // Stage 9 Rec 8: a navigation starts a fresh document — the
     // previous document's policy container must not govern this
     // fetch or its subresources; the new policy is stored when
@@ -907,6 +914,7 @@ async fn execute_fetch(
         }
         MixedContentDecision::Upgrade(upgraded) => upgraded,
     };
+    eprintln!("[pluto-broker] gate mixed ok id={} url={}", request.request_id, current);
     // Blocker (Stage 9 Rec 12, Round 1 basic): EasyList /
     // EasyPrivacy network rules, before CSP per the frozen gate
     // order. An empty blocker (no lists on disk yet) allows
@@ -927,6 +935,7 @@ async fn execute_fetch(
             )));
         }
     }
+    eprintln!("[pluto-broker] gate blocker ok id={}", request.request_id);
     // Frozen gate order (Stage 5): HSTS/mixed → blocker → CSP fetch
     // → CORS → cache → network. The blocker gate ran above; the
     // cache gate runs after CORS, below.
@@ -941,12 +950,10 @@ async fn execute_fetch(
             "CSP pre-request check refused the fetch".to_string(),
         ));
     }
-    // CORS pre-request decision (Stage 9 Rec 2): the preflight, if
-    // one is needed, runs BEFORE any network traffic for the actual
-    // request, and the response check + filtering run after the
-    // headers arrive (below). `SameOrigin` mode to another origin
-    // fails here — the M4 refusal, kept as the fallback.
+    eprintln!("[pluto-broker] gate csp ok id={}", request.request_id);
+    eprintln!("[pluto-broker] gate cors start id={}", request.request_id);
     cors_pre_request(scheduler, request, &current).await?;
+    eprintln!("[pluto-broker] gate cors ok id={}", request.request_id);
     // Cache (Stage 10 Rec 1): the last gate before the network,
     // per the frozen order (HSTS/mixed → blocker → CSP → CORS →
     // cache → network). The blocker already ran above, so a
@@ -980,10 +987,16 @@ async fn execute_fetch(
         };
         match outcome {
             Lookup::Fresh(entry) => {
+                eprintln!("[pluto-broker] cache lookup id={} fresh", request.request_id);
                 return serve_cached(scheduler, request, &current, &entry).await;
             }
-            Lookup::Stale(entry) => revalidate = Some(entry),
-            Lookup::Miss => {}
+            Lookup::Stale(entry) => {
+                eprintln!("[pluto-broker] cache lookup id={} stale", request.request_id);
+                revalidate = Some(entry)
+            }
+            Lookup::Miss => {
+                eprintln!("[pluto-broker] cache lookup id={} miss", request.request_id);
+            }
         }
     }
     let mut method = Method::GET;
@@ -1002,6 +1015,7 @@ async fn execute_fetch(
         // `Authorization` (and `Cookie`, when it exists).
         let crossed_origin = !Origin::from_url(&request.origin)
             .is_same_origin(&Origin::from_url(&current.to_string()));
+        eprintln!("[pluto-broker] network request start id={} hop={} url={}", request.request_id, redirects, current);
         let response = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(NetError::Cancelled),
@@ -1019,6 +1033,7 @@ async fn execute_fetch(
             ) => match result {
                 Ok(Ok(response)) => response,
                 Ok(Err(e)) => {
+                    eprintln!("[pluto-broker] network request error id={} err={}", request.request_id, e);
                     // Stage 9 Rec 5 / RFC 6797 §8.4: a transport
                     // failure talking to a Known HSTS Host is
                     // fatal — no click-through, no HTTP fallback.
@@ -1037,10 +1052,14 @@ async fn execute_fetch(
                     }
                     return Err(NetError::Request(e.to_string()));
                 }
-                Err(_) => return Err(NetError::Timeout("time to first byte".to_string())),
+                Err(_) => {
+                    eprintln!("[pluto-broker] network ttfb timeout id={}", request.request_id);
+                    return Err(NetError::Timeout("time to first byte".to_string()));
+                }
             },
         };
         let status = response.status();
+        eprintln!("[pluto-broker] network headers id={} status={}", request.request_id, status);
         // HSTS recording (RFC 6797 §8.1): any response received
         // over a secure transport with no TLS errors — including
         // redirect responses — may carry a `Strict-Transport-

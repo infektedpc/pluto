@@ -33,7 +33,10 @@ mod viewport;
 #[cfg(test)]
 pub(crate) static TEST_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-use bookmarks::{BookmarkStore, load_bookmarks, save_bookmarks};
+use bookmarks::{
+    Bookmark, BookmarkStore, delete_bookmark_favicon, load_bookmark_favicon,
+    load_bookmarks, save_bookmark_favicon, save_bookmarks,
+};
 use history::{load_history, save_history};
 use compositor::Compositor;
 use cosmic::app::{Core, Task};
@@ -215,6 +218,48 @@ impl Tab {
     }
 }
 
+/// The bookmark dialog's draft state (follow-up UI work,
+/// 2026-11-27): the star opens this instead of toggling. The
+/// name is editable; the favicon is clickable to pick a custom
+/// image. Nothing is written to the store until Save.
+#[derive(Debug, Clone)]
+struct BookmarkDialog {
+    /// The page URL being bookmarked (never edited).
+    url: String,
+    /// The editable bookmark name, prefilled with the page title
+    /// (or the stored title when editing).
+    name: String,
+    /// The custom favicon picked in this dialog, if any: decoded
+    /// pixels for display plus the raw file bytes to persist on
+    /// Save. `None` means "keep whatever favicon the bookmark
+    /// already has (or the site's, for a new bookmark)".
+    custom_favicon: Option<(pluto_paint::DecodedImage, Vec<u8>)>,
+    /// True when the page was already bookmarked when the dialog
+    /// opened — Save edits it in place and a Remove button shows.
+    editing: bool,
+    /// The last file-pick failure, shown in the dialog.
+    error: Option<String>,
+}
+
+impl BookmarkDialog {
+    /// Open the dialog for `url`: prefill the name with the
+    /// stored title when the page is already bookmarked
+    /// (`existing`), else with the current page `title`.
+    fn new(url: &str, title: &str, existing: Option<&Bookmark>) -> Self {
+        let (name, editing) = match existing {
+            Some(bookmark) => (bookmark.title.clone(), true),
+            None => (title.to_string(), false),
+        };
+        Self {
+            url: url.to_string(),
+            name,
+            custom_favicon: None,
+            editing,
+            error: None,
+        }
+    }
+}
+
 pub struct PlutoBrowser {
     core: Core,
     /// The tabs, in strip order (Stage 11 Rec 4). Exactly one
@@ -243,6 +288,14 @@ pub struct PlutoBrowser {
     /// The persisted bookmarks (nav feature): toggled by the
     /// star, listed in the hamburger menu's Bookmarks panel.
     bookmarks: BookmarkStore,
+    /// Decoded custom favicons, by bookmark URL (follow-up UI
+    /// work, 2026-11-27): loaded once at startup from the
+    /// profile dir, so the bookmarks bar and the dialog render
+    /// without re-reading or re-decoding files every frame.
+    bookmark_favicons: std::collections::HashMap<String, pluto_paint::DecodedImage>,
+    /// The open bookmark dialog, if any (follow-up UI work,
+    /// 2026-11-27): the star opens this instead of toggling.
+    bookmark_dialog: Option<BookmarkDialog>,
     /// Whether the hamburger menu is open. Opening a list panel
     /// closes the menu; the menu never shows alongside a panel.
     menu_open: bool,
@@ -297,8 +350,31 @@ pub enum Message {
     Back,
     Forward,
     Reload,
-    /// The bookmark star: toggle a bookmark for the current page.
+    /// The bookmark star: open the bookmark dialog for the
+    /// current page (follow-up UI work, 2026-11-27 — the star no
+    /// longer toggles immediately; the dialog names the bookmark
+    /// and picks its favicon).
     ToggleBookmark,
+    /// The bookmark dialog's name field changed.
+    BookmarkDialogNameChanged(String),
+    /// The bookmark dialog's favicon was clicked: open the file
+    /// chooser for a custom favicon image.
+    BookmarkDialogPickFavicon,
+    /// The favicon file chooser returned: `None` means the user
+    /// cancelled; `Some(Ok(..))` is the picked file's bytes plus
+    /// its decoded pixels; `Some(Err(..))` is a decode failure
+    /// to show in the dialog.
+    BookmarkDialogFaviconPicked(
+        Option<Result<(Vec<u8>, pluto_paint::DecodedImage), String>>,
+    ),
+    /// The bookmark dialog's Save/Add button: persist the
+    /// bookmark (title + custom favicon) and close the dialog.
+    BookmarkDialogSave,
+    /// The bookmark dialog's Cancel button: close without saving.
+    BookmarkDialogCancel,
+    /// The bookmark dialog's Remove button (editing only):
+    /// delete the bookmark and its custom favicon, then close.
+    BookmarkDialogRemove,
     /// The hamburger button: open/close the menu.
     ToggleMenu,
     /// Menu: open the Bookmarks list panel.
@@ -831,23 +907,37 @@ impl PlutoBrowser {
     }
 
     /// The bookmarks bar, directly below the nav bar: one button
-    /// per bookmark, in store order. None when there are no
-    /// bookmarks yet (no dead empty bar).
-    fn bookmarks_bar(&self) -> Option<Element<'_, Message>> {
+    /// per bookmark, in store order, with the bookmark's custom
+    /// favicon when it has one. Always visible, even with no
+    /// bookmarks yet — then it shows a hint instead of a dead
+    /// empty bar (follow-up UI work, 2026-11-27).
+    fn bookmarks_bar(&self) -> Element<'_, Message> {
         let entries = bookmarks_bar_entries(&self.bookmarks);
         if entries.is_empty() {
-            return None;
+            return widget::row([
+                widget::text("No bookmarks yet — use the star to save this page.")
+                    .size(12)
+                    .into(),
+            ])
+            .spacing(4)
+            .padding(4)
+            .into();
         }
         let mut children: Vec<Element<'_, Message>> = Vec::new();
         for (title, url) in entries {
+            let mut row_children: Vec<Element<'_, Message>> = Vec::new();
+            if let Some(image) = self.bookmark_favicons.get(&url) {
+                row_children.push(Self::decoded_image_element(image.clone(), 16.0));
+            }
+            row_children.push(widget::text(ellipsize(&title, 24)).into());
             children.push(
-                widget::button::text(ellipsize(&title, 24))
+                widget::button::custom(widget::row(row_children).spacing(4))
                     .class(small_button_style(SmallButtonBase::Text, false))
                     .on_press(Message::NavigateTo(url))
                     .into(),
             );
         }
-        Some(widget::row(children).spacing(4).padding(4).into())
+        widget::row(children).spacing(4).padding(4).into()
     }
 
     /// The vertical-mode content: the web view as the base layer,
@@ -1028,6 +1118,171 @@ impl PlutoBrowser {
         )
     }
 
+    /// Remove a bookmark and its custom favicon file, then
+    /// persist (follow-up UI work, 2026-11-27): the list panel's
+    /// Remove button and the dialog's Remove button share this,
+    /// so a deleted bookmark never leaves an orphaned favicon
+    /// file or a stale decoded icon behind.
+    fn remove_bookmark(&mut self, url: &str) {
+        if self.bookmarks.remove(url) {
+            delete_bookmark_favicon(url);
+            self.bookmark_favicons.remove(url);
+            save_bookmarks(&self.bookmarks);
+        }
+    }
+
+    /// The active tab's site favicon as decoded pixels, if the
+    /// site has one (the tab's resource table holds it as RGBA).
+    fn active_site_favicon(&self) -> Option<pluto_paint::DecodedImage> {
+        let tab = self.active();
+        let favicon_id = tab.favicon_id?;
+        // `Resource` has a single variant (`Image`), so this
+        // destructure is irrefutable — no `else` needed.
+        let pluto_paint::Resource::Image {
+            width,
+            height,
+            rgba,
+        } = tab.resources.resources.get(&favicon_id)?;
+        Some(pluto_paint::DecodedImage {
+            width: *width,
+            height: *height,
+            rgba: rgba.clone(),
+        })
+    }
+
+    /// A decoded image as a fixed-size iced image element. The
+    /// image is taken by value: the handle owns the pixels
+    /// (`from_rgba` takes the bytes), so the element borrows
+    /// nothing — a decoded site favicon, which only exists as a
+    /// local, can be shown without lifetime gymnastics. A
+    /// favicon is a few KiB, so the copy is negligible.
+    fn decoded_image_element(
+        image: pluto_paint::DecodedImage,
+        size: f32,
+    ) -> Element<'static, Message> {
+        let handle = cosmic::iced::widget::image::Handle::from_rgba(
+            image.width,
+            image.height,
+            image.rgba,
+        );
+        cosmic::iced::widget::image(handle)
+            .width(Length::Fixed(size))
+            .height(Length::Fixed(size))
+            .into()
+    }
+
+    /// The bookmark dialog's favicon (follow-up UI work,
+    /// 2026-11-27): the custom image picked in this dialog, else
+    /// the bookmark's stored custom favicon, else the active
+    /// tab's site favicon, else the host's initial letter. The
+    /// caller wraps it in the clickable button.
+    fn dialog_favicon_element<'a>(
+        &'a self,
+        dialog: &'a BookmarkDialog,
+    ) -> Element<'a, Message> {
+        if let Some((decoded, _)) = &dialog.custom_favicon {
+            return Self::decoded_image_element(decoded.clone(), 32.0);
+        }
+        if let Some(decoded) = self.bookmark_favicons.get(&dialog.url) {
+            return Self::decoded_image_element(decoded.clone(), 32.0);
+        }
+        if let Some(site) = self.active_site_favicon() {
+            return Self::decoded_image_element(site, 32.0);
+        }
+        widget::text(initial_letter(&dialog.url, &dialog.name).to_string())
+            .size(20)
+            .into()
+    }
+
+    /// The hamburger menu as a floating popup (follow-up UI work,
+    /// 2026-11-27): an overlay layer above the whole shell, not
+    /// an in-flow row — opening it moves nothing around it. The
+    /// panel hangs below the nav bar (the top padding clears it);
+    /// clicks outside the 260px panel fall through to the page,
+    /// because the layer itself captures no pointer events —
+    /// only the panel's buttons do.
+    fn menu_overlay(&self) -> Element<'_, Message> {
+        widget::container(self.menu_panel())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(cosmic::iced::core::Padding {
+                top: menu_overlay_top_offset(self.vertical_tabs),
+                right: 8.0,
+                bottom: 0.0,
+                left: 0.0,
+            })
+            .into()
+    }
+
+    /// The bookmark dialog as a floating popup (follow-up UI
+    /// work, 2026-11-27): a centered overlay layer, like the
+    /// menu — it hovers over the page without moving anything.
+    /// The favicon is a button: clicking it opens the file
+    /// chooser for a custom favicon image.
+    fn bookmark_dialog_overlay<'a>(
+        &'a self,
+        dialog: &'a BookmarkDialog,
+    ) -> Element<'a, Message> {
+        let favicon_button = widget::button::custom(self.dialog_favicon_element(dialog))
+            .class(small_button_style(SmallButtonBase::Standard, false))
+            .on_press(Message::BookmarkDialogPickFavicon);
+        let name_input = widget::text_input("Bookmark name", &dialog.name)
+            .on_input(Message::BookmarkDialogNameChanged)
+            .style(small_text_input_style())
+            .width(Length::Fill);
+        let mut children: Vec<Element<'_, Message>> = vec![
+            widget::text(if dialog.editing {
+                "Edit bookmark"
+            } else {
+                "Bookmark this page"
+            })
+            .into(),
+            widget::row([favicon_button.into(), name_input.into()])
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .into(),
+            widget::text("Click the icon to choose your own favicon.")
+                .size(12)
+                .into(),
+        ];
+        if let Some(error) = &dialog.error {
+            children.push(widget::text(error.clone()).size(12).into());
+        }
+        let mut buttons: Vec<Element<'_, Message>> = vec![
+            widget::button::suggested(if dialog.editing {
+                "Save"
+            } else {
+                "Add bookmark"
+            })
+            .class(small_button_style(SmallButtonBase::Suggested, false))
+            .on_press(Message::BookmarkDialogSave)
+            .into(),
+            widget::button::text("Cancel")
+                .class(small_button_style(SmallButtonBase::Text, false))
+                .on_press(Message::BookmarkDialogCancel)
+                .into(),
+        ];
+        if dialog.editing {
+            buttons.push(
+                widget::button::text("Remove")
+                    .class(small_button_style(SmallButtonBase::Text, false))
+                    .on_press(Message::BookmarkDialogRemove)
+                    .into(),
+            );
+        }
+        children.push(widget::row(buttons).spacing(8).into());
+        let panel = widget::column(children).spacing(8).padding(12);
+        let boxed = widget::container(panel)
+            .width(Length::Fixed(BOOKMARK_DIALOG_WIDTH))
+            .style(panel_container_style);
+        widget::container(boxed)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .into()
+    }
+
     /// A tab's favicon as a 16px image, or the site's initial
     /// letter when it has no favicon yet (the host's initial —
     /// "example.com" → 'E' — or the title's first character).
@@ -1053,18 +1308,7 @@ impl PlutoBrowser {
                 .height(Length::Fixed(16.0))
                 .into();
         }
-        let url = tab
-            .active_url
-            .strip_prefix("https://")
-            .or_else(|| tab.active_url.strip_prefix("http://"))
-            .unwrap_or(&tab.active_url);
-        let host = url.split('/').next().unwrap_or(url);
-        let letter = host
-            .chars()
-            .next()
-            .or_else(|| tab.title.chars().next())
-            .unwrap_or('?')
-            .to_ascii_uppercase();
+        let letter = initial_letter(&tab.active_url, &tab.title);
         widget::text(letter.to_string()).into()
     }
 
@@ -1166,6 +1410,31 @@ pub const SHELL_RADIUS: f32 = 4.0;
 /// The hamburger menu panel's fixed width (Chrome/Firefox-sized,
 /// not half-screen).
 pub const MENU_PANEL_WIDTH: f32 = 260.0;
+
+/// The bookmark dialog's fixed width (follow-up UI work,
+/// 2026-11-27): a name field + favicon + buttons, Chrome-sized.
+pub const BOOKMARK_DIALOG_WIDTH: f32 = 360.0;
+
+/// The floating menu overlay's top offset (follow-up UI work,
+/// 2026-11-27): how far below the window top the popup hangs, so
+/// it clears the hamburger button it drops from. The nav bar is
+/// ~48px + a divider; horizontal mode adds the ~40px tab strip
+/// above it. Approximate by design — the panel has its own
+/// background and shadow, so a few px either way is cosmetic —
+/// but it must stay below the nav bar, never over the button.
+pub const MENU_OVERLAY_TOP_VERTICAL: f32 = 56.0;
+pub const MENU_OVERLAY_TOP_HORIZONTAL: f32 = 96.0;
+
+/// The menu overlay's top offset for the current orientation:
+/// the tab strip's height is only above the nav bar in
+/// horizontal mode.
+pub fn menu_overlay_top_offset(vertical_tabs: bool) -> f32 {
+    if vertical_tabs {
+        MENU_OVERLAY_TOP_VERTICAL
+    } else {
+        MENU_OVERLAY_TOP_HORIZONTAL
+    }
+}
 
 /// A collapsed vertical tab chip: a 32px square showing only the
 /// favicon (UI round, 2026-11-27).
@@ -1333,6 +1602,45 @@ pub fn placement_label(placement: TabPlacement) -> &'static str {
 
 /// The bookmarks bar's entries, in store order: (title, url).
 /// The bar reads the store, never a hardcoded list.
+/// The initial letter for a URL: the host's first character
+/// ("example.com" → 'E'), else the title's first character,
+/// else '?'.
+fn initial_letter(url: &str, title: &str) -> char {
+    let host = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or(url);
+    host.chars()
+        .next()
+        .or_else(|| title.chars().next())
+        .unwrap_or('?')
+        .to_ascii_uppercase()
+}
+
+/// Open the OS file chooser for a custom favicon image
+/// (follow-up UI work, 2026-11-27): `rfd`'s async dialog
+/// (portal on Linux), filtered to image files. `None` is a
+/// cancel; `Some(Err(..))` is a file that would not decode
+/// (wrong format, corrupt, or absurdly large — the decode
+/// limits reject it before pixels are allocated).
+async fn pick_favicon_file() -> Option<Result<(Vec<u8>, pluto_paint::DecodedImage), String>> {
+    let picked = rfd::AsyncFileDialog::new()
+        .add_filter(
+            "Images",
+            &["png", "jpg", "jpeg", "gif", "webp", "ico", "svg", "bmp"],
+        )
+        .pick_file()
+        .await?;
+    let bytes = picked.read().await;
+    match pluto_paint::decode_image(&bytes) {
+        Ok(decoded) => Some(Ok((bytes, decoded))),
+        Err(e) => Some(Err(e.to_string())),
+    }
+}
+
 pub fn bookmarks_bar_entries(store: &BookmarkStore) -> Vec<(String, String)> {
     store
         .bookmarks()
@@ -1759,6 +2067,30 @@ impl Application for PlutoBrowser {
         let broker = Arc::new(crate::broker::NetworkBroker::new(broker_loader));
         let history = load_history();
         let history_index = history.len().saturating_sub(1);
+        // Follow-up UI work (2026-11-27): decode each stored
+        // custom favicon once, at startup. A file that no longer
+        // decodes (removed by hand, corrupt) is skipped with a
+        // log line — the bookmark itself survives, it just shows
+        // no custom icon.
+        let bookmarks = load_bookmarks();
+        let mut bookmark_favicons = std::collections::HashMap::new();
+        for bookmark in bookmarks.bookmarks() {
+            if bookmark.favicon.is_some() {
+                match load_bookmark_favicon(&bookmark.url)
+                    .and_then(|bytes| pluto_paint::decode_image(&bytes).ok())
+                {
+                    Some(decoded) => {
+                        bookmark_favicons.insert(bookmark.url.clone(), decoded);
+                    }
+                    None => {
+                        eprintln!(
+                            "[pluto] custom favicon for {} unreadable; showing none",
+                            bookmark.url
+                        );
+                    }
+                }
+            }
+        }
         let mut first_tab = Tab::new(0, url.clone());
         // Persisted history stores URLs only (Stage 10 Rec 8) —
         // restored entries have no state and no scroll.
@@ -1775,7 +2107,9 @@ impl Application for PlutoBrowser {
             // — libcosmic reads the system theme; the workers get
             // it on `RendererReady` and on every change after.
             dark_theme: cosmic::theme::is_dark(),
-            bookmarks: load_bookmarks(),
+            bookmarks,
+            bookmark_favicons,
+            bookmark_dialog: None,
             menu_open: false,
             panel: None,
             vertical_tabs: DEFAULT_VERTICAL_TABS,
@@ -2699,15 +3033,113 @@ impl Application for PlutoBrowser {
                 }
             }
             Message::ToggleBookmark => {
-                // The star toggles a bookmark for the current
-                // page and persists it at once (the profile
-                // pattern: save on every mutation). The bookmark
-                // title is the URL for now — real page titles
-                // from `TitleChanged` are a small follow-up.
+                // Follow-up UI work (2026-11-27): the star opens
+                // the bookmark dialog instead of toggling. The
+                // name prefills with the page title (the URL
+                // until the first TitleChanged arrives); a page
+                // that is already bookmarked opens prefilled for
+                // editing, with a Remove button in the dialog.
                 let url = self.active().active_url.clone();
                 if !url.is_empty() {
-                    self.bookmarks.toggle(&url, &url);
-                    save_bookmarks(&self.bookmarks);
+                    let title = self.active().title.clone();
+                    let existing = self
+                        .bookmarks
+                        .bookmarks()
+                        .iter()
+                        .find(|b| b.url == url);
+                    self.bookmark_dialog =
+                        Some(BookmarkDialog::new(&url, &title, existing));
+                    self.menu_open = false;
+                    self.panel = None;
+                }
+            }
+            Message::BookmarkDialogNameChanged(name) => {
+                if let Some(dialog) = self.bookmark_dialog.as_mut() {
+                    dialog.name = name;
+                }
+            }
+            Message::BookmarkDialogPickFavicon => {
+                // The chooser runs as an iced task: the OS dialog
+                // is async (portal on Linux), and the decode
+                // happens in the task, off the UI thread.
+                return Task::perform(
+                    async {
+                        Message::BookmarkDialogFaviconPicked(pick_favicon_file().await)
+                    },
+                    cosmic::Action::App,
+                );
+            }
+            Message::BookmarkDialogFaviconPicked(picked) => {
+                let Some(dialog) = self.bookmark_dialog.as_mut() else {
+                    return Task::none();
+                };
+                match picked {
+                    // Cancelled: leave the dialog exactly as it
+                    // was (keep any earlier pick and error).
+                    None => {}
+                    Some(Ok((bytes, decoded))) => {
+                        dialog.custom_favicon = Some((decoded, bytes));
+                        dialog.error = None;
+                    }
+                    Some(Err(reason)) => {
+                        dialog.error = Some(format!(
+                            "Couldn't use that image ({reason}) — try a PNG, JPEG, GIF, WebP, ICO or SVG file."
+                        ));
+                    }
+                }
+            }
+            Message::BookmarkDialogSave => {
+                let Some(dialog) = self.bookmark_dialog.take() else {
+                    return Task::none();
+                };
+                // An empty name falls back to the URL — a
+                // bookmark always has something to show.
+                let title = if dialog.name.trim().is_empty() {
+                    dialog.url.clone()
+                } else {
+                    dialog.name.clone()
+                };
+                // A fresh pick replaces the stored favicon; no
+                // pick keeps the bookmark's existing one
+                // (editing) or none (new). A failed favicon
+                // write logs and keeps the bookmark — the title
+                // still saves.
+                let mut favicon = self
+                    .bookmarks
+                    .bookmarks()
+                    .iter()
+                    .find(|b| b.url == dialog.url)
+                    .and_then(|b| b.favicon.clone());
+                let mut decoded = None;
+                if let Some((picked, bytes)) = dialog.custom_favicon {
+                    match save_bookmark_favicon(&dialog.url, &bytes) {
+                        Ok(name) => {
+                            favicon = Some(name);
+                            decoded = Some(picked);
+                        }
+                        Err(e) => {
+                            eprintln!("[pluto] could not save custom favicon: {e}");
+                        }
+                    }
+                }
+                if dialog.editing {
+                    self.bookmarks.set_title(&dialog.url, &title);
+                    self.bookmarks.set_favicon(&dialog.url, favicon);
+                } else {
+                    self.bookmarks
+                        .add_with_favicon(&dialog.url, &title, favicon);
+                }
+                if let Some(decoded) = decoded {
+                    self.bookmark_favicons.insert(dialog.url.clone(), decoded);
+                }
+                save_bookmarks(&self.bookmarks);
+            }
+            Message::BookmarkDialogCancel => {
+                self.bookmark_dialog = None;
+            }
+            Message::BookmarkDialogRemove => {
+                if let Some(dialog) = self.bookmark_dialog.take() {
+                    self.remove_bookmark(&dialog.url);
                 }
             }
             Message::ToggleMenu => {
@@ -2794,9 +3226,7 @@ impl Application for PlutoBrowser {
                 }
             }
             Message::RemoveBookmark(url) => {
-                if self.bookmarks.remove(&url) {
-                    save_bookmarks(&self.bookmarks);
-                }
+                self.remove_bookmark(&url);
             }
             Message::NewWindow => {
                 self.menu_open = false;
@@ -2914,13 +3344,7 @@ impl Application for PlutoBrowser {
         }
         children.push(nav_bar.into());
         children.push(widget::divider::horizontal::default().into());
-        if self.menu_open {
-            children.push(self.menu_panel());
-            children.push(widget::divider::horizontal::default().into());
-        }
-        if let Some(bar) = self.bookmarks_bar() {
-            children.push(bar);
-        }
+        children.push(self.bookmarks_bar());
         // Stage 11 Rec 9: the thin progress bar under the nav
         // bar, while a document load is in flight. Indeterminate
         // (no Content-Length) shows as a half bar, not a
@@ -2948,7 +3372,21 @@ impl Application for PlutoBrowser {
         }
         children.push(widget::divider::horizontal::default().into());
         children.push(status.into());
-        widget::column(children).into()
+        // The shell column is the base layer; the menu and the
+        // bookmark dialog ride on top of it as overlay layers
+        // (follow-up UI work, 2026-11-27) — opening either moves
+        // nothing around it, because a stack layer never affects
+        // the base layer's layout: the column lays out identically
+        // with the layers present or absent.
+        let base = widget::column(children);
+        let mut layers: Vec<Element<'_, Message>> = vec![base.into()];
+        if self.menu_open {
+            layers.push(self.menu_overlay());
+        }
+        if let Some(dialog) = &self.bookmark_dialog {
+            layers.push(self.bookmark_dialog_overlay(dialog));
+        }
+        cosmic::iced::widget::stack(layers).into()
     }
 }
 
@@ -3321,5 +3759,234 @@ mod tests {
                 ("B".to_string(), "https://b.example/".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn bookmark_dialog_prefill_new_and_editing() {
+        let url = "https://example.com/";
+        let fresh = BookmarkDialog::new(url, "Example Domain", None);
+        assert_eq!(fresh.name, "Example Domain");
+        assert!(!fresh.editing);
+        assert!(fresh.custom_favicon.is_none());
+        assert!(fresh.error.is_none());
+        let stored = Bookmark {
+            url: url.to_string(),
+            title: "My Name".to_string(),
+            favicon: None,
+        };
+        let editing = BookmarkDialog::new(url, "Example Domain", Some(&stored));
+        assert_eq!(editing.name, "My Name");
+        assert!(editing.editing);
+    }
+
+    #[test]
+    fn initial_letter_uses_host_then_title() {
+        assert_eq!(initial_letter("https://example.com/page", ""), 'E');
+        assert_eq!(initial_letter("http://sub.example.org/", ""), 'S');
+        assert_eq!(initial_letter("", "Hello"), 'H');
+        assert_eq!(initial_letter("", ""), '?');
+        assert_eq!(initial_letter("about:blank", ""), 'A');
+    }
+
+    #[test]
+    fn menu_overlay_top_offset_clears_the_nav_bar() {
+        assert_eq!(
+            menu_overlay_top_offset(true),
+            MENU_OVERLAY_TOP_VERTICAL
+        );
+        assert_eq!(
+            menu_overlay_top_offset(false),
+            MENU_OVERLAY_TOP_HORIZONTAL
+        );
+        // Both clear the ~48px nav bar (+ divider); horizontal
+        // adds the ~40px tab strip above it.
+        assert_eq!(MENU_OVERLAY_TOP_VERTICAL, 56.0);
+        assert_eq!(MENU_OVERLAY_TOP_HORIZONTAL, 96.0);
+    }
+
+    /// A temp HOME guard, mirroring the one in `bookmarks::tests`:
+    /// profile reads/writes in these tests land in a throwaway
+    /// dir, never in the real profile.
+    struct DialogTestHome {
+        old: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn with_test_home(tag: &str) -> (std::path::PathBuf, DialogTestHome) {
+        let dir = std::env::temp_dir().join(format!("pluto-dialog-test-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = crate::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let old = std::env::var_os("HOME");
+        // SAFETY: HOME is only read by the persistence helpers,
+        // which run on this thread while the lock is held.
+        unsafe {
+            std::env::set_var("HOME", &dir);
+        }
+        (dir, DialogTestHome { old, _lock: lock })
+    }
+
+    fn restore_test_home(home: DialogTestHome) {
+        unsafe {
+            match home.old {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// A fresh shell under a temp HOME (no real profile, no real
+    /// bookmarks) for the dialog state-machine tests, on a known
+    /// page so the dialog prefills from the tab title.
+    fn test_shell(tag: &str) -> (std::path::PathBuf, DialogTestHome, PlutoBrowser) {
+        let (dir, guard) = with_test_home(tag);
+        let (mut app, _) = PlutoBrowser::init(Core::default(), false);
+        app.active_mut().title = "Example Domain".to_string();
+        (dir, guard, app)
+    }
+
+    #[test]
+    fn star_opens_dialog_prefilled_for_new_page() {
+        let (dir, home, mut app) = test_shell("star-new");
+        let _ = app.update(Message::ToggleBookmark);
+        let dialog = app
+            .bookmark_dialog
+            .as_ref()
+            .expect("star opens the dialog");
+        assert_eq!(dialog.url, app.active().active_url);
+        assert_eq!(dialog.name, "Example Domain");
+        assert!(!dialog.editing);
+        assert!(!app.menu_open);
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn dialog_save_adds_bookmark_and_cancel_leaves_store_untouched() {
+        let (dir, home, mut app) = test_shell("save-cancel");
+        let url = app.active().active_url.clone();
+        // Save path: rename in the dialog, then save.
+        let _ = app.update(Message::ToggleBookmark);
+        let _ = app.update(Message::BookmarkDialogNameChanged(
+            "My Example".to_string(),
+        ));
+        let _ = app.update(Message::BookmarkDialogSave);
+        assert!(app.bookmark_dialog.is_none());
+        assert!(app.bookmarks.is_bookmarked(&url));
+        assert_eq!(app.bookmarks.bookmarks()[0].title, "My Example");
+        // Cancel path: the page is bookmarked now, so the dialog
+        // opens in editing mode prefilled with the stored title;
+        // renaming then cancelling keeps the stored title.
+        let _ = app.update(Message::ToggleBookmark);
+        assert!(app.bookmark_dialog.as_ref().unwrap().editing);
+        assert_eq!(
+            app.bookmark_dialog.as_ref().unwrap().name,
+            "My Example"
+        );
+        let _ = app.update(Message::BookmarkDialogNameChanged(
+            "Renamed".to_string(),
+        ));
+        let _ = app.update(Message::BookmarkDialogCancel);
+        assert!(app.bookmark_dialog.is_none());
+        assert_eq!(app.bookmarks.bookmarks()[0].title, "My Example");
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn dialog_remove_deletes_bookmark() {
+        let (dir, home, mut app) = test_shell("remove");
+        let url = app.active().active_url.clone();
+        let _ = app.update(Message::ToggleBookmark);
+        let _ = app.update(Message::BookmarkDialogSave);
+        assert!(app.bookmarks.is_bookmarked(&url));
+        let _ = app.update(Message::ToggleBookmark);
+        assert!(app.bookmark_dialog.as_ref().unwrap().editing);
+        let _ = app.update(Message::BookmarkDialogRemove);
+        assert!(app.bookmark_dialog.is_none());
+        assert!(!app.bookmarks.is_bookmarked(&url));
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn dialog_custom_favicon_pick_is_saved_and_cached() {
+        let (dir, home, mut app) = test_shell("favicon-pick");
+        let url = app.active().active_url.clone();
+        let bytes = vec![1u8, 2, 3, 4];
+        let decoded = pluto_paint::DecodedImage {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 0, 0, 255],
+        };
+        let _ = app.update(Message::ToggleBookmark);
+        let _ = app.update(Message::BookmarkDialogFaviconPicked(Some(Ok((
+            bytes.clone(),
+            decoded.clone(),
+        )))));
+        assert!(app
+            .bookmark_dialog
+            .as_ref()
+            .unwrap()
+            .custom_favicon
+            .is_some());
+        let _ = app.update(Message::BookmarkDialogSave);
+        let bookmark = &app.bookmarks.bookmarks()[0];
+        assert!(bookmark.favicon.is_some());
+        assert_eq!(app.bookmark_favicons.get(&url), Some(&decoded));
+        // The bytes round-trip through the profile file.
+        assert_eq!(load_bookmark_favicon(&url).as_deref(), Some(&bytes[..]));
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn dialog_favicon_pick_failure_shows_error_and_keeps_dialog() {
+        let (dir, home, mut app) = test_shell("favicon-error");
+        let _ = app.update(Message::ToggleBookmark);
+        let _ = app.update(Message::BookmarkDialogFaviconPicked(Some(Err(
+            "image decode failed: unsupported format".to_string(),
+        ))));
+        let dialog = app.bookmark_dialog.as_ref().expect("dialog stays open");
+        assert!(dialog.error.is_some());
+        assert!(dialog.custom_favicon.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn bookmarks_bar_builds_with_an_empty_store() {
+        let (dir, home, app) = test_shell("bar-empty");
+        // The bar is always present now (an Element, not an
+        // Option): building it with no bookmarks must not panic.
+        // The return type is the guarantee — there is no None
+        // branch left to take.
+        let _ = app.bookmarks_bar();
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn menu_overlay_leaves_shell_geometry_untouched() {
+        let (dir, home, mut app) = test_shell("menu-geometry");
+        let viewport_before = app.viewport;
+        let tabs_before = app.tabs.len();
+        let vertical_before = app.vertical_tabs;
+        // The whole shell renders with the menu closed (base
+        // layer only)...
+        let _ = app.view();
+        let _ = app.update(Message::ToggleMenu);
+        assert!(app.menu_open);
+        // ...and with it open (base layer + overlay layer): the
+        // overlay never feeds back into the base layout, so the
+        // geometry inputs are unchanged.
+        assert_eq!(app.viewport, viewport_before);
+        assert_eq!(app.tabs.len(), tabs_before);
+        assert_eq!(app.vertical_tabs, vertical_before);
+        let _ = app.view();
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
     }
 }
