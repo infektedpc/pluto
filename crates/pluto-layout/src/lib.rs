@@ -119,11 +119,13 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use taffy::{
-    AvailableSpace, BoxSizing, Dimension, Display, FlexDirection, FlexWrap, GridAutoFlow,
-    GridTemplateComponent, LayoutInput, LayoutOutput, LengthPercentage, LengthPercentageAuto,
-    Line, MaxTrackSizingFunction, MinTrackSizingFunction, NodeId as TaffyId, Overflow,
-    Position, Size, Style, TaffyError, TaffyTree, TrackSizingFunction,
+    AlignContent, AlignItems, AvailableSpace, BoxSizing, Dimension, Display, FlexDirection,
+    FlexWrap, GridAutoFlow, GridTemplateComponent, JustifyContent, LayoutInput, LayoutOutput,
+    LengthPercentage, LengthPercentageAuto, Line, MaxTrackSizingFunction, MinTrackSizingFunction,
+    NodeId as TaffyId, Overflow, Position, Size, Style, TaffyError, TaffyTree,
+    TrackSizingFunction,
 };
+use taffy::prelude::{AlignContentKeyword, AlignItemsKeyword};
 use taffy::GridPlacement;
 use taffy::prelude::{line as grid_line, span as grid_span};
 
@@ -445,6 +447,20 @@ pub struct ComputedStyle {
     pub flex_grow: f32,
     pub flex_shrink: f32,
     pub flex_basis: Option<Dim>,
+    /// `justify-content` (initial `normal`): main-axis packing of
+    /// a flex/grid container's items. Stored, not dropped, so
+    /// `justify-content: flex-end` puts google.com's Sign in
+    /// button at the right of the header instead of the left.
+    pub justify_content: JustifyContent,
+    /// `align-items` (initial `normal`): cross-axis alignment of
+    /// a flex/grid container's items.
+    pub align_items: AlignItems,
+    /// `justify-items` (initial `normal`): inline-axis alignment
+    /// of a grid container's items.
+    pub justify_items: AlignItems,
+    /// `align-content` (initial `normal`): cross-axis packing of
+    /// a flex/grid container's lines.
+    pub align_content: AlignContent,
     pub grid_template_columns: Vec<GridTrack>,
     pub grid_template_rows: Vec<GridTrack>,
     pub grid_gap: (Dim, Dim), // (row, column)
@@ -546,6 +562,10 @@ impl ComputedStyle {
             flex_grow: 0.0,
             flex_shrink: 1.0,
             flex_basis: None,
+            justify_content: JustifyContent::NORMAL,
+            align_items: AlignItems::NORMAL,
+            justify_items: AlignItems::NORMAL,
+            align_content: AlignContent::NORMAL,
             grid_template_columns: Vec::new(),
             grid_template_rows: Vec::new(),
             grid_gap: (Dim::Px(0.0), Dim::Px(0.0)),
@@ -790,6 +810,60 @@ impl ComputedStyle {
             if let Some((n, v)) = opt_dim("flex-basis", self.flex_basis) {
                 add(&n, v);
             }
+        }
+        if self.display == DisplayKind::Flex || self.display == DisplayKind::Grid {
+            let jc = match self.justify_content.keyword() {
+                AlignContentKeyword::Normal => "normal",
+                AlignContentKeyword::Start => "start",
+                AlignContentKeyword::End => "end",
+                AlignContentKeyword::FlexStart => "flex-start",
+                AlignContentKeyword::FlexEnd => "flex-end",
+                AlignContentKeyword::Center => "center",
+                AlignContentKeyword::SpaceBetween => "space-between",
+                AlignContentKeyword::SpaceAround => "space-around",
+                AlignContentKeyword::SpaceEvenly => "space-evenly",
+                AlignContentKeyword::Stretch => "stretch",
+            };
+            add("justify-content", jc.to_string());
+            let ai = match self.align_items.keyword() {
+                AlignItemsKeyword::Normal => "normal",
+                AlignItemsKeyword::Start => "start",
+                AlignItemsKeyword::End => "end",
+                AlignItemsKeyword::FlexStart => "flex-start",
+                AlignItemsKeyword::FlexEnd => "flex-end",
+                AlignItemsKeyword::SelfStart => "self-start",
+                AlignItemsKeyword::SelfEnd => "self-end",
+                AlignItemsKeyword::Center => "center",
+                AlignItemsKeyword::Baseline => "baseline",
+                AlignItemsKeyword::Stretch => "stretch",
+            };
+            add("align-items", ai.to_string());
+            let ji = match self.justify_items.keyword() {
+                AlignItemsKeyword::Normal => "normal",
+                AlignItemsKeyword::Start => "start",
+                AlignItemsKeyword::End => "end",
+                AlignItemsKeyword::FlexStart => "flex-start",
+                AlignItemsKeyword::FlexEnd => "flex-end",
+                AlignItemsKeyword::SelfStart => "self-start",
+                AlignItemsKeyword::SelfEnd => "self-end",
+                AlignItemsKeyword::Center => "center",
+                AlignItemsKeyword::Baseline => "baseline",
+                AlignItemsKeyword::Stretch => "stretch",
+            };
+            add("justify-items", ji.to_string());
+            let ac = match self.align_content.keyword() {
+                AlignContentKeyword::Normal => "normal",
+                AlignContentKeyword::Start => "start",
+                AlignContentKeyword::End => "end",
+                AlignContentKeyword::FlexStart => "flex-start",
+                AlignContentKeyword::FlexEnd => "flex-end",
+                AlignContentKeyword::Center => "center",
+                AlignContentKeyword::SpaceBetween => "space-between",
+                AlignContentKeyword::SpaceAround => "space-around",
+                AlignContentKeyword::SpaceEvenly => "space-evenly",
+                AlignContentKeyword::Stretch => "stretch",
+            };
+            add("align-content", ac.to_string());
         }
         if self.display == DisplayKind::Grid {
             let tracks = |ts: &[GridTrack]| {
@@ -2830,8 +2904,17 @@ impl<'a, 't> Builder<'a, 't> {
             return self.build_atomic(id, &style);
         }
         let style = self.style_for(id, parent_style);
+        // `display: none` builds nothing. `inline` / `inline-block`
+        // build a full node here: this arm is only reached for a
+        // block-level child (via `build_children`'s catch-all) or
+        // for the `build_atomic` fallback, when an inline(-block)
+        // element holds block content — and the fallback's whole
+        // point is to build the full node instead of dropping the
+        // subtree. Returning `None` here used to discard e.g.
+        // google.com's entire header (`.AorTac` is inline-block
+        // around a block child), Sign in button included.
         match style.display {
-            DisplayKind::None | DisplayKind::Inline | DisplayKind::InlineBlock => None,
+            DisplayKind::None => None,
             _ => {
                 let children = self.build_children(id, &style);
                 let taffy_style = to_taffy_style(&style, self.viewport);
@@ -2913,7 +2996,93 @@ impl<'a, 't> Builder<'a, 't> {
             }
         }
         self.flush_spans(&mut spans, parent_style, &mut out);
+        // Anonymous line boxes: consecutive atomic inline-level
+        // leaves (img, input, inline-block) are grouped into a
+        // flex-row wrapper so they size to their content and honor
+        // the parent's `text-align`. Only block containers wrap —
+        // a flex/grid parent's children must stay direct items.
+        if matches!(
+            parent_style.display,
+            DisplayKind::Block | DisplayKind::FlowRoot
+        ) {
+            self.wrap_inline_runs(&mut out, parent_style);
+        }
         out
+    }
+
+    /// Group consecutive atomic inline-level leaves in `out` into
+    /// anonymous flex-row wrapper nodes (CSS line boxes). A block
+    /// container's inline-level children are laid out by taffy as
+    /// block boxes — full width, left-aligned — so `text-align:
+    /// center` never moves them (the alignment is only applied to
+    /// glyphs at paint time) and a button's width never shrinks to
+    /// its label. Wrapping a maximal run in an anonymous flex row
+    /// (justify-content from the parent's `text-align`) gives each
+    /// atomic its intrinsic width and the run its line alignment:
+    /// google.com's logo `<img>` centers and its two submit buttons
+    /// sit side by side at label width. Text leaves (dom `None`)
+    /// break a run; positioned elements are never wrapped.
+    fn wrap_inline_runs(&mut self, out: &mut Vec<TaffyId>, parent_style: &ComputedStyle) {
+        let justify = match parent_style.text_align {
+            TextAlign::Center => JustifyContent::CENTER,
+            TextAlign::Right => JustifyContent::FLEX_END,
+            _ => JustifyContent::FLEX_START,
+        };
+        let is_atomic = |meta: &HashMap<TaffyId, BoxMeta>, node: TaffyId| -> bool {
+            meta.get(&node).is_some_and(|m| {
+                m.dom.is_some()
+                    && matches!(
+                        m.style.display,
+                        DisplayKind::Inline | DisplayKind::InlineBlock
+                    )
+                    && !matches!(
+                        m.style.position,
+                        PositionKind::Absolute | PositionKind::Fixed
+                    )
+            })
+        };
+        let mut wrapped: Vec<TaffyId> = Vec::with_capacity(out.len());
+        let mut i = 0;
+        while i < out.len() {
+            let node = out[i];
+            if !is_atomic(self.meta, node) {
+                wrapped.push(node);
+                i += 1;
+                continue;
+            }
+            let mut run = vec![node];
+            i += 1;
+            while i < out.len() && is_atomic(self.meta, out[i]) {
+                run.push(out[i]);
+                i += 1;
+            }
+            // A single atomic leaf gets the same treatment: as a
+            // flex item it sizes to its content instead of filling
+            // the parent's width (the 680px submit button).
+            let style = Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                justify_content: justify,
+                align_items: AlignItems::FLEX_START,
+                ..Default::default()
+            };
+            let wrapper = self
+                .taffy
+                .new_with_children(style, &run)
+                .expect("new wrapper node");
+            self.meta.insert(
+                wrapper,
+                BoxMeta {
+                    dom: None,
+                    style: ComputedStyle::initial(),
+                    text: None,
+                    svg_canvas: None,
+                    children: run,
+                },
+            );
+            wrapped.push(wrapper);
+        }
+        *out = wrapped;
     }
 
     /// Recursively collect an inline element's text into `spans`. A
@@ -3496,8 +3665,17 @@ impl<'a, 't> Builder<'a, 't> {
         if tag == "input" {
             let ty = self.dom.input_type(id);
             match ty.as_str() {
-                "checkbox" | "radio" | "hidden" | "submit" | "button" | "reset"
-                | "image" | "file" => {}
+                "checkbox" | "radio" | "hidden" | "image" | "file" => {}
+                // A submit / button / reset input's label IS its
+                // `value` attribute — without this leaf the button
+                // has no text at all (and no intrinsic width, so it
+                // stretches to fill its block parent instead of
+                // sizing to its label, as google.com's "Google
+                // Search" / "I'm Feeling Lucky" buttons did).
+                "submit" | "button" | "reset" => {
+                    let text = self.dom.attr(id, "value").unwrap_or_default();
+                    return Some(self.control_text_leaf(id, style, text));
+                }
                 "password" => {
                     let len = self.dom.form_value(id).map(|v| v.chars().count()).unwrap_or(0);
                     let masked = "\u{2022}".repeat(len);
@@ -3895,17 +4073,28 @@ fn measure_text(ctx: Option<&mut NodeContext>, input: LayoutInput) -> LayoutOutp
         };
     };
     let known_w = input.known_dimensions.width;
+    let known_h = input.known_dimensions.height;
+    // A definite style height wins over the text height: taffy
+    // passes it as a known dimension (the flex algorithm's
+    // definite cross size, a block parent's definite height), and
+    // the measured height must not override it — otherwise a
+    // `height: 36px` submit button renders at one text line
+    // (19px) instead of 36px, as google.com's buttons did.
     let (width, height) = match known_w {
-        Some(w) => (w, wrap_height(shaped, w)),
+        Some(w) => (w, known_h.unwrap_or_else(|| wrap_height(shaped, w))),
         None => match input.available_space.width {
-            AvailableSpace::Definite(w) => (w, wrap_height(shaped, w)),
+            AvailableSpace::Definite(w) => {
+                (w, known_h.unwrap_or_else(|| wrap_height(shaped, w)))
+            }
             AvailableSpace::MinContent => (
                 shaped.min_content,
-                wrap_height(shaped, shaped.min_content.max(1.0)),
+                known_h.unwrap_or_else(|| wrap_height(shaped, shaped.min_content.max(1.0))),
             ),
             AvailableSpace::MaxContent => (
                 shaped.max_content,
-                shaped.segments.len() as f32 * shaped.line_height,
+                known_h.unwrap_or_else(|| {
+                    shaped.segments.len() as f32 * shaped.line_height
+                }),
             ),
         },
     };
@@ -3933,7 +4122,14 @@ fn wrap_height(shaped: &ShapedText, width: f32) -> f32 {
             } else {
                 shaped.space_width + word.advance
             };
-            if i > 0 && line_w + add > width && line_w > 0.0 {
+            // A line that exactly fills the width fits: the word
+            // advances are summed here in a different order than
+            // the shaper summed them, so an exact fit can read a
+            // hair over the width in float arithmetic and wrap a
+            // one-line label ("Google Search") onto two lines. A
+            // half-pixel tolerance absorbs that error; a genuine
+            // wrap overflows by far more than half a pixel.
+            if i > 0 && line_w + add > width + 0.5 && line_w > 0.0 {
                 line_count += 1;
                 line_w = word.advance;
             } else {
@@ -5829,17 +6025,13 @@ fn apply_decl(
             }
         }
         "line-height" => match value {
-            // NOTE: the CSS parser keeps bare numbers as
-            // `Length` (it cannot tell `1.6` from `1.6px`), so a
-            // small `Length` here is read as a multiplier — the
-            // `font: 16px/1.6` form depends on it. A `Length`
-            // >= 10 is read as px. Documented heuristic.
+            // Bare numbers arrive as `Raw` (only `0` is a
+            // `Length`) and are multipliers; a `Length` is a
+            // genuine px value, not a multiplier — the old
+            // `< 10` heuristic existed only because the parser
+            // conflated `1.6` with `1.6px`.
             Value::Length(v) => {
-                style.line_height = if *v > 0.0 && *v < 10.0 {
-                    v * style.font_size
-                } else {
-                    *v
-                }
+                style.line_height = *v;
             }
             Value::Percentage(p) => style.line_height = style.font_size * p / 100.0,
             Value::Em(v) => style.line_height = style.font_size * v,
@@ -6185,6 +6377,178 @@ fn apply_decl(
                 _ => dim_value(value, style.font_size, root_font_size, viewport),
             }
         }
+        "flex" => {
+            // CSS `flex` shorthand: `none | [ <flex-grow>
+            // <flex-shrink>? || <flex-basis> ]`. A single number is
+            // grow (shrink 1, basis 0%); a single width is basis
+            // (grow 1, shrink 1). This arm did not exist before, so
+            // every `flex: 1` / `flex: 100%` in the wild was silently
+            // dropped — google.com's search box collapses to zero
+            // width without it (its `.a4bIc` is `flex: 1` and the
+            // textarea is `flex: 100%`).
+            let tokens: Vec<Value> = match value {
+                Value::Raw(raw) => raw.split_whitespace().map(parse_value).collect(),
+                v => vec![v.clone()],
+            };
+            let mut done = false;
+            if tokens.len() == 1
+                && let Value::Keyword(k) = &tokens[0]
+            {
+                match k.as_str() {
+                    "none" => {
+                        style.flex_grow = 0.0;
+                        style.flex_shrink = 0.0;
+                        style.flex_basis = None;
+                        done = true;
+                    }
+                    "auto" => {
+                        style.flex_grow = 1.0;
+                        style.flex_shrink = 1.0;
+                        style.flex_basis = None;
+                        done = true;
+                    }
+                    "initial" => {
+                        style.flex_grow = 0.0;
+                        style.flex_shrink = 1.0;
+                        style.flex_basis = None;
+                        done = true;
+                    }
+                    _ => {}
+                }
+            }
+            if !done {
+                // Classify each token: a bare number is grow/shrink;
+                // a width (length / % / calc / `auto`) is basis. A
+                // bare `0` arrives as `Length(0.0)` — it is a number
+                // here (`flex: 0` means grow 0), while a non-zero
+                // length is a width (`flex: 200px` means basis).
+                enum FlexToken {
+                    Number(f32),
+                    Basis(Option<Dim>),
+                }
+                let classify = |t: &Value| -> Option<FlexToken> {
+                    match t {
+                        Value::Length(v) if *v == 0.0 => Some(FlexToken::Number(0.0)),
+                        Value::Length(v) => Some(FlexToken::Basis(Some(Dim::Px(*v)))),
+                        Value::Raw(raw) => {
+                            raw.trim().parse::<f32>().ok().map(FlexToken::Number)
+                        }
+                        Value::Keyword(k) if k == "auto" => Some(FlexToken::Basis(None)),
+                        _ => dim_value(t, style.font_size, root_font_size, viewport)
+                            .map(|d| FlexToken::Basis(Some(d))),
+                    }
+                };
+                let mut grow: Option<f32> = None;
+                let mut shrink: Option<f32> = None;
+                let mut basis: Option<Option<Dim>> = None;
+                let mut valid = !tokens.is_empty() && tokens.len() <= 3;
+                for t in &tokens {
+                    match classify(t) {
+                        Some(FlexToken::Number(n)) => {
+                            if grow.is_none() {
+                                grow = Some(n);
+                            } else if shrink.is_none() {
+                                shrink = Some(n);
+                            } else {
+                                valid = false;
+                            }
+                        }
+                        Some(FlexToken::Basis(b)) => {
+                            if basis.is_none() {
+                                basis = Some(b);
+                            } else {
+                                valid = false;
+                            }
+                        }
+                        None => valid = false,
+                    }
+                }
+                if valid {
+                    let single_number =
+                        tokens.len() == 1 && grow.is_some() && basis.is_none();
+                    let single_width =
+                        tokens.len() == 1 && basis.is_some() && grow.is_none();
+                    style.flex_grow = grow.unwrap_or(if single_width { 1.0 } else { 0.0 });
+                    style.flex_shrink = shrink.unwrap_or(1.0);
+                    style.flex_basis = match basis {
+                        Some(b) => b,
+                        // A number alone, or grow+shrink, means basis
+                        // 0%; a lone width already set `basis`.
+                        None => {
+                            if single_number || tokens.len() > 1 {
+                                Some(Dim::Px(0.0))
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                }
+            }
+        }
+        "justify-content" => {
+            if let Value::Keyword(k) = value {
+                style.justify_content = match k.as_str() {
+                    "normal" => JustifyContent::NORMAL,
+                    "start" | "left" => JustifyContent::START,
+                    "end" | "right" => JustifyContent::END,
+                    "flex-start" => JustifyContent::FLEX_START,
+                    "flex-end" => JustifyContent::FLEX_END,
+                    "center" => JustifyContent::CENTER,
+                    "space-between" => JustifyContent::SPACE_BETWEEN,
+                    "space-around" => JustifyContent::SPACE_AROUND,
+                    "space-evenly" => JustifyContent::SPACE_EVENLY,
+                    "stretch" => JustifyContent::STRETCH,
+                    _ => style.justify_content,
+                };
+            }
+        }
+        "align-items" => {
+            if let Value::Keyword(k) = value {
+                style.align_items = match k.as_str() {
+                    "normal" => AlignItems::NORMAL,
+                    "start" | "self-start" => AlignItems::START,
+                    "end" | "self-end" => AlignItems::END,
+                    "flex-start" => AlignItems::FLEX_START,
+                    "flex-end" => AlignItems::FLEX_END,
+                    "center" => AlignItems::CENTER,
+                    "baseline" => AlignItems::BASELINE,
+                    "stretch" => AlignItems::STRETCH,
+                    _ => style.align_items,
+                };
+            }
+        }
+        "justify-items" => {
+            if let Value::Keyword(k) = value {
+                style.justify_items = match k.as_str() {
+                    "normal" => AlignItems::NORMAL,
+                    "start" | "self-start" => AlignItems::START,
+                    "end" | "self-end" => AlignItems::END,
+                    "flex-start" => AlignItems::FLEX_START,
+                    "flex-end" => AlignItems::FLEX_END,
+                    "center" => AlignItems::CENTER,
+                    "baseline" => AlignItems::BASELINE,
+                    "stretch" => AlignItems::STRETCH,
+                    _ => style.justify_items,
+                };
+            }
+        }
+        "align-content" => {
+            if let Value::Keyword(k) = value {
+                style.align_content = match k.as_str() {
+                    "normal" => AlignContent::NORMAL,
+                    "start" | "left" => AlignContent::START,
+                    "end" | "right" => AlignContent::END,
+                    "flex-start" => AlignContent::FLEX_START,
+                    "flex-end" => AlignContent::FLEX_END,
+                    "center" => AlignContent::CENTER,
+                    "space-between" => AlignContent::SPACE_BETWEEN,
+                    "space-around" => AlignContent::SPACE_AROUND,
+                    "space-evenly" => AlignContent::SPACE_EVENLY,
+                    "stretch" => AlignContent::STRETCH,
+                    _ => style.align_content,
+                };
+            }
+        }
         "grid-template-columns" => {
             if let Value::Raw(raw) = value {
                 style.grid_template_columns = parse_track_list(raw, style.font_size, root_font_size, viewport);
@@ -6277,19 +6641,29 @@ fn apply_decl(
         // `CompositingOnly` classifier are later phases — these
         // fields are deliberately NOT in
         // `layout_properties_changed`).
-        "z-index" => match value {
-            Value::Keyword(k) if k == "auto" => style.z_index = None,
-            // Bare numbers arrive as `Length` (the parser cannot
-            // tell `2` from `2px`); only integral ones are valid
-            // `z-index` values.
-            Value::Length(n) if n.fract() == 0.0 => style.z_index = Some(*n as i32),
-            _ => {}
-        },
-        "opacity" => match value {
-            Value::Length(n) => style.opacity = n.clamp(0.0, 1.0),
-            Value::Percentage(p) => style.opacity = (p / 100.0).clamp(0.0, 1.0),
-            _ => {}
-        },
+        "z-index" => {
+            if let Value::Keyword(k) = value {
+                if k == "auto" {
+                    style.z_index = None;
+                }
+            } else if let Some(n) = number_value(value) {
+                // Bare numbers arrive as `Raw` (only `0` is a
+                // `Length`); only integral ones are valid
+                // `z-index` values.
+                if n.fract() == 0.0 {
+                    style.z_index = Some(n as i32);
+                }
+            }
+        }
+        "opacity" => {
+            if let Value::Percentage(p) = value {
+                style.opacity = (p / 100.0).clamp(0.0, 1.0);
+            } else if let Some(n) = number_value(value) {
+                // Bare numbers arrive as `Raw` (only `0` is a
+                // `Length`).
+                style.opacity = n.clamp(0.0, 1.0);
+            }
+        }
         "transform" => match value {
             Value::Transform(list) => style.transform = list.clone(),
             Value::Keyword(k) if k == "none" => style.transform = Vec::new(),
@@ -6540,9 +6914,11 @@ fn apply_decl(
         // Deliberately unmodelled in M2 (stored nowhere, never an
         // error): float/clear (no float layout yet), border widths
         // (no border painting yet), text-decoration, list-style-type,
-        // visibility, justify-content/align-*,
-        // cursor, content. They are ignored
+        // visibility, cursor, content. They are ignored
         // here; adding them is data, not a rewrite.
+        // (`justify-content` / `align-items` / `justify-items` /
+        // `align-content` used to sit in this list; they are stored
+        // and mapped to taffy now — see the arms above.)
         _ => {}
     }
 }
@@ -7130,6 +7506,13 @@ fn to_taffy_style(style: &ComputedStyle, viewport: (f32, f32)) -> Style {
     if let Some(basis) = style.flex_basis {
         s.flex_basis = dim(basis);
     }
+    // Flex/grid alignment: taffy implements these natively — Pluto
+    // only maps the properties. `normal` is taffy's default, so a
+    // container without them lays out exactly as before.
+    s.justify_content = style.justify_content;
+    s.align_items = style.align_items;
+    s.justify_items = style.justify_items;
+    s.align_content = style.align_content;
     // Grid (R12): taffy implements the grid algorithm — Pluto only
     // maps the properties.
     let track = |t: GridTrack| {
@@ -10397,5 +10780,176 @@ mod tests {
         // no space and broke nothing).
         let p = box_for(&tree, &dom, "p");
         assert!(p.height > 0.0);
+    }
+
+    /// Build a laid-out tree from an HTML fragment + author CSS
+    /// (google.com regression tests below).
+    fn google_tree(html: &str, css: &str) -> (Dom, LayoutTree) {
+        let dom = parse_html(html);
+        let sheet = Stylesheet::parse(css);
+        let tree = LayoutTree::build(&dom, &sheet, 1920.0, 1080.0, Theme::Light)
+            .expect("layout builds");
+        (dom, tree)
+    }
+
+    fn box_of_class<'a>(tree: &'a LayoutTree, dom: &Dom, class: &str) -> &'a LayoutBox {
+        tree.boxes
+            .iter()
+            .find(|b| {
+                b.dom.is_some_and(|id| {
+                    dom.attr(id, "class")
+                        .is_some_and(|c| c.split_whitespace().any(|w| w == class))
+                })
+            })
+            .unwrap_or_else(|| panic!("no box for .{class}"))
+    }
+
+    /// google.com (2026-11-28): the `flex` shorthand was silently
+    /// dropped — `flex: 1` and `flex: 100%` left grow 0 / basis
+    /// none, so the search box's flex chain collapsed to zero
+    /// width. Every form of the shorthand now resolves.
+    #[test]
+    fn flex_shorthand_forms() {
+        let html = r#"<div class="a"></div><div class="b"></div><div class="c"></div><div class="d"></div><div class="e"></div><div class="f"></div><div class="g"></div><div class="h"></div>"#;
+        let css = ".a { flex: 1; } .b { flex: 100%; } .c { flex: 1 0 auto; } \
+             .d { flex: auto; } .e { flex: none; } .f { flex: 0 0 200px; } \
+             .g { flex: 2; } .h { flex: 200px; }";
+        let dom = parse_html(html);
+        let sheet = Stylesheet::parse(css);
+        let ua = Stylesheet::ua();
+        let styles = resolve_document_styles(
+            &dom,
+            &ua,
+            &sheet,
+            false,
+            (1920.0, 1080.0),
+            &ElementState::default(),
+            Theme::Light,
+        )
+        .0;
+        // The style map is keyed by DomId, so find the ids by
+        // class in the same document.
+        let by_class = |class: &str| -> Arc<ComputedStyle> {
+            let mut stack = vec![dom.root().unwrap()];
+            while let Some(n) = stack.pop() {
+                if dom.attr(n, "class") == Some(class) {
+                    return styles.get(&n).expect("style retained").clone();
+                }
+                for &c in dom.children(n).iter().rev() {
+                    stack.push(c);
+                }
+            }
+            panic!("no .{class} in DOM")
+        };
+        let a = by_class("a");
+        assert_eq!((a.flex_grow, a.flex_shrink, a.flex_basis), (1.0, 1.0, Some(Dim::Px(0.0))));
+        let b = by_class("b");
+        assert_eq!((b.flex_grow, b.flex_shrink, b.flex_basis), (1.0, 1.0, Some(Dim::Pct(1.0))));
+        let c = by_class("c");
+        assert_eq!((c.flex_grow, c.flex_shrink, c.flex_basis), (1.0, 0.0, None));
+        let d = by_class("d");
+        assert_eq!((d.flex_grow, d.flex_shrink, d.flex_basis), (1.0, 1.0, None));
+        let e = by_class("e");
+        assert_eq!((e.flex_grow, e.flex_shrink, e.flex_basis), (0.0, 0.0, None));
+        let f = by_class("f");
+        assert_eq!((f.flex_grow, f.flex_shrink, f.flex_basis), (0.0, 0.0, Some(Dim::Px(200.0))));
+        let g = by_class("g");
+        assert_eq!((g.flex_grow, g.flex_shrink, g.flex_basis), (2.0, 1.0, Some(Dim::Px(0.0))));
+        let h = by_class("h");
+        assert_eq!((h.flex_grow, h.flex_shrink, h.flex_basis), (1.0, 1.0, Some(Dim::Px(200.0))));
+    }
+
+    /// google.com: the search box's flex chain (`.RNNXgb` >
+    /// `.SDkEP` > `.a4bIc` > `textarea.gLFyf`, with `flex: 1` /
+    /// `flex: 100%` at two levels) must give the textarea a
+    /// non-zero box — before the fix it measured 0 wide.
+    #[test]
+    fn google_search_box_flex_chain_has_nonzero_size() {
+        let (dom, tree) = google_tree(
+            r#"<div class="RNNXgb"><div class="SDkEP"><div class="a4bIc"><textarea class="gLFyf"></textarea></div></div></div>"#,
+            ".RNNXgb { display: flex; min-height: 50px; width: 688px; margin: 0 auto; } \
+             .SDkEP { flex: 1; display: flex; } \
+             .a4bIc { display: flex; flex-wrap: wrap; flex: 1; } \
+             .gLFyf { width: 100%; flex: 100%; display: flex; }",
+        );
+        let area = box_of_class(&tree, &dom, "gLFyf");
+        assert!(area.width > 100.0, "textarea width {}", area.width);
+        assert!(area.height >= 50.0, "textarea height {}", area.height);
+        let box_el = box_of_class(&tree, &dom, "RNNXgb");
+        assert_eq!(box_el.width, 688.0);
+        // `margin: 0 auto` centers the 688px box in 1920.
+        assert_eq!(box_el.x, (1920.0 - 688.0) / 2.0);
+    }
+
+    /// google.com: `justify-content: flex-end` on the header puts
+    /// Sign in at the right; `text-align: center` on the logo
+    /// container centers the `<img>`; the header's inline-block
+    /// wrapper (block content inside it) must not drop the
+    /// subtree.
+    #[test]
+    fn google_header_and_logo_center() {
+        let (dom, tree) = google_tree(
+            r#"<div class="wrap"><div class="ib"><header><div class="spacer"></div><a class="signin">Sign in</a></header></div></div>
+               <div class="logo"><img class="logo-img" src="x.png"></div>"#,
+            ".wrap { display: flex; justify-content: flex-end; width: 100%; } \
+             .ib { display: inline-block; } \
+             header { display: flex; justify-content: flex-end; width: 100%; } \
+             .spacer { width: 100px; height: 40px; } \
+             .signin { display: inline-block; min-width: 85px; height: 40px; } \
+             .logo { text-align: center; } \
+             .logo-img { width: 500px; height: 200px; }",
+        );
+        let signin = box_of_class(&tree, &dom, "signin");
+        assert!(signin.x > 1500.0, "Sign in x {}", signin.x);
+        let logo = box_of_class(&tree, &dom, "logo-img");
+        assert_eq!(logo.x, (1920.0 - 500.0) / 2.0, "logo x {}", logo.x);
+        assert_eq!(logo.width, 500.0);
+    }
+
+    /// google.com: the two submit buttons in `<center>` render
+    /// side by side at their `height: 36px`, with their `value`
+    /// as the label — before the fix they had no text, stretched
+    /// to full width, and stacked vertically.
+    #[test]
+    fn google_submit_buttons_side_by_side() {
+        let (dom, tree) = google_tree(
+            r#"<div class="btns"><center><input type="submit" value="Google Search"><input type="submit" value="I'm Feeling Lucky"></center></div>"#,
+            ".btns { width: 688px; margin: 0 auto; } \
+             .btns input[type=\"submit\"] { height: 36px; min-width: 54px; margin: 11px 4px; padding: 0 16px; font-size: 14px; }",
+        );
+        let boxes: Vec<&LayoutBox> = tree
+            .boxes
+            .iter()
+            .filter(|b| b.dom.is_some_and(|id| dom.tag(id) == Some("input")))
+            .collect();
+        assert_eq!(boxes.len(), 2);
+        let (first, second) = (boxes[0], boxes[1]);
+        assert_eq!(first.y, second.y, "buttons on the same line");
+        assert!(first.x < second.x, "search left of lucky");
+        assert!(first.width > 50.0 && first.width < 200.0, "search w {}", first.width);
+        assert!(second.width > 50.0 && second.width < 200.0, "lucky w {}", second.width);
+        assert_eq!(first.height, 36.0, "search h {}", first.height);
+        assert_eq!(second.height, 36.0, "lucky h {}", second.height);
+        for b in boxes {
+            let text = b.text.as_ref().map(|t| t.spans.iter().map(|s| s.text.clone()).collect::<String>());
+            assert!(text.as_deref().is_some_and(|t| !t.is_empty()), "button has a label");
+        }
+    }
+
+    /// The `wrap_height` float-boundary case: a two-word label
+    /// whose text exactly fills its max-content width must stay
+    /// on one line (before the fix it wrapped to two).
+    #[test]
+    fn exact_fit_label_stays_on_one_line() {
+        let (dom, tree) = google_tree(
+            r#"<div class="row"><input type="submit" value="Google Search"></div>"#,
+            ".row { display: flex; } input[type=\"submit\"] { font-size: 14px; }",
+        );
+        let btn = tree
+            .boxes
+            .iter()
+            .find(|b| b.dom.is_some_and(|id| dom.tag(id) == Some("input")))
+            .expect("button box");
+        assert!(btn.height < 30.0, "one line, got h {}", btn.height);
     }
 }

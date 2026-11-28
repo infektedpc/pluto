@@ -92,6 +92,18 @@ impl AnimatedValue {
             (AnimatedValue::Length(a), AnimatedValue::Length(b)) => {
                 Some(AnimatedValue::Length(a + (b - a) * t))
             }
+            // A bare `0` parses as a `Length` while any other bare
+            // number parses as a `Number`, so a unitless property's
+            // keyframes can straddle the two kinds (`opacity: 0`
+            // → Length(0), `opacity: 1` → Number(1)). They
+            // interpolate as plain numbers; the `Length` side is
+            // necessarily a bare zero in any valid mixed pair.
+            (AnimatedValue::Number(a), AnimatedValue::Length(b)) => {
+                Some(AnimatedValue::Number(a + (b - a) * t))
+            }
+            (AnimatedValue::Length(a), AnimatedValue::Number(b)) => {
+                Some(AnimatedValue::Number(a + (b - a) * t))
+            }
             (
                 AnimatedValue::Colour(ar, ag, ab, aa),
                 AnimatedValue::Colour(br, bg, bb, ba),

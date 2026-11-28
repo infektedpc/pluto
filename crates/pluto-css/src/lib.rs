@@ -2989,7 +2989,7 @@ input { padding: 1px; }
 input, select, textarea { border: 1px solid; background: #ffffff; color: #000000; }
 input { min-width: 150px; }
 textarea { white-space: pre; }
-input[type="checkbox"], input[type="radio"] { min-width: 0; }
+input[type="checkbox"], input[type="radio"], input[type="submit"], input[type="button"], input[type="reset"] { min-width: 0; }
 img { display: inline; }
 /* Stage 15 (M7 Phase 1, Rec 2): `<svg>` and `<canvas>` are replaced
    elements — atomic leaves sized by their intrinsic dimensions, never
@@ -3006,6 +3006,11 @@ svg, canvas { display: inline-block; }
    re-open the fallback-text leak. `<audio>` takes no space
    (no controls UI in M8), but it is still an atomic leaf. */
 video, audio { display: inline-block; }
+/* The `<center>` element is a block that centers its inline
+   content (HTML spec): without this rule it falls back to
+   `display: inline`, so google.com's submit buttons — wrapped in
+   `<center>` — never center and never shrink to their labels. */
+center { display: block; text-align: center; }
 "#;
 
 // ---- top-level parsing ----
@@ -4533,7 +4538,12 @@ fn expand_font_shorthand(raw: &str, important: bool) -> Option<Vec<Declaration>>
         Value::Keyword(k) if FONT_SIZE_KEYWORDS.contains(&k.as_str()) => Value::Keyword(k),
         _ => return None,
     };
-    if matches!(line_height.as_ref(), Some(Value::Raw(_))) {
+    // A unitless line-height (`font: 12px/1.5 ...`) arrives as
+    // `Raw` — accept it when it parses as a number; anything else
+    // in that slot is not a line-height.
+    if let Some(Value::Raw(raw)) = line_height.as_ref()
+        && raw.trim().parse::<f32>().is_err()
+    {
         return None;
     }
     if i >= tokens.len() {
@@ -4723,7 +4733,19 @@ pub fn parse_value(raw: &str) -> Value {
         return Value::Angle(v * 180.0 / std::f32::consts::PI);
     }
     if let Ok(v) = s.parse::<f32>() {
-        return Value::Length(v); // bare number: unitless zero, e.g. `margin: 0`
+        // A bare number is either a unitless zero (`margin: 0`,
+        // the only bare number that is a length) or a plain number
+        // (`flex-grow: 2`, `opacity: 0.5`, `line-height: 1.5`).
+        // Only zero becomes a `Length`; any other bare number
+        // stays `Raw`, so a consumer that needs a number
+        // (`number_value`) reads it and a consumer that needs a
+        // length (`dim_value`) drops it — and, critically, `flex:
+        // 1` (a grow number) is never confused with `flex: 1px`
+        // (a basis width) the way the old code conflated them.
+        if v == 0.0 {
+            return Value::Length(0.0);
+        }
+        return Value::Raw(s.to_string());
     }
     if let Some(hex) = lower.strip_prefix('#')
         && let Some((r, g, b, a)) = parse_hex_color(hex)
@@ -6886,7 +6908,9 @@ mod tests {
             Some(&Value::Keyword("bold".into()))
         );
         assert_eq!(decl(rule, "font-size"), Some(&Value::Length(12.0)));
-        assert_eq!(decl(rule, "line-height"), Some(&Value::Length(1.5)));
+        // A unitless line-height is a bare number, which parses
+        // as `Raw` (only `0` is a `Length`).
+        assert_eq!(decl(rule, "line-height"), Some(&Value::Raw("1.5".into())));
         assert_eq!(decl(rule, "font-family"), Some(&Value::Raw("sans-serif".into())));
         assert!(decl(rule, "font").is_none());
 

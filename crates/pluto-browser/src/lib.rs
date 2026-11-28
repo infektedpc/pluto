@@ -45,7 +45,7 @@ use compositor::Compositor;
 use cosmic::app::{Core, Task};
 use cosmic::iced::{Alignment, Length};
 use cosmic::{Application, Element, executor, widget};
-use pluto_ipc::{BrowserToRenderer, CommandSender, InputEvent, RendererToBrowser};
+use pluto_ipc::{BrowserToRenderer, CommandSender, Destination, InputEvent, RendererToBrowser};
 use pluto_paint::{DisplayList, Resource, ResourceId, ResourceTable, perf};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -399,9 +399,10 @@ impl SettingsDialog {
     }
 }
 
-/// Which DevTools view is showing (Stage 18, M9 stage 3): the
-/// Elements inspector or the Console (stages 1–2). The console
-/// renders exactly as before.
+/// Which DevTools view is showing (Stage 18, M9 stage 3; the
+/// Network tab joins in Stage 20, M9 stage 5): the Elements
+/// inspector, the Console (stages 1–2), or the network
+/// waterfall. The console renders exactly as before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DevToolsView {
     /// The Elements inspector (the default view).
@@ -409,6 +410,8 @@ pub enum DevToolsView {
     Elements,
     /// The console + REPL (stages 1–2).
     Console,
+    /// The network waterfall (Stage 20, M9 stage 5).
+    Network,
 }
 
 /// The DevTools console panel's draft state (Stage 17, M9
@@ -426,6 +429,13 @@ struct DevToolsPanel {
     /// on the web view is intercepted for a hit-test pick
     /// instead of being forwarded to the page.
     pick_mode: bool,
+    /// The Network tab's selected row (Stage 20, M9 stage 5):
+    /// (tab id, request id) — the detail below the list shows
+    /// that request. The tab id rides along because request
+    /// ids are only unique per tab; a switch to another tab
+    /// hides the detail instead of showing the wrong tab's
+    /// row. `None` means no row selected.
+    network_selected: Option<(u64, u64)>,
 }
 
 /// Which bookmarks-bar context menu is open, if any
@@ -585,6 +595,10 @@ pub enum Message {
     Back,
     Forward,
     Reload,
+    /// The Home button: navigate to the configured homepage
+    /// (the same one Settings stores, used at startup / New Tab
+    /// / empty address bar).
+    Home,
     /// The bookmark star: open the bookmark dialog for the
     /// current page (follow-up UI work, 2026-11-27 — the star no
     /// longer toggles immediately; the dialog names the bookmark
@@ -716,6 +730,10 @@ pub enum Message {
     /// override for the selected node and re-ask for the
     /// node's details.
     DevToolsStyleOverrideRemove(String),
+    /// The Network tab's row click (Stage 20, M9 stage 5):
+    /// select the request (its detail shows below the list);
+    /// clicking the selected row again deselects it.
+    DevToolsNetworkSelect(u64),
     /// The settings dialog's Close button: close the dialog.
     /// Everything in it already applied and persisted when it
     /// changed, except an invalid homepage draft, which is
@@ -2232,6 +2250,13 @@ impl PlutoBrowser {
                 ))
                 .on_press(Message::DevToolsView(DevToolsView::Console))
                 .into(),
+            widget::button::text("Network")
+                .class(small_button_style(
+                    SmallButtonBase::Text,
+                    panel.view == DevToolsView::Network,
+                ))
+                .on_press(Message::DevToolsView(DevToolsView::Network))
+                .into(),
             cosmic::iced::widget::space().width(Length::Fill).into(),
             widget::button::text("Close")
                 .class(small_button_style(SmallButtonBase::Text, false))
@@ -2242,6 +2267,7 @@ impl PlutoBrowser {
         let body: Element<'_, Message> = match panel.view {
             DevToolsView::Console => self.devtools_console_view(panel),
             DevToolsView::Elements => self.devtools_elements_view(panel),
+            DevToolsView::Network => self.devtools_network_view(panel),
         };
         let children: Vec<Element<'_, Message>> =
             vec![header.into(), body];
@@ -2312,6 +2338,216 @@ impl PlutoBrowser {
         ])
         .spacing(8)
         .into()
+    }
+
+    /// The DevTools Network tab (Stage 20, M9 stage 5): the
+    /// ACTIVE tab's network waterfall, read from the broker's
+    /// per-tab log — method, status, truncated URL, bytes,
+    /// total, and a timing bar (waiting → body) per row.
+    /// Clicking a row selects it and shows its detail below
+    /// (full URL, timing breakdown, sanitised headers). Page
+    /// output is untrusted plain text, as in the console: URLs
+    /// and header values render as text, never markup. The list
+    /// clears on navigation (the clear rides the tab's Document
+    /// ask) and caps at 200 rows (oldest evicted) — both
+    /// interim choices, Joel's calls.
+    fn devtools_network_view<'a>(
+        &'a self,
+        panel: &'a DevToolsPanel,
+    ) -> Element<'a, Message> {
+        let tab_id = self.active().id;
+        let records = self.broker.network_records(tab_id);
+        let mut row_elements: Vec<Element<'_, Message>> = Vec::new();
+        if records.is_empty() {
+            row_elements.push(
+                widget::text(
+                    "No network requests yet — load a page and its requests will appear here.",
+                )
+                .size(12)
+                .into(),
+            );
+        }
+        // The bar scale: earliest start to latest end across
+        // the rows shown (in-flight rows end "now"). The span
+        // is floored at 1 ms so a single just-started row still
+        // draws a bar instead of dividing by zero.
+        let earliest = records.iter().map(|r| r.started).min();
+        let latest = records.iter().map(|r| r.started + r.total()).max();
+        let span_ms = match (earliest, latest) {
+            (Some(first), Some(last)) => {
+                (last.duration_since(first).as_secs_f64() * 1000.0).max(1.0)
+            }
+            _ => 1.0,
+        };
+        let earliest = earliest.unwrap_or_else(std::time::Instant::now);
+        for record in &records {
+            let status = match &record.outcome {
+                crate::broker::NetworkOutcome::Done => record
+                    .status
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "—".to_string()),
+                crate::broker::NetworkOutcome::InFlight => "…".to_string(),
+                crate::broker::NetworkOutcome::Error { .. } => "ERR".to_string(),
+                crate::broker::NetworkOutcome::Cancelled { .. } => "—".to_string(),
+            };
+            let summary = format!(
+                "{:<6} {:>4}  {}  ·  {}  ·  {}",
+                record.method,
+                status,
+                ellipsize(&record.url, 44),
+                fmt_bytes(record.bytes_received),
+                fmt_ms(record.total()),
+            );
+            let selected = panel.network_selected == Some((tab_id, record.request_id));
+            let row_button = widget::button::text(summary)
+                .class(small_button_style(SmallButtonBase::Text, selected))
+                .on_press(Message::DevToolsNetworkSelect(record.request_id));
+            // The timing bar: waiting (start → TTFB, solid
+            // accent) then body (TTFB → end, accent at 45%).
+            // A request with no headers yet is all waiting.
+            let offset_ms = record.started.duration_since(earliest).as_secs_f64() * 1000.0;
+            let total_ms = record.total().as_secs_f64() * 1000.0;
+            let (wait_ms, body_ms) = match record.ttfb {
+                Some(ttfb) => (
+                    ttfb.as_secs_f64() * 1000.0,
+                    total_ms - ttfb.as_secs_f64() * 1000.0,
+                ),
+                None => (total_ms, 0.0),
+            };
+            let offset_w = (offset_ms / span_ms * NETWORK_BAR_WIDTH as f64) as f32;
+            let wait_w = ((wait_ms / span_ms * NETWORK_BAR_WIDTH as f64) as f32).max(2.0);
+            let body_w = if body_ms > 0.0 {
+                ((body_ms / span_ms * NETWORK_BAR_WIDTH as f64) as f32).max(2.0)
+            } else {
+                0.0
+            };
+            let bar = widget::row([
+                cosmic::iced::widget::space()
+                    .width(Length::Fixed(offset_w))
+                    .into(),
+                widget::container(cosmic::iced::widget::space())
+                    .width(Length::Fixed(wait_w))
+                    .height(Length::Fixed(8.0))
+                    .style(waterfall_wait_style)
+                    .into(),
+                widget::container(cosmic::iced::widget::space())
+                    .width(Length::Fixed(body_w))
+                    .height(Length::Fixed(8.0))
+                    .style(waterfall_body_style)
+                    .into(),
+            ])
+            .height(Length::Fixed(8.0));
+            row_elements.push(
+                widget::column(vec![row_button.into(), bar.into()])
+                    .spacing(2)
+                    .into(),
+            );
+        }
+        let list = cosmic::iced::widget::scrollable(
+            widget::column(row_elements).spacing(4).width(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fixed(DEVTOOLS_NETWORK_LIST_HEIGHT))
+        .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+            Default::default(),
+        ));
+        let mut children: Vec<Element<'_, Message>> = vec![list.into()];
+        // The selected row's detail (Stage 20): full URL,
+        // timing breakdown, sanitised headers. The selection
+        // holds (tab, request) — a switch to another tab hides
+        // the detail instead of showing the wrong tab's row,
+        // and a selection whose row was evicted or cleared
+        // falls back to the hint.
+        let selected_record = panel.network_selected.and_then(|(t, id)| {
+            if t == tab_id {
+                records.iter().find(|r| r.request_id == id)
+            } else {
+                None
+            }
+        });
+        if let Some(record) = selected_record {
+            let mut detail: Vec<Element<'_, Message>> = Vec::new();
+            detail.push(widget::text(record.url.clone()).size(12).into());
+            let mut meta = format!(
+                "{} · {}",
+                record.method,
+                destination_label(record.destination)
+            );
+            if let Some(final_url) = &record.final_url
+                && final_url != &record.url
+            {
+                meta.push_str(&format!(" · final: {final_url}"));
+            }
+            detail.push(widget::text(meta).size(12).into());
+            let status_line = match &record.outcome {
+                crate::broker::NetworkOutcome::Done => format!(
+                    "Status {} · {} received{}",
+                    record
+                        .status
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "—".into()),
+                    fmt_bytes(record.bytes_received),
+                    record
+                        .content_length
+                        .map(|total| format!(" of {}", fmt_bytes(total)))
+                        .unwrap_or_default(),
+                ),
+                crate::broker::NetworkOutcome::InFlight => format!(
+                    "In flight · {} received so far",
+                    fmt_bytes(record.bytes_received)
+                ),
+                crate::broker::NetworkOutcome::Error { code, reason } => {
+                    format!("Failed: {code}: {reason}")
+                }
+                crate::broker::NetworkOutcome::Cancelled { reason } => {
+                    format!("Cancelled: {reason}")
+                }
+            };
+            detail.push(widget::text(status_line).size(12).into());
+            let timing = match record.ttfb {
+                Some(ttfb) => format!(
+                    "Waiting (start → headers): {} · Body: {} · Total: {}",
+                    fmt_ms(ttfb),
+                    fmt_ms(record.total().saturating_sub(ttfb)),
+                    fmt_ms(record.total()),
+                ),
+                None => format!(
+                    "No headers received yet · Elapsed: {}",
+                    fmt_ms(record.total())
+                ),
+            };
+            detail.push(widget::text(timing).size(12).into());
+            detail.push(widget::text("Request headers:").size(12).into());
+            if record.request_headers.is_empty() {
+                detail.push(widget::text("  (none)").size(12).into());
+            }
+            for (name, value) in &record.request_headers {
+                detail.push(widget::text(format!("  {name}: {value}")).size(12).into());
+            }
+            detail.push(widget::text("Response headers:").size(12).into());
+            if record.response_headers.is_empty() {
+                detail.push(widget::text("  (none)").size(12).into());
+            }
+            for (name, value) in &record.response_headers {
+                detail.push(widget::text(format!("  {name}: {value}")).size(12).into());
+            }
+            let detail_scroll = cosmic::iced::widget::scrollable(
+                widget::column(detail).spacing(2).width(Length::Fill),
+            )
+            .width(Length::Fill)
+            .height(Length::Fixed(DEVTOOLS_NETWORK_DETAIL_HEIGHT))
+            .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+                Default::default(),
+            ));
+            children.push(detail_scroll.into());
+        } else {
+            children.push(
+                widget::text("Click a row to see its headers and timing.")
+                    .size(12)
+                    .into(),
+            );
+        }
+        widget::column(children).spacing(8).into()
     }
 
     /// The DevTools Elements tab (Stage 18, M9 stage 3): the
@@ -2710,6 +2946,14 @@ pub const DEVTOOLS_PANEL_WIDTH: f32 = 640.0;
 /// stages 1–2): a fixed scrollable area, so the panel stays a
 /// floating dialog instead of growing with a chatty page.
 pub const DEVTOOLS_PANEL_LOG_HEIGHT: f32 = 320.0;
+/// The Network tab's request-list height (Stage 20, M9 stage 5).
+pub const DEVTOOLS_NETWORK_LIST_HEIGHT: f32 = 240.0;
+/// The Network tab's selected-row detail height (Stage 20).
+pub const DEVTOOLS_NETWORK_DETAIL_HEIGHT: f32 = 160.0;
+/// The waterfall bar's full-scale width in px (Stage 20): every
+/// row's bar is drawn against the same earliest-start →
+/// latest-end span, so rows line up.
+pub const NETWORK_BAR_WIDTH: f32 = 540.0;
 
 /// The per-tab console-line cap (Stage 17, M9 stages 1–2):
 /// the shell keeps the last 1,000 `(level, message)` lines per
@@ -3034,6 +3278,70 @@ fn ellipsize(s: &str, max_chars: usize) -> String {
         let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
         out.push('…');
         out
+    }
+}
+
+/// Format a byte count for a network row (Stage 20, M9 stage 5).
+fn fmt_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// Format a duration for a network row (Stage 20, M9 stage 5):
+/// whole ms under a second, two-decimal seconds above.
+fn fmt_ms(d: std::time::Duration) -> String {
+    let ms = d.as_secs_f64() * 1000.0;
+    if ms < 1.0 {
+        "<1 ms".to_string()
+    } else if ms < 1000.0 {
+        format!("{ms:.0} ms")
+    } else {
+        format!("{:.2} s", ms / 1000.0)
+    }
+}
+
+/// The destination label for a network row / detail (Stage 20,
+/// M9 stage 5).
+fn destination_label(d: Destination) -> &'static str {
+    match d {
+        Destination::Document => "Document",
+        Destination::Stylesheet => "Stylesheet",
+        Destination::Script => "Script",
+        Destination::Image => "Image",
+        Destination::Font => "Font",
+        Destination::Fetch => "Fetch",
+        Destination::Audio => "Audio",
+        Destination::Video => "Video",
+        Destination::WebSocket => "WebSocket",
+        Destination::Stream => "Stream",
+        Destination::Other => "Other",
+    }
+}
+
+/// A waterfall bar's waiting segment (Stage 20, M9 stage 5):
+/// a solid accent block, 8px tall, no radius — start → TTFB.
+fn waterfall_wait_style(theme: &cosmic::Theme) -> cosmic::iced::widget::container::Style {
+    use cosmic::iced::core::{Background, Color};
+    cosmic::iced::widget::container::Style {
+        background: Some(Background::Color(Color::from(theme.cosmic().accent_color()))),
+        ..Default::default()
+    }
+}
+
+/// A waterfall bar's body segment (Stage 20, M9 stage 5): the
+/// same accent at 45% alpha — TTFB → end. One bar, two phases.
+fn waterfall_body_style(theme: &cosmic::Theme) -> cosmic::iced::widget::container::Style {
+    use cosmic::iced::core::{Background, Color};
+    let mut color = Color::from(theme.cosmic().accent_color());
+    color.a = 0.45;
+    cosmic::iced::widget::container::Style {
+        background: Some(Background::Color(color)),
+        ..Default::default()
     }
 }
 
@@ -3839,6 +4147,14 @@ impl Application for PlutoBrowser {
                 tab.crashed = false;
                 let url = tab.active_url.clone();
                 self.commit(url);
+            }
+            Message::Home => {
+                // The Home button goes to the configured homepage
+                // — the same one Settings stores (startup / New
+                // Tab / empty address bar), not the address bar's
+                // current text.
+                let homepage = self.homepage.clone();
+                self.commit(homepage);
             }
             Message::NewTab => {
                 self.menu_open = false;
@@ -5528,6 +5844,22 @@ impl Application for PlutoBrowser {
                     BrowserToRenderer::DevToolsInspectNode { node, epoch },
                 );
             }
+            Message::DevToolsNetworkSelect(id) => {
+                // Stage 20 (M9 stage 5): toggle the Network
+                // tab's selected row — the detail below the list
+                // shows that request. The selection holds (tab,
+                // request): re-clicking the same row deselects
+                // it.
+                let tab_id = self.active().id;
+                if let Some(panel) = self.devtools_panel.as_mut() {
+                    let selected = Some((tab_id, id));
+                    panel.network_selected = if panel.network_selected == selected {
+                        None
+                    } else {
+                        selected
+                    };
+                }
+            }
             Message::DevToolsInputChanged(draft) => {
                 if let Some(panel) = self.devtools_panel.as_mut() {
                     panel.repl_input = draft;
@@ -5624,9 +5956,17 @@ impl Application for PlutoBrowser {
             )))
         };
         // The bookmark star (filled when the current page is
-        // bookmarked) and the hamburger menu, both right after
-        // Go. Round icon buttons like the other nav icons; Go
-        // stays a text button.
+        // bookmarked) and the hamburger menu, both after the
+        // address bar. Nav row order: Back, Forward, Reload,
+        // Home, address bar (Go lives inside it, at its right
+        // end, as a trailing icon button), star, hamburger.
+        // Go is an icon button in the theme icon color like the
+        // other nav icons — never a cyan text button — and Home
+        // is a round icon button like Back/Forward/Reload.
+        let go = widget::button::icon(bundled_icon(include_bytes!(
+            "../assets/icons/go-symbolic.svg"
+        )))
+        .on_press(Message::Navigate);
         let nav_bar = widget::row([
             widget::button::icon(bundled_icon(include_bytes!(
                 "../assets/icons/go-previous-symbolic.svg"
@@ -5643,15 +5983,17 @@ impl Application for PlutoBrowser {
             )))
             .on_press(Message::Reload)
             .into(),
+            widget::button::icon(bundled_icon(include_bytes!(
+                "../assets/icons/go-home-symbolic.svg"
+            )))
+            .on_press(Message::Home)
+            .into(),
             widget::text_input("Enter URL...", &active.url_input)
                 .on_input(Message::UrlChanged)
                 .on_submit(|_| Message::Navigate)
                 .style(small_text_input_style())
+                .trailing_icon(go.into())
                 .width(Length::Fill)
-                .into(),
-            widget::button::suggested("Go")
-                .class(small_button_style(SmallButtonBase::Suggested, false))
-                .on_press(Message::Navigate)
                 .into(),
             star.on_press(Message::ToggleBookmark).into(),
             widget::button::icon(bundled_icon(include_bytes!(
@@ -7232,6 +7574,28 @@ mod tests {
         app.active_mut().url_input = "   ".to_string();
         let _ = app.update(Message::Navigate);
         assert_eq!(app.active().active_url, "https://example.org");
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn home_button_navigates_to_configured_homepage() {
+        let (dir, home, mut app) = test_shell("home-button");
+        // Set the homepage through the settings dialog, like the
+        // real flow, then navigate away from it.
+        let _ = app.update(Message::ShowSettings);
+        let _ = app.update(Message::SettingsHomepageChanged(
+            "example.org".to_string(),
+        ));
+        assert_eq!(app.homepage, "https://example.org");
+        app.active_mut().url_input = "example.com".to_string();
+        let _ = app.update(Message::Navigate);
+        assert_eq!(app.active().active_url, "https://example.com");
+        // Home goes back to the configured homepage — and the
+        // address bar follows it (commit sets url_input).
+        let _ = app.update(Message::Home);
+        assert_eq!(app.active().active_url, "https://example.org");
+        assert_eq!(app.active().url_input, "https://example.org");
         let _ = std::fs::remove_dir_all(&dir);
         restore_test_home(home);
     }
