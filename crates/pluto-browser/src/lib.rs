@@ -911,33 +911,50 @@ impl PlutoBrowser {
     /// favicon when it has one. Always visible, even with no
     /// bookmarks yet — then it shows a hint instead of a dead
     /// empty bar (follow-up UI work, 2026-11-27).
+    /// The bookmarks bar, like the mockup (UI round, 2026-11-27):
+    /// a flat 30px strip with the theme's component background,
+    /// 8px side padding, 4px gaps, 12px chip text, and a 16px
+    /// favicon when one is set — the bottom divider in `view`
+    /// is the strip's lower edge.
     fn bookmarks_bar(&self) -> Element<'_, Message> {
         let entries = bookmarks_bar_entries(&self.bookmarks);
-        if entries.is_empty() {
-            return widget::row([
+        let inner: Element<'_, Message> = if entries.is_empty() {
+            widget::row([
                 widget::text("No bookmarks yet — use the star to save this page.")
                     .size(12)
                     .into(),
             ])
             .spacing(4)
-            .padding(4)
-            .into();
-        }
-        let mut children: Vec<Element<'_, Message>> = Vec::new();
-        for (title, url) in entries {
-            let mut row_children: Vec<Element<'_, Message>> = Vec::new();
-            if let Some(image) = self.bookmark_favicons.get(&url) {
-                row_children.push(Self::decoded_image_element(image.clone(), 16.0));
+            .into()
+        } else {
+            let mut children: Vec<Element<'_, Message>> = Vec::new();
+            for (title, url) in entries {
+                let mut row_children: Vec<Element<'_, Message>> = Vec::new();
+                if let Some(image) = self.bookmark_favicons.get(&url) {
+                    row_children.push(Self::decoded_image_element(image.clone(), 16.0));
+                }
+                row_children.push(widget::text(ellipsize(&title, 24)).size(12).into());
+                children.push(
+                    widget::button::custom(widget::row(row_children).spacing(4))
+                        .class(small_button_style(SmallButtonBase::Text, false))
+                        .on_press(Message::NavigateTo(url))
+                        .into(),
+                );
             }
-            row_children.push(widget::text(ellipsize(&title, 24)).into());
-            children.push(
-                widget::button::custom(widget::row(row_children).spacing(4))
-                    .class(small_button_style(SmallButtonBase::Text, false))
-                    .on_press(Message::NavigateTo(url))
-                    .into(),
-            );
-        }
-        widget::row(children).spacing(4).padding(4).into()
+            widget::row(children).spacing(4).into()
+        };
+        widget::container(inner)
+            .style(bookmarks_bar_style)
+            .width(Length::Fill)
+            .height(Length::Fixed(30.0))
+            .padding(cosmic::iced::core::Padding {
+                top: 0.0,
+                right: 8.0,
+                bottom: 0.0,
+                left: 8.0,
+            })
+            .align_y(Alignment::Center)
+            .into()
     }
 
     /// The vertical-mode content: the web view as the base layer,
@@ -1834,6 +1851,35 @@ fn tab_chip_style(theme: &cosmic::Theme, active: bool) -> cosmic::iced::widget::
     }
 }
 
+/// The bookmarks bar's container style: the theme's component
+/// background as a flat 30px strip, no radius, no border, no
+/// shadow (UI round, 2026-11-27) — the bar reads like the
+/// mockup's dark strip; the bottom divider in `view` is its
+/// lower edge.
+fn bookmarks_bar_style(theme: &cosmic::Theme) -> cosmic::iced::widget::container::Style {
+    use cosmic::iced::core::{Background, Border, Color, Shadow, Vector, border::Radius};
+    let component = &theme.current_container().component;
+    cosmic::iced::widget::container::Style {
+        background: Some(Background::Color(Color::from(component.base))),
+        border: Border {
+            radius: Radius::from(0.0),
+            width: 0.0,
+            color: Color::from(component.divider),
+        },
+        shadow: Shadow {
+            color: Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            },
+            offset: Vector::new(0.0, 0.0),
+            blur_radius: 0.0,
+        },
+        ..Default::default()
+    }
+}
+
 /// A menu / list panel's container style: the theme's component
 /// background, a 4.0px radius, a 1px divider border, and a drop
 /// shadow (UI round, 2026-11-27).
@@ -2652,11 +2698,38 @@ impl Application for PlutoBrowser {
                                 loop {
                                     tokio::select! {
                                         _ = &mut serve => {
-                                            // [pluto-worker] phase log:
-                                            // serve ended — any event
-                                            // still buffered in
-                                            // events_rx is dropped
-                                            // unread from here on.
+                                            // serve ended — drain any
+                                            // event still buffered in
+                                            // events_rx (try_recv only:
+                                            // serve has returned, so
+                                            // nothing more will ever
+                                            // arrive) before breaking,
+                                            // or the terminal Done —
+                                            // and any trailing chunks —
+                                            // is dropped unread and the
+                                            // renderer's fetch waits
+                                            // forever. This was the
+                                            // paint stall: `forward end
+                                            // reason=serve-done
+                                            // buffered=3` with no
+                                            // preceding `forward event
+                                            // … kind=done` (confirmed
+                                            // on-box 2026-11-27).
+                                            while let Ok(event) = events_rx.try_recv() {
+                                                let (kind, bytes) = match &event {
+                                                    pluto_ipc::ResourceEvent::ResponseHeaders { .. } => ("headers", 0),
+                                                    pluto_ipc::ResourceEvent::BodyChunk { bytes, .. } => ("chunk", bytes.len()),
+                                                    pluto_ipc::ResourceEvent::Done { .. } => ("done", 0),
+                                                    pluto_ipc::ResourceEvent::Error { .. } => ("error", 0),
+                                                    pluto_ipc::ResourceEvent::Cancelled { .. } => ("cancelled", 0),
+                                                };
+                                                eprintln!("[pluto-worker] forward event id={} kind={} bytes={}", request_id, kind, bytes);
+                                                if tx.send(BrowserToRenderer::ResourceEvent(event))
+                                                    .is_err()
+                                                {
+                                                    break;
+                                                }
+                                            }
                                             eprintln!("[pluto-worker] forward end id={} reason=serve-done buffered={}", request_id, events_rx.len());
                                             break;
                                         }
@@ -2819,7 +2892,27 @@ impl Application for PlutoBrowser {
                                 tokio::pin!(serve);
                                 loop {
                                     tokio::select! {
-                                        _ = &mut serve => break,
+                                        _ = &mut serve => {
+                                            // Drain any event still
+                                            // buffered in events_rx
+                                            // before breaking (same
+                                            // race as the document
+                                            // fetch loop: a frame
+                                            // buffered when the pump
+                                            // ends would otherwise be
+                                            // dropped unread).
+                                            while let Ok(event) = events_rx.try_recv() {
+                                                if tx.send(BrowserToRenderer::WebSocketEvent {
+                                                    socket_id,
+                                                    event,
+                                                })
+                                                .is_err()
+                                                {
+                                                    break;
+                                                }
+                                            }
+                                            break;
+                                        }
                                         event = events_rx.recv() => match event {
                                             Some(event) => {
                                                 if tx.send(BrowserToRenderer::WebSocketEvent {
@@ -3366,6 +3459,7 @@ impl Application for PlutoBrowser {
         children.push(nav_bar.into());
         children.push(widget::divider::horizontal::default().into());
         children.push(self.bookmarks_bar());
+        children.push(widget::divider::horizontal::default().into());
         // Stage 11 Rec 9: the thin progress bar under the nav
         // bar, while a document load is in flight. Indeterminate
         // (no Content-Length) shows as a half bar, not a
