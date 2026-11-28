@@ -297,6 +297,17 @@ pub struct BrokerHandle {
     next_id: std::sync::atomic::AtomicU64,
 }
 
+/// Short kind tag for a `ResourceEvent`, for the `[pluto-worker]` phase log.
+fn event_kind(event: &ResourceEvent) -> &'static str {
+    match event {
+        ResourceEvent::ResponseHeaders { .. } => "headers",
+        ResourceEvent::BodyChunk { .. } => "chunk",
+        ResourceEvent::Done { .. } => "done",
+        ResourceEvent::Error { .. } => "error",
+        ResourceEvent::Cancelled { .. } => "cancelled",
+    }
+}
+
 impl BrokerHandle {
     pub fn new(out: mpsc::Sender<RendererToBrowser>) -> Arc<Self> {
         Arc::new(Self {
@@ -317,11 +328,20 @@ impl BrokerHandle {
             | ResourceEvent::Error { request_id, .. }
             | ResourceEvent::Cancelled { request_id } => *request_id,
         };
-        let sender = self.pending.lock().await.get(&request_id).cloned();
-        if let Some(sender) = sender
-            && sender.send(event).await.is_err() {
-                self.pending.lock().await.remove(&request_id);
-            }
+        let Some(sender) = self.pending.lock().await.get(&request_id).cloned() else {
+            // [pluto-worker] phase log: an event the shell
+            // forwarded but no fetch is waiting on — a dropped
+            // Done here is a load that never completes.
+            eprintln!(
+                "[pluto-worker] broker deliver dropped id={} kind={}",
+                request_id,
+                event_kind(&event)
+            );
+            return;
+        };
+        if sender.send(event).await.is_err() {
+            self.pending.lock().await.remove(&request_id);
+        }
     }
 
     /// Stream one request through the broker (Stage 16 Phase 3,
@@ -408,6 +428,7 @@ impl BrokerHandle {
             self.pending.lock().await.remove(&request_id);
             return Err(NetError::Request("broker channel closed".to_string()));
         }
+        eprintln!("[pluto-worker] broker fetch start id={} url={}", request_id, request.url);
         let mut status = http::StatusCode::OK;
         let mut headers = http::header::HeaderMap::new();
         let mut body: Vec<u8> = Vec::new();
@@ -415,12 +436,14 @@ impl BrokerHandle {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
+                    eprintln!("[pluto-worker] broker fetch cancelled id={}", request_id);
                     let _ = self.out.send(RendererToBrowser::CancelResource { request_id }).await;
                     self.pending.lock().await.remove(&request_id);
                     return Err(NetError::Cancelled);
                 }
                 event = rx.recv() => {
                     let Some(event) = event else {
+                        eprintln!("[pluto-worker] broker stream ended id={} body_bytes={}", request_id, body.len());
                         self.pending.lock().await.remove(&request_id);
                         return Err(NetError::Request("broker stream ended".to_string()));
                     };
@@ -440,14 +463,19 @@ impl BrokerHandle {
                         }
                         ResourceEvent::BodyChunk { bytes, .. } => {
                             body.extend_from_slice(&bytes);
+                            eprintln!("[pluto-worker] broker chunk id={} bytes={} total={}", request_id, bytes.len(), body.len());
                             if body.len() > cap {
                                 let _ = self.out.send(RendererToBrowser::CancelResource { request_id }).await;
                                 self.pending.lock().await.remove(&request_id);
                                 return Err(NetError::TooLarge { destination: request.destination, cap });
                             }
                         }
-                        ResourceEvent::Done { .. } => break,
+                        ResourceEvent::Done { .. } => {
+                            eprintln!("[pluto-worker] broker done id={} total_bytes={}", request_id, body.len());
+                            break;
+                        }
                         ResourceEvent::Error { code, reason, .. } => {
+                            eprintln!("[pluto-worker] broker error id={} code={} reason={}", request_id, code, reason);
                             self.pending.lock().await.remove(&request_id);
                             return Err(NetError::Request(format!("{code}: {reason}")));
                         }

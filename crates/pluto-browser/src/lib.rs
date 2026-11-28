@@ -500,14 +500,14 @@ impl PlutoBrowser {
     }
 
     /// The window title follows the active tab (Stage 11 Rec 8):
-    /// its page title once known, else its URL — "Pluto" only
-    /// when the tab has neither.
+    /// "Pluto ~ The far out browser ~ <tab title>", or just
+    /// "Pluto ~ The far out browser" when the tab has no title yet.
     fn sync_window_title(&mut self) {
         let title = self.active().title.clone();
         self.core.window.header_title = if title.is_empty() {
-            "Pluto".to_string()
+            "Pluto ~ The far out browser".to_string()
         } else {
-            title
+            format!("Pluto ~ The far out browser ~ {title}")
         };
     }
 
@@ -2046,7 +2046,7 @@ impl Application for PlutoBrowser {
         // drawing a frame, which gives the window two title bars. Show
         // it only when libcosmic is drawing the frame itself.
         core.window.show_headerbar = use_client_decorations;
-        core.window.header_title = "Pluto".to_string();
+        core.window.header_title = "Pluto ~ The far out browser".to_string();
         let url = page::DEFAULT_URL.to_string();
         eprintln!("[pluto] starting, loading {url}");
         // No load task here: the worker subscription (Stage 4 #2)
@@ -2642,6 +2642,7 @@ impl Application for PlutoBrowser {
                             return Task::none();
                         };
                         let broker = Arc::clone(&self.broker);
+                        let request_id = request.request_id;
                         return Task::perform(
                             async move {
                                 let (events_tx, mut events_rx) =
@@ -2650,16 +2651,36 @@ impl Application for PlutoBrowser {
                                 tokio::pin!(serve);
                                 loop {
                                     tokio::select! {
-                                        _ = &mut serve => break,
+                                        _ = &mut serve => {
+                                            // [pluto-worker] phase log:
+                                            // serve ended — any event
+                                            // still buffered in
+                                            // events_rx is dropped
+                                            // unread from here on.
+                                            eprintln!("[pluto-worker] forward end id={} reason=serve-done buffered={}", request_id, events_rx.len());
+                                            break;
+                                        }
                                         event = events_rx.recv() => match event {
                                             Some(event) => {
+                                                let (kind, bytes) = match &event {
+                                                    pluto_ipc::ResourceEvent::ResponseHeaders { .. } => ("headers", 0),
+                                                    pluto_ipc::ResourceEvent::BodyChunk { bytes, .. } => ("chunk", bytes.len()),
+                                                    pluto_ipc::ResourceEvent::Done { .. } => ("done", 0),
+                                                    pluto_ipc::ResourceEvent::Error { .. } => ("error", 0),
+                                                    pluto_ipc::ResourceEvent::Cancelled { .. } => ("cancelled", 0),
+                                                };
+                                                eprintln!("[pluto-worker] forward event id={} kind={} bytes={}", request_id, kind, bytes);
                                                 if tx.send(BrowserToRenderer::ResourceEvent(event))
                                                     .is_err()
                                                 {
+                                                    eprintln!("[pluto-worker] forward end id={} reason=send-failed buffered={}", request_id, events_rx.len());
                                                     break;
                                                 }
                                             }
-                                            None => break,
+                                            None => {
+                                                eprintln!("[pluto-worker] forward end id={} reason=channel-closed buffered={}", request_id, events_rx.len());
+                                                break;
+                                            }
                                         },
                                     }
                                 }

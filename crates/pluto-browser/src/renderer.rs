@@ -1065,6 +1065,8 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                     },
                     None => (Arc::new(DisplayList::new()), Vec::new()),
                 };
+                let (items, glyphs) = display_list_counts(&display);
+                eprintln!("[pluto-worker] actor display list built items={items} glyphs={glyphs} blobs={}", blobs.len());
                 let _ = reply.send((display, blobs));
             }
             LayoutJob::ResizeSizes { ids, reply } => {
@@ -4213,6 +4215,7 @@ async fn handle_nav_outcome(
             ..
         } => {
             eprintln!("[pluto] worker fetched {final_url}");
+            eprintln!("[pluto-worker] nav outcome loaded epoch={} url={}", epoch, final_url);
             // Stage 10 Rec 3: a committed URL is visited from now
             // on — record it before laying out, so the new page's
             // own links to it already match `:visited`.
@@ -4253,6 +4256,7 @@ async fn handle_nav_outcome(
             {
                 return;
             }
+            eprintln!("[pluto-worker] did commit url={}", final_url);
             layout_and_submit(state, events, Some(*document), false, std::time::Instant::now()).await;
             // Stage 16 Phase 3, Rec 8 (finisher): a traversal's
             // `popstate` fires after the commit — the state was
@@ -4267,6 +4271,7 @@ async fn handle_nav_outcome(
         }
         LoadOutcome::Failed { url, reason, .. } => {
             eprintln!("[pluto] worker fetch failed: {reason}");
+            eprintln!("[pluto-worker] nav outcome failed epoch={} url={} reason={}", epoch, url, reason);
             let document = page::parse_document(&page::error_document(&url, &reason));
             state.document = Some(document.clone());
             state.scroll_offsets.clear();
@@ -5093,6 +5098,17 @@ async fn announce_blobs(
 /// resources crossed IPC out-of-band in `ResourceReady` frames,
 /// and the shell validates the list against the per-tab table it
 /// accumulated from them.
+/// Item + glyph counts of a display list, for the `[pluto-worker]` phase log.
+fn display_list_counts(display: &DisplayList) -> (usize, usize) {
+    let mut glyphs = 0;
+    for item in &display.0 {
+        if let pluto_paint::DisplayItem::Glyphs { glyphs: g, .. } = item {
+            glyphs += g.len();
+        }
+    }
+    (display.0.len(), glyphs)
+}
+
 async fn submit(
     state: &mut TabState,
     events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
@@ -5106,7 +5122,8 @@ async fn submit(
         perf::SpanKind::Ipc,
         started.elapsed().as_secs_f32() * 1000.0,
     );
-    emit_tab(
+    let byte_len = bytes.len();
+    let sent = emit_tab(
         events,
         RendererToBrowser::SubmitDisplayList {
             epoch: state.epoch,
@@ -5114,7 +5131,9 @@ async fn submit(
             resources: ResourceTable::new(),
         },
     )
-    .await
+    .await;
+    eprintln!("[pluto-worker] submit display list epoch={} bytes={} sent={}", state.epoch, byte_len, sent);
+    sent
 }
 
 /// Lay out at the tab's viewport on the layout-actor thread and
@@ -5384,6 +5403,7 @@ async fn layout_and_submit(
         )
         .await;
     }
+    eprintln!("[pluto-worker] layout tree sent epoch={} incremental={}", state.nav_epoch, incremental);
     // Stage 12 Rec 3: the actor reports which path the layout
     // took; the frame sample carries it into the histogram.
     let outcome = match tree_rx.await {
@@ -5399,6 +5419,7 @@ async fn layout_and_submit(
         }
     };
     let layout_kind = outcome.kind;
+    eprintln!("[pluto-worker] layout tree done kind={layout_kind:?}");
     state.has_document = true;
     // M6 Phase 3 (Rec 11): fold the outcome's animation work
     // into the engine + computed-style cache before any branch —
@@ -5564,6 +5585,8 @@ async fn layout_and_submit(
             // list lands (it covers the observer steps above
             // plus the collect round trip).
             let collect_ms = collect_started.elapsed().as_secs_f32() * 1000.0;
+            let (items, glyphs) = display_list_counts(&display);
+            eprintln!("[pluto-worker] display list collected items={items} glyphs={glyphs} blobs={}", blobs.len());
             perf::record_span(
                 perf::SpanKind::WorkerBuild,
                 started.elapsed().as_secs_f32() * 1000.0,

@@ -753,12 +753,15 @@ pub async fn load_page_cancellable_with_hooks(
         epoch,
         csp,
     );
+    let mut fed_chunks = 0usize;
     for chunk in response.body.chunks(FEED_CHUNK_BYTES) {
         if cancel.is_cancelled() {
             return Err("navigation cancelled".to_string());
         }
         load.drive(chunk).await?;
+        fed_chunks += 1;
     }
+    eprintln!("[pluto-worker] parse fed url={} chunks={} bytes={}", final_url, fed_chunks, response.body.len());
     if cancel.is_cancelled() {
         return Err("navigation cancelled".to_string());
     }
@@ -784,6 +787,13 @@ pub async fn load_page_cancellable_with_hooks(
     eprintln!(
         "[pluto] parsed {} ({} defer, {} async scripts held)",
         final_url,
+        document.defer_scripts.len(),
+        document.async_scripts.len()
+    );
+    eprintln!(
+        "[pluto-worker] parse done url={} nodes={} defer={} async={}",
+        final_url,
+        document.dom().all_node_ids().len(),
         document.defer_scripts.len(),
         document.async_scripts.len()
     );
