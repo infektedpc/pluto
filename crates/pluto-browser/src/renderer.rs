@@ -2216,6 +2216,18 @@ async fn tab_main(
                     }
                 }
                 drive_js(&mut state);
+                // Stage 17 (M9 stages 1–2): the console drain —
+                // once per tick, after the JS drive, forward only
+                // the lines captured since the last tick (the
+                // take, not a clone — see
+                // `TabJs::take_console_lines`). Best-effort like
+                // the heartbeat: a full event channel means the
+                // bridge is gone, and the tick continues. The
+                // drain runs always, whether DevTools is open or
+                // not, so lines logged before it opens are still
+                // there when it opens (the shell caps its per-tab
+                // buffer).
+                drain_console_lines(&mut state, &events);
                 // Stage 12 Rec 7: a script may have asked for a
                 // navigation (`location.assign` / `reload`) or an
                 // image load (`Image().src` / `<img>` src) — the
@@ -2569,6 +2581,22 @@ async fn handle_single_command(
                 js.deliver_ws_event(ws_event);
             }
         }
+        BrowserToRenderer::DevToolsEval { source } => {
+            // Stage 17 (M9 stages 1–2 — the DevTools REPL):
+            // evaluate on the tab thread, with page privileges
+            // only — exactly like a script the page itself ran —
+            // and answer with the result formatted to a string
+            // (`eval_to_string` renders it while the value is
+            // still live in the realm; a live JS value never
+            // crosses threads). A throw answers with the formatted
+            // exception. No realm yet (no page loaded) still gets
+            // an answer, so the panel never waits forever.
+            let result = match state.tab_js.as_mut() {
+                Some(js) => js.eval_to_string(&source).unwrap_or_else(|e| e),
+                None => "No page loaded yet.".to_string(),
+            };
+            let _ = events.try_send(RendererToBrowser::DevToolsEvalResult { result });
+        }
         BrowserToRenderer::InputEvent(event) => {
             handle_input(state, events, event).await;
         }
@@ -2607,6 +2635,23 @@ fn drive_js(state: &mut TabState) {
     }
     if poisoned {
         recreate_realm(state);
+    }
+}
+
+/// Drain one tick's new console lines to the shell (Stage 17,
+/// M9 stages 1–2). Nothing is sent when nothing was captured
+/// since the last tick — the empty batch stays on the tab
+/// thread, never on the wire.
+fn drain_console_lines(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+) {
+    let Some(js) = state.tab_js.as_ref() else {
+        return;
+    };
+    let lines = js.take_console_lines();
+    if !lines.is_empty() {
+        let _ = events.try_send(RendererToBrowser::ConsoleLines { lines });
     }
 }
 
@@ -7300,7 +7345,14 @@ mod tests {
                     | RendererToBrowser::FaviconChanged { .. }
                     | RendererToBrowser::ResourceReady { .. }
                     | RendererToBrowser::Heartbeat
-                    | RendererToBrowser::SandboxReport { .. } => continue,
+                    | RendererToBrowser::SandboxReport { .. }
+                    // Stage 17 (M9 stages 1–2): the console drain
+                    // and the REPL answer are out-of-band too —
+                    // they can arrive between any two navigation
+                    // events, so the strict event readers skip
+                    // them like the heartbeat.
+                    | RendererToBrowser::ConsoleLines { .. }
+                    | RendererToBrowser::DevToolsEvalResult { .. } => continue,
                     event => return event,
                 },
                 other => panic!("expected a RendererEvent, got {other:?}"),
@@ -9389,6 +9441,98 @@ mod tests {
             wait_for_glyphs(&mut event_rx, 6, Duration::from_secs(8)).await,
             "timer set by the later script did not fire"
         );
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Stage 17 (M9 stages 1–2): a page's `console.log` reaches
+    /// the shell as a `ConsoleLines` drain, and the DevTools REPL
+    /// round trip works on the real tab thread — the snippet
+    /// evaluates with page privileges (it reads page state) and
+    /// the formatted result comes back.
+    #[tokio::test]
+    async fn worker_console_drain_and_repl_round_trip() {
+        let page = "<!doctype html><html><head><style>body{margin:0}</style></head><body><span>hi</span><script>console.log('hello-console'); var replState = 41;</script></body></html>";
+        let routes = std::sync::Arc::new(vec![(
+            "/".to_string(),
+            "text/html".to_string(),
+            page.to_string(),
+        )]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_routes(listener, routes));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        cmd_tx
+            .send(BrowserToRenderer::CommitNavigation {
+                url,
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
+            .expect("worker takes the command");
+        // The drain and the commit arrive in either order — the
+        // tick drains the log the parse just captured, while the
+        // commit comes from the load path.
+        let mut saw_console = false;
+        let mut committed = false;
+        let found = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match event_rx.next().await.expect("worker emits an event") {
+                    crate::Message::RendererEvent(
+                        _,
+                        RendererToBrowser::ConsoleLines { lines },
+                    ) => {
+                        if lines
+                            .iter()
+                            .any(|(level, message)| level == "log" && message == "hello-console")
+                        {
+                            saw_console = true;
+                        }
+                    }
+                    crate::Message::RendererEvent(
+                        _,
+                        RendererToBrowser::DidCommit { .. },
+                    ) => {
+                        committed = true;
+                    }
+                    crate::Message::RendererEvent(_, _) => {}
+                    other => panic!("expected a RendererEvent, got {other:?}"),
+                }
+                if saw_console && committed {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            found.is_ok(),
+            "timed out waiting for the console drain + commit"
+        );
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsEval {
+                source: "replState + 1".to_string(),
+            })
+            .expect("worker takes DevToolsEval");
+        let found = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match event_rx.next().await.expect("worker emits an event") {
+                    crate::Message::RendererEvent(
+                        _,
+                        RendererToBrowser::DevToolsEvalResult { result },
+                    ) => {
+                        assert_eq!(result, "42");
+                        return;
+                    }
+                    crate::Message::RendererEvent(_, _) => continue,
+                    other => panic!("expected a RendererEvent, got {other:?}"),
+                }
+            }
+        })
+        .await;
+        assert!(found.is_ok(), "timed out waiting for the REPL result");
         cmd_tx
             .send(BrowserToRenderer::Shutdown)
             .expect("worker takes Shutdown");

@@ -549,6 +549,31 @@ impl TabRealm {
             }
         }
     }
+
+    /// Evaluate `source` as a classic script and format its value
+    /// to a string on this thread (Stage 17, M9 stages 1–2 — the
+    /// DevTools REPL). The same shape as the `Classic` arm of
+    /// [`JsEngine::eval`], except the live `Value` is rendered
+    /// with [`crate::bindings::format_console_arg`] (like
+    /// `String(value)`) before it leaves the `Ctx`: a REPL result
+    /// is a formatted string, never a live JS value crossing
+    /// threads. A throw is the caught value's string, with its
+    /// stack when rquickjs appends one — the same string
+    /// `eval` would have classified as an exception.
+    pub(crate) fn eval_formatted(&mut self, source: &str) -> Result<String, JsError> {
+        self.check_usable()?;
+        self.arm_budget(self.script_budget);
+        let result = self.with_ctx(|ctx| {
+            let r: rquickjs::Result<Value> = ctx.eval(source);
+            match r.catch(&ctx) {
+                Ok(value) => Ok(crate::bindings::format_console_arg(&ctx, &value)),
+                Err(caught) => Err(caught.to_string()),
+            }
+        });
+        let classified = self.classify_call_result(result);
+        self.disarm_budget();
+        classified
+    }
 }
 
 impl JsEngine for TabRealm {

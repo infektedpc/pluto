@@ -58,6 +58,14 @@ pub mod transport;
 /// The protocol version every encoded message carries. Bump on any
 /// breaking change to the enums below.
 ///
+/// v14 (Stage 17, M9 stages 1–2): the DevTools console channel.
+/// [`BrowserToRenderer::DevToolsEval`] (evaluate a snippet in the
+/// tab's realm) and [`RendererToBrowser::DevToolsEvalResult`] /
+/// `ConsoleLines` (the formatted result, and batched console +
+/// error lines drained from the tab), all appended at the end so
+/// existing variants keep their postcard discriminants. The bump is
+/// the shape change; v13 bytes are rejected by [`decode_message`].
+///
 /// v13 (Stage 16 Phase 3, Rec 8/9/11 — finisher): the history
 /// and WebSocket message shapes change together.
 /// [`BrowserToRenderer::CommitNavigation`] gains `state_json`,
@@ -124,7 +132,7 @@ pub mod transport;
 /// `SetFocused` and `ScrollViewport`. v2 bytes are rejected by
 /// [`decode_message`] — Pluto ships one binary, so a bump is a
 /// clean break, not a migration.
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// What went wrong decoding a versioned message.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -234,6 +242,16 @@ pub enum BrowserToRenderer {
         socket_id: u64,
         event: WebSocketEvent,
     },
+    /// Evaluate a snippet in this tab's realm (Stage 17, M9
+    /// stages 1–2 — the DevTools REPL): the worker runs it with
+    /// page privileges only, formats the result to a string on
+    /// the tab thread, and answers with
+    /// [`RendererToBrowser::DevToolsEvalResult`]. No request id:
+    /// the panel sends one snippet at a time and the channel is
+    /// in-order, so the next result is always the answer to the
+    /// last eval. Appended at the end so existing variants keep
+    /// their postcard discriminants.
+    DevToolsEval { source: String },
 }
 
 /// Messages from the renderer worker to the browser (shell).
@@ -440,6 +458,24 @@ pub enum RendererToBrowser {
         code: Option<u16>,
         reason: String,
     },
+    /// The DevTools REPL's answer (Stage 17, M9 stages 1–2):
+    /// the snippet's value formatted to a string on the tab
+    /// thread (`format_console_arg` — a live JS value never
+    /// crosses the wire), or the thrown exception formatted
+    /// with its stack when the snippet threw. Appended at the
+    /// end so existing variants keep their postcard
+    /// discriminants.
+    DevToolsEvalResult { result: String },
+    /// Batched console output (Stage 17, M9 stages 1–2): the
+    /// tab thread drains its captured `console` lines (and its
+    /// uncaught-error lines, as `level: "error"`) once per
+    /// frame tick and pushes only the new ones — a `console.log`
+    /// in a loop never produces a message per line, and a
+    /// chatty page never makes the shell re-read the whole
+    /// capture. The shell caps its per-tab buffer (~1,000
+    /// lines, oldest evicted). Appended at the end so existing
+    /// variants keep their postcard discriminants.
+    ConsoleLines { lines: Vec<(String, String)> },
 }
 
 /// A resource ask, frozen as v1 in Stage 5. This is the payload of
@@ -1103,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_thirteen() {
+    fn protocol_version_is_fourteen() {
         // Bumped 5 -> 6 (Stage 13: ResourceRequest.body for form
         // POSTs), 6 -> 7 (Stage 13 Rec 12: SandboxReport +
         // Heartbeat), 7 -> 8 (Stage 14 Rec 9: CompositingUpdate),
@@ -1119,8 +1155,47 @@ mod tests {
         // Destination::Stream), and 12 -> 13 (Stage 16 Phase 3,
         // finisher: CommitNavigation also carries the entry's
         // scroll, and every WebSocketEvent variant carries
-        // `socket_id` — the Phase 3 wire shapes, completed).
-        assert_eq!(PROTOCOL_VERSION, 13);
+        // `socket_id` — the Phase 3 wire shapes, completed), and
+        // 13 -> 14 (Stage 17, M9 stages 1–2: DevToolsEval /
+        // DevToolsEvalResult / ConsoleLines, appended at the end
+        // of each enum).
+        assert_eq!(PROTOCOL_VERSION, 14);
+    }
+
+    #[test]
+    fn devtools_messages_round_trip_through_versioned_bytes() {
+        // Stage 17 (M9 stages 1–2): the REPL ask, its formatted
+        // answer, and a batched console drain all survive the
+        // versioned envelope — including an empty drain (a tick
+        // with nothing new sends nothing, but the shape must
+        // still decode) and a multi-line error batch.
+        let eval = BrowserToRenderer::DevToolsEval {
+            source: "document.title".to_string(),
+        };
+        let bytes = encode_message(&eval);
+        assert_eq!(decode_message::<BrowserToRenderer>(&bytes), Ok(eval));
+        let result = RendererToBrowser::DevToolsEvalResult {
+            result: "Example Domain".to_string(),
+        };
+        let bytes = encode_message(&result);
+        assert_eq!(
+            decode_message::<RendererToBrowser>(&bytes),
+            Ok(result)
+        );
+        let lines = RendererToBrowser::ConsoleLines {
+            lines: vec![
+                ("log".to_string(), "hello".to_string()),
+                (
+                    "error".to_string(),
+                    "boom\n    at test.js:1:1".to_string(),
+                ),
+            ],
+        };
+        let bytes = encode_message(&lines);
+        assert_eq!(decode_message::<RendererToBrowser>(&bytes), Ok(lines));
+        let empty = RendererToBrowser::ConsoleLines { lines: vec![] };
+        let bytes = encode_message(&empty);
+        assert_eq!(decode_message::<RendererToBrowser>(&bytes), Ok(empty));
     }
 
     #[test]

@@ -454,6 +454,27 @@ impl TabJs {
         self.bindings.borrow().console_lines.clone()
     }
 
+    /// Drain the console output captured since the last drain
+    /// (Stage 17, M9 stages 1–2 — the DevTools console): the
+    /// `console` lines are TAKEN, not cloned, so a chatty page
+    /// never makes the renderer re-send (or the shell re-read)
+    /// the whole capture — only new lines cross, once per frame
+    /// tick. Uncaught script errors ride the same drain as
+    /// `("error", message)` lines (the `report_error` /
+    /// `script_errors` vecs plus binding-recorded errors,
+    /// including unhandled rejections, which are drained first);
+    /// the formatted stack travels inside the message string,
+    /// exactly as `script_errors` reports it. After this call
+    /// both captures are empty until the page logs again.
+    pub fn take_console_lines(&self) -> Vec<(String, String)> {
+        self.drain_rejections();
+        let mut lines = std::mem::take(&mut self.bindings.borrow_mut().console_lines);
+        let mut errors = std::mem::take(&mut self.state.borrow_mut().script_errors);
+        errors.extend(std::mem::take(&mut self.bindings.borrow_mut().errors));
+        lines.extend(errors.into_iter().map(|e| ("error".to_string(), e)));
+        lines
+    }
+
     /// Dispatch an external event (a shell click, a key press) to a
     /// node: enqueued as a `UserInteraction`-source task, so the
     /// listeners run on the loop, not inline in the caller.
@@ -856,6 +877,20 @@ impl TabJs {
     pub fn eval_value(&mut self, source: &str) -> Result<JsValue, JsError> {
         self.microtask_checkpoint()?;
         self.realm.eval(EvalKind::Classic, source, "host-read.js")
+    }
+
+    /// Evaluate a snippet and return its value formatted to a
+    /// string (Stage 17, M9 stages 1–2 — the DevTools REPL).
+    /// The same contract as [`TabJs::eval_value`] (microtasks
+    /// drained first, synchronous, on the tab thread, page
+    /// privileges only — the snippet runs exactly like a script
+    /// the page itself ran), except the result is rendered with
+    /// `format_console_arg` while the value is still live in the
+    /// realm, so the caller gets a plain `String`, never a JS
+    /// value. A throw is the exception formatted with its stack.
+    pub fn eval_to_string(&mut self, source: &str) -> Result<String, String> {
+        self.microtask_checkpoint().map_err(|e| e.to_string())?;
+        self.realm.eval_formatted(source).map_err(|e| e.to_string())
     }
 
     /// Navigate: fresh realm, cleared queues, bumped epoch. Pending

@@ -169,6 +169,15 @@ struct Tab {
     /// Rec 9): bytes received vs `Content-Length` (`None` =
     /// indeterminate). Cleared on commit.
     progress: Option<(u64, Option<u64>)>,
+    /// The tab's console lines (Stage 17, M9 stages 1–2): the
+    /// `(level, message)` pairs the worker drains once per tick
+    /// (`RendererToBrowser::ConsoleLines`), plus the DevTools
+    /// REPL's own echo (`> source`, level `""`) and result
+    /// lines (level `""`). Page output is untrusted plain text
+    /// — rendered as text, never as markup, never evaluated.
+    /// Capped at [`CONSOLE_LINES_CAP`] (oldest evicted); the
+    /// DevTools panel shows the active tab's buffer.
+    console_lines: Vec<(String, String)>,
     /// Per-layer sandbox results from the child's
     /// `SandboxReport` (Stage 13 Rec 12a): empty until the first
     /// report arrives (in-process tabs never report).
@@ -212,11 +221,22 @@ impl Tab {
             status: format!("Loading {url}…"),
             pending_url: Some(url),
             progress: None,
+            console_lines: Vec::new(),
             sandbox_layers: Vec::new(),
             crashed: false,
             crash_times: Vec::new(),
             crash_reason: String::new(),
             dead: false,
+        }
+    }
+
+    /// Append console lines, evicting the oldest past
+    /// [`CONSOLE_LINES_CAP`] (Stage 17, M9 stages 1–2).
+    fn push_console_lines(&mut self, lines: Vec<(String, String)>) {
+        self.console_lines.extend(lines);
+        let excess = self.console_lines.len().saturating_sub(CONSOLE_LINES_CAP);
+        if excess > 0 {
+            self.console_lines.drain(..excess);
         }
     }
 }
@@ -316,6 +336,17 @@ impl SettingsDialog {
             homepage_error: None,
         }
     }
+}
+
+/// The DevTools console panel's draft state (Stage 17, M9
+/// stages 1–2): only the REPL input is a draft — the console
+/// lines themselves live per tab (see `Tab::console_lines`),
+/// and the panel follows the active tab, so switching tabs
+/// shows the new tab's lines with the same input draft.
+#[derive(Debug, Clone, Default)]
+struct DevToolsPanel {
+    /// The REPL input as typed.
+    repl_input: String,
 }
 
 /// Which bookmarks-bar context menu is open, if any
@@ -421,6 +452,10 @@ pub struct PlutoBrowser {
     /// 2026-11-28): opened from the hamburger menu's
     /// "Settings" entry.
     settings_dialog: Option<SettingsDialog>,
+    /// The open DevTools console panel, if any (Stage 17, M9
+    /// stages 1–2): opened from the hamburger menu's
+    /// "DevTools" entry. The panel follows the active tab.
+    devtools_panel: Option<DevToolsPanel>,
     /// Whether the hamburger menu is open. Opening a list panel
     /// closes the menu; the menu never shows alongside a panel.
     menu_open: bool,
@@ -554,6 +589,21 @@ pub enum Message {
     /// Menu: open the settings dialog (settings round,
     /// 2026-11-28).
     ShowSettings,
+    /// Menu: open the DevTools console panel (Stage 17, M9
+    /// stages 1–2). The panel follows the active tab; its
+    /// console lines are stored per tab (see `Tab`).
+    ShowDevTools,
+    /// The DevTools panel's Close button: dismiss the panel.
+    /// The tabs keep their console lines — reopening shows
+    /// what was captured while it was closed.
+    CloseDevTools,
+    /// The DevTools REPL input changed (the draft lives in the
+    /// panel, not per tab — the panel follows the active tab).
+    DevToolsInputChanged(String),
+    /// The DevTools REPL's submit (Enter or the Run button):
+    /// echo the source into the active tab's console lines and
+    /// send it to that tab's worker as `DevToolsEval`.
+    DevToolsSubmit,
     /// The settings dialog's Close button: close the dialog.
     /// Everything in it already applied and persisted when it
     /// changed, except an invalid homepage draft, which is
@@ -1057,6 +1107,7 @@ impl PlutoBrowser {
                 "New Tab" => Message::NewTab,
                 "New Window" => Message::NewWindow,
                 "Settings" => Message::ShowSettings,
+                "DevTools" => Message::ShowDevTools,
                 // `menu_items` is the pinned backend list; a new
                 // entry needs a message here too.
                 _ => unreachable!("menu item {label} has no message"),
@@ -1982,6 +2033,90 @@ impl PlutoBrowser {
             .into()
     }
 
+    /// The DevTools console panel (Stage 17, M9 stages 1–2):
+    /// a floating overlay like the settings dialog — a centered
+    /// panel over the page, in the `view()` stack layers. It
+    /// shows the ACTIVE tab's console lines and a REPL input.
+    /// Page output is rendered as untrusted plain text (the
+    /// text widget — never markup, never evaluated): a page
+    /// that logs `<script>…</script>` cannot inject into the
+    /// panel. Lines with an empty level are the REPL's own echo
+    /// (`> source`) and result lines, rendered as-is; real
+    /// console lines render as `level: message` (an error's
+    /// formatted stack is inside its message, so it wraps over
+    /// several visual lines). The log area is a fixed-height
+    /// scrollable, so a chatty page never grows the panel.
+    fn devtools_panel_overlay<'a>(
+        &'a self,
+        panel: &'a DevToolsPanel,
+    ) -> Element<'a, Message> {
+        let tab = self.active();
+        let mut line_elements: Vec<Element<'_, Message>> = Vec::new();
+        if tab.console_lines.is_empty() {
+            line_elements.push(
+                widget::text("No console output yet — console.log from this page will appear here.")
+                    .size(12)
+                    .into(),
+            );
+        }
+        for (level, message) in &tab.console_lines {
+            let shown = if level.is_empty() {
+                message.clone()
+            } else {
+                format!("{level}: {message}")
+            };
+            line_elements.push(widget::text(shown).size(12).into());
+        }
+        let log = cosmic::iced::widget::scrollable(
+            widget::column(line_elements).spacing(2).width(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fixed(DEVTOOLS_PANEL_LOG_HEIGHT))
+        .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+            Default::default(),
+        ));
+        let children: Vec<Element<'_, Message>> = vec![
+            widget::row([
+                widget::text("DevTools — Console").size(16).into(),
+                cosmic::iced::widget::space().width(Length::Fill).into(),
+                widget::button::text("Close")
+                    .class(small_button_style(SmallButtonBase::Text, false))
+                    .on_press(Message::CloseDevTools)
+                    .into(),
+            ])
+            .spacing(8)
+            .into(),
+            log.into(),
+            widget::row([
+                widget::text_input("Evaluate in this page…", &panel.repl_input)
+                    .id("devtools-repl".into())
+                    .on_input(Message::DevToolsInputChanged)
+                    .on_submit(|_| Message::DevToolsSubmit)
+                    .style(small_text_input_style())
+                    .width(Length::Fill)
+                    .into(),
+                widget::button::text("Run")
+                    .class(small_button_style(SmallButtonBase::Text, false))
+                    .on_press(Message::DevToolsSubmit)
+                    .into(),
+            ])
+            .spacing(8)
+            .into(),
+            widget::text("Runs with page privileges, like a script the page itself ran.")
+                .size(12)
+                .into(),
+        ];
+        let boxed = widget::container(widget::column(children).spacing(8).padding(12))
+            .width(Length::Fixed(DEVTOOLS_PANEL_WIDTH))
+            .style(panel_container_style);
+        widget::container(boxed)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .into()
+    }
+
     /// A tab's favicon as a 16px image, or the site's initial
     /// letter when it has no favicon yet (the host's initial —
     /// "example.com" → 'E' — or the title's first character).
@@ -2092,6 +2227,22 @@ pub const BOOKMARK_DIALOG_WIDTH: f32 = 400.0;
 /// a little wider than the bookmark dialog — it holds rows of
 /// option buttons (theme, provider, placement).
 pub const SETTINGS_DIALOG_WIDTH: f32 = 440.0;
+
+/// The DevTools console panel's width (Stage 17, M9 stages
+/// 1–2): wider than the settings dialog — console lines and a
+/// REPL input want room, and the panel floats over the page.
+pub const DEVTOOLS_PANEL_WIDTH: f32 = 640.0;
+
+/// The DevTools console panel's log area height (Stage 17, M9
+/// stages 1–2): a fixed scrollable area, so the panel stays a
+/// floating dialog instead of growing with a chatty page.
+pub const DEVTOOLS_PANEL_LOG_HEIGHT: f32 = 320.0;
+
+/// The per-tab console-line cap (Stage 17, M9 stages 1–2):
+/// the shell keeps the last 1,000 `(level, message)` lines per
+/// tab (oldest evicted), so a page that logs in a loop cannot
+/// grow the shell's buffer without bound.
+pub const CONSOLE_LINES_CAP: usize = 1000;
 
 /// The bookmarks-bar popups' (context menu, folder dropdown)
 /// top offset (bookmarks round, 2026-11-28): they hang just
@@ -2648,7 +2799,8 @@ fn panel_container_style(theme: &cosmic::Theme) -> cosmic::iced::widget::contain
 /// History opens the session-history list, New Tab opens a tab
 /// in this window (Stage 11 Rec 4), New Window spawns a second
 /// Pluto process, Settings opens the settings dialog (settings
-/// round, 2026-11-28). Bookmarks used to open the bookmark list
+/// round, 2026-11-28), DevTools opens the console panel (Stage
+/// 17, M9 stages 1–2). Bookmarks used to open the bookmark list
 /// panel here; the entry was removed 2026-11-28 (Joel) and the
 /// panel with it — bookmarks live on the bookmarks bar and in
 /// the add/edit dialog. Nothing else from the reference
@@ -2658,7 +2810,7 @@ fn panel_container_style(theme: &cosmic::Theme) -> cosmic::iced::widget::contain
 /// of it is listed. No shortcuts are shown next to the items:
 /// none of the screenshot's shortcuts are wired.
 pub fn menu_items() -> &'static [&'static str] {
-    &["History", "New Tab", "New Window", "Settings"]
+    &["History", "New Tab", "New Window", "Settings", "DevTools"]
 }
 
 /// The theme preference (settings round, 2026-11-28):
@@ -3078,6 +3230,7 @@ impl Application for PlutoBrowser {
             homepage: prefs.homepage.clone(),
             search_provider: prefs.search_provider,
             settings_dialog: None,
+            devtools_panel: None,
             menu_open: false,
             panel: None,
             tab_placement: prefs.tab_placement,
@@ -3502,6 +3655,26 @@ impl Application for PlutoBrowser {
                         // the next commit.
                         let tab = &mut self.tabs[tab_index];
                         tab.progress = Some((received, total));
+                    }
+                    RendererToBrowser::ConsoleLines { lines } => {
+                        // Stage 17 (M9 stages 1–2): the worker's
+                        // per-tick console drain — append to this
+                        // tab's buffer (capped, oldest evicted).
+                        // The lines are the page's own output, so
+                        // they are stored as plain text and the
+                        // panel renders them as plain text.
+                        let tab = &mut self.tabs[tab_index];
+                        tab.push_console_lines(lines);
+                    }
+                    RendererToBrowser::DevToolsEvalResult { result } => {
+                        // Stage 17 (M9 stages 1–2): the REPL's
+                        // answer for this tab — the snippet's value
+                        // formatted on the tab thread (or the
+                        // formatted exception). Level `""`: the
+                        // panel renders it as-is, under the `>`
+                        // echo the submit already stored.
+                        let tab = &mut self.tabs[tab_index];
+                        tab.push_console_lines(vec![(String::new(), result)]);
                     }
                     RendererToBrowser::TitleChanged { title } => {
                         // Stage 11 Rec 8: the tab's title, shown
@@ -4524,6 +4697,47 @@ impl Application for PlutoBrowser {
                 let homepage = self.homepage.clone();
                 self.settings_dialog = Some(SettingsDialog::new(&homepage));
             }
+            Message::ShowDevTools => {
+                // Stage 17 (M9 stages 1–2): the console panel,
+                // opened from the hamburger menu like the settings
+                // dialog. The panel follows the active tab; the
+                // tabs keep their console lines while it is
+                // closed, so reopening shows what was captured.
+                self.menu_open = false;
+                self.close_bar_popups();
+                self.devtools_panel = Some(DevToolsPanel::default());
+            }
+            Message::CloseDevTools => {
+                self.devtools_panel = None;
+            }
+            Message::DevToolsInputChanged(draft) => {
+                if let Some(panel) = self.devtools_panel.as_mut() {
+                    panel.repl_input = draft;
+                }
+            }
+            Message::DevToolsSubmit => {
+                // Stage 17 (M9 stages 1–2): the REPL submit —
+                // echo the source into the active tab's console
+                // lines (level `""`: rendered as-is, `> source`),
+                // clear the input, and send the snippet to that
+                // tab's worker. An empty snippet is a no-op (the
+                // echo would be a bare `>`). A tab with no worker
+                // yet still gets the echo; the worker's
+                // `DevToolsEval` answer (or its "no page loaded"
+                // answer) arrives as `DevToolsEvalResult`.
+                let Some(panel) = self.devtools_panel.as_mut() else {
+                    return Task::none();
+                };
+                let source = std::mem::take(&mut panel.repl_input);
+                if source.trim().is_empty() {
+                    return Task::none();
+                }
+                self.active_mut().push_console_lines(vec![(
+                    String::new(),
+                    format!("> {source}"),
+                )]);
+                self.send_command(BrowserToRenderer::DevToolsEval { source });
+            }
             Message::CloseSettings => {
                 self.settings_dialog = None;
             }
@@ -4747,6 +4961,11 @@ impl Application for PlutoBrowser {
         if let Some(dialog) = &self.settings_dialog {
             layers.push(self.settings_dialog_overlay(dialog));
         }
+        // Stage 17 (M9 stages 1–2): the DevTools console panel
+        // rides on top too, above the settings dialog.
+        if let Some(panel) = &self.devtools_panel {
+            layers.push(self.devtools_panel_overlay(panel));
+        }
         // Bookmarks round (2026-11-28): the bar's context menu,
         // a folder's dropdown, and the new-folder dialog ride
         // on top too — above the dialog, so the menu is usable
@@ -4907,7 +5126,7 @@ mod tests {
         // multi-tab shell), so it is listed, not excluded.
         assert_eq!(
             menu_items(),
-            &["History", "New Tab", "New Window", "Settings"]
+            &["History", "New Tab", "New Window", "Settings", "DevTools"]
         );
         for forbidden in [
             "Bookmarks",
@@ -5411,6 +5630,125 @@ mod tests {
         )
         .unwrap();
         assert!(load_shell_prefs().show_bookmarks_bar);
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn devtools_opens_from_menu_and_closes() {
+        // Stage 17 (M9 stages 1–2): the DevTools panel opens
+        // from the hamburger menu (like the settings dialog)
+        // and closes from its Close button — the panel follows
+        // the active tab, and the tabs keep their console lines
+        // while it is closed.
+        let (dir, home, mut app) = test_shell("devtools-open");
+        assert!(app.devtools_panel.is_none());
+        let _ = app.update(Message::ToggleMenu);
+        assert!(app.menu_open);
+        let _ = app.update(Message::ShowDevTools);
+        assert!(!app.menu_open);
+        assert!(app.devtools_panel.is_some());
+        let _ = app.update(Message::CloseDevTools);
+        assert!(app.devtools_panel.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn devtools_console_lines_route_to_the_tab_and_cap() {
+        // Stage 17 (M9 stages 1–2): a `ConsoleLines` drain
+        // reaches the shell-side buffer of the tab it belongs
+        // to, and the buffer caps at 1,000 lines with the oldest
+        // evicted — a page logging in a loop cannot grow it
+        // without bound.
+        let (dir, home, mut app) = test_shell("devtools-cap");
+        let tab_id = app.active().id;
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::ConsoleLines {
+                lines: vec![
+                    ("log".to_string(), "first".to_string()),
+                    ("warn".to_string(), "second".to_string()),
+                ],
+            },
+        ));
+        assert_eq!(
+            app.active().console_lines,
+            vec![
+                ("log".to_string(), "first".to_string()),
+                ("warn".to_string(), "second".to_string()),
+            ]
+        );
+        let flood: Vec<(String, String)> = (0..CONSOLE_LINES_CAP + 5)
+            .map(|i| ("log".to_string(), format!("line {i}")))
+            .collect();
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::ConsoleLines { lines: flood },
+        ));
+        assert_eq!(app.active().console_lines.len(), CONSOLE_LINES_CAP);
+        assert_eq!(
+            app.active().console_lines.first().unwrap().1,
+            "line 5".to_string(),
+            "the oldest lines are evicted first"
+        );
+        assert_eq!(
+            app.active().console_lines.last().unwrap().1,
+            format!("line {}", CONSOLE_LINES_CAP + 4)
+        );
+        // An event for a closed tab is ignored, not a panic.
+        let _ = app.update(Message::RendererEvent(
+            tab_id + 1000,
+            RendererToBrowser::ConsoleLines {
+                lines: vec![("log".to_string(), "ghost".to_string())],
+            },
+        ));
+        assert_eq!(app.active().console_lines.len(), CONSOLE_LINES_CAP);
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn devtools_repl_submit_echoes_and_clears() {
+        // Stage 17 (M9 stages 1–2): submitting the REPL echoes
+        // `> source` into the active tab's console lines and
+        // clears the input (the worker is not running in the
+        // test shell, so `send_command` is a no-op — the echo
+        // and the `DevToolsEvalResult` arm are the shell-side
+        // halves, tested separately). An empty submit is a
+        // no-op, and the result line lands under the echo.
+        let (dir, home, mut app) = test_shell("devtools-repl");
+        let tab_id = app.active().id;
+        let _ = app.update(Message::ShowDevTools);
+        let _ = app.update(Message::DevToolsInputChanged("1 + 2".to_string()));
+        let _ = app.update(Message::DevToolsSubmit);
+        assert_eq!(
+            app.devtools_panel
+                .as_ref()
+                .expect("panel stays open")
+                .repl_input,
+            ""
+        );
+        assert_eq!(
+            app.active().console_lines,
+            vec![(String::new(), "> 1 + 2".to_string())]
+        );
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DevToolsEvalResult {
+                result: "3".to_string(),
+            },
+        ));
+        assert_eq!(
+            app.active().console_lines,
+            vec![
+                (String::new(), "> 1 + 2".to_string()),
+                (String::new(), "3".to_string()),
+            ]
+        );
+        let _ = app.update(Message::DevToolsInputChanged("   ".to_string()));
+        let _ = app.update(Message::DevToolsSubmit);
+        assert_eq!(app.active().console_lines.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
         restore_test_home(home);
     }

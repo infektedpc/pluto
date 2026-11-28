@@ -819,6 +819,24 @@ relying on external browsers.
 - **Done criteria**: inspect any element on a page, toggle CSS rules live,
   view network requests, execute JS snippets in the active tab context.
 
+**Stage 17 (M9 stages 1–2) — done 2026-11-28 (NOT the whole
+milestone: inspector, matched rules / live CSS, network monitor,
+dock, and structured stack frames are still open):** protocol 13
+→ 14 (`DevToolsEval` / `DevToolsEvalResult` / `ConsoleLines`,
+appended at the end of each enum); the console drain —
+`TabJs::take_console_lines()` takes (never clones) the captured
+`console` lines plus uncaught-error lines as `("error", …)`,
+the tab thread forwards only new lines once per tick, and the
+shell keeps the last 1,000 per tab (oldest evicted); the REPL —
+`TabJs::eval_to_string()` drains microtasks first and formats
+the result with `format_console_arg` on the tab thread (page
+privileges only, a throw answers as the formatted exception);
+a floating native console panel (hamburger menu → "DevTools")
+showing the active tab's lines as untrusted plain text plus a
+REPL input (`> source` echo, result line under it). Capture
+runs always, so lines logged before DevTools opens are there
+when it opens.
+
 ### Milestone 10: Security Hardening, Extensions & Browser Polish
 
 Goal: prepare Pluto for daily-driver usage with strict web security,

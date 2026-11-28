@@ -645,6 +645,77 @@ fn console_goes_to_the_host_log() {
     );
 }
 
+#[test]
+fn console_drain_takes_only_new_lines() {
+    // Stage 17 (M9 stages 1–2): the drain is a take, not a
+    // clone — a tick with nothing new sends nothing, and a
+    // later log arrives exactly once.
+    let mut tab = test_tab();
+    run(&mut tab, "console.log('one');");
+    assert_eq!(
+        tab.take_console_lines(),
+        vec![("log".to_string(), "one".to_string())]
+    );
+    assert!(tab.take_console_lines().is_empty());
+    assert!(tab.console_lines().is_empty());
+    run(&mut tab, "console.log('two'); console.warn('three');");
+    assert_eq!(
+        tab.take_console_lines(),
+        vec![
+            ("log".to_string(), "two".to_string()),
+            ("warn".to_string(), "three".to_string()),
+        ]
+    );
+    assert!(tab.take_console_lines().is_empty());
+}
+
+#[test]
+fn console_drain_carries_uncaught_errors_as_error_lines() {
+    // Stage 17 (M9 stages 1–2): a throwing script reaches the
+    // same drain as an `("error", …)` line, and is consumed by
+    // it — `script_errors` is empty after the drain.
+    let mut tab = test_tab();
+    run(&mut tab, "throw new Error('kaboom');");
+    assert!(
+        tab.script_errors()
+            .iter()
+            .any(|e| e.contains("kaboom")),
+        "expected kaboom in errors: {:?}",
+        tab.script_errors()
+    );
+    let lines = tab.take_console_lines();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].0, "error");
+    assert!(lines[0].1.contains("kaboom"), "line: {:?}", lines[0]);
+    assert!(tab.script_errors().is_empty());
+    assert!(tab.take_console_lines().is_empty());
+}
+
+#[test]
+fn repl_eval_formats_values_and_throws() {
+    // Stage 17 (M9 stages 1–2): the REPL formats on the tab
+    // thread — primitives render like `String(value)`, an
+    // object renders `[object Object]`, and a throw comes back
+    // as the formatted exception, not a panic.
+    let mut tab = test_tab();
+    assert_eq!(tab.eval_to_string("1 + 2").unwrap(), "3");
+    assert_eq!(tab.eval_to_string("'a' + 'b'").unwrap(), "ab");
+    assert_eq!(tab.eval_to_string("1 < 2").unwrap(), "true");
+    assert_eq!(tab.eval_to_string("undefined").unwrap(), "undefined");
+    assert_eq!(tab.eval_to_string("null").unwrap(), "null");
+    assert_eq!(tab.eval_to_string("({a: 1})").unwrap(), "[object Object]");
+    assert_eq!(tab.eval_to_string("[1, 2]").unwrap(), "1,2");
+    let err = tab.eval_to_string("throw new Error('repl-boom');");
+    assert!(err.is_err());
+    assert!(
+        err.unwrap_err().contains("repl-boom"),
+        "expected repl-boom in the formatted throw"
+    );
+    // A snippet sees page state, like a page script would.
+    run(&mut tab, "const replState = 41;");
+    assert_eq!(tab.eval_to_string("replState + 1").unwrap(), "42");
+}
+
 // ---------------------------------------------------------------- onerror
 
 #[test]
