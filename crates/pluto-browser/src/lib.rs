@@ -93,6 +93,11 @@ struct InspectorNodeDetails {
     attrs: Vec<(String, String)>,
     computed: Vec<(String, String)>,
     geometry: Option<pluto_ipc::DevToolsBox>,
+    /// The rules that matched the node (Stage 19, M9 stage
+    /// 4), retained by the style pass in cascade order —
+    /// the inspector's matched-rules section renders them,
+    /// with the winner per property editable.
+    matched: Vec<pluto_ipc::DevToolsMatchedRule>,
 }
 
 struct Tab {
@@ -218,6 +223,15 @@ struct Tab {
     /// panel shows "node no longer in the document" instead
     /// of trusting a dead id.
     inspector_gone: bool,
+    /// Draft values for matched-rule edits (Stage 19, M9 stage
+    /// 4): (rule index in the current matched list, property)
+    /// -> the text typed in the value input, not yet submitted.
+    /// The rule index is only meaningful against the current
+    /// details, so the map is cleared whenever the details are
+    /// replaced, the selection changes, or the inspector is
+    /// cleared — a stale index must never apply to a different
+    /// rule's property.
+    devtools_style_drafts: std::collections::HashMap<(usize, String), String>,
     /// Per-layer sandbox results from the child's
     /// `SandboxReport` (Stage 13 Rec 12a): empty until the first
     /// report arrives (in-process tabs never report).
@@ -268,6 +282,7 @@ impl Tab {
             inspector_selected: None,
             inspector_details: None,
             inspector_gone: false,
+            devtools_style_drafts: std::collections::HashMap::new(),
             sandbox_layers: Vec::new(),
             crashed: false,
             crash_times: Vec::new(),
@@ -682,6 +697,25 @@ pub enum Message {
     /// The inspector's tree row click (Stage 18): select the
     /// node — ask the worker for its details and highlight it.
     DevToolsSelectNode(u64),
+    /// The inspector's matched-rule value edit (Stage 19, M9
+    /// stage 4): a winning declaration's value input changed —
+    /// the draft lives per tab, keyed by (rule index,
+    /// property), until it is submitted or a fresh
+    /// `DevToolsNode` answer replaces the details.
+    DevToolsStyleDraftChanged(usize, String, String),
+    /// The inspector's matched-rule value submit (Stage 19):
+    /// Enter on a winning declaration's value input — send
+    /// the draft as a `DevToolsStyleOverride` for the
+    /// selected node, then re-ask for the node's details
+    /// (the answer carries the fresh styles). A submit with
+    /// no draft, or a draft identical to the rule's current
+    /// value, is a no-op.
+    DevToolsStyleValueSubmit(usize, String),
+    /// The inspector's override remove (Stage 19): the × on a
+    /// DevTools-origin declaration — clear that property's
+    /// override for the selected node and re-ask for the
+    /// node's details.
+    DevToolsStyleOverrideRemove(String),
     /// The settings dialog's Close button: close the dialog.
     /// Everything in it already applied and persisted when it
     /// changed, except an invalid homepage draft, which is
@@ -968,6 +1002,7 @@ impl PlutoBrowser {
         tab.inspector_selected = None;
         tab.inspector_details = None;
         tab.inspector_gone = false;
+        tab.devtools_style_drafts.clear();
     }
 
     /// Ask a tab's worker for the root's children (Stage 18, M9
@@ -2437,6 +2472,80 @@ impl PlutoBrowser {
         }
         for (name, value) in &details.computed {
             rows.push(widget::text(format!("{name}: {value}")).size(12).into());
+        }
+        // Matched rules (Stage 19, M9 stage 4): cascade order,
+        // lowest first. A winning declaration is an editable
+        // input — Enter applies the value live through the
+        // DevTools override sheet; a losing one is greyed-out
+        // plain text. A DevTools-origin row carries a × that
+        // clears the override. The input shows the draft while
+        // one exists for (rule index, property), else the
+        // rule's value — both borrowed from the tab, so the
+        // rows stay valid for the view's lifetime.
+        rows.push(widget::text("Matched rules").size(13).into());
+        rows.push(
+            widget::text(
+                "Edit a value and press Enter to override it live. Overrides reset on navigation.",
+            )
+            .size(12)
+            .into(),
+        );
+        for (rule_idx, rule) in details.matched.iter().enumerate() {
+            rows.push(
+                widget::text(format!(
+                    "{} — {} (#{})",
+                    rule.selector,
+                    rule.origin.label(),
+                    rule.source_order
+                ))
+                .size(12)
+                .into(),
+            );
+            for decl in &rule.declarations {
+                if decl.winning {
+                    let shown: &str = tab
+                        .devtools_style_drafts
+                        .get(&(rule_idx, decl.property.clone()))
+                        .map(|d| d.as_str())
+                        .unwrap_or(&decl.value);
+                    let property = decl.property.clone();
+                    let property_for_submit = property.clone();
+                    let mut row_elements: Vec<Element<'_, Message>> = vec![
+                        widget::text(format!("{}:", decl.property)).size(12).into(),
+                        widget::text_input("", shown)
+                            .id(format!("devtools-style-{rule_idx}-{property}").into())
+                            .on_input(move |v| {
+                                Message::DevToolsStyleDraftChanged(rule_idx, property.clone(), v)
+                            })
+                            .on_submit(move |_| {
+                                Message::DevToolsStyleValueSubmit(rule_idx, property_for_submit.clone())
+                            })
+                            .style(small_text_input_style())
+                            .width(Length::Fill)
+                            .into(),
+                    ];
+                    if decl.important {
+                        row_elements.push(widget::text("!important").size(12).into());
+                    }
+                    if rule.origin == pluto_ipc::DevToolsRuleOrigin::DevTools {
+                        let property_for_remove = decl.property.clone();
+                        row_elements.push(
+                            widget::button::text("×")
+                                .class(small_button_style(SmallButtonBase::Text, false))
+                                .on_press(Message::DevToolsStyleOverrideRemove(property_for_remove))
+                                .into(),
+                        );
+                    }
+                    rows.push(widget::row(row_elements).spacing(4).into());
+                } else {
+                    let mut label =
+                        format!("{}: {} (overridden)", decl.property, decl.value);
+                    if decl.important {
+                        label.push_str(" !important");
+                    }
+                    rows.push(widget::text(label).size(12).into());
+                }
+            }
         }
         match &details.geometry {
             Some(b) => {
@@ -4101,6 +4210,7 @@ impl Application for PlutoBrowser {
                         attrs,
                         computed,
                         geometry,
+                        matched,
                     } => {
                         // Stage 18: the selected node's details.
                         // A stale epoch is dropped; an answer for
@@ -4115,6 +4225,13 @@ impl Application for PlutoBrowser {
                             if epoch > tab.inspector_epoch {
                                 tab.inspector_epoch = epoch;
                             }
+                            // A fresh answer replaces the
+                            // details the drafts were typed
+                            // against — drop them, or a later
+                            // submit would apply a stale (rule
+                            // index, property) pair to a different
+                            // rule's property.
+                            tab.devtools_style_drafts.clear();
                             if tag.is_empty() {
                                 tab.inspector_details = None;
                                 tab.inspector_gone = true;
@@ -4128,6 +4245,7 @@ impl Application for PlutoBrowser {
                                     // `Box` exists only to keep the
                                     // IPC variant small).
                                     geometry: geometry.map(|b| *b),
+                                    matched,
                                 });
                                 tab.inspector_gone = false;
                             }
@@ -5313,6 +5431,7 @@ impl Application for PlutoBrowser {
                     tab.inspector_selected = Some(id);
                     tab.inspector_details = None;
                     tab.inspector_gone = false;
+                    tab.devtools_style_drafts.clear();
                 }
                 self.send_inspector_highlight(index, Some(id));
                 let (tab_id, epoch) = {
@@ -5322,6 +5441,91 @@ impl Application for PlutoBrowser {
                 self.send_command_to(
                     tab_id,
                     BrowserToRenderer::DevToolsInspectNode { node: id, epoch },
+                );
+            }
+            Message::DevToolsStyleDraftChanged(rule_idx, property, draft) => {
+                // Stage 19 (M9 stage 4): stash the typed value
+                // against (rule index, property) — the input
+                // shows it until it is submitted or a fresh
+                // `DevToolsNode` answer replaces the details.
+                let tab = &mut self.tabs[self.active_tab];
+                tab.devtools_style_drafts
+                    .insert((rule_idx, property), draft);
+            }
+            Message::DevToolsStyleValueSubmit(rule_idx, property) => {
+                // Stage 19 (M9 stage 4): send the draft as a
+                // live-CSS override for the selected node, then
+                // re-ask for its details — the answer carries
+                // the fresh styles (and clears the drafts). A
+                // submit with no draft, no selected node, no
+                // details, or a draft identical to the rule's
+                // current value is a no-op.
+                let index = self.active_tab;
+                let (tab_id, epoch, node, value) = {
+                    let tab = &self.tabs[index];
+                    let Some(node) = tab.inspector_selected else {
+                        return Task::none();
+                    };
+                    let Some(details) = &tab.inspector_details else {
+                        return Task::none();
+                    };
+                    let Some(draft) = tab
+                        .devtools_style_drafts
+                        .get(&(rule_idx, property.clone()))
+                    else {
+                        return Task::none();
+                    };
+                    let current = details.matched.get(rule_idx).and_then(|r| {
+                        r.declarations
+                            .iter()
+                            .find(|d| d.property == property)
+                            .map(|d| d.value.clone())
+                    });
+                    if Some(draft.clone()) == current {
+                        return Task::none();
+                    }
+                    (tab.id, tab.inspector_epoch, node, draft.clone())
+                };
+                self.send_command_to(
+                    tab_id,
+                    BrowserToRenderer::DevToolsStyleOverride {
+                        node,
+                        property,
+                        value,
+                        enabled: true,
+                        epoch,
+                    },
+                );
+                self.send_command_to(
+                    tab_id,
+                    BrowserToRenderer::DevToolsInspectNode { node, epoch },
+                );
+            }
+            Message::DevToolsStyleOverrideRemove(property) => {
+                // Stage 19 (M9 stage 4): clear the property's
+                // override for the selected node, then re-ask
+                // for its details. No-op without a selected node.
+                let index = self.active_tab;
+                let (tab_id, epoch, node) = {
+                    let tab = &self.tabs[index];
+                    let Some(node) = tab.inspector_selected else {
+                        return Task::none();
+                    };
+                    (tab.id, tab.inspector_epoch, node)
+                };
+                self.send_command_to(
+                    tab_id,
+                    BrowserToRenderer::DevToolsStyleOverride {
+                        node,
+                        property,
+                        value: String::new(),
+                        enabled: false,
+                        epoch,
+                    },
+                );
+                self.send_command_to(
+                    tab_id,
+                    BrowserToRenderer::DevToolsInspectNode { node, epoch },
                 );
             }
             Message::DevToolsInputChanged(draft) => {
@@ -6462,6 +6666,25 @@ mod tests {
                     margin: ["0px".into(), "0px".into(), "0px".into(), "0px".into()],
                     padding: ["0px".into(), "0px".into(), "0px".into(), "0px".into()],
                 })),
+                matched: vec![pluto_ipc::DevToolsMatchedRule {
+                    selector: "div".to_string(),
+                    origin: pluto_ipc::DevToolsRuleOrigin::Author,
+                    source_order: 3,
+                    declarations: vec![
+                        pluto_ipc::DevToolsMatchedDecl {
+                            property: "display".to_string(),
+                            value: "block".to_string(),
+                            important: false,
+                            winning: true,
+                        },
+                        pluto_ipc::DevToolsMatchedDecl {
+                            property: "color".to_string(),
+                            value: "#ff0000".to_string(),
+                            important: false,
+                            winning: false,
+                        },
+                    ],
+                }],
             },
         ));
         let details = app.active().inspector_details.as_ref().expect("details land");
@@ -6473,6 +6696,73 @@ mod tests {
         );
         assert_eq!(details.geometry.as_ref().unwrap().width, 200.0);
         assert!(!app.active().inspector_gone);
+        // Stage 19 (M9 stage 4): the matched rules land with
+        // the details — selector, origin, and the winner per
+        // property.
+        assert_eq!(details.matched.len(), 1);
+        assert_eq!(details.matched[0].selector, "div");
+        assert_eq!(
+            details.matched[0].origin,
+            pluto_ipc::DevToolsRuleOrigin::Author
+        );
+        assert!(details.matched[0].declarations[0].winning);
+        assert!(!details.matched[0].declarations[1].winning);
+        // A draft is stashed against (rule index, property)
+        // and cleared by the next fresh answer — a stale
+        // index must never apply to a different rule.
+        let _ = app.update(Message::DevToolsStyleDraftChanged(
+            0,
+            "display".to_string(),
+            "inline".to_string(),
+        ));
+        assert_eq!(
+            app.active()
+                .devtools_style_drafts
+                .get(&(0, "display".to_string()))
+                .map(|d| d.as_str()),
+            Some("inline")
+        );
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DevToolsNode {
+                epoch: 0,
+                node: 7,
+                tag: "div".to_string(),
+                attrs: vec![("id".to_string(), "a".to_string())],
+                computed: vec![("display".to_string(), "inline".to_string())],
+                geometry: None,
+                matched: vec![pluto_ipc::DevToolsMatchedRule {
+                    selector: "div".to_string(),
+                    origin: pluto_ipc::DevToolsRuleOrigin::DevTools,
+                    source_order: u32::MAX,
+                    declarations: vec![pluto_ipc::DevToolsMatchedDecl {
+                        property: "display".to_string(),
+                        value: "inline".to_string(),
+                        important: false,
+                        winning: true,
+                    }],
+                }],
+            },
+        ));
+        assert!(app.active().devtools_style_drafts.is_empty());
+        assert_eq!(
+            app.active()
+                .inspector_details
+                .as_ref()
+                .unwrap()
+                .matched[0]
+                .origin,
+            pluto_ipc::DevToolsRuleOrigin::DevTools
+        );
+        // A submit with no draft is a no-op, and a remove with
+        // no worker behind the tab is a no-op — neither panics.
+        let _ = app.update(Message::DevToolsStyleValueSubmit(
+            0,
+            "display".to_string(),
+        ));
+        let _ = app.update(Message::DevToolsStyleOverrideRemove(
+            "display".to_string(),
+        ));
         // An answer for a node that is no longer selected is
         // dropped — the details stay the div's.
         let _ = app.update(Message::RendererEvent(
@@ -6484,6 +6774,7 @@ mod tests {
                 attrs: Vec::new(),
                 computed: Vec::new(),
                 geometry: None,
+                matched: vec![],
             },
         ));
         assert_eq!(app.active().inspector_details.as_ref().unwrap().tag, "div");
@@ -6507,6 +6798,7 @@ mod tests {
                 attrs: Vec::new(),
                 computed: Vec::new(),
                 geometry: None,
+                matched: vec![],
             },
         ));
         assert_eq!(app.active().inspector_details.as_ref().unwrap().tag, "div");
@@ -6520,6 +6812,7 @@ mod tests {
                 attrs: Vec::new(),
                 computed: Vec::new(),
                 geometry: None,
+                matched: vec![],
             },
         ));
         assert!(app.active().inspector_details.is_none());

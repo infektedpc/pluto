@@ -694,6 +694,10 @@ pub(crate) struct InspectNodeData {
     pub geometry: Option<pluto_js::Geometry>,
     pub margin: [String; 4],
     pub padding: [String; 4],
+    /// The rules that matched the node (Stage 19, M9 stage 4),
+    /// retained by the style pass in cascade order — carried
+    /// to the shell as `DevToolsMatchedRule`s.
+    pub matched: Vec<pluto_layout::MatchedRule>,
 }
 
 /// One entry of a wheel scroll chain (Stage 8 Rec 9): the scroll
@@ -789,6 +793,42 @@ fn geometry_of(tree: &LayoutTree, id: NodeId) -> Option<pluto_js::Geometry> {
 /// The inspector's tag for one node (Stage 18, M9 stage 3): the
 /// element name, or `#text` / `#comment` / `#document` /
 /// `#doctype` for non-elements. An unknown id has no tag.
+/// Convert layout retained matched rules into the IPC
+/// shape (Stage 19, M9 stage 4): a plain field-by-field
+/// copy — the layout types and the wire types are kept
+/// separate so a style-pass change never silently re-shapes
+/// the wire.
+fn devtools_matched_to_ipc(
+    rules: &[pluto_layout::MatchedRule],
+) -> Vec<pluto_ipc::DevToolsMatchedRule> {
+    rules
+        .iter()
+        .map(|r| pluto_ipc::DevToolsMatchedRule {
+            selector: r.selector.clone(),
+            origin: match r.origin {
+                pluto_layout::MatchedOrigin::Ua => pluto_ipc::DevToolsRuleOrigin::Ua,
+                pluto_layout::MatchedOrigin::User => pluto_ipc::DevToolsRuleOrigin::User,
+                pluto_layout::MatchedOrigin::Author => pluto_ipc::DevToolsRuleOrigin::Author,
+                pluto_layout::MatchedOrigin::Inline => pluto_ipc::DevToolsRuleOrigin::Inline,
+                pluto_layout::MatchedOrigin::DevTools => {
+                    pluto_ipc::DevToolsRuleOrigin::DevTools
+                }
+            },
+            source_order: r.source_order,
+            declarations: r
+                .declarations
+                .iter()
+                .map(|d| pluto_ipc::DevToolsMatchedDecl {
+                    property: d.property.clone(),
+                    value: d.value.clone(),
+                    important: d.important,
+                    winning: d.winning,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 fn devtools_tag(dom: &pluto_html::Dom, id: NodeId) -> String {
     match dom.get(id).map(|n| &n.kind) {
         Some(pluto_html::NodeKind::Element { tag }) => tag.clone(),
@@ -1367,11 +1407,18 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                             std::array::from_fn(|_| "0px".to_string()),
                         ),
                     };
+                    // Stage 19 (M9 stage 4): the retained matched
+                    // rules ride along — a node with a style entry
+                    // has them; a box-only node has none.
+                    let matched = style
+                        .map(|s| s.matched.clone())
+                        .unwrap_or_default();
                     Some(InspectNodeData {
                         computed,
                         geometry: geometry_of(tree, id),
                         margin,
                         padding,
+                        matched,
                     })
                 });
                 let _ = reply.send(data);
@@ -1774,6 +1821,18 @@ struct TabState {
     /// `SetHighlight` for the same node skips the re-collect +
     /// submit. Cleared on navigation with the actor's copy.
     devtools_highlight: Option<NodeId>,
+    /// The DevTools live-CSS overrides for the current document
+    /// (Stage 19, M9 stage 4): `node -> [(property, raw value
+    /// string)]`, the source of truth — copied into the layout
+    /// job's `ElementState` by `layout_and_submit`, so the
+    /// style pass applies them above the author cascade.
+    /// Never written into the `Dom` or the author sheet (page
+    /// JS cannot see the override sheet, only the computed
+    /// style it produces), and cleared on navigation with the
+    /// highlight above — overrides live in memory per document
+    /// and reset on navigation / reload (Joel has not decided
+    /// whether they should persist; see ARCHITECTURE.md).
+    devtools_overrides: HashMap<NodeId, Vec<(String, String)>>,
     /// The last title sent to the shell (Stage 11 Rec 8):
     /// `TitleChanged` fires at most once per submit, only when
     /// the title actually changed.
@@ -2101,6 +2160,7 @@ impl TabState {
             images: ImageStore::new(),
             last_display: None,
             devtools_highlight: None,
+            devtools_overrides: HashMap::new(),
             last_title: String::new(),
             favicon_url: None,
             favicon_resource: None,
@@ -2815,8 +2875,8 @@ async fn handle_single_command(
             } else {
                 (String::new(), Vec::new())
             };
-            let (computed, geometry) = if tag.is_empty() {
-                (Vec::new(), None)
+            let (computed, geometry, matched) = if tag.is_empty() {
+                (Vec::new(), None, Vec::new())
             } else {
                 let (reply_tx, reply_rx) = oneshot::channel();
                 if state
@@ -2824,7 +2884,7 @@ async fn handle_single_command(
                     .send(LayoutJob::InspectNode { id, reply: reply_tx })
                     .is_err()
                 {
-                    (Vec::new(), None)
+                    (Vec::new(), None, Vec::new())
                 } else {
                     match reply_rx.await {
                         Ok(Some(data)) => {
@@ -2833,6 +2893,7 @@ async fn handle_single_command(
                                 geometry,
                                 margin,
                                 padding,
+                                matched,
                             } = data;
                             (
                                 computed,
@@ -2844,9 +2905,10 @@ async fn handle_single_command(
                                     margin,
                                     padding,
                                 })),
+                                devtools_matched_to_ipc(&matched),
                             )
                         }
-                        _ => (Vec::new(), None),
+                        _ => (Vec::new(), None, Vec::new()),
                     }
                 }
             };
@@ -2857,6 +2919,7 @@ async fn handle_single_command(
                 attrs,
                 computed,
                 geometry,
+                matched,
             });
         }
         BrowserToRenderer::DevToolsPickNode { x, y, epoch: _ } => {
@@ -2888,6 +2951,52 @@ async fn handle_single_command(
                     // the tick's own `relayout_and_submit` calls.
                     recollect_and_submit(state, events).await;
                 }
+            }
+        }
+        BrowserToRenderer::DevToolsStyleOverride {
+            node,
+            property,
+            value,
+            enabled,
+            epoch,
+        } => {
+            // Stage 19 (M9 stage 4): a live-CSS edit from the
+            // inspector. Guards first — a stale epoch is ignored
+            // outright (the node belongs to an old document), as
+            // is an ask with no document or for a node the live
+            // `Dom` no longer holds. Otherwise record the
+            // override in the per-document map (set replaces an
+            // existing value for the property; clear removes it)
+            // and restyle the node's subtree through the
+            // incremental path — `layout_and_submit` copies the
+            // map into the job's `ElementState`, so the pass
+            // applies it above the author cascade and retains
+            // it as a `DevTools` matched entry. No answer is
+            // sent here: the shell re-asks `DevToolsInspectNode`
+            // after sending, and messages are processed in
+            // order, so the answer carries the fresh styles.
+            if epoch == state.nav_epoch
+                && state.has_document
+                && state
+                    .document
+                    .as_ref()
+                    .is_some_and(|doc| doc.dom().get(NodeId::from(slotmap::KeyData::from_ffi(node))).is_some())
+            {
+                let id = NodeId::from(slotmap::KeyData::from_ffi(node));
+                if enabled {
+                    let decls = state.devtools_overrides.entry(id).or_default();
+                    if let Some(slot) = decls.iter_mut().find(|(p, _)| *p == property) {
+                        slot.1 = value;
+                    } else {
+                        decls.push((property, value));
+                    }
+                } else if let Some(decls) = state.devtools_overrides.get_mut(&id) {
+                    decls.retain(|(p, _)| *p != property);
+                    if decls.is_empty() {
+                        state.devtools_overrides.remove(&id);
+                    }
+                }
+                restyle(state, events, &[id]).await;
             }
         }
         BrowserToRenderer::InputEvent(event) => {
@@ -4411,6 +4520,11 @@ fn start_navigation_with_body(
     state.last_title = String::new();
     state.last_display = None;
     state.devtools_highlight = None;
+    // Stage 19 (M9 stage 4): a navigation drops the old page's
+    // overrides with its highlight — their node ids die with
+    // the document, and the reset-on-navigation default is the
+    // conservative one until Joel decides on persistence.
+    state.devtools_overrides.clear();
     state.last_image_map = ImageMap::new();
     state.last_canvas_announced.clear();
     state.animation_visible.clear();
@@ -5771,10 +5885,22 @@ async fn layout_and_submit(
     // (1) Layout tree on the actor (no display list yet).
     let layout_started = std::time::Instant::now();
     let (tree_tx, tree_rx) = oneshot::channel();
+    // Stage 19 (M9 stage 4): the tab thread's per-document
+    // DevTools overrides ride into the style pass on the job's
+    // `ElementState` (the existing per-pass style-input
+    // carrier — the same shape as the hover / visited / form
+    // sets). The host's copy (`restyle`'s `set_element_state`)
+    // does NOT carry them: the host never resolves styles.
+    let mut element_state = state.element_state.clone();
+    element_state.devtools_overrides = state
+        .devtools_overrides
+        .iter()
+        .map(|(id, decls)| (*id, decls.clone()))
+        .collect();
     let job = LayoutJob::LayoutTree {
         document: Box::new(document),
         viewport: state.viewport,
-        state: state.element_state.clone(),
+        state: element_state,
         offsets: state.scroll_offsets.clone(),
         incremental,
         images,
@@ -10187,6 +10313,237 @@ mod tests {
         let (epoch, children) = wait_for_children(&mut event_rx, Some(div)).await;
         assert_eq!(epoch, 1, "the answer carries the current epoch");
         assert!(children.is_empty(), "a stale ask gets no data");
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    #[tokio::test]
+    async fn worker_devtools_override_round_trip() {
+        // Stage 19 (M9 stage 4): a live-CSS override on a real
+        // tab thread — inspect the <p>, see its author rule
+        // with the winning red; set an override to green; the
+        // next inspect shows the computed color green and a
+        // `DevTools override` matched entry winning; clear it
+        // and the author rule wins again. A stale-epoch
+        // override is ignored outright.
+        let page = "<!doctype html><html><head><style>p{color:#ff0000}</style></head><body><p id=\"x\">hi</p></body></html>";
+        let routes = std::sync::Arc::new(vec![(
+            "/".to_string(),
+            "text/html".to_string(),
+            page.to_string(),
+        )]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_routes(listener, routes));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        cmd_tx
+            .send(BrowserToRenderer::CommitNavigation {
+                url,
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
+            .expect("worker takes the command");
+        assert!(matches!(
+            next_event(&mut event_rx).await,
+            RendererToBrowser::DidCommit { .. }
+        ));
+        assert!(matches!(
+            next_event(&mut event_rx).await,
+            RendererToBrowser::SubmitDisplayList { .. }
+        ));
+        // Walk the tree to the <p>: root -> html -> body -> p.
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsDomChildren {
+                node: None,
+                epoch: 1,
+            })
+            .expect("worker takes DevToolsDomChildren");
+        let (_, children) = wait_for_children(&mut event_rx, None).await;
+        let html = children
+            .iter()
+            .find(|c| c.tag == "html")
+            .expect("html among root children")
+            .id;
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsDomChildren {
+                node: Some(html),
+                epoch: 1,
+            })
+            .expect("worker takes DevToolsDomChildren");
+        let (_, children) = wait_for_children(&mut event_rx, Some(html)).await;
+        let body = children
+            .iter()
+            .find(|c| c.tag == "body")
+            .expect("body among html children")
+            .id;
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsDomChildren {
+                node: Some(body),
+                epoch: 1,
+            })
+            .expect("worker takes DevToolsDomChildren");
+        let (_, children) = wait_for_children(&mut event_rx, Some(body)).await;
+        let p = children
+            .iter()
+            .find(|c| c.tag == "p")
+            .expect("p among body children")
+            .id;
+        // Inspect: the author rule wins red.
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsInspectNode {
+                node: p,
+                epoch: 1,
+            })
+            .expect("worker takes DevToolsInspectNode");
+        match wait_for_node(&mut event_rx, p).await {
+            RendererToBrowser::DevToolsNode {
+                computed, matched, ..
+            } => {
+                assert!(
+                    computed.contains(&("color".to_string(), "#ff0000".to_string())),
+                    "computed is red before the override: {computed:?}"
+                );
+                let author = matched
+                    .iter()
+                    .find(|r| r.selector == "p" && r.origin == pluto_ipc::DevToolsRuleOrigin::Author)
+                    .expect("the author p rule is retained");
+                let color = author
+                    .declarations
+                    .iter()
+                    .find(|d| d.property == "color")
+                    .expect("author color decl");
+                assert!(color.winning, "author color wins before the override");
+            }
+            other => panic!("expected DevToolsNode, got {other:?}"),
+        }
+        // Override to green: computed flips, the DevTools
+        // entry wins, the author rule loses.
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsStyleOverride {
+                node: p,
+                property: "color".to_string(),
+                value: "#00ff00".to_string(),
+                enabled: true,
+                epoch: 1,
+            })
+            .expect("worker takes DevToolsStyleOverride");
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsInspectNode {
+                node: p,
+                epoch: 1,
+            })
+            .expect("worker takes DevToolsInspectNode");
+        match wait_for_node(&mut event_rx, p).await {
+            RendererToBrowser::DevToolsNode {
+                computed, matched, ..
+            } => {
+                assert!(
+                    computed.contains(&("color".to_string(), "#00ff00".to_string())),
+                    "computed is green after the override: {computed:?}"
+                );
+                let devtools = matched
+                    .iter()
+                    .find(|r| r.origin == pluto_ipc::DevToolsRuleOrigin::DevTools)
+                    .expect("the DevTools override entry is retained");
+                assert_eq!(devtools.selector, "DevTools override");
+                let color = devtools
+                    .declarations
+                    .iter()
+                    .find(|d| d.property == "color")
+                    .expect("override color decl");
+                assert!(color.winning, "the override wins its property");
+                let author = matched
+                    .iter()
+                    .find(|r| r.selector == "p" && r.origin == pluto_ipc::DevToolsRuleOrigin::Author)
+                    .expect("the author p rule is still retained");
+                assert!(
+                    !author
+                        .declarations
+                        .iter()
+                        .find(|d| d.property == "color")
+                        .expect("author color decl")
+                        .winning,
+                    "the author color loses to the override"
+                );
+            }
+            other => panic!("expected DevToolsNode, got {other:?}"),
+        }
+        // A stale-epoch override is ignored: the color stays green.
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsStyleOverride {
+                node: p,
+                property: "color".to_string(),
+                value: "#0000ff".to_string(),
+                enabled: true,
+                epoch: 0,
+            })
+            .expect("worker takes DevToolsStyleOverride");
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsInspectNode {
+                node: p,
+                epoch: 1,
+            })
+            .expect("worker takes DevToolsInspectNode");
+        match wait_for_node(&mut event_rx, p).await {
+            RendererToBrowser::DevToolsNode { computed, .. } => {
+                assert!(
+                    computed.contains(&("color".to_string(), "#00ff00".to_string())),
+                    "a stale-epoch override must not land: {computed:?}"
+                );
+            }
+            other => panic!("expected DevToolsNode, got {other:?}"),
+        }
+        // Clear the override: the author rule wins red again
+        // and the DevTools entry is gone.
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsStyleOverride {
+                node: p,
+                property: "color".to_string(),
+                value: String::new(),
+                enabled: false,
+                epoch: 1,
+            })
+            .expect("worker takes DevToolsStyleOverride");
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsInspectNode {
+                node: p,
+                epoch: 1,
+            })
+            .expect("worker takes DevToolsInspectNode");
+        match wait_for_node(&mut event_rx, p).await {
+            RendererToBrowser::DevToolsNode {
+                computed, matched, ..
+            } => {
+                assert!(
+                    computed.contains(&("color".to_string(), "#ff0000".to_string())),
+                    "computed is red again after clearing: {computed:?}"
+                );
+                assert!(
+                    !matched
+                        .iter()
+                        .any(|r| r.origin == pluto_ipc::DevToolsRuleOrigin::DevTools),
+                    "no DevTools entry after clearing: {matched:?}"
+                );
+                let author = matched
+                    .iter()
+                    .find(|r| r.selector == "p" && r.origin == pluto_ipc::DevToolsRuleOrigin::Author)
+                    .expect("the author p rule is retained");
+                assert!(
+                    author
+                        .declarations
+                        .iter()
+                        .find(|d| d.property == "color")
+                        .expect("author color decl")
+                        .winning,
+                    "the author color wins again after clearing"
+                );
+            }
+            other => panic!("expected DevToolsNode, got {other:?}"),
+        }
         cmd_tx
             .send(BrowserToRenderer::Shutdown)
             .expect("worker takes Shutdown");

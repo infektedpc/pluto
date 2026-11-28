@@ -871,6 +871,60 @@ attributes, computed style, box model + the honest borders
 note); a selected node whose inspect answer comes back with the
 empty tag shows "node no longer in the document".
 
+**Stage 19 (M9 stage 4) — done 2026-11-28 (matched rules +
+live CSS; network monitor, dock, and structured stack frames
+still open):** protocol 15 → 16 (`DevToolsNode` gains the
+matched rules; new `DevToolsStyleOverride` appended at the end
+of `BrowserToRenderer`). Matched rules are RETAINED, not
+re-derived: `resolve_style` records one `MatchedRule` per
+matching (rule, selector) in cascade order on
+`NodeStyle.matched`, each with its declarations and the
+cascade winner per property (last declaration in cascade
+order wins; a winner whose `var()` fails or whose property
+`apply_decl` does not know still reads as winning — the
+computed style is what actually applied). Selector text comes
+from `Selector::to_css()`; values are parsed-value renderings
+(`#ff0000` shows as `#ff0000`, percentages stay percentages);
+presentation attributes are not rules and are not retained.
+Inline style is one entry (`element.style`, origin `Inline`,
+source order `u32::MAX`). Live CSS is a separate DevTools
+override sheet above the author cascade: overrides live in
+the tab thread's per-document map
+(`TabState.devtools_overrides`, never in the `Dom` or the
+author sheet — page JS cannot see the override sheet, only
+the computed style it produces), ride into the style pass on
+the job's `ElementState.devtools_overrides`, and are applied
+in `resolve_style` with a synthetic maximum `CascadeKey`
+(origin rank `u8::MAX`, `!important`, max layer / specificity
+/ source order) so they always win their property; they are
+recorded as a matched entry (`DevTools override`, origin
+`DevTools`) showing the raw typed value. The shell sends
+`DevToolsStyleOverride` (set / clear, stale epochs ignored,
+node-existence checked against the live `Dom`); the tab
+thread updates the map and restyles the node's subtree
+through the incremental `restyle` path (a failed incremental
+attempt falls back to FullLayout — the pre-existing ~100%
+fallback, not a DevTools bug), and the shell re-asks
+`DevToolsInspectNode` for the fresh styles — messages are
+processed in order, so no new answer variant was needed.
+The inspector shows the matched rules under the computed
+style: winning declarations are editable inputs (Enter
+applies the value live; a submit with no draft, or a draft
+identical to the current value, is a no-op), losers render
+as `property: value (overridden)`; DevTools-origin rows
+carry a × that clears the override. Drafts live per tab
+keyed by (rule index, property) and are cleared whenever
+the details are replaced, the selection changes, or the
+inspector is cleared, so a stale index can never apply to
+a different rule. **Open questions for Joel:** overrides
+live in memory per document and RESET on navigation / reload
+(the conservative default — persistence undecided); there is
+no author-rule toggle-off (a rule can only be beaten by an
+override, not disabled); an override whose `var()` fails
+still reads as winning in its matched entry; editing a value
+replaces the details on the next answer, so the input loses
+focus after Enter (the draft is dropped with the refresh).
+
 ### Milestone 10: Security Hardening, Extensions & Browser Polish
 
 Goal: prepare Pluto for daily-driver usage with strict web security,

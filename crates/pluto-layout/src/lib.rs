@@ -1150,17 +1150,101 @@ pub struct NodeStyle {
     pub hint: RestyleHint,
     pub damage: RestyleDamage,
     pub selector_flags: SelectorFlags,
+    /// The rules that matched this node, retained during
+    /// `resolve_style` (Stage 19, M9 stage 4) so the DevTools
+    /// inspector can show them without re-running the matcher
+    /// (a re-run would need the same viewport / theme /
+    /// `ElementState` as the applied pass, or it would show
+    /// rules that did not apply). One entry per matching
+    /// (rule, selector), in cascade order (lowest first), each
+    /// with its declarations and the cascade winner per
+    /// property marked.
+    pub matched: Vec<MatchedRule>,
 }
 
-/// Dynamic pseudo-class state for one style/layout pass: which
-/// elements are currently hovered / active / focused, and which
-/// links point at URLs the session has visited. The shell owns
-/// this (hit-testing feeds `:hover`; the worker's committed-URL
-/// set feeds `:visited` — see `TabState::visited_urls` in
-/// pluto-browser, which projects the set onto element ids before
-/// each layout pass).
+/// One declaration of a matched rule, as the inspector shows
+/// it: the property, the parsed value rendered as CSS text
+/// (`#ff0000` renders as `rgb(255, 0, 0)` — the serialiser
+/// renders parsed values, not the author's source), whether
+/// it was `!important`, and whether it won the cascade for
+/// its property (the last declaration in cascade order wins;
+/// the rest are shown greyed out as overridden).
+#[derive(Debug, Clone)]
+pub struct MatchedDecl {
+    pub property: String,
+    pub value: String,
+    pub important: bool,
+    pub winning: bool,
+}
+
+/// One rule that matched a node, as the inspector shows it.
+#[derive(Debug, Clone)]
+pub struct MatchedRule {
+    /// The selector as written (`div.card > a:hover`), or
+    /// `element.style` for the inline `style=""` attribute,
+    /// or `DevTools override` for a live-CSS override.
+    pub selector: String,
+    pub origin: MatchedOrigin,
+    /// Global sequence across the whole stylesheet, in
+    /// document order (UA sheet: 0..); the override entry
+    /// carries `u32::MAX`.
+    pub source_order: u32,
+    pub declarations: Vec<MatchedDecl>,
+}
+
+/// Where a matched rule came from. Mirrors
+/// [`pluto_css::Origin`] plus the two synthetic origins the
+/// cascade synthesises: the inline `style=""` attribute and
+/// the DevTools override sheet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchedOrigin {
+    Ua,
+    User,
+    Author,
+    Inline,
+    DevTools,
+}
+
+impl From<pluto_css::Origin> for MatchedOrigin {
+    fn from(origin: pluto_css::Origin) -> Self {
+        match origin {
+            pluto_css::Origin::Ua => MatchedOrigin::Ua,
+            pluto_css::Origin::User => MatchedOrigin::User,
+            pluto_css::Origin::Author => MatchedOrigin::Author,
+        }
+    }
+}
+
+/// Per-pass style inputs beyond the DOM and the sheets, for
+/// one style/layout pass. Mostly dynamic pseudo-class state:
+/// which elements are currently hovered / active / focused,
+/// and which links point at URLs the session has visited. The
+/// shell owns this (hit-testing feeds `:hover`; the worker's
+/// committed-URL set feeds `:visited` — see
+/// `TabState::visited_urls` in pluto-browser, which projects
+/// the set onto element ids before each layout pass).
+///
+/// It also carries the DevTools live-CSS overrides (Stage 19,
+/// M9 stage 4): `(node, [(property, raw value)])`, owned by
+/// the tab thread's per-document map and copied into the
+/// pass's `ElementState` by `layout_and_submit` — this struct
+/// is already the carrier for everything a style pass needs
+/// beyond `Dom` + sheets, so the overrides ride it rather
+/// than churning every `resolve_*` / `build*` signature.
+/// The overrides are never written into the `Dom` or the
+/// author sheet, so they reset by dropping the tab thread's
+/// map on navigation and never leak to page JS.
 #[derive(Debug, Clone, Default)]
 pub struct ElementState {
+    /// DevTools live-CSS overrides for this pass (Stage 19,
+    /// M9 stage 4): `(node, [(property, raw value string)])`.
+    /// Applied in `resolve_style` above the whole author
+    /// cascade (including inline style and `!important`
+    /// author declarations) via a synthetic maximum
+    /// [`CascadeKey`], so an override always wins its
+    /// property. The value is parsed with `parse_value` at
+    /// apply time, never embedded in a stylesheet string.
+    pub devtools_overrides: Vec<(DomId, Vec<(String, String)>)>,
     pub hover: HashSet<DomId>,
     pub active: HashSet<DomId>,
     pub focus: HashSet<DomId>,
@@ -4428,6 +4512,10 @@ struct StyleCtx<'a> {
     /// The root element's computed font size (`rem` resolves against
     /// it; 16.0 until the root level is resolved).
     root_font_size: f32,
+    /// DevTools live-CSS overrides for this pass (Stage 19, M9
+    /// stage 4), borrowed from `state.devtools_overrides`:
+    /// `(node, [(property, raw value string)])`.
+    overrides: &'a [(DomId, Vec<(String, String)>)],
 }
 
 /// Phase 2: resolve one style per entry of `levels`, level by level.
@@ -4499,18 +4587,20 @@ fn resolve_styles(
             state,
             viewport,
             root_font_size,
+            overrides: &state.devtools_overrides,
         };
         let resolve_one =
             |&(id, ref parent): &(DomId, Arc<ComputedStyle>)| {
-                let (style, flags) = resolve_style(dom, id, &ctx, parent);
-                (id, Arc::new(style), flags)
+                let (style, flags, matched) = resolve_style(dom, id, &ctx, parent);
+                (id, Arc::new(style), flags, matched)
             };
-        let resolved_level: Vec<(DomId, Arc<ComputedStyle>, SelectorFlags)> = if parallel {
-            inputs.par_iter().map(resolve_one).collect()
-        } else {
-            inputs.iter().map(resolve_one).collect()
-        };
-        for (id, style, flags) in resolved_level {
+        let resolved_level: Vec<(DomId, Arc<ComputedStyle>, SelectorFlags, Vec<MatchedRule>)> =
+            if parallel {
+                inputs.par_iter().map(resolve_one).collect()
+            } else {
+                inputs.iter().map(resolve_one).collect()
+            };
+        for (id, style, flags, matched) in resolved_level {
             node_styles.insert(
                 id,
                 NodeStyle {
@@ -4521,6 +4611,7 @@ fn resolve_styles(
                     hint: RestyleHint::full(),
                     damage: RestyleDamage::full(),
                     selector_flags: flags,
+                    matched,
                 },
             );
             resolved.insert(id, style);
@@ -5088,7 +5179,7 @@ fn resolve_style(
     id: DomId,
     ctx: &StyleCtx,
     parent: &Arc<ComputedStyle>,
-) -> (ComputedStyle, SelectorFlags) {
+) -> (ComputedStyle, SelectorFlags, Vec<MatchedRule>) {
     let mut style = (**parent).clone();
     // Non-inherited properties fall back to initial (the inherited
     // ones — color, font-*, line-height, text-align, white-space —
@@ -5139,6 +5230,15 @@ fn resolve_style(
     // temporary, so borrowed values would not live long enough.)
     let mut decls: Vec<(CascadeKey, String, Value)> = Vec::new();
     let mut flags = SelectorFlags::default();
+    // Stage 19 (M9 stage 4): the matched rules, retained for
+    // the inspector. `matched_keys` runs parallel to `decls` —
+    // (cascade key, entry index, declaration index) in the
+    // same insertion order — so the winner marking after the
+    // sort addresses the retained declarations by index.
+    // Presentation attributes are NOT retained: they are not
+    // rules (SVG-only, author-level, specificity 0).
+    let mut matched: Vec<MatchedRule> = Vec::new();
+    let mut matched_keys: Vec<(CascadeKey, usize, usize)> = Vec::new();
     for cand in ctx.index.candidates(dom, id) {
         let sel = &cand.rule.selectors[cand.selector_idx];
         if !selector_matches(dom, id, sel, ctx.state) {
@@ -5148,6 +5248,12 @@ fn resolve_style(
         flags.has_dynamic_pseudo |= f.has_dynamic_pseudo;
         flags.has_sibling_combinator |= f.has_sibling_combinator;
         flags.has_descendant_combinator |= f.has_descendant_combinator;
+        // Stage 19 (M9 stage 4): retain the matched rule for
+        // the inspector — same declarations, same keys as the
+        // flat `decls` list, so the winner marking below (by
+        // cascade key) addresses them by index.
+        let entry_idx = matched.len();
+        let mut entry_decls: Vec<MatchedDecl> = Vec::new();
         for decl in &cand.rule.declarations {
             // For `!important` the layer order reverses (Cascade 5):
             // earlier layers win, and unlayered important loses to
@@ -5157,19 +5263,29 @@ fn resolve_style(
             } else {
                 cand.layer_order
             };
-            decls.push((
-                CascadeKey {
-                    origin_rank: cand.rule.origin.rank(decl.important),
-                    important: decl.important,
-                    layer_order,
-                    inline: false,
-                    specificity: sel.specificity(),
-                    source_order: cand.source_order,
-                },
-                decl.property.clone(),
-                decl.value.clone(),
-            ));
+            let key = CascadeKey {
+                origin_rank: cand.rule.origin.rank(decl.important),
+                important: decl.important,
+                layer_order,
+                inline: false,
+                specificity: sel.specificity(),
+                source_order: cand.source_order,
+            };
+            decls.push((key, decl.property.clone(), decl.value.clone()));
+            matched_keys.push((key, entry_idx, entry_decls.len()));
+            entry_decls.push(MatchedDecl {
+                property: decl.property.clone(),
+                value: decl.value.to_string(),
+                important: decl.important,
+                winning: false,
+            });
         }
+        matched.push(MatchedRule {
+            selector: sel.to_css(),
+            origin: MatchedOrigin::from(cand.rule.origin),
+            source_order: cand.source_order,
+            declarations: entry_decls,
+        });
     }
     // Inline `style=""`: parsed as declarations of a dummy rule.
     // Inline beats all rule-based declarations of the same
@@ -5177,26 +5293,38 @@ fn resolve_style(
     if let Some(attr) = dom.attr(id, "style")
         && !attr.trim().is_empty() {
             let inline_sheet = Stylesheet::parse(&format!("* {{ {attr} }}"));
+            let entry_idx = matched.len();
+            let mut entry_decls: Vec<MatchedDecl> = Vec::new();
             for rule in &inline_sheet.rules {
                 for decl in &rule.declarations {
-                    decls.push((
-                        CascadeKey {
-                            origin_rank: Origin::Author.rank(decl.important),
-                            important: decl.important,
-                            layer_order: if decl.important {
-                                i32::MAX.wrapping_neg()
-                            } else {
-                                i32::MAX
-                            },
-                            inline: true,
-                            specificity: (0, 0, 0),
-                            source_order: u32::MAX,
+                    let key = CascadeKey {
+                        origin_rank: Origin::Author.rank(decl.important),
+                        important: decl.important,
+                        layer_order: if decl.important {
+                            i32::MAX.wrapping_neg()
+                        } else {
+                            i32::MAX
                         },
-                        decl.property.clone(),
-                        decl.value.clone(),
-                    ));
+                        inline: true,
+                        specificity: (0, 0, 0),
+                        source_order: u32::MAX,
+                    };
+                    decls.push((key, decl.property.clone(), decl.value.clone()));
+                    matched_keys.push((key, entry_idx, entry_decls.len()));
+                    entry_decls.push(MatchedDecl {
+                        property: decl.property.clone(),
+                        value: decl.value.to_string(),
+                        important: decl.important,
+                        winning: false,
+                    });
                 }
             }
+            matched.push(MatchedRule {
+                selector: "element.style".to_string(),
+                origin: MatchedOrigin::Inline,
+                source_order: u32::MAX,
+                declarations: entry_decls,
+            });
         }
     // Presentation attributes (Stage 15, M7 Phase 1, Rec 6): an
     // SVG element's `fill` / `stroke` / `stroke-width` /
@@ -5235,7 +5363,104 @@ fn resolve_style(
             }
         }
     }
+    // Stage 19 (M9 stage 4): DevTools live-CSS overrides —
+    // one entry per overridden node, applied above the whole
+    // author cascade (including inline style and `!important`
+    // author declarations): the synthetic key sorts above
+    // every real key, so an override always wins its property
+    // and the panel shows it last. The value is parsed with
+    // `parse_value` (never embedded in a stylesheet string),
+    // so a hostile value cannot inject a second declaration
+    // — the same rule as presentation attributes.
+    if let Some(node_overrides) = ctx
+        .overrides
+        .iter()
+        .find(|(oid, _)| *oid == id)
+        .map(|(_, decls)| decls)
+    {
+        let entry_idx = matched.len();
+        let mut entry_decls: Vec<MatchedDecl> = Vec::new();
+        for (property, raw) in node_overrides {
+            let key = CascadeKey {
+                origin_rank: u8::MAX,
+                important: true,
+                layer_order: i32::MAX,
+                inline: true,
+                specificity: (u32::MAX, u32::MAX, u32::MAX),
+                source_order: u32::MAX,
+            };
+            decls.push((key, property.clone(), parse_value(raw)));
+            matched_keys.push((key, entry_idx, entry_decls.len()));
+            entry_decls.push(MatchedDecl {
+                property: property.clone(),
+                // The value as typed (the panel's input shows
+                // what the user typed, not the parsed rendering).
+                value: raw.clone(),
+                important: false,
+                winning: false,
+            });
+        }
+        matched.push(MatchedRule {
+            selector: "DevTools override".to_string(),
+            origin: MatchedOrigin::DevTools,
+            source_order: u32::MAX,
+            declarations: entry_decls,
+        });
+    }
     decls.sort_by_key(|(key, _, _)| *key);
+
+    // Stage 19 (M9 stage 4): mark the cascade winner per
+    // property — the last declaration in sorted order wins
+    // (the sort is stable, so equal keys keep insertion
+    // order). A winner whose `var()` fails to resolve, or
+    // whose property `apply_decl` does not know, still reads
+    // as winning here: the panel marks by cascade key, as the
+    // research report specifies, and the computed style shows
+    // what actually applied.
+    matched_keys.sort_by_key(|(key, _, _)| *key);
+    {
+        // Owned keys: a `HashSet<&str>` would borrow the
+        // properties out of `matched` itself, which then
+        // cannot be mutably marked winning.
+        let mut seen: HashSet<String> = HashSet::new();
+        for &(_, entry_idx, decl_idx) in matched_keys.iter().rev() {
+            let property = matched[entry_idx].declarations[decl_idx]
+                .property
+                .clone();
+            if seen.insert(property) {
+                matched[entry_idx].declarations[decl_idx].winning = true;
+            }
+        }
+    }
+    // Entries in cascade order (lowest first): each entry
+    // sorts by its highest declaration key; the sort is
+    // stable, so entries whose declarations share a key keep
+    // collection order (UA first, author in document order,
+    // inline, then DevTools overrides). Rules with no
+    // declarations (an empty rule that matched) are dropped —
+    // the panel has nothing to show for them.
+    let mut entry_max: Vec<CascadeKey> = matched
+        .iter()
+        .map(|_| CascadeKey {
+            origin_rank: 0,
+            important: false,
+            layer_order: i32::MIN,
+            inline: false,
+            specificity: (0, 0, 0),
+            source_order: 0,
+        })
+        .collect();
+    for (key, entry_idx, _) in &matched_keys {
+        let m = &mut entry_max[*entry_idx];
+        if *key > *m {
+            *m = *key;
+        }
+    }
+    let mut paired: Vec<(CascadeKey, MatchedRule)> =
+        entry_max.into_iter().zip(matched).collect();
+    paired.retain(|(_, rule)| !rule.declarations.is_empty());
+    paired.sort_by_key(|(key, _)| *key);
+    matched = paired.into_iter().map(|(_, rule)| rule).collect();
 
     // M6 Rec 12: custom properties first. The element's own `--*`
     // declarations (in cascade order — the sorted list, so the
@@ -5322,7 +5547,7 @@ fn resolve_style(
     if style.stroke == Paint::CurrentColor {
         style.stroke = Paint::Color(style.color);
     }
-    (style, flags)
+    (style, flags, matched)
 }
 
 /// Resolve `var()` references in one declaration value against
@@ -9008,6 +9233,158 @@ mod tests {
         assert_eq!(ns.computed.font_size, 16.0);
         assert!(ns.hint.restyle_self && ns.hint.restyle_subtree);
         assert!(ns.damage.repaint && ns.damage.reflow);
+    }
+
+    // ---- Stage 19 (M9 stage 4): matched rules + live CSS ----
+
+    fn matched_for<'a>(ns: &'a NodeStyle, selector: &str) -> &'a MatchedRule {
+        ns.matched
+            .iter()
+            .find(|r| r.selector == selector)
+            .unwrap_or_else(|| panic!("no matched rule {selector} in {:?}", ns.matched))
+    }
+
+    fn winning<'a>(rule: &'a MatchedRule, property: &str) -> &'a MatchedDecl {
+        rule.declarations
+            .iter()
+            .find(|d| d.property == property)
+            .unwrap_or_else(|| panic!("no {property} in {rule:?}"))
+    }
+
+    #[test]
+    fn matched_rules_retained_in_cascade_order() {
+        // Stage 19 (M9 stage 4): the inspector's matched rules
+        // come from the pass that applied the cascade, not a
+        // second matcher run — UA first, then author in
+        // specificity / source order, with the winner per
+        // property marked and the losers greyed out.
+        let dom = parse_html("<html><body><p id=\"x\" class=\"hot\">hi</p></body></html>");
+        let sheet = Stylesheet::parse(
+            "p { color: #ff0000; margin: 0px; } .hot { color: #0000ff; } #x { margin: 4px; }",
+        );
+        let ua = Stylesheet::ua();
+        let (_, node_styles) = resolve_document_styles(
+            &dom,
+            &ua,
+            &sheet,
+            false,
+            (800.0, 600.0),
+            &ElementState::default(),
+            Theme::Light,
+        );
+        let p = find_element(&dom, dom.root().unwrap(), "p").unwrap();
+        let ns = node_styles.get(p).expect("node style for <p>");
+        // Cascade order: the UA `p` rule, then author `p`, `.hot`,
+        // `#x` (specificity, then source order). The shorthand
+        // `margin` is expanded to longhands at parse time, so the
+        // margin checks below read `margin-top`.
+        let selectors: Vec<&str> = ns
+            .matched
+            .iter()
+            .map(|r| r.selector.as_str())
+            .collect();
+        assert_eq!(selectors, vec!["p", "p", ".hot", "#x"]);
+        assert_eq!(ns.matched[0].origin, MatchedOrigin::Ua);
+        assert_eq!(ns.matched[1].origin, MatchedOrigin::Author);
+        // `color`: the author `p` rule loses to `.hot`.
+        let author_p = ns
+            .matched
+            .iter()
+            .find(|r| r.selector == "p" && r.origin == MatchedOrigin::Author)
+            .unwrap();
+        assert!(!winning(author_p, "color").winning);
+        assert!(winning(matched_for(ns, ".hot"), "color").winning);
+        // `margin-top`: the UA `1em` and author `0px` both lose
+        // to `#x`'s `4px`.
+        assert!(winning(matched_for(ns, "#x"), "margin-top").winning);
+        assert!(!winning(author_p, "margin-top").winning);
+        let ua_p = ns
+            .matched
+            .iter()
+            .find(|r| r.selector == "p" && r.origin == MatchedOrigin::Ua)
+            .unwrap();
+        assert!(!winning(ua_p, "margin-top").winning);
+        // The UA `display: block` is unopposed, so it wins.
+        assert!(winning(ua_p, "display").winning);
+        // The computed style agrees with the winners.
+        let computed = ns.computed.to_pairs();
+        assert!(computed
+            .iter()
+            .any(|(n, v)| n == "color" && v == "#0000ff"));
+        assert!(computed
+            .iter()
+            .any(|(n, v)| n == "margin" && v == "4px 4px 4px 4px"));
+    }
+
+    #[test]
+    fn devtools_override_wins_and_is_retained() {
+        // Stage 19 (M9 stage 4): an override beats the whole
+        // author cascade (including a higher-specificity rule)
+        // and is retained as a `DevTools` matched entry, last,
+        // with its declaration winning.
+        let dom = parse_html("<html><body><p class=\"hot\">hi</p></body></html>");
+        let sheet = Stylesheet::parse("p { color: #ff0000; } .hot { color: #0000ff; }");
+        let ua = Stylesheet::ua();
+        let p = find_element(&dom, dom.root().unwrap(), "p").unwrap();
+        let state = ElementState {
+            devtools_overrides: vec![(p, vec![("color".to_string(), "#00ff00".to_string())])],
+            ..Default::default()
+        };
+        let (styles, node_styles) = resolve_document_styles(
+            &dom, &ua, &sheet, false, (800.0, 600.0), &state, Theme::Light,
+        );
+        let pairs = styles.get(&p).unwrap().to_pairs();
+        assert!(pairs
+            .iter()
+            .any(|(n, v)| n == "color" && v == "#00ff00"));
+        let ns = node_styles.get(p).expect("node style for <p>");
+        let last = ns.matched.last().expect("override entry last");
+        assert_eq!(last.origin, MatchedOrigin::DevTools);
+        assert_eq!(last.selector, "DevTools override");
+        assert_eq!(last.declarations.len(), 1);
+        assert_eq!(last.declarations[0].property, "color");
+        assert!(last.declarations[0].winning);
+        // The author winner lost its crown.
+        assert!(!winning(matched_for(ns, ".hot"), "color").winning);
+    }
+
+    #[test]
+    fn devtools_override_custom_property_inherits_to_descendants() {
+        // Stage 19 (M9 stage 4): overrides participate in the
+        // cascade, they are not a post-hoc overlay — a `--*`
+        // override on an ancestor flows into descendants'
+        // `var()` resolution during their own resolve, so it
+        // must be in the pass, not applied after it.
+        let dom = parse_html(
+            "<html><body><div id=\"parent\"><span id=\"child\">hi</span></div></body></html>",
+        );
+        let sheet = Stylesheet::parse(
+            "html { --brand: #ff0000; } #child { color: var(--brand); }",
+        );
+        let ua = Stylesheet::ua();
+        let html = find_element(&dom, dom.root().unwrap(), "html").unwrap();
+        let child = find_element(&dom, dom.root().unwrap(), "span").unwrap();
+        let state = ElementState {
+            devtools_overrides: vec![(
+                html,
+                vec![("--brand".to_string(), "#0000ff".to_string())],
+            )],
+            ..Default::default()
+        };
+        let (styles, node_styles) = resolve_document_styles(
+            &dom, &ua, &sheet, false, (800.0, 600.0), &state, Theme::Light,
+        );
+        let pairs = styles.get(&child).unwrap().to_pairs();
+        assert!(
+            pairs.iter().any(|(n, v)| n == "color" && v == "#0000ff"),
+            "child inherits the overridden --brand: {pairs:?}"
+        );
+        // And the override is retained on the ancestor it was set on.
+        let ns = node_styles.get(html).expect("node style for <html>");
+        assert!(ns
+            .matched
+            .iter()
+            .any(|r| r.origin == MatchedOrigin::DevTools));
     }
 
     // ---- R11 pre-shape: serial fallback path only (test) ----

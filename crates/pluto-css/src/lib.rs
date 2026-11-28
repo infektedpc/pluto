@@ -1279,6 +1279,35 @@ pub struct AnPlusB {
     pub b: i32,
 }
 
+impl AnPlusB {
+    /// The `an+b` microsyntax as written in a selector
+    /// (`2n+1`; `odd` parses to `2, 1` and renders `2n+1` —
+    /// the serialiser is faithful to the parsed values, not to
+    /// the author's keywords).
+    pub fn to_css(&self) -> String {
+        match (self.a, self.b) {
+            (0, b) => format!("{b}"),
+            (a, 0) => match a {
+                1 => "n".to_string(),
+                -1 => "-n".to_string(),
+                _ => format!("{a}n"),
+            },
+            (a, b) => {
+                let a_part = match a {
+                    1 => "n".to_string(),
+                    -1 => "-n".to_string(),
+                    _ => format!("{a}n"),
+                };
+                if b > 0 {
+                    format!("{a_part}+{b}")
+                } else {
+                    format!("{a_part}{b}")
+                }
+            }
+        }
+    }
+}
+
 /// An attribute-selector operator: `[a]`, `[a=v]`, `[a~=v]`, `[a|=v]`,
 /// `[a^=v]`, `[a$=v]`, `[a*=v]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1351,6 +1380,55 @@ impl PseudoClass {
             _ => (0, 1, 0),
         }
     }
+
+    /// The pseudo-class as written (`:hover`, `:nth-child(2n+1)`,
+    /// `:not(.a, .b)`). The serialiser is faithful to the parsed
+    /// values — `:nth-child(odd)` renders as `:nth-child(n+1)`.
+    pub fn to_css(&self) -> String {
+        let list = |args: &[Selector]| {
+            args.iter()
+                .map(|s| s.to_css())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match self {
+            PseudoClass::Root => ":root".to_string(),
+            PseudoClass::FirstChild => ":first-child".to_string(),
+            PseudoClass::LastChild => ":last-child".to_string(),
+            PseudoClass::NthChild(ab) => format!(":nth-child({})", ab.to_css()),
+            PseudoClass::NthLastChild(ab) => {
+                format!(":nth-last-child({})", ab.to_css())
+            }
+            PseudoClass::OnlyChild => ":only-child".to_string(),
+            PseudoClass::Empty => ":empty".to_string(),
+            PseudoClass::FirstOfType => ":first-of-type".to_string(),
+            PseudoClass::LastOfType => ":last-of-type".to_string(),
+            PseudoClass::NthOfType(ab) => format!(":nth-of-type({})", ab.to_css()),
+            PseudoClass::NthLastOfType(ab) => {
+                format!(":nth-last-of-type({})", ab.to_css())
+            }
+            PseudoClass::OnlyOfType => ":only-of-type".to_string(),
+            PseudoClass::Link => ":link".to_string(),
+            PseudoClass::Visited => ":visited".to_string(),
+            PseudoClass::AnyLink => ":any-link".to_string(),
+            PseudoClass::Hover => ":hover".to_string(),
+            PseudoClass::Active => ":active".to_string(),
+            PseudoClass::Focus => ":focus".to_string(),
+            PseudoClass::FocusVisible => ":focus-visible".to_string(),
+            PseudoClass::FocusWithin => ":focus-within".to_string(),
+            PseudoClass::Valid => ":valid".to_string(),
+            PseudoClass::Invalid => ":invalid".to_string(),
+            PseudoClass::Required => ":required".to_string(),
+            PseudoClass::Optional => ":optional".to_string(),
+            PseudoClass::Disabled => ":disabled".to_string(),
+            PseudoClass::Checked => ":checked".to_string(),
+            PseudoClass::ReadOnly => ":read-only".to_string(),
+            PseudoClass::Not(args) => format!(":not({})", list(args)),
+            PseudoClass::Is(args) => format!(":is({})", list(args)),
+            PseudoClass::Where(args) => format!(":where({})", list(args)),
+            PseudoClass::Has(args) => format!(":has({})", list(args)),
+        }
+    }
 }
 
 /// A pseudo-element (`::before`, ...). Parsed and stored on the
@@ -1363,6 +1441,20 @@ pub enum PseudoElement {
     FirstLetter,
     Marker,
     Selection,
+}
+
+impl PseudoElement {
+    /// The CSS name (`::before`, ...), without the colons.
+    pub fn name(&self) -> &'static str {
+        match self {
+            PseudoElement::Before => "before",
+            PseudoElement::After => "after",
+            PseudoElement::FirstLine => "first-line",
+            PseudoElement::FirstLetter => "first-letter",
+            PseudoElement::Marker => "marker",
+            PseudoElement::Selection => "selection",
+        }
+    }
 }
 
 /// One simple selector: part of a compound selector, all parts of which
@@ -1413,6 +1505,53 @@ impl SimpleSelector {
             SimpleSelector::Type(_) => 2,
             SimpleSelector::Universal => 1,
             SimpleSelector::PseudoElement(_) => 0,
+        }
+    }
+
+    /// The simple selector as written (`.note`, `#main`,
+    /// `[href^="https"]`, `:hover`). Attribute values are
+    /// re-quoted (with `"` and `\` escaped), so the output
+    /// always parses back to the same selector.
+    pub fn to_css(&self) -> String {
+        match self {
+            SimpleSelector::Universal => "*".to_string(),
+            SimpleSelector::Type(t) => t.clone(),
+            SimpleSelector::Class(c) => format!(".{c}"),
+            SimpleSelector::Id(w) => format!("#{w}"),
+            SimpleSelector::Attribute {
+                name,
+                op,
+                value,
+                case_sensitive,
+            } => {
+                let mut out = format!("[{name}");
+                if *op != AttrOp::Exists {
+                    let op_str = match op {
+                        AttrOp::Exists => unreachable!(),
+                        AttrOp::Equals => "=",
+                        AttrOp::Includes => "~=",
+                        AttrOp::Dash => "|=",
+                        AttrOp::Prefix => "^=",
+                        AttrOp::Suffix => "$=",
+                        AttrOp::Substring => "*=",
+                    };
+                    let v = value.as_deref().unwrap_or("");
+                    let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
+                    out.push_str(op_str);
+                    out.push('"');
+                    out.push_str(&escaped);
+                    out.push('"');
+                }
+                match case_sensitive {
+                    Some(false) => out.push_str(" i"),
+                    Some(true) => out.push_str(" s"),
+                    None => {}
+                }
+                out.push(']');
+                out
+            }
+            SimpleSelector::PseudoClass(pc) => pc.to_css(),
+            SimpleSelector::PseudoElement(pe) => format!("::{}", pe.name()),
         }
     }
 }
@@ -1511,6 +1650,33 @@ impl Selector {
             // event state this triple does not carry.
             _ => false,
         })
+    }
+
+    /// The selector as written (`div.card > a[href^="https"]:hover`,
+    /// `p:nth-child(2n+1)`). Used by the DevTools inspector to
+    /// show which rules matched an element — the serialiser is
+    /// faithful to the parsed values, so `:nth-child(odd)` renders
+    /// as `:nth-child(2n+1)` and `#ff0000` colours are unaffected
+    /// (this only serialises selectors, never values).
+    pub fn to_css(&self) -> String {
+        let mut out = String::new();
+        for (i, compound) in self.compounds.iter().enumerate() {
+            if i > 0 {
+                out.push_str(match self.combinators[i - 1] {
+                    Combinator::Descendant => " ",
+                    Combinator::Child => " > ",
+                    Combinator::NextSibling => " + ",
+                    Combinator::SubsequentSibling => " ~ ",
+                });
+            }
+            for part in &compound.parts {
+                out.push_str(&part.to_css());
+            }
+        }
+        if let Some(pe) = &self.pseudo_element {
+            out.push_str(&format!("::{}", pe.name()));
+        }
+        out
     }
 }
 
@@ -7384,5 +7550,56 @@ mod tests {
         assert_eq!(r.radial_t((50.0, 50.0), (0.0, 0.0, 100.0, 100.0)), 0.0);
         let corner = r.radial_t((100.0, 100.0), (0.0, 0.0, 100.0, 100.0));
         assert!((corner - 1.0).abs() < 1e-5, "corner t = {corner}");
+    }
+
+    #[test]
+    fn selector_to_css_round_trip() {
+        // Stage 19 (M9 stage 4): the inspector shows matched
+        // rules by selector text, so the serialiser must render
+        // what the parser parsed — including combinators,
+        // attribute operators, pseudo-classes, logical
+        // pseudo-classes, and pseudo-elements. A re-parse of the
+        // serialised text must give the same selector back.
+        let cases = [
+            ("div", "div"),
+            ("*", "*"),
+            ("div.note", "div.note"),
+            ("#main", "#main"),
+            ("div.card > a[href^=\"https\"]:hover", "div.card > a[href^=\"https\"]:hover"),
+            ("ul li + li", "ul li + li"),
+            ("p ~ span", "p ~ span"),
+            ("a:link, a:visited", "a:link"),
+            ("p:nth-child(2n+1)", "p:nth-child(2n+1)"),
+            ("p:nth-child(odd)", "p:nth-child(2n+1)"),
+            ("li:first-child", "li:first-child"),
+            ("input:checked", "input:checked"),
+            ("div:not(.a, .b)", "div:not(.a, .b)"),
+            ("div:is(.a, #b)", "div:is(.a, #b)"),
+            ("p::first-line", "p::first-line"),
+            ("a::after", "a::after"),
+            ("[data-x]", "[data-x]"),
+            ("[href$='.pdf' i]", "[href$=\".pdf\" i]"),
+            (":root", ":root"),
+            // The parser inserts the implied universal for a
+            // relative selector: `> img` is stored as `* > img`.
+            ("div:has(> img)", "div:has(* > img)"),
+        ];
+        for (source, expected) in cases {
+            let sheet = Stylesheet::parse(&format!("{source} {{ color: red; }}"));
+            assert_eq!(sheet.rules.len(), 1, "one rule for {source}");
+            let got = sheet.rules[0].selectors[0].to_css();
+            assert_eq!(got, expected, "serialise {source}");
+            // Re-parsing the serialised text gives the same
+            // selector back (the `odd` case re-parses to the
+            // same `2n+1` form, which is the point).
+            let again = Stylesheet::parse(&format!("{got} {{ color: red; }}"));
+            assert_eq!(again.rules.len(), 1, "re-parse {got}");
+            assert_eq!(again.rules[0].selectors[0], sheet.rules[0].selectors[0]);
+        }
+        // The comma case above parses two selectors; the second
+        // one serialises too.
+        let sheet = Stylesheet::parse("a:link, a:visited { color: red; }");
+        assert_eq!(sheet.rules[0].selectors.len(), 2);
+        assert_eq!(sheet.rules[0].selectors[1].to_css(), "a:visited");
     }
 }

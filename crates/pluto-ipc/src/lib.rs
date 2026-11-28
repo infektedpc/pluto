@@ -141,7 +141,7 @@ pub mod transport;
 /// `SetFocused` and `ScrollViewport`. v2 bytes are rejected by
 /// [`decode_message`] — Pluto ships one binary, so a bump is a
 /// clean break, not a migration.
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// What went wrong decoding a versioned message.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -300,6 +300,25 @@ pub enum BrowserToRenderer {
     /// end so existing variants keep their postcard
     /// discriminants.
     DevToolsHighlight { node: Option<u64>, epoch: u64 },
+    /// Set or clear one live-CSS override (Stage 19, M9 stage
+    /// 4): the inspector's edit of a declaration value.
+    /// `enabled: true` records `(property, value)` for the
+    /// node — it wins that property until cleared;
+    /// `enabled: false` removes the node's override for the
+    /// property (`value` is ignored then). The worker restyles
+    /// the node's subtree through the incremental path and the
+    /// shell re-asks `DevToolsInspectNode` for the fresh
+    /// styles — there is no dedicated answer variant. A stale
+    /// `epoch` is ignored outright, like the highlight.
+    /// Appended at the end so existing variants keep their
+    /// postcard discriminants.
+    DevToolsStyleOverride {
+        node: u64,
+        property: String,
+        value: String,
+        enabled: bool,
+        epoch: u64,
+    },
 }
 
 /// Messages from the renderer worker to the browser (shell).
@@ -563,6 +582,11 @@ pub enum RendererToBrowser {
         attrs: Vec<(String, String)>,
         computed: Vec<(String, String)>,
         geometry: Option<Box<DevToolsBox>>,
+        /// The rules that matched this node (Stage 19, M9
+        /// stage 4), retained by the style pass in cascade
+        /// order (lowest first), each with its declarations
+        /// and the cascade winner per property marked.
+        matched: Vec<DevToolsMatchedRule>,
     },
     /// The pick mode's hit-test answer (Stage 18, M9 stage 3):
     /// the node under the clicked point, if any — `None` when
@@ -601,6 +625,60 @@ pub struct DevToolsBox {
     pub height: f32,
     pub margin: [String; 4],
     pub padding: [String; 4],
+}
+
+/// Where a matched rule came from (Stage 19, M9 stage 4):
+/// the stylesheet origin, plus the two synthetic origins the
+/// cascade synthesises — the inline `style=""` attribute and
+/// the DevTools override sheet. The shell matches on this to
+/// decide which rows are editable and which carry a remove
+/// button (only `DevTools` rows do).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DevToolsRuleOrigin {
+    Ua,
+    User,
+    Author,
+    Inline,
+    DevTools,
+}
+
+impl DevToolsRuleOrigin {
+    /// The label the inspector shows (`UA`, `author`,
+    /// `inline`, `DevTools override`).
+    pub fn label(&self) -> &'static str {
+        match self {
+            DevToolsRuleOrigin::Ua => "UA",
+            DevToolsRuleOrigin::User => "user",
+            DevToolsRuleOrigin::Author => "author",
+            DevToolsRuleOrigin::Inline => "inline",
+            DevToolsRuleOrigin::DevTools => "DevTools override",
+        }
+    }
+}
+
+/// One declaration of a matched rule (Stage 19, M9 stage 4):
+/// the property, the parsed value rendered as CSS text, whether
+/// it was `!important`, and whether it won the cascade for its
+/// property (the last declaration in cascade order wins).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DevToolsMatchedDecl {
+    pub property: String,
+    pub value: String,
+    pub important: bool,
+    pub winning: bool,
+}
+
+/// One rule that matched a node (Stage 19, M9 stage 4): the
+/// selector as written (`div.card > a:hover`), or
+/// `element.style` for the inline `style=""` attribute, or
+/// `DevTools override` for a live-CSS override — plus the
+/// origin, the source order, and the rule's declarations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DevToolsMatchedRule {
+    pub selector: String,
+    pub origin: DevToolsRuleOrigin,
+    pub source_order: u32,
+    pub declarations: Vec<DevToolsMatchedDecl>,
 }
 
 /// A resource ask, frozen as v1 in Stage 5. This is the payload of
@@ -1287,8 +1365,12 @@ mod tests {
         // DevToolsDomChildren / DevToolsInspectNode /
         // DevToolsPickNode / DevToolsHighlight and
         // DevToolsChildren / DevToolsNode / DevToolsPicked,
-        // appended at the end of each enum).
-        assert_eq!(PROTOCOL_VERSION, 15);
+        // appended at the end of each enum), and 15 -> 16
+        // (Stage 19, M9 stage 4: `DevToolsNode` gains the
+        // matched rules, and `DevToolsStyleOverride` sets a
+        // live-CSS override — both appended at the end of
+        // their enum).
+        assert_eq!(PROTOCOL_VERSION, 16);
     }
 
     #[test]
@@ -1388,6 +1470,25 @@ mod tests {
             tag: "div".to_string(),
             attrs: vec![("id".to_string(), "a".to_string())],
             computed: vec![("display".to_string(), "block".to_string())],
+            matched: vec![DevToolsMatchedRule {
+                selector: "div".to_string(),
+                origin: DevToolsRuleOrigin::Author,
+                source_order: 3,
+                declarations: vec![
+                    DevToolsMatchedDecl {
+                        property: "display".to_string(),
+                        value: "block".to_string(),
+                        important: false,
+                        winning: true,
+                    },
+                    DevToolsMatchedDecl {
+                        property: "color".to_string(),
+                        value: "#ff0000".to_string(),
+                        important: false,
+                        winning: false,
+                    },
+                ],
+            }],
             geometry: Some(Box::new(DevToolsBox {
                 x: 8.0,
                 y: 16.0,
@@ -1416,6 +1517,7 @@ mod tests {
             attrs: vec![],
             computed: vec![],
             geometry: None,
+            matched: vec![],
         };
         let bytes = encode_message(&gone);
         assert_eq!(decode_message::<RendererToBrowser>(&bytes), Ok(gone));
@@ -1425,6 +1527,26 @@ mod tests {
         };
         let bytes = encode_message(&picked);
         assert_eq!(decode_message::<RendererToBrowser>(&bytes), Ok(picked));
+        // Stage 19 (M9 stage 4): a live-CSS override set and a
+        // clear both survive the versioned envelope.
+        let set = BrowserToRenderer::DevToolsStyleOverride {
+            node: 42,
+            property: "color".to_string(),
+            value: "#00ff00".to_string(),
+            enabled: true,
+            epoch: 3,
+        };
+        let bytes = encode_message(&set);
+        assert_eq!(decode_message::<BrowserToRenderer>(&bytes), Ok(set));
+        let clear = BrowserToRenderer::DevToolsStyleOverride {
+            node: 42,
+            property: "color".to_string(),
+            value: String::new(),
+            enabled: false,
+            epoch: 3,
+        };
+        let bytes = encode_message(&clear);
+        assert_eq!(decode_message::<BrowserToRenderer>(&bytes), Ok(clear));
     }
 
     #[test]
