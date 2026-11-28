@@ -850,9 +850,486 @@ privacy controls, and extensibility.
     lists, and block stats in the UI.
   The porn-mode list (M12) is an extra list set on top of this
   engine, not a second blocker.
+- **Web extensions — native Wasm only (Joel, 2026-11-28)**: no
+  Chrome/Firefox WebExtension support, ever — no JSON-RPC
+  serialization, no background service-worker lifecycles, no
+  untrusted HTML/JS popup sandboxes. Extensions are Wasm components;
+  the host is wasmtime.
+  - **Why Wasm, not native libraries**: Rust has no stable ABI, so
+    loading compiled .so/.dll plugins breaks across compiler
+    versions. Wasm is the universal, sandboxed plugin target (the
+    shape Zed and Zellij use).
+  - **Runtime**: embed wasmtime (Bytecode Alliance, Rust) as the
+    extension host, with fuel consumption / epoch interruption so a
+    buggy extension cannot freeze a thread, plus per-extension
+    memory limits.
+  - **Contract (.wit)**: the browser's extension APIs are defined
+    in WIT files (`wit/browser.wit`, package
+    `pluto:extension@0.1.0`); `wasmtime::component::bindgen!`
+    generates strongly typed Rust host traits, and extension authors
+    get generated bindings in Rust, JS, Python, or C. Resource
+    types give extensions opaque handles to stateful objects (tabs,
+    requests) instead of raw pointers. The top-level world is
+    `browser-extension`: it imports `tabs` and `ui`, and exports
+    `on-load` / `on-ui-event` for the browser to call into the
+    extension.
+    ```wit
+    package pluto:extension@0.1.0;
+
+    interface tabs {
+        record tab-info {
+            id: u64,
+            url: string,
+            title: string,
+            active: bool,
+        }
+
+        // Host functions called by the extension
+        get-active: func() -> option<tab-info>;
+        create: func(url: string) -> result<tab-info, string>;
+    }
+
+    interface ui {
+        // Declarative UI nodes for popups/sidebars
+        variant widget {
+            column(list<widget>),
+            row(list<widget>),
+            text(string),
+            button(button-props),
+            text-input(input-props),
+        }
+
+        record button-props {
+            id: string,
+            label: string,
+        }
+
+        record input-props {
+            id: string,
+            placeholder: string,
+            value: string,
+        }
+
+        // Extension pushes a new UI tree to the browser chrome
+        render-popup: func(root: widget);
+    }
+
+    // The top-level world every extension targets
+    world browser-extension {
+        import tabs;
+        import ui;
+
+        // Guest functions exported by the extension for the browser to call
+        export on-load: func();
+        export on-ui-event: func(component-id: string, event-type: string, payload: string);
+    }
+    ```
+  - **Host setup**: one `wasmtime::Store` per extension holding its
+    `ExtensionState` (extension id, `WasiCtx`, `ResourceTable`, and
+    an `mpsc::Sender<BrowserCommand>` back to the browser/UI
+    thread). `bindgen!` generates the `tabs::Host` / `ui::Host`
+    traits; the host implements them by sending commands (e.g.
+    `CreateTab`, `UpdateExtensionUi`) over the channel, never by
+    sharing mutable state.
+  - **Capability-based security (WASI)**: extensions run with zero
+    ambient authority — no filesystem, network, or OS access by
+    default. The extension declares permissions in its
+    `manifest.toml` (e.g. storage, tabs, http-request); the host
+    links only the approved interfaces into that extension's
+    `Store`, and builds a locked-down `WasiCtx` (no
+    filesystem/network unless granted).
+  - **Execution contexts**: background workers are long-lived or
+    event-driven Wasm instances on a dedicated async runtime
+    (tokio), talking to the browser core over typed message
+    channels (`tokio::sync::mpsc`). Content scripts get DOM access
+    two ways: a constrained, WIT-defined DOM/CSS selector API
+    straight from Pluto's own layout/DOM tree (fast, no JS
+    serialization), or Wasm injected alongside the page's rquickjs
+    engine via wasm-bindgen bindings.
+  - **Extension UI — declarative native widgets, not web views**:
+    when the user clicks the extension icon, the host calls the
+    extension's `on-popup-open`; the extension builds a `Widget`
+    tree and pushes it with `ui::render-popup`; the host maps the
+    tree to native libcosmic/iced widgets in `view()` and dispatches
+    user events back through `on-ui-event` (refilling fuel first),
+    so the extension can re-render with updated state. Native over
+    web views because: instant startup (<1 ms, just an enum tree
+    across the boundary, vs 20–100 ms to spin up a DOM/CSS/JS
+    pipeline per popup), negligible memory (shares the main window's
+    wgpu surface and font cache, vs megabytes per popup), and full
+    visual cohesion (inherits theme, dark/light mode, spacing,
+    typography) — at the cost of layout flexibility (only the widget
+    primitives in the .wit file). Escape hatch for custom graphics:
+    a `Canvas(width, height, list<u8>)` or `Svg(string)` widget
+    variant pushing raw RGBA buffers or vector paths straight to a
+    wgpu texture — no full web view needed.
+  - **Packaging & distribution**: one signed archive holding a
+    single .wasm component binary plus `manifest.toml` (or the
+    manifest embedded as a custom Wasm section). Extensions compile
+    to `wasm32-wasip2`, so one binary runs identically on Linux,
+    macOS, and Windows.
+  - **Guest SDK (`pluto-ext-sdk`)**: extension authors never touch
+    raw WIT bindings. The SDK crate bundles the WIT file and runs
+    `wit_bindgen::generate!` privately inside itself; per-instance
+    state lives in a thread-local `RefCell` (Wasm components are
+    single-threaded per instance, so zero locking overhead); a
+    `#[pluto_ext::main]` procedural macro (or a
+    `register_extension!` declarative macro) implements the raw WIT
+    `Guest` trait and forwards calls to the developer's struct,
+    which implements an Elm-inspired `Extension` trait (`on_load`,
+    `on_event`, `view`, `on_ui_event`). After `on_ui_event` or
+    `on_event` finishes, the SDK glue automatically calls `view()`
+    and pushes the updated `Widget` tree across the boundary via
+    `ui::render_popup` — authors never call render functions
+    themselves. What an author writes:
+    ```rust
+    use pluto_ext_sdk::prelude::*;
+
+    #[derive(Default)]
+    struct WordCounter {
+        count: usize,
+    }
+
+    impl Extension for WordCounter {
+        fn on_load(&mut self) {
+            // Subscribe to page navigation events
+            events::subscribe(EventTopic::PageLoaded);
+        }
+
+        fn on_event(&mut self, event: BrowserEvent) {
+            if let BrowserEvent::PageLoaded { tab_id } = event {
+                if let Some(doc) = dom::document(tab_id) {
+                    let text = doc.query_selector("body")
+                        .map(|el| el.inner_text())
+                        .unwrap_or_default();
+                    self.count = text.split_whitespace().count();
+                }
+            }
+        }
+
+        fn view(&self) -> Widget {
+            Column::new()
+                .push(Text::new(format!("Page word count: {}", self.count)))
+                .push(Button::new("reset", "Reset Counter"))
+                .into()
+        }
+
+        fn on_ui_event(&mut self, id: &str, _kind: UiEventKind) {
+            if id == "reset" {
+                self.count = 0;
+            }
+        }
+    }
+
+    // Expands to the raw WIT `Guest` implementation + `wit_bindgen::export!`
+    pluto_ext_sdk::register_extension!(WordCounter);
+    ```
+  - **Page / DOM interaction (`wit/dom.wit`)**: never serialize a
+    whole DOM tree across the boundary — use WIT resource types.
+    A resource is an opaque handle (a u32 index in the host's
+    `wasmtime::component::ResourceTable`); the DOM nodes stay in
+    the browser engine's memory and the extension only holds
+    handles and invokes methods on them.
+    ```wit
+    interface dom {
+        // Opaque handles to live host-side DOM objects
+        resource document {
+            query-selector: func(selector: string) -> option<element>;
+            query-selector-all: func(selector: string) -> list<element>;
+            create-element: func(tag: string) -> element;
+        }
+
+        resource element {
+            tag-name: func() -> string;
+            get-attribute: func(name: string) -> option<string>;
+            set-attribute: func(name: string, value: string);
+            inner-text: func() -> string;
+            set-inner-text: func(text: string);
+            append-child: func(child: borrow<element>);
+            remove: func();
+        }
+
+        // Entry point gated by activeTab or host permissions
+        get-document: func(tab-id: u64) -> result<document, string>;
+    }
+    ```
+    Host-side safety: stale-handle protection — when a user
+    navigates away or a node is collected by the layout engine,
+    the host removes/invalidates the `ResourceTable` entry, and the
+    host resource struct holds a `Weak` pointer or generational
+    arena key (`slotmap::DefaultKey`), so calling a method on a
+    dead node safely returns a no-op or error instead of crashing.
+    Automatic cleanup — when the extension drops an `Element`
+    handle, the Component Model invokes `HostElement::drop` on the
+    host and frees the handle. Batched mutations — `set_inner_text`
+    / `append_child` queue onto the tab's layout/style invalidation
+    pipeline, so taffy layout and the wgpu render pass recalculate
+    only once per frame.
+  - **Extension lifecycle & storage**: extensions are event-driven
+    actors, not always-on processes, so startup stays fast and idle
+    memory stays low.
+    - **Per-extension key-value storage (`wit/storage.wit`)**: no
+      direct WASI filesystem access for settings (path traversal
+      risk, cluttered directories) — a dedicated, quota-enforced
+      interface backed by an embedded Rust database (redb, sled,
+      or a SQLite table partitioned by `extension_id`).
+      ```wit
+      interface storage {
+          get: func(key: string) -> result<option<list<u8>>, string>;
+          set: func(key: string, value: list<u8>) -> result<_, string>;
+          remove: func(key: string) -> result<_, string>;
+          clear: func() -> result<_, string>;
+      }
+      ```
+      Quota enforced in `storage::Host` (track bytes per
+      `extension_id`, e.g. 5 MB cap for standard extensions)
+      before writing to disk. The SDK wraps get/set with generic
+      `storage::get_json<T>()` / `storage::set_json<T>()` using
+      serde, so developers store typed Rust structs directly.
+    - **Event subscriptions & wake-up lifecycle**: no polling
+      loops. Extensions declare static wake-up triggers in
+      `manifest.toml` (e.g. `events = ["page-loaded",
+      "url-match:https://github.com*"]`) and can also call
+      `events::subscribe(...)` at runtime. The host keeps a central
+      `HashMap<EventTopic, Vec<ExtensionId>>` dispatcher; when a
+      tab finishes loading or a network request fires it checks
+      which extensions subscribe to that topic (and that their
+      manifest permissions allow that URL/domain), then dispatches
+      `bindings.call_on_event` if the extension's Store is warm.
+      Hibernation: an extension with no event in 60 seconds and no
+      open popup has its `wasmtime::Store` dropped to reclaim RAM;
+      only its compiled `wasmtime::Component` stays cached in
+      memory, and re-instantiating a pre-compiled component takes
+      ~50 microseconds, so it is rebuilt on demand when a
+      subscribed event fires.
+  - **Packaging & manifest schema (`.plutoext`)**: distribute
+    extensions as a single-file signed archive — a deterministic
+    `tar.zst` (Zstandard-compressed tarball) or ZIP containing
+    `manifest.toml`, `extension.wasm`, static assets (icons), and a
+    detached cryptographic signature. `manifest.toml` uses strict
+    serde deserialization (`#[serde(deny_unknown_fields)]`) so
+    malformed manifests fail fast at install time.
+    ```toml
+    [extension]
+    id = "org.example.word-counter" # Reverse-DNS unique identifier
+    name = "Word Counter"
+    version = "0.1.0"
+    sdk_version = "0.1"              # Checked against host WIT compatibility
+    entry = "extension.wasm"
+
+    [permissions]
+    # Coarse capabilities linked into the Wasmtime Linker
+    capabilities = ["tabs", "storage", "dom"]
+
+    # Fine-grained URL patterns (enforced by the host before dispatching events/DOM handles)
+    hosts = [
+        "https://*.wikipedia.org/*",
+        "https://github.com*"
+    ]
+
+    # Declarative wake-up triggers (allows cold-booting hibernated extensions)
+    [triggers]
+    events = ["page-loaded", "toolbar-click"]
+    network_filter = true
+    ```
+    Permission prompts & runtime enforcement, in two layers:
+    install-time grants and runtime checks. Linker-level gating —
+    if `"tabs"` is not in capabilities,
+    `pluto::extension::tabs::add_to_linker` is never called, so the
+    extension literally cannot import or invoke tab functions.
+    Host-pattern guard — even with `"dom"` linked,
+    `dom::get-document(tab_id)` checks the tab's current URL
+    against the user-approved hosts glob list (e.g. the `globset`
+    crate) before returning a `Document` handle. Install prompts
+    group raw capabilities into plain-English risk tiers (e.g.
+    `"dom"` + `hosts = ["<all_urls>"]` becomes "Read and modify
+    data on all websites"). Cryptographic signing (ed25519-dalek):
+    compute a BLAKE3 hash over the canonical concatenation of
+    `manifest.toml` + `extension.wasm` + `assets/`; store
+    `signature.ed25519` (64-byte signature + 32-byte publisher
+    public key) inside the bundle; verify the signature at load,
+    before `wasmtime::Component::from_binary`, against either a
+    trusted extension-store public key or a user-pinned developer
+    key (sideloaded extensions).
+  - **Network interception — zero-stall pipeline**: never call into
+    a Wasm sandbox synchronously on every HTTP request — two tiers.
+    Tier 1, declarative rule engine (zero Wasm overhead): for
+    ad-blockers and tracker blockers, extensions register static
+    filter rules (EasyList/uBlock-style) via a WIT call on startup;
+    the network stack (hyper + rustls) evaluates them natively in
+    Rust (compiled Aho-Corasick / regex automata) in nanoseconds
+    without waking Wasm. Tier 2, dynamic Wasm interception
+    (`wit/network.wit`): when an extension must rewrite headers,
+    redirect URLs, or inspect payloads, an async `on-request` hook
+    with strict timeouts.
+    ```wit
+    interface network {
+        record request-meta {
+            id: u64,
+            url: string,
+            method: string,
+            resource-type: string, // "document", "script", "image", "fetch"
+            headers: list<tuple<string, string>>,
+        }
+
+        variant intercept-action {
+            allow,
+            block,
+            redirect(string),
+            modify-headers(list<tuple<string, string>>),
+        }
+
+        // Extension registers URL patterns it wants to dynamically inspect
+        register-interceptor: func(url-patterns: list<string>) -> result<_, string>;
+    }
+    ```
+    Preventing page-load stalls: pre-filtering — only invoke Wasm
+    if the request URL matches the registered `url-patterns` and
+    the extension's manifest `hosts` permissions. Strict fuel +
+    wall-clock timeout — wrap `bindings.call_on_request(...)` in a
+    15 ms `tokio::time::timeout` alongside a tight wasmtime fuel
+    cap; if an extension hangs or exceeds 15 ms, cancel the future
+    and fall back to `InterceptAction::Allow` (or a user-configured
+    fail-closed mode) so browsing stays snappy.
+  - **Cross-extension & web-page messaging**: Wasm components are
+    completely memory-isolated from web pages and from each other,
+    so all communication flows through structured,
+    capability-checked message brokers on the host. Web page ↔
+    extension bridge (`window.pluto`): pages are untrusted and must
+    never access extension APIs directly. When a tab loads a URL
+    matching an extension's `hosts` permission and the extension
+    declares `page_bridge = true`, rquickjs injects a frozen global
+    helper into the page context
+    (`window.pluto.sendMessage("org.example.wallet",
+    { type: "CONNECT_REQUEST" })`); the host serializes the JS
+    object into a safe intermediate format (JSON or CBOR — never raw
+    JS object references), enforces a max payload size (256 KB),
+    and passes `(sender_origin, payload_bytes)` into the
+    extension's exported `on-page-message` WIT function; the
+    extension explicitly checks `sender_origin` before returning a
+    response. Cross-extension messaging (`wit/ipc.wit`): extensions
+    expose modular services to each other (e.g. a password manager
+    providing credentials to a form-filler) without tight coupling.
+    ```wit
+    interface ipc {
+        record message-envelope {
+            sender-id: string,
+            topic: string,
+            payload: list<u8>,
+        }
+
+        // Send a request to another installed extension and await its reply
+        request: func(target-ext-id: string, topic: string, payload: list<u8>) -> result<list<u8>, string>;
+    }
+    ```
+    Allow-list security: `manifest.toml` specifies
+    `accept_ipc_from = ["org.example.trusted-ext"]` (or `"*"` for
+    public service extensions); the host's `ipc::Host::request`
+    checks the allow-list before routing the bytes across
+    `tokio::sync::oneshot` channels between the two extension
+    actors.
+  - **Workspace scaffolding (`pluto-extensions/`)**: a separate
+    multi-crate workspace so the shared .wit contract is the single
+    source of truth for host and guests.
+    ```
+    pluto-extensions/
+    ├── Cargo.toml                  # Workspace root
+    ├── wit/
+    │   └── browser.wit             # Shared WIT contract
+    ├── crates/
+    │   ├── pluto-ext-host/         # Embedded into your browser binary (Wasmtime + ResourceTable)
+    │   ├── pluto-ext-sdk/          # Published crate for extension authors (wit-bindgen + macros)
+    │   └── pluto-ext-cli/          # CLI tool (`cargo install pluto-ext`)
+    └── examples/
+        └── word-counter/           # Sample extension compiling to `wasm32-wasip2`
+            ├── Cargo.toml
+            ├── manifest.toml
+            └── src/lib.rs
+    ```
+    Root `Cargo.toml`: workspace resolver 2, members
+    `crates/pluto-ext-host`, `crates/pluto-ext-sdk`,
+    `crates/pluto-ext-cli`, `examples/word-counter`; workspace
+    dependencies wasmtime 27.0 (`component-model`, `async`),
+    wasmtime-wasi 27.0, wit-bindgen 0.36, tokio 1.41 (`full`),
+    serde 1.0 (`derive`), toml 0.8, ed25519-dalek 2.1
+    (`rand_core`), blake3 1.5. The SDK keeps raw
+    `wit_bindgen::generate!` private and exposes the `Extension`
+    trait plus the `register_extension!` macro (thread-local
+    `RefCell` instance, `Guest` impl forwarding `on_load` /
+    `on_ui_event` with automatic `render_popup` re-render). Example
+    extension crates compile as `cdylib` so rustc outputs a Wasm
+    component for `wasm32-wasip2`:
+    ```toml
+    [package]
+    name = "word-counter"
+    version = "0.1.0"
+    edition = "2021"
+
+    [lib]
+    crate-type = ["cdylib"]
+
+    [dependencies]
+    pluto-ext-sdk = { path = "../../crates/pluto-ext-sdk" }
+    ```
+  - **Developer tooling (`pluto-ext` CLI)**: one CLI for
+    scaffolding, cross-compilation, signing, and live reloading.
+    `pluto-ext new <name>` generates a ready-to-build folder
+    (`Cargo.toml` with `crate-type = ["cdylib"]`,
+    `.cargo/config.toml` defaulting `build.target =
+    "wasm32-wasip2"`, `manifest.toml`, starter `src/lib.rs`).
+    `pluto-ext build --release` runs `cargo build --target
+    wasm32-wasip2 --release`, validates `manifest.toml` against the
+    strict schema, and strips debug symbols (`wasm-tools strip`).
+    `pluto-ext pack --key developer.pem` hashes manifest +
+    extension.wasm with blake3, signs with ed25519-dalek, writes
+    `signature.ed25519`, and bundles deterministically into
+    `dist/<id>-<version>.plutoext` (tar.zst). `pluto-ext dev`
+    (hot-reload) watches `src/` and `manifest.toml` via the `notify`
+    crate, recompiles on save, and sends a local IPC message over a
+    Unix domain socket (`~/.pluto/dev.sock`) to the running browser;
+    state-preserving reload — before swapping the
+    `wasmtime::Component`, the host calls an optional
+    `serialize-state: func() -> list<u8>` export on the old
+    instance, instantiates the new binary, and passes the bytes into
+    `restore-state: func(data: list<u8>)`, so popup UI state
+    survives code edits.
+  - **Security hardening & threat model**: Wasm's memory sandbox
+    alone does not cover denial-of-service, spoofing, or
+    side-channel vectors from untrusted extensions.
+    - **Memory exhaustion** (extension allocates `Vec<u8>` in a
+      loop): implement `wasmtime::ResourceLimiter` on every `Store`
+      to cap linear memory (32 MB per extension) and table growth;
+      `memory_growing` returning false triggers a clean Wasm trap
+      instead of an OS OOM kill.
+    - **CPU starvation / infinite loops** (`loop {}` inside
+      `on-request` or `on-load`, hanging a Tokio worker): enable
+      `config.epoch_interruption(true)` alongside
+      `consume_fuel(true)`; a lightweight background timer thread
+      increments the engine epoch every 10 ms, and each `Store`
+      gets an epoch deadline (2 ticks = 20 ms max slice).
+    - **UI spoofing / clickjacking** (a popup mimicking the
+      browser's master password prompt or URL bar): render extension
+      popups strictly inside a sandboxed, visually distinct popover
+      container with a non-removable header bar displaying the
+      extension's verified name, icon, and publisher badge; never
+      allow extensions to position floating overlays outside their
+      assigned viewport bounds.
+    - **Timing side-channels (Spectre / cache)** (high-resolution
+      timers measuring cross-origin network or memory latency):
+      provide a coarsened, jittered clock in the WASI time provider
+      (100 microsecond resolution + random jitter) unless the user
+      explicitly grants a high-precision-timing permission.
+    - **Resource handle flooding**
+      (`dom::query_selector_all("*")` in a loop without dropping
+      handles): cap the maximum active entries in each extension's
+      `ResourceTable` (4,096 live handles); reject further handle
+      allocations with `Err("Resource limit exceeded")` until the
+      guest drops existing handles.
 - **Done criteria**: Pluto safely isolates cross-origin sites, blocks
-  trackers natively, manages downloads/bookmarks, and passes core security
-  & Web Platform Test (WPT) suites.
+  trackers natively, manages downloads/bookmarks, passes core security
+  & Web Platform Test (WPT) suites, and loads a signed .wasm
+  extension in a fuel-limited, permission-gated sandbox whose popup
+  renders as native widgets.
 
 ### Milestone 11: Built-in WireGuard VPN (Joel, 2026-11-24)
 

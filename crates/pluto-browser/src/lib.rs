@@ -39,7 +39,7 @@ use bookmarks::{
     save_bookmarks,
 };
 use history::{load_history, save_history};
-use crate::js_host::storage::{JsonValue, parse_json, write_file_atomic};
+use crate::js_host::storage::{JsonValue, json_escape, parse_json, write_file_atomic};
 use crate::security::profile_dir;
 use compositor::Compositor;
 use cosmic::app::{Core, Task};
@@ -292,6 +292,32 @@ struct FolderDialog {
     name: String,
 }
 
+/// The settings dialog's draft state (settings round,
+/// 2026-11-28): only the homepage is a draft — it is typed
+/// free-form, so it validates as it is typed and only a valid
+/// value is saved. Theme, search provider, tab placement, and
+/// the bookmarks-bar checkbox apply and persist immediately
+/// when clicked, so they read straight off the shell.
+#[derive(Debug, Clone)]
+struct SettingsDialog {
+    /// The homepage field as typed, prefilled with the saved
+    /// homepage when the dialog opens.
+    homepage_draft: String,
+    /// The validation error for the draft, if it is not a
+    /// usable homepage (shown in the dialog; the saved
+    /// homepage is untouched until the draft validates).
+    homepage_error: Option<String>,
+}
+
+impl SettingsDialog {
+    fn new(homepage: &str) -> Self {
+        Self {
+            homepage_draft: homepage.to_string(),
+            homepage_error: None,
+        }
+    }
+}
+
 /// Which bookmarks-bar context menu is open, if any
 /// (bookmarks round, 2026-11-28): the generic bar menu, or the
 /// menu for one bookmark chip / folder chip.
@@ -377,6 +403,23 @@ pub struct PlutoBrowser {
     /// The open new-folder dialog, if any (bookmarks round,
     /// 2026-11-28).
     folder_dialog: Option<FolderDialog>,
+    /// The theme preference (settings round, 2026-11-28):
+    /// System follows the OS; Light / Dark force it. The
+    /// effective value lives in `dark_theme` (forwarded to
+    /// the workers); this is what the user chose.
+    theme_pref: ThemePref,
+    /// The default homepage (settings round, 2026-11-28):
+    /// the page opened at startup, for a new tab, and for an
+    /// empty address bar. A normalized URL, persisted.
+    homepage: String,
+    /// The default search provider (settings round,
+    /// 2026-11-28): address-bar input that is a query rather
+    /// than a URL goes to this provider. Persisted.
+    search_provider: page::SearchProvider,
+    /// The open settings dialog, if any (settings round,
+    /// 2026-11-28): opened from the hamburger menu's
+    /// "Settings" entry.
+    settings_dialog: Option<SettingsDialog>,
     /// Whether the hamburger menu is open. Opening a list panel
     /// closes the menu; the menu never shows alongside a panel.
     menu_open: bool,
@@ -508,6 +551,24 @@ pub enum Message {
     FolderDialogSave,
     /// The new-folder dialog's Cancel: close without creating.
     FolderDialogCancel,
+    /// Menu: open the settings dialog (settings round,
+    /// 2026-11-28).
+    ShowSettings,
+    /// The settings dialog's Close button: close the dialog.
+    /// Everything in it already applied and persisted when it
+    /// changed, except an invalid homepage draft, which is
+    /// discarded — the saved homepage is untouched.
+    CloseSettings,
+    /// The settings dialog's theme choice: apply it at once
+    /// (shell chrome + workers) and persist it.
+    SettingsThemeChanged(ThemePref),
+    /// The settings dialog's homepage field changed: the draft
+    /// validates as it is typed — a valid value is saved at
+    /// once, an invalid one shows an error and saves nothing.
+    SettingsHomepageChanged(String),
+    /// The settings dialog's search-provider choice: apply it
+    /// at once and persist it.
+    SettingsSearchProviderChanged(page::SearchProvider),
     /// The hamburger button: open/close the menu.
     ToggleMenu,
     /// Menu: open the Bookmarks list panel.
@@ -799,6 +860,47 @@ impl PlutoBrowser {
         }
     }
 
+    /// The theme the preference means right now (settings
+    /// round, 2026-11-28): a forced preference decides;
+    /// System asks the OS.
+    fn effective_dark(&self) -> bool {
+        theme_pref_is_dark(self.theme_pref)
+    }
+
+    /// Apply the theme preference everywhere it matters
+    /// (settings round, 2026-11-28): the workers get the
+    /// effective dark flag via `apply_theme` (so
+    /// `prefers-color-scheme` follows), and the returned task
+    /// switches the shell's own libcosmic theme. For System
+    /// the task restores the OS preference; for a forced theme
+    /// it installs it. Callers return the task from `update`
+    /// (or `init`) so libcosmic runs it.
+    fn apply_theme_pref(&mut self) -> Task<Message> {
+        self.apply_theme(self.effective_dark());
+        match self.theme_pref {
+            ThemePref::System => {
+                cosmic::command::set_theme(cosmic::theme::system_preference())
+            }
+            ThemePref::Light => cosmic::command::set_theme(cosmic::Theme::light()),
+            ThemePref::Dark => cosmic::command::set_theme(cosmic::Theme::dark()),
+        }
+    }
+
+    /// Persist the shell's current preferences (settings
+    /// round, 2026-11-28): every handler that changes a
+    /// preference calls this instead of building a
+    /// `ShellPrefs` by hand — a hand-built literal would
+    /// silently reset the fields it does not mention.
+    fn save_prefs(&self) {
+        save_shell_prefs(&ShellPrefs {
+            show_bookmarks_bar: self.show_bookmarks_bar,
+            theme: self.theme_pref,
+            homepage: self.homepage.clone(),
+            search_provider: self.search_provider,
+            tab_placement: self.tab_placement,
+        });
+    }
+
     /// Start a navigation in the active tab: update the address
     /// bar and status, reset the scroll, and hand the URL to the
     /// worker — or hold it until the worker starts. The old page
@@ -958,6 +1060,7 @@ impl PlutoBrowser {
                 "History" => Message::ShowHistory,
                 "New Tab" => Message::NewTab,
                 "New Window" => Message::NewWindow,
+                "Settings" => Message::ShowSettings,
                 // `menu_items` is the pinned backend list; a new
                 // entry needs a message here too.
                 _ => unreachable!("menu item {label} has no message"),
@@ -1779,6 +1882,125 @@ impl PlutoBrowser {
             .into()
     }
 
+    /// The settings dialog as a floating popup (settings round,
+    /// 2026-11-28): a centered overlay layer, like the bookmark
+    /// dialog — it hovers over the page without moving anything.
+    /// Every control applies and persists at once when it
+    /// changes; there is no Save, only Close. The homepage is
+    /// the exception: it validates as it is typed, and an
+    /// invalid draft shows an error and saves nothing (closing
+    /// discards it). There is no VPN section — there is no VPN
+    /// yet (that is M11), and a settings page for a VPN that
+    /// does not exist would be a dead control.
+    fn settings_dialog_overlay<'a>(
+        &'a self,
+        dialog: &'a SettingsDialog,
+    ) -> Element<'a, Message> {
+        // One option button: a ✓ when it is the current value.
+        let option = |label: String, selected: bool, message: Message| {
+            widget::button::text(label)
+                .class(small_button_style(SmallButtonBase::Text, selected))
+                .on_press(message)
+                .into()
+        };
+        let mut theme_buttons: Vec<Element<'_, Message>> = Vec::new();
+        for theme in ThemePref::all() {
+            let label = if theme == self.theme_pref {
+                format!("{} ✓", theme.label())
+            } else {
+                theme.label().to_string()
+            };
+            theme_buttons.push(option(
+                label,
+                theme == self.theme_pref,
+                Message::SettingsThemeChanged(theme),
+            ));
+        }
+        let mut provider_buttons: Vec<Element<'_, Message>> = Vec::new();
+        for provider in page::SearchProvider::all() {
+            let label = if provider == self.search_provider {
+                format!("{} ✓", provider.label())
+            } else {
+                provider.label().to_string()
+            };
+            provider_buttons.push(option(
+                label,
+                provider == self.search_provider,
+                Message::SettingsSearchProviderChanged(provider),
+            ));
+        }
+        let mut placement_buttons: Vec<Element<'_, Message>> = Vec::new();
+        for placement in [TabPlacement::Left, TabPlacement::Right, TabPlacement::Both] {
+            let label = if placement == self.tab_placement {
+                format!("{} ✓", placement_label(placement))
+            } else {
+                placement_label(placement).to_string()
+            };
+            placement_buttons.push(option(
+                label,
+                placement == self.tab_placement,
+                Message::SetTabPlacement(placement),
+            ));
+        }
+        let bar_label = if self.show_bookmarks_bar {
+            "Bookmarks bar ✓"
+        } else {
+            "Bookmarks bar"
+        };
+        let mut children: Vec<Element<'_, Message>> = vec![
+            widget::text("Settings").size(16).into(),
+            widget::text("Theme").size(12).into(),
+            widget::row(theme_buttons).spacing(8).into(),
+            widget::text("Default homepage").size(12).into(),
+            widget::text_input(page::DEFAULT_URL, &dialog.homepage_draft)
+                .id("settings-homepage".into())
+                .on_input(Message::SettingsHomepageChanged)
+                .on_submit(|_| Message::CloseSettings)
+                .style(small_text_input_style())
+                .width(Length::Fill)
+                .into(),
+            widget::text(
+                "The page Pluto opens at startup, for a new tab, and for an empty address bar.",
+            )
+            .size(12)
+            .into(),
+            widget::text("Default search provider").size(12).into(),
+            widget::row(provider_buttons).spacing(8).into(),
+            widget::text("Tabs").size(12).into(),
+            widget::row(placement_buttons).spacing(8).into(),
+            widget::text("Bookmarks bar").size(12).into(),
+            option(
+                bar_label.to_string(),
+                self.show_bookmarks_bar,
+                Message::ToggleBookmarksBar,
+            ),
+        ];
+        if let Some(error) = &dialog.homepage_error {
+            children.push(widget::text(error.clone()).size(12).into());
+        }
+        children.push(
+            widget::row([
+                cosmic::iced::widget::space().width(Length::Fill).into(),
+                widget::button::text("Close")
+                    .class(small_button_style(SmallButtonBase::Text, false))
+                    .on_press(Message::CloseSettings)
+                    .into(),
+            ])
+            .spacing(8)
+            .into(),
+        );
+        let panel = widget::column(children).spacing(8).padding(12);
+        let boxed = widget::container(panel)
+            .width(Length::Fixed(SETTINGS_DIALOG_WIDTH))
+            .style(panel_container_style);
+        widget::container(boxed)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .into()
+    }
+
     /// A tab's favicon as a 16px image, or the site's initial
     /// letter when it has no favicon yet (the host's initial —
     /// "example.com" → 'E' — or the title's first character).
@@ -1912,6 +2134,11 @@ pub const MENU_PANEL_WIDTH: f32 = 260.0;
 /// 2026-11-28, for the Firefox-style Name / URL / Tags /
 /// Keyword rows).
 pub const BOOKMARK_DIALOG_WIDTH: f32 = 400.0;
+
+/// The settings dialog's width (settings round, 2026-11-28):
+/// a little wider than the bookmark dialog — it holds rows of
+/// option buttons (theme, provider, placement).
+pub const SETTINGS_DIALOG_WIDTH: f32 = 440.0;
 
 /// The bookmarks-bar popups' (context menu, folder dropdown)
 /// top offset (bookmarks round, 2026-11-28): they hang just
@@ -2108,6 +2335,27 @@ pub fn placement_label(placement: TabPlacement) -> &'static str {
         TabPlacement::Left => "Tabs on left",
         TabPlacement::Right => "Tabs on right",
         TabPlacement::Both => "Tabs on both sides",
+    }
+}
+
+impl TabPlacement {
+    /// The persisted key for this placement.
+    pub fn key(self) -> &'static str {
+        match self {
+            TabPlacement::Left => "left",
+            TabPlacement::Right => "right",
+            TabPlacement::Both => "both",
+        }
+    }
+
+    /// The placement from a persisted key (`None` = unknown key).
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "left" => Some(TabPlacement::Left),
+            "right" => Some(TabPlacement::Right),
+            "both" => Some(TabPlacement::Both),
+            _ => None,
+        }
     }
 }
 
@@ -2446,32 +2694,102 @@ fn panel_container_style(theme: &cosmic::Theme) -> cosmic::iced::widget::contain
 /// entry here names an action the shell really performs —
 /// Bookmarks opens the persistent bookmark list, History opens
 /// the session-history list, New Tab opens a tab in this window
-/// (Stage 11 Rec 4), New Window spawns a second Pluto process.
-/// Nothing else from the reference screenshot qualifies
-/// (no download-prompt UI, no settings / zoom / find / sync /
+/// (Stage 11 Rec 4), New Window spawns a second Pluto process,
+/// Settings opens the settings dialog (settings round,
+/// 2026-11-28). Nothing else from the reference screenshot
+/// qualifies (no download-prompt UI, no zoom / find / sync /
 /// profiles / passwords / extensions / print / save-page /
 /// translate backend, and Porn Mode is M12, not built), so none
 /// of it is listed. No shortcuts are shown next to the items:
 /// none of the screenshot's shortcuts are wired.
 pub fn menu_items() -> &'static [&'static str] {
-    &["Bookmarks", "History", "New Tab", "New Window"]
+    &["Bookmarks", "History", "New Tab", "New Window", "Settings"]
+}
+
+/// The theme preference (settings round, 2026-11-28):
+/// follow the OS, or force light / dark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemePref {
+    /// Follow the OS theme (the default).
+    #[default]
+    System,
+    /// Force the light theme.
+    Light,
+    /// Force the dark theme.
+    Dark,
+}
+
+impl ThemePref {
+    /// The persisted key for this preference.
+    pub fn key(self) -> &'static str {
+        match self {
+            ThemePref::System => "system",
+            ThemePref::Light => "light",
+            ThemePref::Dark => "dark",
+        }
+    }
+
+    /// The preference from a persisted key (`None` = unknown key).
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "system" => Some(ThemePref::System),
+            "light" => Some(ThemePref::Light),
+            "dark" => Some(ThemePref::Dark),
+            _ => None,
+        }
+    }
+
+    /// The label the settings dialog shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemePref::System => "System default",
+            ThemePref::Light => "Light",
+            ThemePref::Dark => "Dark",
+        }
+    }
+
+    /// All preferences, in dialog order.
+    pub fn all() -> [ThemePref; 3] {
+        [ThemePref::Light, ThemePref::Dark, ThemePref::System]
+    }
+}
+
+/// Whether the theme preference means dark right now: a
+/// forced preference decides; System asks the OS.
+fn theme_pref_is_dark(pref: ThemePref) -> bool {
+    match pref {
+        ThemePref::System => cosmic::theme::is_dark(),
+        ThemePref::Light => false,
+        ThemePref::Dark => true,
+    }
 }
 
 /// The shell's small preferences: which parts of the shell are
-/// visible, persisted across restarts in `preferences.json` in
-/// the profile dir (bookmarks round, 2026-11-28). The file is
-/// read on startup and rewritten whenever a preference changes;
-/// a missing or corrupt file means defaults (everything
-/// visible), never a failed launch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// visible and how it behaves, persisted across restarts in
+/// `preferences.json` in the profile dir (bookmarks round,
+/// 2026-11-28; theme / homepage / search provider / tab
+/// placement added by the settings round, 2026-11-28). The file
+/// is read on startup and rewritten whenever a preference
+/// changes; a missing or corrupt file means defaults, and a
+/// file from an older version (fewer keys) loads with defaults
+/// for the missing ones — never a failed launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ShellPrefs {
     show_bookmarks_bar: bool,
+    theme: ThemePref,
+    homepage: String,
+    search_provider: page::SearchProvider,
+    tab_placement: TabPlacement,
 }
 
 impl Default for ShellPrefs {
     fn default() -> Self {
         Self {
             show_bookmarks_bar: true,
+            theme: ThemePref::default(),
+            homepage: page::DEFAULT_URL.to_string(),
+            search_provider: page::SearchProvider::default(),
+            tab_placement: TabPlacement::default(),
         }
     }
 }
@@ -2502,18 +2820,47 @@ fn load_shell_prefs() -> ShellPrefs {
     if let Some(JsonValue::Bool(show)) = parsed.get("show_bookmarks_bar") {
         prefs.show_bookmarks_bar = *show;
     }
+    if let Some(key) = parsed.get("theme").and_then(JsonValue::as_str)
+        && let Some(theme) = ThemePref::from_key(key)
+    {
+        prefs.theme = theme;
+    }
+    if let Some(homepage) = parsed.get("homepage").and_then(JsonValue::as_str)
+        && let Ok(normalized) = page::normalize_url(homepage)
+    {
+        // A hand-edited or stale homepage that no longer
+        // normalizes falls back to the default, never a
+        // broken startup URL.
+        prefs.homepage = normalized;
+    }
+    if let Some(key) = parsed
+        .get("search_provider")
+        .and_then(JsonValue::as_str)
+        && let Some(provider) = page::SearchProvider::from_key(key)
+    {
+        prefs.search_provider = provider;
+    }
+    if let Some(key) = parsed.get("tab_placement").and_then(JsonValue::as_str)
+        && let Some(placement) = TabPlacement::from_key(key)
+    {
+        prefs.tab_placement = placement;
+    }
     prefs
 }
 
 /// Save the shell preferences (a failure is logged, not fatal —
 /// the in-memory value still applies for this run).
-fn save_shell_prefs(prefs: ShellPrefs) {
+fn save_shell_prefs(prefs: &ShellPrefs) {
     let Some(dir) = profile_dir() else {
         return;
     };
     let text = format!(
-        "{{\"version\":1,\"show_bookmarks_bar\":{}}}",
-        prefs.show_bookmarks_bar
+        "{{\"version\":2,\"show_bookmarks_bar\":{},\"theme\":{},\"homepage\":{},\"search_provider\":{},\"tab_placement\":{}}}",
+        prefs.show_bookmarks_bar,
+        json_escape(prefs.theme.key()),
+        json_escape(&prefs.homepage),
+        json_escape(prefs.search_provider.key()),
+        json_escape(prefs.tab_placement.key()),
     );
     if let Err(e) = write_file_atomic(&dir, PREFS_FILE, &text) {
         eprintln!("[pluto] failed to save preferences ({e})");
@@ -2689,7 +3036,12 @@ impl Application for PlutoBrowser {
         // it only when libcosmic is drawing the frame itself.
         core.window.show_headerbar = use_client_decorations;
         core.window.header_title = "Pluto ~ The far out browser".to_string();
-        let url = page::DEFAULT_URL.to_string();
+        // Settings round (2026-11-28): the preferences load
+        // once here and feed the whole shell — the homepage is
+        // the first tab's URL, the theme preference decides the
+        // starting dark flag and (when forced) the shell theme.
+        let prefs = load_shell_prefs();
+        let url = prefs.homepage.clone();
         eprintln!("[pluto] starting, loading {url}");
         // No load task here: the worker subscription (Stage 4 #2)
         // starts the pipeline, and the first navigation is flushed
@@ -2745,10 +3097,13 @@ impl Application for PlutoBrowser {
             next_tab_id: 1,
             viewport: page::DEFAULT_VIEWPORT,
             visible: true,
-            // M6 Phase 3 (Rec 12): the real OS theme at startup
-            // — libcosmic reads the system theme; the workers get
-            // it on `RendererReady` and on every change after.
-            dark_theme: cosmic::theme::is_dark(),
+            // M6 Phase 3 (Rec 12): the real theme at startup —
+            // the preference decides, not just the OS (settings
+            // round, 2026-11-28): a forced Light / Dark starts
+            // dark or light; System asks the OS. The workers
+            // get it on `RendererReady` and on every change
+            // after.
+            dark_theme: theme_pref_is_dark(prefs.theme),
             bookmarks,
             bookmark_favicons,
             bookmark_dialog: None,
@@ -2756,15 +3111,21 @@ impl Application for PlutoBrowser {
             // comes from the persisted preferences; edit mode,
             // the context menu, the folder dropdown, and the
             // folder dialog all start closed.
-            show_bookmarks_bar: load_shell_prefs().show_bookmarks_bar,
+            show_bookmarks_bar: prefs.show_bookmarks_bar,
             bookmarks_edit_mode: false,
             bar_context_menu: None,
             bar_context_chip: false,
             open_folder: None,
             folder_dialog: None,
+            // Settings round (2026-11-28): the persisted
+            // preferences; the dialog itself starts closed.
+            theme_pref: prefs.theme,
+            homepage: prefs.homepage.clone(),
+            search_provider: prefs.search_provider,
+            settings_dialog: None,
             menu_open: false,
             panel: None,
-            tab_placement: DEFAULT_TAB_PLACEMENT,
+            tab_placement: prefs.tab_placement,
             flyout_tab: None,
             flyout_progress: 0.0,
             flyout_target: 0.0,
@@ -2775,19 +3136,32 @@ impl Application for PlutoBrowser {
             last_wheel: None,
             broker,
         };
-        (app, Task::none())
+        // Settings round (2026-11-28): a forced theme applies
+        // at startup — the shell chrome switches before the
+        // first paint, and the workers get it via `dark_theme`
+        // on `RendererReady`. System needs no task: libcosmic
+        // already follows the OS.
+        let theme_task = match prefs.theme {
+            ThemePref::System => Task::none(),
+            ThemePref::Light => cosmic::command::set_theme(cosmic::Theme::light()),
+            ThemePref::Dark => cosmic::command::set_theme(cosmic::Theme::dark()),
+        };
+        (app, theme_task)
     }
 
     /// The OS theme mode changed (M6 Phase 3, Rec 12): libcosmic
     /// calls this when the system light/dark mode flips. The mode
     /// carries the dark flag directly — the authoritative signal
-    /// for `prefers-color-scheme`.
+    /// for `prefers-color-scheme`. Settings round (2026-11-28):
+    /// a forced Light / Dark preference wins over the OS signal
+    /// (the workers keep the forced value); System follows the
+    /// OS as before.
     fn system_theme_mode_update(
         &mut self,
         _keys: &[&'static str],
-        new_theme: &cosmic::cosmic_theme::ThemeMode,
+        _new_theme: &cosmic::cosmic_theme::ThemeMode,
     ) -> Task<Self::Message> {
-        self.apply_theme(new_theme.is_dark);
+        self.apply_theme(self.effective_dark());
         Task::none()
     }
 
@@ -2795,12 +3169,14 @@ impl Application for PlutoBrowser {
     /// switch that keeps the mode (e.g. a new light theme) still
     /// re-reads the active theme — libcosmic installs it before
     /// calling this hook, so `is_dark()` sees the new one.
+    /// Settings round (2026-11-28): same preference rule as
+    /// the mode hook — a forced theme is not disturbed.
     fn system_theme_update(
         &mut self,
         _keys: &[&'static str],
         _new_theme: &cosmic::cosmic_theme::Theme,
     ) -> Task<Self::Message> {
-        self.apply_theme(cosmic::theme::is_dark());
+        self.apply_theme(self.effective_dark());
         Task::none()
     }
 
@@ -2841,6 +3217,22 @@ impl Application for PlutoBrowser {
                     self.commit(bookmark.url.clone());
                     return Task::none();
                 }
+                // Settings round (2026-11-28): an empty address
+                // bar goes to the homepage, and a query (words,
+                // not a host) goes to the default search
+                // provider — the browser had no search at all
+                // before this, so words used to become a broken
+                // `https://<words>` URL.
+                if input.trim().is_empty() {
+                    let homepage = self.homepage.clone();
+                    self.commit(homepage);
+                    return Task::none();
+                }
+                if page::is_search_query(&input) {
+                    let url = self.search_provider.search_url(&input);
+                    self.commit(url);
+                    return Task::none();
+                }
                 match page::normalize_url(&input) {
                     Ok(url) => self.commit(url),
                     Err(reason) => {
@@ -2869,7 +3261,8 @@ impl Application for PlutoBrowser {
             }
             Message::NewTab => {
                 self.menu_open = false;
-                self.new_tab(page::DEFAULT_URL.to_string());
+                let homepage = self.homepage.clone();
+                self.new_tab(homepage);
             }
             Message::CloseTab(index) => {
                 self.close_tab(index);
@@ -3991,6 +4384,11 @@ impl Application for PlutoBrowser {
             }
             Message::SetTabPlacement(placement) => {
                 self.tab_placement = placement;
+                // Settings round (2026-11-28): placement is a
+                // persisted preference now — the menu entry and
+                // the settings dialog write the same field and
+                // the same file, so they cannot disagree.
+                self.save_prefs();
                 self.menu_open = false;
                 self.close_bar_popups();
                 self.clear_flyout();
@@ -4055,9 +4453,7 @@ impl Application for PlutoBrowser {
             }
             Message::ToggleBookmarksBar => {
                 self.show_bookmarks_bar = !self.show_bookmarks_bar;
-                save_shell_prefs(ShellPrefs {
-                    show_bookmarks_bar: self.show_bookmarks_bar,
-                });
+                self.save_prefs();
                 self.menu_open = false;
                 if !self.show_bookmarks_bar {
                     // A hidden bar shows no pencil and no chips —
@@ -4124,9 +4520,7 @@ impl Application for PlutoBrowser {
             }
             Message::BarHideBookmarksBar => {
                 self.show_bookmarks_bar = false;
-                save_shell_prefs(ShellPrefs {
-                    show_bookmarks_bar: false,
-                });
+                self.save_prefs();
                 self.bookmarks_edit_mode = false;
                 self.close_bar_popups();
             }
@@ -4172,6 +4566,50 @@ impl Application for PlutoBrowser {
             }
             Message::FolderDialogCancel => {
                 self.folder_dialog = None;
+            }
+            Message::ShowSettings => {
+                self.menu_open = false;
+                self.close_bar_popups();
+                let homepage = self.homepage.clone();
+                self.settings_dialog = Some(SettingsDialog::new(&homepage));
+            }
+            Message::CloseSettings => {
+                self.settings_dialog = None;
+            }
+            Message::SettingsThemeChanged(theme) => {
+                if theme != self.theme_pref {
+                    self.theme_pref = theme;
+                    self.save_prefs();
+                    return self.apply_theme_pref();
+                }
+            }
+            Message::SettingsHomepageChanged(draft) => {
+                if let Some(dialog) = self.settings_dialog.as_mut() {
+                    dialog.homepage_draft = draft;
+                    // Validate as it is typed: a valid value is
+                    // saved at once (normalized — a bare host
+                    // gains `https://`); an invalid one shows an
+                    // error and saves nothing, so the saved
+                    // homepage is never a broken URL.
+                    match page::normalize_url(&dialog.homepage_draft) {
+                        Ok(normalized) => {
+                            dialog.homepage_error = None;
+                            if normalized != self.homepage {
+                                self.homepage = normalized;
+                                self.save_prefs();
+                            }
+                        }
+                        Err(reason) => {
+                            dialog.homepage_error = Some(reason);
+                        }
+                    }
+                }
+            }
+            Message::SettingsSearchProviderChanged(provider) => {
+                if provider != self.search_provider {
+                    self.search_provider = provider;
+                    self.save_prefs();
+                }
             }
             Message::NewWindow => {
                 self.menu_open = false;
@@ -4327,6 +4765,11 @@ impl Application for PlutoBrowser {
         }
         if let Some(dialog) = &self.bookmark_dialog {
             layers.push(self.bookmark_dialog_overlay(dialog));
+        }
+        // Settings round (2026-11-28): the settings dialog
+        // rides on top too, above the bookmark dialog.
+        if let Some(dialog) = &self.settings_dialog {
+            layers.push(self.settings_dialog_overlay(dialog));
         }
         // Bookmarks round (2026-11-28): the bar's context menu,
         // a folder's dropdown, and the new-folder dialog ride
@@ -4488,7 +4931,7 @@ mod tests {
         // multi-tab shell), so it is listed, not excluded.
         assert_eq!(
             menu_items(),
-            &["Bookmarks", "History", "New Tab", "New Window"]
+            &["Bookmarks", "History", "New Tab", "New Window", "Settings"]
         );
         for forbidden in [
             "Sync and save data",
@@ -4502,7 +4945,6 @@ mod tests {
             "Find in Page",
             "Translate Page",
             "Zoom",
-            "Settings",
         ] {
             assert!(
                 !menu_items().contains(&forbidden),
@@ -4975,12 +5417,14 @@ mod tests {
         // visible.
         assert_eq!(load_shell_prefs(), ShellPrefs::default());
         assert!(ShellPrefs::default().show_bookmarks_bar);
-        save_shell_prefs(ShellPrefs {
+        save_shell_prefs(&ShellPrefs {
             show_bookmarks_bar: false,
+            ..ShellPrefs::default()
         });
         assert!(!load_shell_prefs().show_bookmarks_bar);
-        save_shell_prefs(ShellPrefs {
+        save_shell_prefs(&ShellPrefs {
             show_bookmarks_bar: true,
+            ..ShellPrefs::default()
         });
         assert!(load_shell_prefs().show_bookmarks_bar);
         // A corrupt file falls back to the default, not an error.
@@ -4992,6 +5436,125 @@ mod tests {
         assert!(load_shell_prefs().show_bookmarks_bar);
         let _ = std::fs::remove_dir_all(&dir);
         restore_test_home(home);
+    }
+
+    #[test]
+    fn settings_opens_from_menu_and_closes() {
+        let (dir, home, mut app) = test_shell("settings-open");
+        assert!(app.settings_dialog.is_none());
+        let _ = app.update(Message::ToggleMenu);
+        assert!(app.menu_open);
+        let _ = app.update(Message::ShowSettings);
+        assert!(!app.menu_open);
+        let dialog = app.settings_dialog.as_ref().expect("settings opens");
+        assert_eq!(dialog.homepage_draft, app.homepage);
+        assert!(dialog.homepage_error.is_none());
+        let _ = app.update(Message::CloseSettings);
+        assert!(app.settings_dialog.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn settings_theme_applies_and_persists() {
+        let (dir, home, mut app) = test_shell("settings-theme");
+        assert_eq!(app.theme_pref, ThemePref::System);
+        let _ = app.update(Message::SettingsThemeChanged(ThemePref::Dark));
+        assert_eq!(app.theme_pref, ThemePref::Dark);
+        assert!(app.dark_theme);
+        assert_eq!(load_shell_prefs().theme, ThemePref::Dark);
+        // A new shell in the same temp HOME reads it back.
+        let (app2, _) = PlutoBrowser::init(Core::default(), false);
+        assert_eq!(app2.theme_pref, ThemePref::Dark);
+        assert!(app2.dark_theme);
+        // And back to Light, then to System (which follows the OS).
+        let _ = app.update(Message::SettingsThemeChanged(ThemePref::Light));
+        assert!(!app.dark_theme);
+        assert_eq!(load_shell_prefs().theme, ThemePref::Light);
+        let _ = app.update(Message::SettingsThemeChanged(ThemePref::System));
+        assert_eq!(app.theme_pref, ThemePref::System);
+        assert_eq!(app.dark_theme, cosmic::theme::is_dark());
+        assert_eq!(load_shell_prefs().theme, ThemePref::System);
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn settings_homepage_applies_and_persists() {
+        let (dir, home, mut app) = test_shell("settings-homepage");
+        let _ = app.update(Message::ShowSettings);
+        // A bare host gains https:// and is saved at once.
+        let _ = app.update(Message::SettingsHomepageChanged(
+            "example.org".to_string(),
+        ));
+        assert_eq!(app.homepage, "https://example.org");
+        assert_eq!(load_shell_prefs().homepage, "https://example.org");
+        // A new shell starts on it.
+        let (app2, _) = PlutoBrowser::init(Core::default(), false);
+        assert_eq!(app2.homepage, "https://example.org");
+        assert_eq!(app2.active().active_url, "https://example.org");
+        // A rejected scheme shows an error and saves nothing.
+        let _ = app.update(Message::SettingsHomepageChanged(
+            "javascript:alert(1)".to_string(),
+        ));
+        let dialog = app.settings_dialog.as_ref().expect("dialog stays open");
+        assert!(dialog.homepage_error.is_some());
+        assert_eq!(app.homepage, "https://example.org");
+        assert_eq!(load_shell_prefs().homepage, "https://example.org");
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn settings_tab_placement_persists() {
+        let (dir, home, mut app) = test_shell("settings-placement");
+        assert_eq!(app.tab_placement, TabPlacement::Left);
+        let _ = app.update(Message::SetTabPlacement(TabPlacement::Right));
+        assert_eq!(app.tab_placement, TabPlacement::Right);
+        assert_eq!(load_shell_prefs().tab_placement, TabPlacement::Right);
+        let (app2, _) = PlutoBrowser::init(Core::default(), false);
+        assert_eq!(app2.tab_placement, TabPlacement::Right);
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn prefs_v1_file_loads_with_defaults_for_new_fields() {
+        let (dir, home, _app) = test_shell("prefs-v1");
+        // Nothing has been saved yet in this temp HOME, so the
+        // profile dir does not exist — create it before writing
+        // the v1 file by hand.
+        let path = shell_prefs_file().expect("temp HOME has a profile dir");
+        std::fs::create_dir_all(path.parent().expect("prefs file has a dir"))
+            .unwrap();
+        std::fs::write(
+            path,
+            "{\"version\":1,\"show_bookmarks_bar\":false}",
+        )
+        .unwrap();
+        let prefs = load_shell_prefs();
+        assert!(!prefs.show_bookmarks_bar);
+        assert_eq!(prefs.theme, ThemePref::System);
+        assert_eq!(prefs.homepage, page::DEFAULT_URL);
+        assert_eq!(
+            prefs.search_provider,
+            page::SearchProvider::DuckDuckGo
+        );
+        assert_eq!(prefs.tab_placement, TabPlacement::Left);
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn settings_pref_keys_round_trip() {
+        for theme in ThemePref::all() {
+            assert_eq!(ThemePref::from_key(theme.key()), Some(theme));
+        }
+        assert_eq!(ThemePref::from_key("nope"), None);
+        for placement in [TabPlacement::Left, TabPlacement::Right, TabPlacement::Both] {
+            assert_eq!(TabPlacement::from_key(placement.key()), Some(placement));
+        }
+        assert_eq!(TabPlacement::from_key("nope"), None);
     }
 
     #[test]
@@ -5030,6 +5593,51 @@ mod tests {
         app.active_mut().url_input = "example.com".to_string();
         let _ = app.update(Message::Navigate);
         assert_eq!(app.active().active_url, "https://example.com");
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn address_bar_query_goes_to_search_provider() {
+        let (dir, home, mut app) = test_shell("query-search");
+        // The homepage is changed first so the empty-bar case
+        // below proves the bar really went to it — through the
+        // dialog, like the real flow (the homepage draft lives
+        // in the dialog).
+        let _ = app.update(Message::ShowSettings);
+        let _ = app.update(Message::SettingsHomepageChanged(
+            "example.org".to_string(),
+        ));
+        assert_eq!(app.homepage, "https://example.org");
+        // The default provider is DuckDuckGo.
+        app.active_mut().url_input = "rust browser".to_string();
+        let _ = app.update(Message::Navigate);
+        assert_eq!(
+            app.active().active_url,
+            "https://duckduckgo.com/?q=rust+browser"
+        );
+        // Switching provider switches the search, and persists.
+        let _ = app.update(Message::SettingsSearchProviderChanged(
+            page::SearchProvider::Google,
+        ));
+        assert_eq!(
+            load_shell_prefs().search_provider,
+            page::SearchProvider::Google
+        );
+        app.active_mut().url_input = "rust browser".to_string();
+        let _ = app.update(Message::Navigate);
+        assert_eq!(
+            app.active().active_url,
+            "https://www.google.com/search?q=rust+browser"
+        );
+        // A bare host still navigates — it is not a query.
+        app.active_mut().url_input = "example.com".to_string();
+        let _ = app.update(Message::Navigate);
+        assert_eq!(app.active().active_url, "https://example.com");
+        // An empty address bar goes to the homepage.
+        app.active_mut().url_input = "   ".to_string();
+        let _ = app.update(Message::Navigate);
+        assert_eq!(app.active().active_url, "https://example.org");
         let _ = std::fs::remove_dir_all(&dir);
         restore_test_home(home);
     }

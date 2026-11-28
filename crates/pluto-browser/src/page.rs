@@ -244,6 +244,110 @@ enum StyleSource {
 /// The page loaded at startup and when the address bar is empty.
 pub const DEFAULT_URL: &str = "https://example.com";
 
+/// A search provider for address-bar queries (settings round,
+/// 2026-11-28): every provider is just an https search URL the
+/// normal fetch path can already reach — no new network code.
+/// The provider is a persisted preference; DuckDuckGo is the
+/// default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchProvider {
+    /// `https://duckduckgo.com/?q=…` (the default).
+    #[default]
+    DuckDuckGo,
+    /// `https://www.google.com/search?q=…`.
+    Google,
+    /// `https://www.bing.com/search?q=…`.
+    Bing,
+    /// `https://search.brave.com/search?q=…`.
+    Brave,
+}
+
+impl SearchProvider {
+    /// All providers, in dialog order.
+    pub fn all() -> [SearchProvider; 4] {
+        [
+            SearchProvider::DuckDuckGo,
+            SearchProvider::Google,
+            SearchProvider::Bing,
+            SearchProvider::Brave,
+        ]
+    }
+
+    /// The persisted key for this provider.
+    pub fn key(self) -> &'static str {
+        match self {
+            SearchProvider::DuckDuckGo => "duckduckgo",
+            SearchProvider::Google => "google",
+            SearchProvider::Bing => "bing",
+            SearchProvider::Brave => "brave",
+        }
+    }
+
+    /// The provider from a persisted key (`None` = unknown key).
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "duckduckgo" => Some(SearchProvider::DuckDuckGo),
+            "google" => Some(SearchProvider::Google),
+            "bing" => Some(SearchProvider::Bing),
+            "brave" => Some(SearchProvider::Brave),
+            _ => None,
+        }
+    }
+
+    /// The label the settings dialog shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            SearchProvider::DuckDuckGo => "DuckDuckGo",
+            SearchProvider::Google => "Google",
+            SearchProvider::Bing => "Bing",
+            SearchProvider::Brave => "Brave",
+        }
+    }
+
+    /// The search URL for `query` (trimmed, form-encoded).
+    pub fn search_url(self, query: &str) -> String {
+        let encoded: String =
+            url::form_urlencoded::byte_serialize(query.trim().as_bytes()).collect();
+        match self {
+            SearchProvider::DuckDuckGo => format!("https://duckduckgo.com/?q={encoded}"),
+            SearchProvider::Google => format!("https://www.google.com/search?q={encoded}"),
+            SearchProvider::Bing => format!("https://www.bing.com/search?q={encoded}"),
+            SearchProvider::Brave => format!("https://search.brave.com/search?q={encoded}"),
+        }
+    }
+}
+
+/// Whether address-bar input is a search query rather than a
+/// URL or host (settings round, 2026-11-28): no scheme, and
+/// either it contains whitespace ("rust browser") or it is a
+/// single word with no dot ("rust"). A bare host ("example.com",
+/// "localhost", "localhost:8080") is not a query — nor is
+/// anything with a scheme (`https://…`, `about:blank`) or an
+/// empty input (the caller sends that to the homepage).
+pub fn is_search_query(input: &str) -> bool {
+    let input = input.trim();
+    if input.is_empty() {
+        return false;
+    }
+    if url_scheme(input).is_some() {
+        return false;
+    }
+    if input.contains(char::is_whitespace) {
+        return true;
+    }
+    // A `host:port` is a host, not a query.
+    if input.contains(':') {
+        return false;
+    }
+    if input.contains('.') {
+        return false;
+    }
+    if input.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    true
+}
+
 /// The scheme of `url` (lowercased), if it has one: the part before
 /// the first `:` when it is valid scheme syntax — and not a
 /// `host:port`. A colon followed only by digits up to a `/`, `?`,
@@ -1975,6 +2079,46 @@ mod tests {
         // The internal blank page is allowed.
         assert_eq!(normalize_url("about:blank").unwrap(), "about:blank");
         assert_eq!(normalize_url("ABOUT:BLANK").unwrap(), "about:blank");
+    }
+
+    #[test]
+    fn search_provider_urls() {
+        assert_eq!(
+            SearchProvider::DuckDuckGo.search_url("rust browser"),
+            "https://duckduckgo.com/?q=rust+browser"
+        );
+        assert_eq!(
+            SearchProvider::Google.search_url("  hello world  "),
+            "https://www.google.com/search?q=hello+world"
+        );
+        assert_eq!(
+            SearchProvider::Bing.search_url("a&b=c"),
+            "https://www.bing.com/search?q=a%26b%3Dc"
+        );
+        assert_eq!(
+            SearchProvider::Brave.search_url("rust"),
+            "https://search.brave.com/search?q=rust"
+        );
+        // Keys round-trip.
+        for provider in SearchProvider::all() {
+            assert_eq!(SearchProvider::from_key(provider.key()), Some(provider));
+        }
+        assert_eq!(SearchProvider::from_key("nope"), None);
+    }
+
+    #[test]
+    fn is_search_query_cases() {
+        assert!(is_search_query("rust browser"));
+        assert!(is_search_query("rust"));
+        assert!(is_search_query("  how do i  "));
+        assert!(!is_search_query("example.com"));
+        assert!(!is_search_query("localhost"));
+        assert!(!is_search_query("localhost:8080"));
+        assert!(!is_search_query("example.com:8080/path"));
+        assert!(!is_search_query("https://example.com"));
+        assert!(!is_search_query("about:blank"));
+        assert!(!is_search_query(""));
+        assert!(!is_search_query("   "));
     }
 
     /// Stage 9 Rec 7 (T11): every non-http(s) scheme is rejected —
