@@ -366,7 +366,8 @@ pub struct PlutoBrowser {
     /// it (never a refetch).
     dark_theme: bool,
     /// The persisted bookmarks (nav feature): toggled by the
-    /// star, listed in the hamburger menu's Bookmarks panel.
+    /// star, shown on the bookmarks bar and in the add/edit
+    /// dialog.
     bookmarks: BookmarkStore,
     /// Decoded custom favicons, by bookmark URL (follow-up UI
     /// work, 2026-11-27): loaded once at startup from the
@@ -423,9 +424,8 @@ pub struct PlutoBrowser {
     /// Whether the hamburger menu is open. Opening a list panel
     /// closes the menu; the menu never shows alongside a panel.
     menu_open: bool,
-    /// The open Bookmarks/History list panel, if any. The lists
-    /// read the real stores: bookmarks from the profile store,
-    /// history from the active tab's session history.
+    /// The open History list panel, if any: history from the
+    /// active tab's session history.
     panel: Option<Panel>,
     /// Which edge(s) the vertical strip sits on (default Left).
     tab_placement: TabPlacement,
@@ -571,8 +571,6 @@ pub enum Message {
     SettingsSearchProviderChanged(page::SearchProvider),
     /// The hamburger button: open/close the menu.
     ToggleMenu,
-    /// Menu: open the Bookmarks list panel.
-    ShowBookmarks,
     /// Menu: open the History list panel.
     ShowHistory,
     /// Close the open list panel.
@@ -593,7 +591,7 @@ pub enum Message {
     /// Select the tab at this strip index (Stage 11 Rec 4):
     /// clicking its tab-strip button, plus Ctrl+Tab to cycle.
     SelectTab(usize),
-    /// The hamburger menu: put the vertical strip on an edge (or
+    /// The settings dialog: put the vertical strip on an edge (or
     /// both).
     SetTabPlacement(TabPlacement),
     /// A vertical tab's chip was hovered (mouse entered): start
@@ -1047,16 +1045,14 @@ impl PlutoBrowser {
     /// a floating popover would show.
     /// The hamburger menu (UI round, 2026-11-27): a compact
     /// 260px dropdown, right-aligned under the hamburger — not
-    /// the half-screen column it was. The four backend items from
-    /// `menu_items()` come first, then the placement entries
-    /// (left/right/both), which are the only exceptions to the
-    /// backends-only rule: they switch modes the shell really
-    /// performs.
+    /// the half-screen column it was. Below the backend items,
+    /// a divider, then the bookmarks-bar checkbox — the only view
+    /// option left in the menu (tab placement moved out to the
+    /// settings dialog only, 2026-11-28).
     fn menu_panel(&self) -> Element<'_, Message> {
         let mut items: Vec<Element<'_, Message>> = Vec::new();
         for label in menu_items() {
             let message = match *label {
-                "Bookmarks" => Message::ShowBookmarks,
                 "History" => Message::ShowHistory,
                 "New Tab" => Message::NewTab,
                 "New Window" => Message::NewWindow,
@@ -1074,24 +1070,9 @@ impl PlutoBrowser {
             );
         }
         items.push(widget::divider::horizontal::default().into());
-        for placement in [TabPlacement::Left, TabPlacement::Right, TabPlacement::Both] {
-            let label = if placement == self.tab_placement {
-                format!("{} ✓", placement_label(placement))
-            } else {
-                placement_label(placement).to_string()
-            };
-            items.push(
-                widget::button::text(label)
-                    .class(small_button_style(SmallButtonBase::Text, false))
-                    .on_press(Message::SetTabPlacement(placement))
-                    .width(Length::Fill)
-                    .into(),
-            );
-        }
         // The bookmarks-bar checkbox (bookmarks round,
-        // 2026-11-28): a view option, so it sits with the other
-        // view options — the placement entries — not in
-        // `menu_items` (that list is pinned to working
+        // 2026-11-28): the only view option in the menu — it is
+        // not in `menu_items` (that list is pinned to working
         // backends). Checked = the bar is visible; clicking
         // toggles it and persists the choice.
         let bar_label = if self.show_bookmarks_bar {
@@ -2030,15 +2011,14 @@ impl PlutoBrowser {
         widget::text(letter.to_string()).into()
     }
 
-    /// The open Bookmarks/History list panel: a header row plus
-    /// one row per entry. Bookmark rows navigate on click and
-    /// carry a Remove button; history rows navigate on click
-    /// (most recent first, capped — the session history itself
-    /// is unbounded). An empty list says so instead of showing
-    /// a blank panel.
+    /// The open History list panel: a header row plus one row
+    /// per entry. History rows navigate on click (most recent
+    /// first, capped — the session history itself is unbounded).
+    /// An empty list says so instead of showing a blank panel.
+    /// (The Bookmarks list panel was removed with its menu entry,
+    /// 2026-11-28 — bookmarks live on the bar and in the dialog.)
     fn list_panel(&self, panel: Panel) -> Element<'_, Message> {
         let title = match panel {
-            Panel::Bookmarks => "Bookmarks",
             Panel::History => "History",
         };
         let mut children: Vec<Element<'_, Message>> = vec![
@@ -2054,32 +2034,6 @@ impl PlutoBrowser {
             .into(),
         ];
         match panel {
-            Panel::Bookmarks => {
-                if self.bookmarks.bookmarks().is_empty() {
-                    children.push(
-                        widget::text("No bookmarks yet — use the star to save this page.")
-                            .into(),
-                    );
-                }
-                for bookmark in self.bookmarks.bookmarks() {
-                    let url = bookmark.url.clone();
-                    children.push(
-                        widget::row([
-                            widget::button::text(bookmark.title.clone())
-                                .class(small_button_style(SmallButtonBase::Text, false))
-                                .on_press(Message::NavigateTo(url.clone()))
-                                .width(Length::Fill)
-                                .into(),
-                            widget::button::text("Remove")
-                                .class(small_button_style(SmallButtonBase::Text, false))
-                                .on_press(Message::RemoveBookmark(url))
-                                .into(),
-                        ])
-                        .spacing(8)
-                        .into(),
-                    );
-                }
-            }
             Panel::History => {
                 let history = &self.active().history;
                 if history.is_empty() {
@@ -2109,7 +2063,6 @@ impl PlutoBrowser {
 /// Which list panel the hamburger menu opened, if any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
-    Bookmarks,
     History,
 }
 
@@ -2692,18 +2645,20 @@ fn panel_container_style(theme: &cosmic::Theme) -> cosmic::iced::widget::contain
 /// The hamburger menu's items, in order. The menu lists ONLY
 /// items with a working backend behind them (Joel's rule): each
 /// entry here names an action the shell really performs —
-/// Bookmarks opens the persistent bookmark list, History opens
-/// the session-history list, New Tab opens a tab in this window
-/// (Stage 11 Rec 4), New Window spawns a second Pluto process,
-/// Settings opens the settings dialog (settings round,
-/// 2026-11-28). Nothing else from the reference screenshot
-/// qualifies (no download-prompt UI, no zoom / find / sync /
-/// profiles / passwords / extensions / print / save-page /
+/// History opens the session-history list, New Tab opens a tab
+/// in this window (Stage 11 Rec 4), New Window spawns a second
+/// Pluto process, Settings opens the settings dialog (settings
+/// round, 2026-11-28). Bookmarks used to open the bookmark list
+/// panel here; the entry was removed 2026-11-28 (Joel) and the
+/// panel with it — bookmarks live on the bookmarks bar and in
+/// the add/edit dialog. Nothing else from the reference
+/// screenshot qualifies (no download-prompt UI, no zoom / find /
+/// sync / profiles / passwords / extensions / print / save-page /
 /// translate backend, and Porn Mode is M12, not built), so none
 /// of it is listed. No shortcuts are shown next to the items:
 /// none of the screenshot's shortcuts are wired.
 pub fn menu_items() -> &'static [&'static str] {
-    &["Bookmarks", "History", "New Tab", "New Window", "Settings"]
+    &["History", "New Tab", "New Window", "Settings"]
 }
 
 /// The theme preference (settings round, 2026-11-28):
@@ -4368,11 +4323,6 @@ impl Application for PlutoBrowser {
                     self.close_bar_popups();
                 }
             }
-            Message::ShowBookmarks => {
-                self.menu_open = false;
-                self.panel = Some(Panel::Bookmarks);
-                self.close_bar_popups();
-            }
             Message::ShowHistory => {
                 self.menu_open = false;
                 self.panel = Some(Panel::History);
@@ -4385,9 +4335,10 @@ impl Application for PlutoBrowser {
             Message::SetTabPlacement(placement) => {
                 self.tab_placement = placement;
                 // Settings round (2026-11-28): placement is a
-                // persisted preference now — the menu entry and
-                // the settings dialog write the same field and
-                // the same file, so they cannot disagree.
+                // persisted preference — the settings dialog is
+                // its only writer (the menu entries were removed
+                // 2026-11-28, Joel), so it cannot disagree with
+                // itself.
                 self.save_prefs();
                 self.menu_open = false;
                 self.close_bar_popups();
@@ -4729,10 +4680,22 @@ impl Application for PlutoBrowser {
             children.push(self.bookmarks_bar());
             children.push(widget::divider::horizontal::default().into());
         }
-        // Stage 11 Rec 9: the thin progress bar under the nav
-        // bar, while a document load is in flight. Indeterminate
-        // (no Content-Length) shows as a half bar, not a
-        // percentage — the status text carries the byte count.
+        if let Some(panel) = self.panel {
+            children.push(self.list_panel(panel));
+            children.push(widget::divider::horizontal::default().into());
+        }
+        children.push(self.vertical_content(web_view.into()));
+        children.push(widget::divider::horizontal::default().into());
+        // Stage 11 Rec 9: the load progress bar — a thin (~3px)
+        // line at the bottom of the window, above the status line,
+        // only while a document load is in flight (moved down from
+        // under the bookmarks bar, 2026-11-28). Indeterminate (no
+        // Content-Length) shows as a half bar, not a percentage —
+        // the status text carries the byte count. The girth is set
+        // explicitly (iced's default is 30px, which rendered as the
+        // fat accent bar Joel saw on-box) and the corners are square
+        // (radius 0, not the theme's rounded style) so it reads as a
+        // straight line, not a pill.
         if let Some((received, total)) = active.progress {
             let fraction = total.map_or(0.5, |t| {
                 if t == 0 {
@@ -4742,15 +4705,28 @@ impl Application for PlutoBrowser {
                 }
             });
             children.push(
-                cosmic::iced::widget::progress_bar(0.0..=1.0, fraction).into(),
+                cosmic::iced::widget::progress_bar(0.0..=1.0, fraction)
+                    .girth(Length::Fixed(3.0))
+                    .class(cosmic::theme::ProgressBar::custom(|theme| {
+                        // The theme's own default progress-bar style
+                        // (accent fill, divider track) with only the
+                        // corner radius flattened to 0 — the theme
+                        // uses radius_xl, which reads as a pill.
+                        // (The iced `.style()` builder can't be used
+                        // here: cosmic::Theme's progress-bar class
+                        // is an enum with no From<StyleFn> impl.)
+                        let class = <cosmic::Theme as cosmic::iced::widget::progress_bar::Catalog>::default(
+                        );
+                        let mut style = <cosmic::Theme as cosmic::iced::widget::progress_bar::Catalog>::style(
+                            theme, &class,
+                        );
+                        style.border.radius =
+                            cosmic::iced::core::border::Radius::from(0.0);
+                        style
+                    }))
+                    .into(),
             );
         }
-        if let Some(panel) = self.panel {
-            children.push(self.list_panel(panel));
-            children.push(widget::divider::horizontal::default().into());
-        }
-        children.push(self.vertical_content(web_view.into()));
-        children.push(widget::divider::horizontal::default().into());
         children.push(status.into());
         // The shell column is the base layer; the menu and the
         // bookmark dialog ride on top of it as overlay layers
@@ -4931,9 +4907,10 @@ mod tests {
         // multi-tab shell), so it is listed, not excluded.
         assert_eq!(
             menu_items(),
-            &["Bookmarks", "History", "New Tab", "New Window", "Settings"]
+            &["History", "New Tab", "New Window", "Settings"]
         );
         for forbidden in [
+            "Bookmarks",
             "Sync and save data",
             "Profiles",
             "Porn Mode",

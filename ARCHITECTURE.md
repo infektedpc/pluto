@@ -1325,6 +1325,113 @@ privacy controls, and extensibility.
       `ResourceTable` (4,096 live handles); reject further handle
       allocations with `Err("Resource limit exceeded")` until the
       guest drops existing handles.
+  - **Reference extension — web archiver ("Archive Vault")
+    (Joel, 2026-11-28)**: a first-party reference extension for the
+    native Wasm extension system above, paired with a self-hosted
+    companion server. Unlike a traditional crawler that re-fetches a
+    URL from scratch (missing paywalled, authenticated, or
+    JS-rendered content), the extension captures the live, post-JS
+    DOM directly from the browser — the exact state of the page on
+    screen — runs the "fat reducer" optimizer in Wasm, and streams
+    the compact snapshot to the Vault for permanent storage. It
+    depends on the extensions host (pluto-ext-host + the
+    `page-snapshot` WIT interface below), so it lands after the
+    extension system itself. Design only — no implementation yet.
+    - **Extension UI (pluto-ext-sdk, native libcosmic popover)**:
+      the Archive Page toolbar icon opens a native popover with
+      presets and a live size estimator. Presets (row of buttons):
+      Lossless (100%) — keeps original PNG/JPEG/WebP files, full
+      CSS, and raw HTML (legal/reference receipts); Balanced (75%)
+      — minifies HTML/CSS, strips unused CSS rules, strips EXIF,
+      re-encodes images to WebP at quality 75 (cuts page size
+      ~60–70% with no visible quality loss); Ultra-Slim /
+      Text-First (30%) — downscales images to 800px max width,
+      quality 30, strips web fonts (`@font-face`), removes
+      `<video>`/`<iframe>` embeds (thousands of articles on low
+      storage). Image quality slider (10–100) fine-tunes
+      compression and switches the active badge to "Custom".
+      Feature toggles: strip unused CSS (selectors not matching
+      the current DOM), remove tracking scripts & ads (strips
+      `<script>` tags before saving, so archived pages are static,
+      safe, and instant to load), embed assets inline (packs
+      everything into a single standalone `.html` file with `data:`
+      URIs, versus sending separate deduplicated blobs to the
+      server). Action button "Save Snapshot" with a live preview
+      badge (e.g. `Estimated: 4.8 MB → 620 KB`).
+    - **"Fat reducer" & optimization pipeline (inside Wasm,
+      `wasm32-wasip2`)**: pure-Rust passes run in memory before
+      upload. (1) Live DOM snapshot (`wit/dom.wit`): ask the host
+      to serialize the active tab's live DOM — dynamic JS-rendered
+      content and computed input states included — along with the
+      already-cached bytes of its stylesheets and images, avoiding
+      duplicate network downloads; strip all `<script>` tags,
+      `on*` event attributes, and `<link rel="preload">` hints so
+      the archived page is 100% static and cannot phone home
+      later. (2) CSS tree-shaking & minification (lightningcss):
+      parse all `<style>` blocks and external `.css` files, filter
+      out `@media print`, unused `@font-face` rules (if toggled),
+      and selectors that match no element in the captured DOM, then
+      minify whitespace and hex colors. (3) HTML minification
+      (minify-html): collapse whitespace, strip HTML comments,
+      remove redundant quotes/closing tags. (4) Image fat reducer
+      (`image` + `webp` / `ravif`): for every `<img>` and CSS
+      background-image — decode the raster bytes, resize if width
+      > max_width (1600px in Balanced, 800px in Ultra-Slim),
+      re-encode to WebP (fast) or AVIF (smallest) at the slider's
+      quality, keep whichever is smaller
+      (`compressed.len() < original.len()`), and rewrite the
+      `<img src="...">` attribute to point at the optimized blob.
+    - **Self-hosted Rust backend ("Archive Vault")**: a
+      lightweight single-binary server (axum + tokio) for a home
+      server, NAS, or VPS. Content-addressed blob store
+      (cross-page deduplication): hash every image and stylesheet
+      with BLAKE3, store assets on disk as
+      `blobs/<blake3_prefix>/<blake3_hash>.zst` — 50 archived pages
+      from the same blog share one copy of the site logo, fonts,
+      or CSS framework. Metadata & full-text search: SQLite (sqlx
+      or rusqlite) stores snapshot records (id, url, title,
+      captured_at, preset_used, original_bytes, saved_bytes,
+      html_blob_hash); Tantivy (pure-Rust Lucene alternative)
+      indexes the extracted plain text of every archived page for
+      millisecond search across the whole offline archive, with
+      fuzzy matching and snippet highlighting. Built-in replay
+      viewer: serves archived pages back at
+      `http://vault.local/<snapshot_id>` with a strict
+      Content-Security-Policy (`default-src 'none'; img-src 'self'
+      data:; style-src 'self' 'unsafe-inline';`) — archived pages
+      can never execute rogue scripts or leak requests to the live
+      web.
+    - **Host WIT additions (`wit/archive.wit`)**: one
+      resource-reading interface on pluto-ext-host, so the
+      extension can grab already-downloaded subresources from the
+      browser's memory cache without re-fetching them over the
+      network.
+      ```wit
+      interface page-snapshot {
+          record captured-asset {
+              url: string,
+              mime-type: string,
+              data: list<u8>,
+          }
+
+          record raw-snapshot {
+              url: string,
+              title: string,
+              serialized-html: string,
+              assets: list<captured-asset>,
+          }
+
+          // Grabs live DOM HTML + cached images/CSS from the active tab
+          capture-tab: func(tab-id: u64) -> result<raw-snapshot, string>;
+      }
+      ```
+    - **Staged build order** (three parts, in dependency order):
+      (1) the browser host `capture-tab` implementation (serialize
+      the live DOM tree, pull cached assets from memory); (2) the
+      pluto-ext archiver extension (quality-slider UI,
+      lightningcss/minify-html passes, image compressor); (3) the
+      self-hosted axum archive server (BLAKE3 deduplicated blob
+      store, SQLite schema, Tantivy full-text search).
 - **Done criteria**: Pluto safely isolates cross-origin sites, blocks
   trackers natively, manages downloads/bookmarks, passes core security
   & Web Platform Test (WPT) suites, and loads a signed .wasm
