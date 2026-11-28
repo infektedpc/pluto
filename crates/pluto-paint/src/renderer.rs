@@ -1785,6 +1785,42 @@ fn dim(color: [f32; 4], opacity: f32) -> [f32; 4] {
 }
 
 fn rect_vertices_for(item: &DisplayItem, transform: &Affine, opacity: f32) -> Vec<RectVertex> {
+    // The DevTools highlight (Stage 18, M9 stage 3) draws as an
+    // OUTLINE — four thin rects around the border box — never a
+    // fill that would hide the content underneath. Corners are
+    // counted once each (the side rects inset by the thickness).
+    if let DisplayItem::Highlight {
+        x,
+        y,
+        width,
+        height,
+        color,
+    } = item
+    {
+        let t = 2.0f32;
+        let c = dim(*color, opacity);
+        let mut verts: Vec<RectVertex> = Vec::with_capacity(24);
+        let quad = |x0: f32, y0: f32, x1: f32, y1: f32, verts: &mut Vec<RectVertex>| {
+            for (px, py) in [
+                (x0, y0),
+                (x1, y0),
+                (x0, y1),
+                (x1, y0),
+                (x1, y1),
+                (x0, y1),
+            ] {
+                verts.push(RectVertex {
+                    pos: xform([px, py], transform),
+                    color: c,
+                });
+            }
+        };
+        quad(*x, *y, x + width, y + t, &mut verts);
+        quad(*x, y + height - t, x + width, y + height, &mut verts);
+        quad(*x, y + t, x + t, y + height - t, &mut verts);
+        quad(x + width - t, y + t, x + width, y + height - t, &mut verts);
+        return verts;
+    }
     // Caret / selection paint as plain rects (Stage 13 Rec 4):
     // normalise them to a `FillRect` at this seam so the run
     // builder below needs no new run kind.
@@ -3318,7 +3354,8 @@ impl PaintRenderer {
             match item {
                 DisplayItem::FillRect { .. }
                 | DisplayItem::Caret { .. }
-                | DisplayItem::SelectionRect { .. } => {
+                | DisplayItem::SelectionRect { .. }
+                | DisplayItem::Highlight { .. } => {
                     has_content = true;
                     let first = rect_vertices.len() as u32;
                     let verts =

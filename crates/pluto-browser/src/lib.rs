@@ -81,6 +81,20 @@ impl HistoryEntry {
 /// owns the document; the shell never lays out. Switching tabs
 /// swaps the active compositor — no re-fetch, no re-layout — and
 /// closing a tab kills its renderer (see `close_tab`).
+/// The inspector's details for one selected node (Stage 18, M9
+/// stage 3): tag, attributes in source order, computed style as
+/// name/value pairs, and the border-box rect + margin/padding
+/// strings — or `None` when the node has no box (`display:
+/// none`, or layout pending). Rendered as plain text; the
+/// strings are page output, never markup.
+#[derive(Debug, Clone, Default)]
+struct InspectorNodeDetails {
+    tag: String,
+    attrs: Vec<(String, String)>,
+    computed: Vec<(String, String)>,
+    geometry: Option<pluto_ipc::DevToolsBox>,
+}
+
 struct Tab {
     /// Shell-assigned id, echoed by the worker (never hardcoded 0).
     id: u64,
@@ -178,6 +192,32 @@ struct Tab {
     /// Capped at [`CONSOLE_LINES_CAP`] (oldest evicted); the
     /// DevTools panel shows the active tab's buffer.
     console_lines: Vec<(String, String)>,
+    /// The inspector's epoch (Stage 18, M9 stage 3): the latest
+    /// worker `nav_epoch` this tab knows — bumped when the
+    /// shell sends `CommitNavigation` for this tab, and adopted
+    /// from inspector answers that carry a newer epoch. An
+    /// answer with an older epoch is stale and dropped (the
+    /// worker bumps its epoch on worker-side navigations too —
+    /// a link click — so the shell learns the new epoch from
+    /// the answer, never from its own sends alone).
+    inspector_epoch: u64,
+    /// The inspector's lazily loaded tree (Stage 18): the node
+    /// asked for (`None` = root) → its children, one query per
+    /// expansion. Only ever the current document's nodes —
+    /// navigation clears it.
+    inspector_children: std::collections::HashMap<Option<u64>, Vec<pluto_ipc::DevToolsNodeSummary>>,
+    /// The inspector's expanded node ids (Stage 18).
+    inspector_expanded: HashSet<u64>,
+    /// The inspector's selected node id (Stage 18), if any.
+    inspector_selected: Option<u64>,
+    /// The selected node's details (Stage 18), if the worker
+    /// answered — tag, attributes, computed style, box.
+    inspector_details: Option<InspectorNodeDetails>,
+    /// The selected node is gone from the document (Stage 18):
+    /// its inspect answer came back with the empty tag. The
+    /// panel shows "node no longer in the document" instead
+    /// of trusting a dead id.
+    inspector_gone: bool,
     /// Per-layer sandbox results from the child's
     /// `SandboxReport` (Stage 13 Rec 12a): empty until the first
     /// report arrives (in-process tabs never report).
@@ -222,6 +262,12 @@ impl Tab {
             pending_url: Some(url),
             progress: None,
             console_lines: Vec::new(),
+            inspector_epoch: 0,
+            inspector_children: std::collections::HashMap::new(),
+            inspector_expanded: HashSet::new(),
+            inspector_selected: None,
+            inspector_details: None,
+            inspector_gone: false,
             sandbox_layers: Vec::new(),
             crashed: false,
             crash_times: Vec::new(),
@@ -338,6 +384,18 @@ impl SettingsDialog {
     }
 }
 
+/// Which DevTools view is showing (Stage 18, M9 stage 3): the
+/// Elements inspector or the Console (stages 1–2). The console
+/// renders exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DevToolsView {
+    /// The Elements inspector (the default view).
+    #[default]
+    Elements,
+    /// The console + REPL (stages 1–2).
+    Console,
+}
+
 /// The DevTools console panel's draft state (Stage 17, M9
 /// stages 1–2): only the REPL input is a draft — the console
 /// lines themselves live per tab (see `Tab::console_lines`),
@@ -347,6 +405,12 @@ impl SettingsDialog {
 struct DevToolsPanel {
     /// The REPL input as typed.
     repl_input: String,
+    /// The view showing (Stage 18, M9 stage 3).
+    view: DevToolsView,
+    /// Pick mode (Stage 18): while on, the next `PointerDown`
+    /// on the web view is intercepted for a hit-test pick
+    /// instead of being forwarded to the page.
+    pick_mode: bool,
 }
 
 /// Which bookmarks-bar context menu is open, if any
@@ -604,6 +668,20 @@ pub enum Message {
     /// echo the source into the active tab's console lines and
     /// send it to that tab's worker as `DevToolsEval`.
     DevToolsSubmit,
+    /// The DevTools panel's view switch (Stage 18, M9 stage 3):
+    /// Elements (inspector) or Console.
+    DevToolsView(DevToolsView),
+    /// The inspector's "Pick element" toggle (Stage 18): while
+    /// on, the next `PointerDown` on the web view is a
+    /// hit-test pick, not a click.
+    DevToolsTogglePick,
+    /// The inspector's tree chevron (Stage 18): expand the
+    /// node (asking the worker for its children) or collapse
+    /// it (no query — the cached children stay).
+    DevToolsToggleNode(u64),
+    /// The inspector's tree row click (Stage 18): select the
+    /// node — ask the worker for its details and highlight it.
+    DevToolsSelectNode(u64),
     /// The settings dialog's Close button: close the dialog.
     /// Everything in it already applied and persisted when it
     /// changed, except an invalid homepage draft, which is
@@ -877,6 +955,50 @@ impl PlutoBrowser {
                 tab.renderer_tx = None;
             }
     }
+
+    /// Clear the inspector's per-tab state (Stage 18, M9 stage
+    /// 3): tree cache, expanded set, selection, details, gone
+    /// flag. The epoch is NOT cleared — it is the latest known
+    /// epoch, and the next answer re-adopts it. Called on
+    /// commit / load failure, before re-requesting the root.
+    fn clear_inspector(&mut self, tab_index: usize) {
+        let tab = &mut self.tabs[tab_index];
+        tab.inspector_children.clear();
+        tab.inspector_expanded.clear();
+        tab.inspector_selected = None;
+        tab.inspector_details = None;
+        tab.inspector_gone = false;
+    }
+
+    /// Ask a tab's worker for the root's children (Stage 18, M9
+    /// stage 3) — the inspector's first load, after opening the
+    /// panel, switching to a tab without a cached root, or after
+    /// a commit. No-op when the tab has no renderer yet.
+    fn request_inspector_root(&mut self, tab_index: usize) {
+        let (tab_id, epoch) = {
+            let tab = &self.tabs[tab_index];
+            (tab.id, tab.inspector_epoch)
+        };
+        self.send_command_to(
+            tab_id,
+            BrowserToRenderer::DevToolsDomChildren { node: None, epoch },
+        );
+    }
+
+    /// Set (or clear) the highlight on a tab's worker (Stage 18,
+    /// M9 stage 3). The worker re-collects + submits without a
+    /// layout pass; a repeat ask for the same node is a no-op
+    /// worker-side.
+    fn send_inspector_highlight(&mut self, tab_index: usize, node: Option<u64>) {
+        let (tab_id, epoch) = {
+            let tab = &self.tabs[tab_index];
+            (tab.id, tab.inspector_epoch)
+        };
+        self.send_command_to(
+            tab_id,
+            BrowserToRenderer::DevToolsHighlight { node, epoch },
+        );
+    }
     /// Tell a tab's worker the shell's session-history length and
     /// index (Stage 16 Phase 3, Rec 8 — finisher): the worker's
     /// realm mirrors them, so `history.length` and the `popstate`
@@ -1044,6 +1166,11 @@ impl PlutoBrowser {
             tab.renderer_tx.is_some()
         };
         if has_renderer {
+            // Stage 18 (M9 stage 3): the inspector's epoch
+            // moves with the navigation — the worker bumps its
+            // own on `start_navigation`, so the shell's copy
+            // must move here, at the send.
+            self.tabs[tab_index].inspector_epoch += 1;
             let tab_id = self.tabs[tab_index].id;
             self.send_command_to(
                 tab_id,
@@ -2033,20 +2160,72 @@ impl PlutoBrowser {
             .into()
     }
 
-    /// The DevTools console panel (Stage 17, M9 stages 1–2):
-    /// a floating overlay like the settings dialog — a centered
-    /// panel over the page, in the `view()` stack layers. It
-    /// shows the ACTIVE tab's console lines and a REPL input.
-    /// Page output is rendered as untrusted plain text (the
-    /// text widget — never markup, never evaluated): a page
-    /// that logs `<script>…</script>` cannot inject into the
-    /// panel. Lines with an empty level are the REPL's own echo
-    /// (`> source`) and result lines, rendered as-is; real
+    /// The DevTools panel (Stage 17, M9 stages 1–2, extended in
+    /// Stage 18, M9 stage 3): a floating overlay like the
+    /// settings dialog — a centered panel over the page, in the
+    /// `view()` stack layers. A tab strip at the top switches
+    /// between the Elements inspector and the Console; the
+    /// console tab renders exactly as in stages 1–2 (the
+    /// ACTIVE tab's console lines and the REPL input). The
+    /// Elements view shows the active tab's lazily loaded DOM
+    /// tree on the left and the selected node's details on the
+    /// right. Page output is rendered as untrusted plain text
+    /// (the text widget — never markup, never evaluated): a
+    /// page that logs `<script>…</script>` cannot inject into
+    /// the panel. Lines with an empty level are the REPL's own
+    /// echo (`> source`) and result lines, rendered as-is; real
     /// console lines render as `level: message` (an error's
     /// formatted stack is inside its message, so it wraps over
     /// several visual lines). The log area is a fixed-height
     /// scrollable, so a chatty page never grows the panel.
     fn devtools_panel_overlay<'a>(
+        &'a self,
+        panel: &'a DevToolsPanel,
+    ) -> Element<'a, Message> {
+        let header = widget::row([
+            widget::button::text("Elements")
+                .class(small_button_style(
+                    SmallButtonBase::Text,
+                    panel.view == DevToolsView::Elements,
+                ))
+                .on_press(Message::DevToolsView(DevToolsView::Elements))
+                .into(),
+            widget::button::text("Console")
+                .class(small_button_style(
+                    SmallButtonBase::Text,
+                    panel.view == DevToolsView::Console,
+                ))
+                .on_press(Message::DevToolsView(DevToolsView::Console))
+                .into(),
+            cosmic::iced::widget::space().width(Length::Fill).into(),
+            widget::button::text("Close")
+                .class(small_button_style(SmallButtonBase::Text, false))
+                .on_press(Message::CloseDevTools)
+                .into(),
+        ])
+        .spacing(8);
+        let body: Element<'_, Message> = match panel.view {
+            DevToolsView::Console => self.devtools_console_view(panel),
+            DevToolsView::Elements => self.devtools_elements_view(panel),
+        };
+        let children: Vec<Element<'_, Message>> =
+            vec![header.into(), body];
+        let boxed = widget::container(widget::column(children).spacing(8).padding(12))
+            .width(Length::Fixed(DEVTOOLS_PANEL_WIDTH))
+            .style(panel_container_style);
+        widget::container(boxed)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .into()
+    }
+
+    /// The DevTools Console tab (Stage 17, M9 stages 1–2): the
+    /// ACTIVE tab's console lines and the REPL input, exactly
+    /// as the whole panel rendered before the Stage 18 tab
+    /// strip.
+    fn devtools_console_view<'a>(
         &'a self,
         panel: &'a DevToolsPanel,
     ) -> Element<'a, Message> {
@@ -2075,17 +2254,7 @@ impl PlutoBrowser {
         .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
             Default::default(),
         ));
-        let children: Vec<Element<'_, Message>> = vec![
-            widget::row([
-                widget::text("DevTools — Console").size(16).into(),
-                cosmic::iced::widget::space().width(Length::Fill).into(),
-                widget::button::text("Close")
-                    .class(small_button_style(SmallButtonBase::Text, false))
-                    .on_press(Message::CloseDevTools)
-                    .into(),
-            ])
-            .spacing(8)
-            .into(),
+        widget::column(vec![
             log.into(),
             widget::row([
                 widget::text_input("Evaluate in this page…", &panel.repl_input)
@@ -2105,16 +2274,211 @@ impl PlutoBrowser {
             widget::text("Runs with page privileges, like a script the page itself ran.")
                 .size(12)
                 .into(),
+        ])
+        .spacing(8)
+        .into()
+    }
+
+    /// The DevTools Elements tab (Stage 18, M9 stage 3): the
+    /// "Pick element" toggle, the lazily loaded DOM tree on
+    /// the left, the selected node's details on the right.
+    fn devtools_elements_view<'a>(
+        &'a self,
+        panel: &'a DevToolsPanel,
+    ) -> Element<'a, Message> {
+        let tab = self.active();
+        let pick_label = if panel.pick_mode {
+            "Picking… click the page"
+        } else {
+            "Pick element"
+        };
+        let pick = widget::button::text(pick_label)
+            .class(small_button_style(
+                SmallButtonBase::Text,
+                panel.pick_mode,
+            ))
+            .on_press(Message::DevToolsTogglePick);
+        let mut tree_rows: Vec<Element<'_, Message>> = Vec::new();
+        match tab.inspector_children.get(&None) {
+            None => {
+                tree_rows.push(widget::text("Loading…").size(12).into());
+            }
+            Some(children) if children.is_empty() => {
+                tree_rows.push(
+                    widget::text("No document loaded yet.").size(12).into(),
+                );
+            }
+            Some(_) => {
+                Self::inspector_tree_rows(tab, None, 0, &mut tree_rows);
+            }
+        }
+        let tree = cosmic::iced::widget::scrollable(
+            widget::column(tree_rows).spacing(2).width(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fixed(DEVTOOLS_PANEL_LOG_HEIGHT))
+        .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+            Default::default(),
+        ));
+        let details = cosmic::iced::widget::scrollable(
+            widget::column(Self::inspector_details_rows(tab))
+                .spacing(2)
+                .width(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fixed(DEVTOOLS_PANEL_LOG_HEIGHT))
+        .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+            Default::default(),
+        ));
+        widget::column(vec![
+            pick.into(),
+            widget::row([
+                tree.into(),
+                details.into(),
+            ])
+            .spacing(12)
+            .into(),
+        ])
+        .spacing(8)
+        .into()
+    }
+
+    /// One inspector tree row's label (Stage 18, M9 stage 3):
+    /// the tag, plus the text preview for text / comment nodes.
+    /// Page strings are plain text, never markup.
+    fn inspector_label(summary: &pluto_ipc::DevToolsNodeSummary) -> String {
+        match &summary.text {
+            Some(preview) if !preview.is_empty() => {
+                format!("{} \"{preview}\"", summary.tag)
+            }
+            _ => summary.tag.clone(),
+        }
+    }
+
+    /// The inspector tree's rows for one parent (Stage 18, M9
+    /// stage 3), appended to `rows` recursively: a chevron
+    /// button (expand / collapse, or a spacer for leaves) plus
+    /// a label button (select). Depth indents by 14 px per
+    /// level. Only cached children render — an unexpanded node
+    /// shows nothing below it until the worker answers.
+    fn inspector_tree_rows<'a>(
+        tab: &'a Tab,
+        parent: Option<u64>,
+        depth: usize,
+        rows: &mut Vec<Element<'a, Message>>,
+    ) {
+        let Some(children) = tab.inspector_children.get(&parent) else {
+            return;
+        };
+        for child in children {
+            let expanded = tab.inspector_expanded.contains(&child.id);
+            let selected = tab.inspector_selected == Some(child.id);
+            let chevron: Element<'_, Message> = if !child.has_children {
+                widget::text(" ").size(12).into()
+            } else if expanded {
+                widget::button::text("v")
+                    .class(small_button_style(SmallButtonBase::Text, false))
+                    .on_press(Message::DevToolsToggleNode(child.id))
+                    .into()
+            } else {
+                widget::button::text(">")
+                    .class(small_button_style(SmallButtonBase::Text, false))
+                    .on_press(Message::DevToolsToggleNode(child.id))
+                    .into()
+            };
+            rows.push(
+                widget::row([
+                    cosmic::iced::widget::space()
+                        .width(Length::Fixed(depth as f32 * 14.0))
+                        .into(),
+                    chevron,
+                    widget::button::text(Self::inspector_label(child))
+                        .class(small_button_style(SmallButtonBase::Text, selected))
+                        .on_press(Message::DevToolsSelectNode(child.id))
+                        .into(),
+                ])
+                .spacing(4)
+                .into(),
+            );
+            if expanded {
+                Self::inspector_tree_rows(tab, Some(child.id), depth + 1, rows);
+            }
+        }
+    }
+
+    /// The selected node's details rows (Stage 18, M9 stage 3):
+    /// tag, attributes as plain text, computed style as
+    /// name/value rows, and the box model — border-box rect +
+    /// margin/padding strings, with the honest note that
+    /// borders are unmodelled in Pluto (padding box ==
+    /// border box), never invented border numbers. A node with
+    /// no box says so instead of showing a fake rect.
+    fn inspector_details_rows(tab: &Tab) -> Vec<Element<'_, Message>> {
+        if tab.inspector_gone {
+            return vec![
+                widget::text("node no longer in the document").size(12).into(),
+            ];
+        }
+        let Some(details) = &tab.inspector_details else {
+            if tab.inspector_selected.is_some() {
+                return vec![widget::text("Loading…").size(12).into()];
+            }
+            return vec![
+                widget::text("Select an element in the tree, or pick one from the page.")
+                    .size(12)
+                    .into(),
+            ];
+        };
+        let mut rows: Vec<Element<'_, Message>> = vec![
+            widget::text(format!("<{}>", details.tag)).size(13).into(),
         ];
-        let boxed = widget::container(widget::column(children).spacing(8).padding(12))
-            .width(Length::Fixed(DEVTOOLS_PANEL_WIDTH))
-            .style(panel_container_style);
-        widget::container(boxed)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(Alignment::Center)
-            .align_y(Alignment::Center)
-            .into()
+        for (name, value) in &details.attrs {
+            rows.push(widget::text(format!("{name}=\"{value}\"")).size(12).into());
+        }
+        for (name, value) in &details.computed {
+            rows.push(widget::text(format!("{name}: {value}")).size(12).into());
+        }
+        match &details.geometry {
+            Some(b) => {
+                rows.push(
+                    widget::text(format!(
+                        "border box: x {} y {} — {} × {}",
+                        b.x, b.y, b.width, b.height
+                    ))
+                    .size(12)
+                    .into(),
+                );
+                rows.push(
+                    widget::text(format!(
+                        "margin: {} {} {} {}",
+                        b.margin[0], b.margin[1], b.margin[2], b.margin[3]
+                    ))
+                    .size(12)
+                    .into(),
+                );
+                rows.push(
+                    widget::text(format!(
+                        "padding: {} {} {} {}",
+                        b.padding[0], b.padding[1], b.padding[2], b.padding[3]
+                    ))
+                    .size(12)
+                    .into(),
+                );
+                rows.push(
+                    widget::text("borders not modelled in Pluto — padding box == border box")
+                        .size(12)
+                        .into(),
+                );
+            }
+            None => {
+                rows.push(
+                    widget::text("No box — the node has no layout box (display: none, or layout pending).")
+                        .size(12)
+                        .into(),
+                );
+            }
+        }
+        rows
     }
 
     /// A tab's favicon as a 16px image, or the site's initial
@@ -3391,6 +3755,17 @@ impl Application for PlutoBrowser {
                     // while the tab was in the background).
                     self.convert_stored_video_frames(index);
                     self.sync_window_title();
+                    // Stage 18 (M9 stage 3): the inspector
+                    // follows the tab — if the panel is open and
+                    // this tab has no cached root yet, ask for it
+                    // (the cached tree survives a switch away and
+                    // back, so a tab with a root is not
+                    // re-asked).
+                    if self.devtools_panel.is_some()
+                        && !self.tabs[index].inspector_children.contains_key(&None)
+                    {
+                        self.request_inspector_root(index);
+                    }
                 }
             }
             Message::RendererReady(tab_id, tx) => {
@@ -3432,6 +3807,12 @@ impl Application for PlutoBrowser {
                     if let Ok(mut counters) = perf::global().lock() {
                         counters.note_navigation_start();
                     }
+                    // Stage 18 (M9 stage 3): the first
+                    // navigation is a `CommitNavigation` send too
+                    // — the inspector's epoch moves with it.
+                    if let Some(idx) = self.tab_index(tab_id) {
+                        self.tabs[idx].inspector_epoch += 1;
+                    }
                     self.send_command_to(
                         tab_id,
                         BrowserToRenderer::CommitNavigation {
@@ -3470,6 +3851,20 @@ impl Application for PlutoBrowser {
                 match event {
                     RendererToBrowser::DidCommit { url, status, replace } => {
                         eprintln!("[pluto] page loaded: {url}");
+                        // Stage 18 (M9 stage 3): a commit is a
+                        // new document — the inspector's tree,
+                        // selection, and highlight are stale.
+                        // Clear them and, while the panel is open,
+                        // ask for the new root (the answer
+                        // re-adopts the epoch, so a worker-side
+                        // navigation's bump is picked up here).
+                        // This runs before the `about:crashed`
+                        // early return below — the crash page is
+                        // a new document too.
+                        self.clear_inspector(tab_index);
+                        if self.devtools_panel.is_some() {
+                            self.request_inspector_root(tab_index);
+                        }
                         // Stage 13 Rec 12c: the crash page commits
                         // like any page, but it must not touch the
                         // URL, title, or history — the address bar
@@ -3676,6 +4071,102 @@ impl Application for PlutoBrowser {
                         let tab = &mut self.tabs[tab_index];
                         tab.push_console_lines(vec![(String::new(), result)]);
                     }
+                    RendererToBrowser::DevToolsChildren {
+                        epoch,
+                        node,
+                        children,
+                    } => {
+                        // Stage 18 (M9 stage 3): the lazy tree's
+                        // answer. A stale epoch (older than the
+                        // latest known) is dropped; a newer one is
+                        // adopted — a worker-side navigation (a
+                        // link click) bumps the worker's epoch
+                        // without the shell sending
+                        // `CommitNavigation`, so adoption is how
+                        // the shell learns the new epoch. The
+                        // answer lands in the per-tab tree cache,
+                        // keyed by the node asked for.
+                        let tab = &mut self.tabs[tab_index];
+                        if epoch >= tab.inspector_epoch {
+                            if epoch > tab.inspector_epoch {
+                                tab.inspector_epoch = epoch;
+                            }
+                            tab.inspector_children.insert(node, children);
+                        }
+                    }
+                    RendererToBrowser::DevToolsNode {
+                        epoch,
+                        node,
+                        tag,
+                        attrs,
+                        computed,
+                        geometry,
+                    } => {
+                        // Stage 18: the selected node's details.
+                        // A stale epoch is dropped; an answer for
+                        // a node that is no longer selected is
+                        // dropped too (the user moved on). An
+                        // empty tag means the node is gone from
+                        // the document.
+                        let tab = &mut self.tabs[tab_index];
+                        if epoch < tab.inspector_epoch || tab.inspector_selected != Some(node) {
+                            // Stale or superseded: ignore.
+                        } else {
+                            if epoch > tab.inspector_epoch {
+                                tab.inspector_epoch = epoch;
+                            }
+                            if tag.is_empty() {
+                                tab.inspector_details = None;
+                                tab.inspector_gone = true;
+                            } else {
+                                tab.inspector_details = Some(InspectorNodeDetails {
+                                    tag,
+                                    attrs,
+                                    computed,
+                                    // Unbox: the details struct
+                                    // holds the box by value (the
+                                    // `Box` exists only to keep the
+                                    // IPC variant small).
+                                    geometry: geometry.map(|b| *b),
+                                });
+                                tab.inspector_gone = false;
+                            }
+                        }
+                    }
+                    RendererToBrowser::DevToolsPicked { epoch, node } => {
+                        // Stage 18: the pick mode's answer. A
+                        // stale epoch is dropped; a newer one is
+                        // adopted. A hit selects the node —
+                        // details + highlight, like a tree click.
+                        // A miss (`None`) selects nothing.
+                        let picked = {
+                            let tab = &mut self.tabs[tab_index];
+                            if epoch < tab.inspector_epoch {
+                                None
+                            } else {
+                                if epoch > tab.inspector_epoch {
+                                    tab.inspector_epoch = epoch;
+                                }
+                                match node {
+                                    Some(id) => {
+                                        tab.inspector_selected = Some(id);
+                                        tab.inspector_details = None;
+                                        tab.inspector_gone = false;
+                                        Some(id)
+                                    }
+                                    None => None,
+                                }
+                            }
+                        };
+                        if let Some(id) = picked {
+                            self.send_inspector_highlight(tab_index, Some(id));
+                            let tab_id = self.tabs[tab_index].id;
+                            self.send_command_to(
+                                tab_id,
+                                BrowserToRenderer::DevToolsInspectNode { node: id, epoch },
+                            );
+                        }
+                    }
                     RendererToBrowser::TitleChanged { title } => {
                         // Stage 11 Rec 8: the tab's title, shown
                         // in the tab strip — and the window title,
@@ -3694,6 +4185,14 @@ impl Application for PlutoBrowser {
                     RendererToBrowser::LoadFailed { reason, .. } => {
                         // The worker already submitted the error page as
                         // a display list; the status line says why.
+                        // Stage 18 (M9 stage 3): a failed load
+                        // still lands a new document (the error
+                        // page) — the inspector's tree is stale,
+                        // like on a commit.
+                        self.clear_inspector(tab_index);
+                        if self.devtools_panel.is_some() {
+                            self.request_inspector_root(tab_index);
+                        }
                         let tab = &mut self.tabs[tab_index];
                         tab.status = format!("Failed: {reason}");
                         tab.progress = None;
@@ -3790,6 +4289,12 @@ impl Application for PlutoBrowser {
                         // locally (no fetch). The resize/visibility
                         // re-sync follows so the fresh child lays
                         // the page out at the real window size.
+                        // Stage 18 (M9 stage 3): the crash page
+                        // is a `CommitNavigation` send too — the
+                        // inspector's epoch moves with it.
+                        if let Some(idx) = self.tab_index(tab_id) {
+                            self.tabs[idx].inspector_epoch += 1;
+                        }
                         self.send_command_to(
                             tab_id,
                             BrowserToRenderer::CommitNavigation {
@@ -4202,6 +4707,27 @@ impl Application for PlutoBrowser {
                 }));
             }
             Message::PointerDown { x, y, button } => {
+                // Stage 18 (M9 stage 3): pick mode intercepts
+                // the next primary click on the web view — it is
+                // NOT forwarded to the page. The widget coords
+                // become page coords with the same `x + scroll`
+                // pattern as a normal click, and the worker
+                // answers with the hit node (`DevToolsPicked`).
+                if button == 0
+                    && let Some(panel) = self.devtools_panel.as_mut()
+                    && panel.view == DevToolsView::Elements
+                    && panel.pick_mode
+                {
+                    panel.pick_mode = false;
+                    let (sx, sy) = self.active().compositor.scroll();
+                    let epoch = self.active().inspector_epoch;
+                    self.send_command(BrowserToRenderer::DevToolsPickNode {
+                        x: x + sx,
+                        y: y + sy,
+                        epoch,
+                    });
+                    return Task::none();
+                }
                 // Record the held button before forwarding, so the
                 // event's own `buttons` mask includes it.
                 self.buttons_held |= 1 << button;
@@ -4266,6 +4792,15 @@ impl Application for PlutoBrowser {
                                 self.active_tab = next;
                                 self.convert_stored_video_frames(next);
                                 self.sync_window_title();
+                                // Stage 18 (M9 stage 3): the
+                                // inspector follows the tab — see
+                                // `SelectTab` for the same
+                                // root-request on switch.
+                                if self.devtools_panel.is_some()
+                                    && !self.tabs[next].inspector_children.contains_key(&None)
+                                {
+                                    self.request_inspector_root(next);
+                                }
                             }
                             return Task::none();
                         }
@@ -4703,12 +5238,91 @@ impl Application for PlutoBrowser {
                 // dialog. The panel follows the active tab; the
                 // tabs keep their console lines while it is
                 // closed, so reopening shows what was captured.
+                // Stage 18 (M9 stage 3): opening also asks the
+                // active tab's worker for the inspector's root
+                // children — the Elements view's first load.
                 self.menu_open = false;
                 self.close_bar_popups();
                 self.devtools_panel = Some(DevToolsPanel::default());
+                let index = self.active_tab;
+                self.request_inspector_root(index);
             }
             Message::CloseDevTools => {
+                // Stage 18 (M9 stage 3): closing clears the
+                // highlight on the active tab's worker (the
+                // worker re-collects without it) and the
+                // selection — the highlight must never survive
+                // DevTools closing. The tree cache and expanded
+                // set stay, so reopening re-requests only the
+                // root and re-expands from the cache.
+                let index = self.active_tab;
+                self.send_inspector_highlight(index, None);
+                let tab = &mut self.tabs[index];
+                tab.inspector_selected = None;
+                tab.inspector_details = None;
+                tab.inspector_gone = false;
                 self.devtools_panel = None;
+            }
+            Message::DevToolsView(view) => {
+                if let Some(panel) = self.devtools_panel.as_mut() {
+                    panel.view = view;
+                }
+            }
+            Message::DevToolsTogglePick => {
+                if let Some(panel) = self.devtools_panel.as_mut() {
+                    panel.pick_mode = !panel.pick_mode;
+                }
+            }
+            Message::DevToolsToggleNode(id) => {
+                // Stage 18: expand the node — ask the worker for
+                // its children (the cached answer lands in
+                // `inspector_children`) — or collapse it, which
+                // needs no query; the cached children stay for
+                // the next expansion.
+                let index = self.active_tab;
+                let expanding = {
+                    let tab = &mut self.tabs[index];
+                    if tab.inspector_expanded.contains(&id) {
+                        tab.inspector_expanded.remove(&id);
+                        false
+                    } else {
+                        tab.inspector_expanded.insert(id);
+                        true
+                    }
+                };
+                if expanding {
+                    let (tab_id, epoch) = {
+                        let tab = &self.tabs[index];
+                        (tab.id, tab.inspector_epoch)
+                    };
+                    self.send_command_to(
+                        tab_id,
+                        BrowserToRenderer::DevToolsDomChildren {
+                            node: Some(id),
+                            epoch,
+                        },
+                    );
+                }
+            }
+            Message::DevToolsSelectNode(id) => {
+                // Stage 18: select the node — ask the worker for
+                // its details and highlight it, like a pick.
+                let index = self.active_tab;
+                {
+                    let tab = &mut self.tabs[index];
+                    tab.inspector_selected = Some(id);
+                    tab.inspector_details = None;
+                    tab.inspector_gone = false;
+                }
+                self.send_inspector_highlight(index, Some(id));
+                let (tab_id, epoch) = {
+                    let tab = &self.tabs[index];
+                    (tab.id, tab.inspector_epoch)
+                };
+                self.send_command_to(
+                    tab_id,
+                    BrowserToRenderer::DevToolsInspectNode { node: id, epoch },
+                );
             }
             Message::DevToolsInputChanged(draft) => {
                 if let Some(panel) = self.devtools_panel.as_mut() {
@@ -5749,6 +6363,378 @@ mod tests {
         let _ = app.update(Message::DevToolsInputChanged("   ".to_string()));
         let _ = app.update(Message::DevToolsSubmit);
         assert_eq!(app.active().console_lines.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn devtools_inspector_stale_epoch_answers_dropped_and_newer_adopted() {
+        // Stage 18 (M9 stage 3): the epoch rule — an inspector
+        // answer older than the latest known epoch is dropped
+        // outright, and a newer one is adopted (the worker
+        // bumps its epoch on worker-side navigations, so the
+        // shell learns the new epoch from the answer). The
+        // worker is not running in the test shell, so the
+        // answers are fed in by hand.
+        let (dir, home, mut app) = test_shell("devtools-epoch");
+        let tab_id = app.active().id;
+        let _ = app.update(Message::ShowDevTools);
+        assert_eq!(app.active().inspector_epoch, 0);
+        let html = pluto_ipc::DevToolsNodeSummary {
+            id: 7,
+            tag: "html".to_string(),
+            text: None,
+            has_children: true,
+        };
+        // Epoch 5 is newer than 0: adopted, and the answer lands.
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DevToolsChildren {
+                epoch: 5,
+                node: None,
+                children: vec![html.clone()],
+            },
+        ));
+        assert_eq!(app.active().inspector_epoch, 5);
+        assert_eq!(app.active().inspector_children.get(&None).unwrap().len(), 1);
+        // Epoch 3 is stale: dropped, the cache is untouched.
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DevToolsChildren {
+                epoch: 3,
+                node: None,
+                children: Vec::new(),
+            },
+        ));
+        assert_eq!(app.active().inspector_epoch, 5);
+        assert_eq!(app.active().inspector_children.get(&None).unwrap().len(), 1);
+        // A keyed answer at the current epoch lands; a stale
+        // keyed answer never creates an entry.
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DevToolsChildren {
+                epoch: 5,
+                node: Some(7),
+                children: Vec::new(),
+            },
+        ));
+        assert!(app.active().inspector_children.contains_key(&Some(7)));
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DevToolsChildren {
+                epoch: 4,
+                node: Some(8),
+                children: vec![html],
+            },
+        ));
+        assert!(!app.active().inspector_children.contains_key(&Some(8)));
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn devtools_inspector_node_details_and_gone() {
+        // Stage 18 (M9 stage 3): the selected node's details
+        // land from `DevToolsNode` — tag, attributes, computed
+        // style, box — while an answer for a different node, or
+        // a stale epoch, is dropped. An empty tag means the
+        // node is gone from the document: the panel shows that
+        // instead of trusting a dead id.
+        let (dir, home, mut app) = test_shell("devtools-node");
+        let tab_id = app.active().id;
+        let _ = app.update(Message::ShowDevTools);
+        let _ = app.update(Message::DevToolsSelectNode(7));
+        assert_eq!(app.active().inspector_selected, Some(7));
+        assert!(app.active().inspector_details.is_none());
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DevToolsNode {
+                epoch: 0,
+                node: 7,
+                tag: "div".to_string(),
+                attrs: vec![("id".to_string(), "a".to_string())],
+                computed: vec![("display".to_string(), "block".to_string())],
+                geometry: Some(Box::new(pluto_ipc::DevToolsBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 200.0,
+                    height: 100.0,
+                    margin: ["0px".into(), "0px".into(), "0px".into(), "0px".into()],
+                    padding: ["0px".into(), "0px".into(), "0px".into(), "0px".into()],
+                })),
+            },
+        ));
+        let details = app.active().inspector_details.as_ref().expect("details land");
+        assert_eq!(details.tag, "div");
+        assert_eq!(details.attrs, vec![("id".to_string(), "a".to_string())]);
+        assert_eq!(
+            details.computed,
+            vec![("display".to_string(), "block".to_string())]
+        );
+        assert_eq!(details.geometry.as_ref().unwrap().width, 200.0);
+        assert!(!app.active().inspector_gone);
+        // An answer for a node that is no longer selected is
+        // dropped — the details stay the div's.
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DevToolsNode {
+                epoch: 0,
+                node: 8,
+                tag: "span".to_string(),
+                attrs: Vec::new(),
+                computed: Vec::new(),
+                geometry: None,
+            },
+        ));
+        assert_eq!(app.active().inspector_details.as_ref().unwrap().tag, "div");
+        // A stale epoch is dropped too: first adopt epoch 5,
+        // then answer at 3.
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DevToolsChildren {
+                epoch: 5,
+                node: None,
+                children: Vec::new(),
+            },
+        ));
+        assert_eq!(app.active().inspector_epoch, 5);
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DevToolsNode {
+                epoch: 3,
+                node: 7,
+                tag: "p".to_string(),
+                attrs: Vec::new(),
+                computed: Vec::new(),
+                geometry: None,
+            },
+        ));
+        assert_eq!(app.active().inspector_details.as_ref().unwrap().tag, "div");
+        // An empty tag at the current epoch: the node is gone.
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DevToolsNode {
+                epoch: 5,
+                node: 7,
+                tag: String::new(),
+                attrs: Vec::new(),
+                computed: Vec::new(),
+                geometry: None,
+            },
+        ));
+        assert!(app.active().inspector_details.is_none());
+        assert!(app.active().inspector_gone);
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn devtools_inspector_picked_selects_node_and_miss_selects_nothing() {
+        // Stage 18 (M9 stage 3): the pick mode's answer — a hit
+        // selects the node (the worker is not running in the
+        // test shell, so the details + highlight sends are
+        // no-ops; the selection is the shell-side half), a miss
+        // selects nothing, and a stale epoch is dropped.
+        let (dir, home, mut app) = test_shell("devtools-picked");
+        let tab_id = app.active().id;
+        let _ = app.update(Message::ShowDevTools);
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DevToolsPicked {
+                epoch: 0,
+                node: Some(9),
+            },
+        ));
+        assert_eq!(app.active().inspector_selected, Some(9));
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DevToolsPicked {
+                epoch: 0,
+                node: None,
+            },
+        ));
+        assert_eq!(app.active().inspector_selected, Some(9));
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DevToolsChildren {
+                epoch: 5,
+                node: None,
+                children: Vec::new(),
+            },
+        ));
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DevToolsPicked {
+                epoch: 3,
+                node: Some(10),
+            },
+        ));
+        assert_eq!(app.active().inspector_selected, Some(9));
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn devtools_inspector_pick_mode_intercepts_pointer_down() {
+        // Stage 18 (M9 stage 3): while pick mode is on, the
+        // next primary `PointerDown` on the web view is
+        // intercepted — it is NOT forwarded to the page (the
+        // `buttons_held` mask stays clear, which is exactly
+        // what forwarding would set), and pick mode switches
+        // off. A non-primary button, or pick mode in the
+        // Console view, forwards as usual.
+        let (dir, home, mut app) = test_shell("devtools-pick");
+        let _ = app.update(Message::ShowDevTools);
+        assert_eq!(
+            app.devtools_panel.as_ref().unwrap().view,
+            DevToolsView::Elements
+        );
+        let _ = app.update(Message::DevToolsTogglePick);
+        assert!(app.devtools_panel.as_ref().unwrap().pick_mode);
+        let _ = app.update(Message::PointerDown {
+            x: 10.0,
+            y: 20.0,
+            button: 0,
+        });
+        assert!(!app.devtools_panel.as_ref().unwrap().pick_mode);
+        assert_eq!(app.buttons_held, 0, "the click was not forwarded");
+        // A non-primary button does not intercept.
+        let _ = app.update(Message::DevToolsTogglePick);
+        let _ = app.update(Message::PointerDown {
+            x: 10.0,
+            y: 20.0,
+            button: 1,
+        });
+        assert!(app.devtools_panel.as_ref().unwrap().pick_mode);
+        assert_eq!(app.buttons_held, 1 << 1);
+        let _ = app.update(Message::PointerUp {
+            x: 10.0,
+            y: 20.0,
+            button: 1,
+        });
+        // In the Console view, pick mode does not intercept.
+        let _ = app.update(Message::DevToolsView(DevToolsView::Console));
+        let _ = app.update(Message::PointerDown {
+            x: 10.0,
+            y: 20.0,
+            button: 0,
+        });
+        assert!(app.devtools_panel.as_ref().unwrap().pick_mode);
+        assert_eq!(app.buttons_held, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn devtools_inspector_commit_and_load_failed_clear_tree() {
+        // Stage 18 (M9 stage 3): a commit — and a failed load,
+        // which still lands a new document (the error page) —
+        // clears the inspector's tree cache, expanded set,
+        // selection, details, and gone flag. The epoch is NOT
+        // cleared: it is the latest known epoch.
+        let (dir, home, mut app) = test_shell("devtools-clear");
+        let tab_id = app.active().id;
+        let _ = app.update(Message::ShowDevTools);
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DevToolsChildren {
+                epoch: 2,
+                node: None,
+                children: vec![pluto_ipc::DevToolsNodeSummary {
+                    id: 7,
+                    tag: "html".to_string(),
+                    text: None,
+                    has_children: true,
+                }],
+            },
+        ));
+        let _ = app.update(Message::DevToolsToggleNode(7));
+        let _ = app.update(Message::DevToolsSelectNode(7));
+        assert!(!app.active().inspector_children.is_empty());
+        assert!(!app.active().inspector_expanded.is_empty());
+        assert_eq!(app.active().inspector_selected, Some(7));
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DidCommit {
+                url: "https://example.com/".to_string(),
+                status: "OK".to_string(),
+                replace: false,
+            },
+        ));
+        assert!(app.active().inspector_children.is_empty());
+        assert!(app.active().inspector_expanded.is_empty());
+        assert!(app.active().inspector_selected.is_none());
+        assert!(app.active().inspector_details.is_none());
+        assert!(!app.active().inspector_gone);
+        assert_eq!(app.active().inspector_epoch, 2, "the epoch survives");
+        // Re-seed, then a failed load clears it the same way.
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DevToolsChildren {
+                epoch: 2,
+                node: None,
+                children: vec![pluto_ipc::DevToolsNodeSummary {
+                    id: 7,
+                    tag: "html".to_string(),
+                    text: None,
+                    has_children: true,
+                }],
+            },
+        ));
+        let _ = app.update(Message::DevToolsSelectNode(7));
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::LoadFailed {
+                reason: "dns".to_string(),
+                url: "https://example.com/".to_string(),
+            },
+        ));
+        assert!(app.active().inspector_children.is_empty());
+        assert!(app.active().inspector_selected.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        restore_test_home(home);
+    }
+
+    #[test]
+    fn devtools_inspector_view_switch_and_toggle_node() {
+        // Stage 18 (M9 stage 3): the panel opens on Elements
+        // (the default view) and switches to Console and back;
+        // the tree chevron expands (inserting into the expanded
+        // set) and collapses (removing it, with no query).
+        let (dir, home, mut app) = test_shell("devtools-view");
+        let tab_id = app.active().id;
+        let _ = app.update(Message::ShowDevTools);
+        assert_eq!(
+            app.devtools_panel.as_ref().unwrap().view,
+            DevToolsView::Elements
+        );
+        let _ = app.update(Message::DevToolsView(DevToolsView::Console));
+        assert_eq!(
+            app.devtools_panel.as_ref().unwrap().view,
+            DevToolsView::Console
+        );
+        let _ = app.update(Message::DevToolsView(DevToolsView::Elements));
+        assert_eq!(
+            app.devtools_panel.as_ref().unwrap().view,
+            DevToolsView::Elements
+        );
+        let _ = app.update(Message::RendererEvent(
+            tab_id,
+            RendererToBrowser::DevToolsChildren {
+                epoch: 0,
+                node: None,
+                children: vec![pluto_ipc::DevToolsNodeSummary {
+                    id: 7,
+                    tag: "html".to_string(),
+                    text: None,
+                    has_children: true,
+                }],
+            },
+        ));
+        let _ = app.update(Message::DevToolsToggleNode(7));
+        assert!(app.active().inspector_expanded.contains(&7));
+        let _ = app.update(Message::DevToolsToggleNode(7));
+        assert!(!app.active().inspector_expanded.contains(&7));
         let _ = std::fs::remove_dir_all(&dir);
         restore_test_home(home);
     }

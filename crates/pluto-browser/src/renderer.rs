@@ -62,6 +62,7 @@ use crate::page::{self, Document};
 use cosmic::iced::futures::SinkExt;
 use cosmic::iced::futures::channel::mpsc;
 use pluto_html::NodeId;
+use slotmap::Key as _;
 use pluto_ipc::{
     BrowserToRenderer, CommandReceiver, CredentialsMode, DeltaMode, Destination, InputEvent,
     Origin, PointerKind, Priority, RendererToBrowser, RequestMode, ResourceRequest, WheelPhase,
@@ -658,6 +659,41 @@ pub(crate) enum LayoutJob {
         svg_images: HashMap<NodeId, ResourceId>,
         reply: oneshot::Sender<Option<ScrolledDisplayList>>,
     },
+    /// Computed style + box of one node (Stage 18, M9 stage 3 —
+    /// the inspector): the actor reads its retained tree's
+    /// `node_styles` and `boxes_for_dom`. `None` when the actor
+    /// holds no tree, or the node has neither a retained style
+    /// nor a box (a text node has neither — the tab thread
+    /// still answers with the DOM's tag + attributes).
+    InspectNode {
+        id: NodeId,
+        reply: oneshot::Sender<Option<InspectNodeData>>,
+    },
+    /// Set or clear the DevTools highlight (Stage 18, M9 stage
+    /// 3): stored on the retained tree's `highlight` field, so
+    /// the next display-list build outlines that node's border
+    /// box(es). Fire-and-forget — no reply: the tab thread
+    /// re-collects + submits after sending this (see
+    /// [`recollect_and_submit`]), and the job channel orders
+    /// the collect after the set. A full rebuild carries the
+    /// highlight over from the old tree; a navigation clears
+    /// it (`start_navigation_with_body` sends `None`).
+    SetHighlight { id: Option<NodeId> },
+}
+
+/// One node's computed style + box, as the layout actor answers
+/// it (Stage 18, M9 stage 3 — the inspector's `InspectNode`
+/// job): the computed style already formatted as CSS name/value
+/// strings (`ComputedStyle::to_pairs`), the border box in page
+/// coordinates (`None` when the node has no box), and the
+/// margin / padding as CSS strings in top/right/bottom/left
+/// order — percentages kept as percentages, never resolved to
+/// fake px.
+pub(crate) struct InspectNodeData {
+    pub computed: Vec<(String, String)>,
+    pub geometry: Option<pluto_js::Geometry>,
+    pub margin: [String; 4],
+    pub padding: [String; 4],
 }
 
 /// One entry of a wheel scroll chain (Stage 8 Rec 9): the scroll
@@ -748,6 +784,52 @@ fn geometry_of(tree: &LayoutTree, id: NodeId) -> Option<pluto_js::Geometry> {
         width: b.width as f64,
         height: b.height as f64,
     })
+}
+
+/// The inspector's tag for one node (Stage 18, M9 stage 3): the
+/// element name, or `#text` / `#comment` / `#document` /
+/// `#doctype` for non-elements. An unknown id has no tag.
+fn devtools_tag(dom: &pluto_html::Dom, id: NodeId) -> String {
+    match dom.get(id).map(|n| &n.kind) {
+        Some(pluto_html::NodeKind::Element { tag }) => tag.clone(),
+        Some(pluto_html::NodeKind::Text(_)) => "#text".to_string(),
+        Some(pluto_html::NodeKind::Comment(_)) => "#comment".to_string(),
+        Some(pluto_html::NodeKind::Document) => "#document".to_string(),
+        Some(pluto_html::NodeKind::Doctype { .. }) => "#doctype".to_string(),
+        Some(pluto_html::NodeKind::ProcessingInstruction { .. }) => {
+            "#processing-instruction".to_string()
+        }
+        None => String::new(),
+    }
+}
+
+/// One node's text as a short preview (Stage 18, M9 stage 3):
+/// whitespace collapsed to single spaces, trimmed, capped at 40
+/// chars — a long text node must not bloat the wire.
+fn devtools_text_preview(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(40)
+        .collect()
+}
+
+/// One row of the inspector's lazy tree (Stage 18, M9 stage 3):
+/// the wire id (the slotmap key's ffi value — the shell only
+/// echoes it back), the tag, a text preview for text / comment
+/// nodes, and whether it has children to expand into.
+fn devtools_summary(dom: &pluto_html::Dom, id: NodeId) -> pluto_ipc::DevToolsNodeSummary {
+    let text = dom
+        .get(id)
+        .and_then(|n| n.text().or_else(|| n.comment()))
+        .map(devtools_text_preview);
+    pluto_ipc::DevToolsNodeSummary {
+        id: id.data().as_ffi(),
+        tag: devtools_tag(dom, id),
+        text,
+        has_children: !dom.children(id).is_empty(),
+    }
 }
 
 /// Full rebuild of the layout tree for `doc`: the fallback for a
@@ -973,9 +1055,16 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                     // Hand the retained tree's FontSystem to the
                     // rebuild (Stage 8 Rec 9): a fresh one would
                     // re-scan the system fonts per rebuild.
+                    // Stage 18 (M9 stage 3): a fresh build also
+                    // carries the DevTools highlight over — the
+                    // node still exists in the new tree (same
+                    // document), so the outline must survive a
+                    // relayout; a dead id draws nothing anyway.
+                    let old_highlight = tree.as_ref().and_then(|t| t.highlight);
                     let old_tree = tree.take();
                     let mut new_tree =
                         build_full_tree(doc, viewport, &state, old_tree, &images, theme);
+                    new_tree.highlight = old_highlight;
                     if !offsets.is_empty() {
                         for (&id, &(x, y)) in &offsets {
                             new_tree.set_scroll_offset(id, x, y);
@@ -1202,7 +1291,11 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                     .as_ref()
                     .map(|t| t.theme)
                     .unwrap_or(Theme::Light);
-                let new_tree = build_full_tree(doc, viewport, &state, old_tree, &images, theme);
+                // Stage 18 (M9 stage 3): and its DevTools
+                // highlight, like the `LayoutTree` job does.
+                let old_highlight = old_tree.as_ref().and_then(|t| t.highlight);
+                let mut new_tree = build_full_tree(doc, viewport, &state, old_tree, &images, theme);
+                new_tree.highlight = old_highlight;
                 let geometry = geometry_of(&new_tree, id);
                 tree = Some(new_tree);
                 let _ = reply.send(geometry);
@@ -1243,6 +1336,59 @@ pub(crate) fn layout_thread(jobs: std::sync::mpsc::Receiver<LayoutJob>) {
                     (Arc::new(list), sticky_moved, blobs)
                 });
                 let _ = reply.send(display);
+            }
+            LayoutJob::InspectNode { id, reply } => {
+                // Stage 18 (M9 stage 3): computed style + box
+                // from the retained tree. `None` when the actor
+                // holds no tree, or the node has neither a
+                // retained style nor a box — the tab thread still
+                // answers with the DOM's tag + attributes, so
+                // the panel shows the node, just without style
+                // or box. Margin/padding default to the initial
+                // `0px` when the style entry is missing but a
+                // box exists (unreachable in practice: every box
+                // is built from a retained style).
+                let data = tree.as_ref().and_then(|tree| {
+                    let style = tree.node_styles.get(id);
+                    let has_box = !tree.boxes_for_dom(id).is_empty();
+                    if style.is_none() && !has_box {
+                        return None;
+                    }
+                    let computed = style
+                        .map(|s| s.computed.to_pairs())
+                        .unwrap_or_default();
+                    let (margin, padding) = match style {
+                        Some(s) => (
+                            s.computed.margin.map(|m| m.to_css()),
+                            s.computed.padding.map(|p| p.to_css()),
+                        ),
+                        None => (
+                            std::array::from_fn(|_| "0px".to_string()),
+                            std::array::from_fn(|_| "0px".to_string()),
+                        ),
+                    };
+                    Some(InspectNodeData {
+                        computed,
+                        geometry: geometry_of(tree, id),
+                        margin,
+                        padding,
+                    })
+                });
+                let _ = reply.send(data);
+            }
+            LayoutJob::SetHighlight { id } => {
+                // Stage 18 (M9 stage 3): store the highlight on
+                // the retained tree; the next display-list build
+                // outlines it. No reply — the tab thread
+                // re-collects after sending this. A tree that
+                // does not exist yet drops it (the tab thread
+                // only re-collects once a list has been
+                // submitted, so a highlight set before the first
+                // layout is re-sent by the shell's selection,
+                // which survives on the tab).
+                if let Some(tree) = tree.as_mut() {
+                    tree.highlight = id;
+                }
             }
         }
     }
@@ -1622,6 +1768,12 @@ struct TabState {
     /// frame advance can re-submit it with fresh pixels and no
     /// layout at all (Stage 11 Rec 11).
     last_display: Option<Arc<DisplayList>>,
+    /// The DevTools highlight the tab thread last asked the
+    /// layout actor to draw (Stage 18, M9 stage 3): a mirror of
+    /// the actor's `LayoutTree.highlight`, so a repeat
+    /// `SetHighlight` for the same node skips the re-collect +
+    /// submit. Cleared on navigation with the actor's copy.
+    devtools_highlight: Option<NodeId>,
     /// The last title sent to the shell (Stage 11 Rec 8):
     /// `TitleChanged` fires at most once per submit, only when
     /// the title actually changed.
@@ -1948,6 +2100,7 @@ impl TabState {
             fetch_handle,
             images: ImageStore::new(),
             last_display: None,
+            devtools_highlight: None,
             last_title: String::new(),
             favicon_url: None,
             favicon_resource: None,
@@ -2596,6 +2749,146 @@ async fn handle_single_command(
                 None => "No page loaded yet.".to_string(),
             };
             let _ = events.try_send(RendererToBrowser::DevToolsEvalResult { result });
+        }
+        BrowserToRenderer::DevToolsDomChildren { node, epoch } => {
+            // Stage 18 (M9 stage 3): the lazy DOM tree — answered
+            // straight from the tab thread's live `Dom`, no layout
+            // job needed. The root ask (`None`) always answers
+            // the current document's root children; a keyed ask
+            // whose epoch is stale answers empty (a generational
+            // id from the old document could collide with a
+            // different node in the new one — see the IPC docs).
+            // A dead id, or a tab with no document yet, answers
+            // empty too — never a panic.
+            let children = if epoch != state.nav_epoch && node.is_some() {
+                Vec::new()
+            } else {
+                match state.document.as_ref() {
+                    Some(doc) => {
+                        let dom = doc.dom();
+                        let parent = match node {
+                            None => dom.root(),
+                            Some(v) => {
+                                Some(NodeId::from(slotmap::KeyData::from_ffi(v)))
+                            }
+                        };
+                        match parent {
+                            Some(id) => dom
+                                .children(id)
+                                .iter()
+                                .map(|&child| devtools_summary(dom, child))
+                                .collect(),
+                            None => Vec::new(),
+                        }
+                    }
+                    None => Vec::new(),
+                }
+            };
+            let _ = events.try_send(RendererToBrowser::DevToolsChildren {
+                epoch: state.nav_epoch,
+                node,
+                children,
+            });
+        }
+        BrowserToRenderer::DevToolsInspectNode { node, epoch } => {
+            // Stage 18 (M9 stage 3): tag + attributes from the
+            // live DOM, computed style + box from the layout
+            // actor. A stale epoch, or an id the document no
+            // longer holds, answers with the empty tag — the
+            // shell shows "node no longer in the document" for
+            // that, never a dead id's stale data. A live node
+            // whose actor has no style/box yet (layout pending,
+            // `display: none`) still answers with its tag +
+            // attributes and empty computed / `None` geometry.
+            let id = NodeId::from(slotmap::KeyData::from_ffi(node));
+            let (tag, attrs) = if epoch == state.nav_epoch {
+                match state.document.as_ref() {
+                    Some(doc) => {
+                        let dom = doc.dom();
+                        match dom.get(id) {
+                            Some(n) => (devtools_tag(dom, id), n.attrs.clone()),
+                            None => (String::new(), Vec::new()),
+                        }
+                    }
+                    None => (String::new(), Vec::new()),
+                }
+            } else {
+                (String::new(), Vec::new())
+            };
+            let (computed, geometry) = if tag.is_empty() {
+                (Vec::new(), None)
+            } else {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                if state
+                    .layout_tx
+                    .send(LayoutJob::InspectNode { id, reply: reply_tx })
+                    .is_err()
+                {
+                    (Vec::new(), None)
+                } else {
+                    match reply_rx.await {
+                        Ok(Some(data)) => {
+                            let InspectNodeData {
+                                computed,
+                                geometry,
+                                margin,
+                                padding,
+                            } = data;
+                            (
+                                computed,
+                                geometry.map(|g| Box::new(pluto_ipc::DevToolsBox {
+                                    x: g.x as f32,
+                                    y: g.y as f32,
+                                    width: g.width as f32,
+                                    height: g.height as f32,
+                                    margin,
+                                    padding,
+                                })),
+                            )
+                        }
+                        _ => (Vec::new(), None),
+                    }
+                }
+            };
+            let _ = events.try_send(RendererToBrowser::DevToolsNode {
+                epoch: state.nav_epoch,
+                node,
+                tag,
+                attrs,
+                computed,
+                geometry,
+            });
+        }
+        BrowserToRenderer::DevToolsPickNode { x, y, epoch: _ } => {
+            // Stage 18 (M9 stage 3): the pick mode's click —
+            // the same `HitTest` job every click already uses.
+            // Coordinates carry no node id, so the epoch is
+            // advisory: always answer against the current tree,
+            // with the current epoch (the shell adopts it).
+            let hit = hit_test(state, x, y).await;
+            let _ = events.try_send(RendererToBrowser::DevToolsPicked {
+                epoch: state.nav_epoch,
+                node: hit.map(|id| id.data().as_ffi()),
+            });
+        }
+        BrowserToRenderer::DevToolsHighlight { node, epoch } => {
+            // Stage 18 (M9 stage 3): a stale epoch is ignored
+            // outright — a highlight for an old document's node
+            // must not land on the new one. Otherwise store it
+            // on the actor and re-collect + submit WITHOUT a
+            // layout pass (a highlight is paint-only). A repeat
+            // ask for the same node skips the re-collect.
+            if epoch == state.nav_epoch {
+                let id = node.map(|v| NodeId::from(slotmap::KeyData::from_ffi(v)));
+                if id != state.devtools_highlight {
+                    state.devtools_highlight = id;
+                    let _ = state.layout_tx.send(LayoutJob::SetHighlight { id });
+                    // A failed re-collect is already reported as
+                    // a crash inside; the loop keeps running like
+                    // the tick's own `relayout_and_submit` calls.
+                    recollect_and_submit(state, events).await;
+                }
+            }
         }
         BrowserToRenderer::InputEvent(event) => {
             handle_input(state, events, event).await;
@@ -4068,6 +4361,14 @@ fn start_navigation_with_body(
     }
     state.nav_epoch += 1;
     let epoch = state.nav_epoch;
+    // Stage 18 (M9 stage 3): a navigation drops the old page's
+    // highlight — its node id dies with the document. Best
+    // effort, like the other fire-and-forget job sends: a dead
+    // actor drops it, and the shell clears its own selection on
+    // `DidCommit` too.
+    let _ = state
+        .layout_tx
+        .send(LayoutJob::SetHighlight { id: None });
     state.nav_replace = replace;
     state.pending_popstate = if traversal {
         Some(state_json.clone())
@@ -4109,6 +4410,7 @@ fn start_navigation_with_body(
     state.favicon_resource = None;
     state.last_title = String::new();
     state.last_display = None;
+    state.devtools_highlight = None;
     state.last_image_map = ImageMap::new();
     state.last_canvas_announced.clear();
     state.animation_visible.clear();
@@ -5179,6 +5481,65 @@ async fn submit(
     .await;
     eprintln!("[pluto-worker] submit display list epoch={} bytes={} sent={}", state.epoch, byte_len, sent);
     sent
+}
+
+/// Re-collect the display list from the retained tree and submit
+/// it, WITHOUT a layout pass (Stage 18, M9 stage 3 — the
+/// highlight change path): a highlight is paint-only, so no
+/// style resolution, no observers, no relayout. Mirrors the
+/// collect step of [`layout_and_submit`] (canvas drain, blob
+/// announcement, caret overlay, `last_display` cache) minus the
+/// layout. Returns false when the shell is gone or the layout
+/// actor died (a crash is emitted in the latter case, like the
+/// collect step does). Skipped entirely when no list has ever
+/// been submitted — there is no tree to collect from, and an
+/// empty list must never blank the page.
+async fn recollect_and_submit(
+    state: &mut TabState,
+    events: &tokio::sync::mpsc::Sender<RendererToBrowser>,
+) -> bool {
+    if !state.has_document || state.last_display.is_none() {
+        return true;
+    }
+    let (canvas_live, canvas_new, svg_images) = collect_canvas_state(state);
+    let (list_tx, list_rx) = oneshot::channel();
+    if state
+        .layout_tx
+        .send(LayoutJob::CollectDisplayList {
+            canvas_live,
+            canvas_new,
+            svg_images,
+            reply: list_tx,
+        })
+        .is_err()
+    {
+        return emit_tab(
+            events,
+            RendererToBrowser::RendererCrashed {
+                reason: "layout actor is gone".to_string(),
+            },
+        )
+        .await;
+    }
+    match list_rx.await {
+        Ok((display, blobs)) => {
+            state.last_display = Some(Arc::clone(&display));
+            let display = with_caret(state, display);
+            if !announce_blobs(state, events, blobs).await {
+                return false;
+            }
+            submit(state, events, display).await
+        }
+        Err(_) => {
+            emit_tab(
+                events,
+                RendererToBrowser::RendererCrashed {
+                    reason: "layout actor reply lost".to_string(),
+                },
+            )
+            .await
+        }
+    }
 }
 
 /// Lay out at the tab's viewport on the layout-actor thread and
@@ -7352,7 +7713,15 @@ mod tests {
                     // events, so the strict event readers skip
                     // them like the heartbeat.
                     | RendererToBrowser::ConsoleLines { .. }
-                    | RendererToBrowser::DevToolsEvalResult { .. } => continue,
+                    | RendererToBrowser::DevToolsEvalResult { .. }
+                    // Stage 18 (M9 stage 3): the inspector
+                    // answers are out-of-band the same way — a
+                    // drain arriving before `DidCommit` broke a
+                    // worker test in stage 1–2, and these would
+                    // do the same.
+                    | RendererToBrowser::DevToolsChildren { .. }
+                    | RendererToBrowser::DevToolsNode { .. }
+                    | RendererToBrowser::DevToolsPicked { .. } => continue,
                     event => return event,
                 },
                 other => panic!("expected a RendererEvent, got {other:?}"),
@@ -9533,6 +9902,291 @@ mod tests {
         })
         .await;
         assert!(found.is_ok(), "timed out waiting for the REPL result");
+        cmd_tx
+            .send(BrowserToRenderer::Shutdown)
+            .expect("worker takes Shutdown");
+        handle.await.expect("worker task ends cleanly");
+    }
+
+    /// Wait for a `DevToolsChildren` answer for `node`, skipping
+    /// every other event (the channel carries display lists,
+    /// commits, and heartbeats alongside the inspector answers).
+    async fn wait_for_children(
+        rx: &mut mpsc::Receiver<crate::Message>,
+        node: Option<u64>,
+    ) -> (u64, Vec<pluto_ipc::DevToolsNodeSummary>) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match rx.next().await.expect("worker emits an event") {
+                    crate::Message::RendererEvent(
+                        _,
+                        RendererToBrowser::DevToolsChildren {
+                            epoch,
+                            node: answered,
+                            children,
+                        },
+                    ) if answered == node => return (epoch, children),
+                    crate::Message::RendererEvent(_, _) => continue,
+                    other => panic!("expected a RendererEvent, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("children answer arrives in time")
+    }
+
+    /// Wait for a `DevToolsNode` answer for `node`, skipping
+    /// every other event.
+    async fn wait_for_node(
+        rx: &mut mpsc::Receiver<crate::Message>,
+        node: u64,
+    ) -> RendererToBrowser {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match rx.next().await.expect("worker emits an event") {
+                    crate::Message::RendererEvent(
+                        _,
+                        event @ RendererToBrowser::DevToolsNode { node: answered, .. },
+                    ) if answered == node => return event,
+                    crate::Message::RendererEvent(_, _) => continue,
+                    other => panic!("expected a RendererEvent, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("node answer arrives in time")
+    }
+
+    /// Wait for a `DevToolsPicked` answer, skipping every other
+    /// event.
+    async fn wait_for_picked(rx: &mut mpsc::Receiver<crate::Message>) -> (u64, Option<u64>) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match rx.next().await.expect("worker emits an event") {
+                    crate::Message::RendererEvent(
+                        _,
+                        RendererToBrowser::DevToolsPicked { epoch, node },
+                    ) => return (epoch, node),
+                    crate::Message::RendererEvent(_, _) => continue,
+                    other => panic!("expected a RendererEvent, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("pick answer arrives in time")
+    }
+
+    #[tokio::test]
+    async fn worker_inspector_lazy_tree_inspect_pick_and_highlight() {
+        // Stage 18 (M9 stage 3): the lazy inspector on a real tab
+        // thread — root children, expand down to the div, inspect
+        // it (computed + box present), pick it by coordinates,
+        // highlight it (the next submit carries a `Highlight`
+        // item for its border box), clear it (the next submit
+        // carries none). A stale-epoch ask answers empty with
+        // the current epoch.
+        let page = "<!doctype html><html><head><style>body{margin:0} div{width:200px;height:100px;background:#eee}</style></head><body><div id=\"a\">hello</div></body></html>";
+        let routes = std::sync::Arc::new(vec![(
+            "/".to_string(),
+            "text/html".to_string(),
+            page.to_string(),
+        )]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_routes(listener, routes));
+        let (_home, handle, cmd_tx, mut event_rx) = spawn_worker();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        cmd_tx
+            .send(BrowserToRenderer::CommitNavigation {
+                url,
+                state_json: None,
+                traversal: false,
+                scroll: (0.0, 0.0),
+            })
+            .expect("worker takes the command");
+        // Commit, then the first display list (the epoch is 1
+        // after one navigation).
+        assert!(matches!(
+            next_event(&mut event_rx).await,
+            RendererToBrowser::DidCommit { .. }
+        ));
+        assert!(matches!(
+            next_event(&mut event_rx).await,
+            RendererToBrowser::SubmitDisplayList { .. }
+        ));
+        // Root children: the doctype plus <html>.
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsDomChildren {
+                node: None,
+                epoch: 1,
+            })
+            .expect("worker takes DevToolsDomChildren");
+        let (epoch, children) = wait_for_children(&mut event_rx, None).await;
+        assert_eq!(epoch, 1);
+        let html = children
+            .iter()
+            .find(|c| c.tag == "html")
+            .expect("html among root children")
+            .id;
+        assert!(
+            children
+                .iter()
+                .find(|c| c.tag == "html")
+                .unwrap()
+                .has_children
+        );
+        // Expand <html>: <head> + <body>.
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsDomChildren {
+                node: Some(html),
+                epoch: 1,
+            })
+            .expect("worker takes DevToolsDomChildren");
+        let (epoch, children) = wait_for_children(&mut event_rx, Some(html)).await;
+        assert_eq!(epoch, 1);
+        let body = children
+            .iter()
+            .find(|c| c.tag == "body")
+            .expect("body among html children")
+            .id;
+        // Expand <body>: the div (plus its text node, which is
+        // the div's child, not the body's).
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsDomChildren {
+                node: Some(body),
+                epoch: 1,
+            })
+            .expect("worker takes DevToolsDomChildren");
+        let (epoch, children) = wait_for_children(&mut event_rx, Some(body)).await;
+        assert_eq!(epoch, 1);
+        let div_summary = children
+            .iter()
+            .find(|c| c.tag == "div")
+            .expect("div among body children");
+        assert!(div_summary.has_children, "the div holds its text");
+        let div = div_summary.id;
+        // Expand the div: its text node, with a preview.
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsDomChildren {
+                node: Some(div),
+                epoch: 1,
+            })
+            .expect("worker takes DevToolsDomChildren");
+        let (epoch, children) = wait_for_children(&mut event_rx, Some(div)).await;
+        assert_eq!(epoch, 1);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].tag, "#text");
+        assert_eq!(children[0].text.as_deref(), Some("hello"));
+        // Inspect the div: tag + attributes + computed + box.
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsInspectNode {
+                node: div,
+                epoch: 1,
+            })
+            .expect("worker takes DevToolsInspectNode");
+        match wait_for_node(&mut event_rx, div).await {
+            RendererToBrowser::DevToolsNode {
+                epoch,
+                tag,
+                attrs,
+                computed,
+                geometry,
+                ..
+            } => {
+                assert_eq!(epoch, 1);
+                assert_eq!(tag, "div");
+                assert!(
+                    attrs.contains(&("id".to_string(), "a".to_string())),
+                    "attrs carry id=a: {attrs:?}"
+                );
+                assert!(
+                    computed.contains(&("display".to_string(), "block".to_string())),
+                    "computed has display: {computed:?}"
+                );
+                assert!(
+                    computed.contains(&("width".to_string(), "200px".to_string())),
+                    "computed has width: {computed:?}"
+                );
+                assert!(
+                    computed.contains(&(
+                        "background-color".to_string(),
+                        "#eeeeee".to_string()
+                    )),
+                    "computed has background: {computed:?}"
+                );
+                let b = geometry.expect("the div has a box");
+                assert_eq!((b.x, b.y, b.width, b.height), (0.0, 0.0, 200.0, 100.0));
+                assert_eq!(b.margin, ["0px", "0px", "0px", "0px"]);
+                assert_eq!(b.padding, ["0px", "0px", "0px", "0px"]);
+            }
+            other => panic!("expected DevToolsNode, got {other:?}"),
+        }
+        // Pick the div by coordinates: (10, 10) is inside it.
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsPickNode {
+                x: 10.0,
+                y: 10.0,
+                epoch: 1,
+            })
+            .expect("worker takes DevToolsPickNode");
+        let (epoch, picked) = wait_for_picked(&mut event_rx).await;
+        assert_eq!(epoch, 1);
+        assert_eq!(picked, Some(div), "the click hits the div");
+        // Highlight the div: the next submit carries one
+        // `Highlight` item for its border box, last in the list.
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsHighlight {
+                node: Some(div),
+                epoch: 1,
+            })
+            .expect("worker takes DevToolsHighlight");
+        let list = wait_for_list(&mut event_rx, Duration::from_secs(20), |list| {
+            list.0.iter().any(|i| matches!(
+                i,
+                DisplayItem::Highlight {
+                    x,
+                    y,
+                    width,
+                    height,
+                    ..
+                } if (*x, *y, *width, *height) == (0.0, 0.0, 200.0, 100.0)
+            ))
+        })
+        .await
+        .expect("a submit carrying the highlight arrives");
+        assert!(
+            matches!(list.0.last(), Some(DisplayItem::Highlight { .. })),
+            "the highlight is last in the submitted list"
+        );
+        // Clear it: the next submit carries no highlight.
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsHighlight {
+                node: None,
+                epoch: 1,
+            })
+            .expect("worker takes DevToolsHighlight");
+        let list = wait_for_list(&mut event_rx, Duration::from_secs(20), |list| {
+            !list
+                .0
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Highlight { .. }))
+        })
+        .await
+        .expect("a submit without the highlight arrives");
+        assert!(
+            !list.0.iter().any(|i| matches!(i, DisplayItem::Highlight { .. })),
+            "the highlight is gone after clearing"
+        );
+        // A stale-epoch ask answers empty with the current epoch.
+        cmd_tx
+            .send(BrowserToRenderer::DevToolsDomChildren {
+                node: Some(div),
+                epoch: 0,
+            })
+            .expect("worker takes DevToolsDomChildren");
+        let (epoch, children) = wait_for_children(&mut event_rx, Some(div)).await;
+        assert_eq!(epoch, 1, "the answer carries the current epoch");
+        assert!(children.is_empty(), "a stale ask gets no data");
         cmd_tx
             .send(BrowserToRenderer::Shutdown)
             .expect("worker takes Shutdown");

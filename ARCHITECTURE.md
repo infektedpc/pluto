@@ -837,6 +837,40 @@ REPL input (`> source` echo, result line under it). Capture
 runs always, so lines logged before DevTools opens are there
 when it opens.
 
+**Stage 18 (M9 stage 3) — done 2026-11-28 (NOT the whole
+milestone: matched rules / live CSS, network monitor, dock, and
+structured stack frames are still open):** protocol 14 → 15
+(`DevToolsDomChildren` / `DevToolsInspectNode` / `DevToolsPickNode`
+/ `DevToolsHighlight` and `DevToolsChildren` / `DevToolsNode` /
+`DevToolsPicked`, appended at the end of each enum). The
+inspector, read-only: the tab thread answers lazy DOM-tree
+queries straight from the live `Dom` (root children on panel
+open, children per expansion — dead ids answer empty, never a
+panic); computed style + box come from the layout actor
+(`LayoutJob::InspectNode`, reading `node_styles` +
+`boxes_for_dom`; `ComputedStyle::to_pairs()` renders the main
+properties as CSS strings — percentages stay percentages, never
+fake px — and there are NO border fields anywhere: borders are
+unmodelled in Pluto, padding box == border box); pick reuses
+`LayoutJob::HitTest`; the highlight is a `DisplayItem::Highlight`
+drawn as a thin outline (never a fill), emitted last in the
+display list from `LayoutTree.highlight`, re-collected without
+a layout pass on change, and cleared on panel close, deselect,
+and navigation. Epoch discipline: the worker bumps `nav_epoch`
+in `start_navigation` (also on worker-side navigations — link
+clicks, form submits, JS `location` changes — with NO shell
+`CommitNavigation`); the shell's per-tab `inspector_epoch` is
+bumped on its own `CommitNavigation` sends AND adopted from
+answers carrying a newer epoch, and answers with an older epoch
+are dropped (the as-specified `epoch !=` rule would have
+permanently dropped every inspector answer after the first link
+click). The panel gains an Elements / Console tab strip; the
+Elements view has the pick toggle, the lazy tree (chevrons,
+tag + text preview), and the selected node's details (tag,
+attributes, computed style, box model + the honest borders
+note); a selected node whose inspect answer comes back with the
+empty tag shows "node no longer in the document".
+
 ### Milestone 10: Security Hardening, Extensions & Browser Polish
 
 Goal: prepare Pluto for daily-driver usage with strict web security,

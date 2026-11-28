@@ -216,6 +216,48 @@ pub enum Spacing {
     Auto,
 }
 
+/// Format a float for CSS output (Stage 18, M9 stage 3):
+/// rounded to 3 decimals, so `0.05 * 100` prints as `5`,
+/// not `5.0000005`. Rust's `Display` for `f32` already drops
+/// a trailing `.0` (`16.0` prints as `16`).
+fn fmt_num(v: f32) -> String {
+    format!("{}", (v * 1000.0).round() / 1000.0)
+}
+
+/// One RGB colour as a CSS hex string (`#rrggbb`).
+fn fmt_rgb(c: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
+}
+
+impl Dim {
+    /// This dimension as a CSS string (`16px`, `5%`, `50vh`):
+    /// percentages stay percentages — never resolved to fake
+    /// px (Stage 18, M9 stage 3).
+    pub fn to_css(self) -> String {
+        match self {
+            Dim::Px(v) => format!("{}px", fmt_num(v)),
+            Dim::Pct(f) => format!("{}%", fmt_num(f * 100.0)),
+            Dim::Vh(f) => format!("{}vh", fmt_num(f * 100.0)),
+            Dim::Vw(f) => format!("{}vw", fmt_num(f * 100.0)),
+        }
+    }
+}
+
+impl Spacing {
+    /// This spacing as a CSS string (`16px`, `5%`, `auto`):
+    /// percentages stay percentages — never resolved to fake
+    /// px (Stage 18, M9 stage 3).
+    pub fn to_css(self) -> String {
+        match self {
+            Spacing::Px(v) => format!("{}px", fmt_num(v)),
+            Spacing::Pct(f) => format!("{}%", fmt_num(f * 100.0)),
+            Spacing::Vh(f) => format!("{}vh", fmt_num(f * 100.0)),
+            Spacing::Vw(f) => format!("{}vw", fmt_num(f * 100.0)),
+            Spacing::Auto => "auto".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayKind {
     Block,
@@ -529,6 +571,298 @@ impl ComputedStyle {
             animations: Vec::new(),
             custom_properties: HashMap::new(),
         }
+    }
+}
+
+impl ComputedStyle {
+    /// The main computed properties as CSS name/value strings
+    /// (Stage 18, M9 stage 3 — the inspector's read-out). Only
+    /// properties Pluto models are listed; values are the
+    /// computed values (`em` already resolved, `%`/`auto` kept
+    /// as-is, never resolved to fake px). `custom_properties`
+    /// (`--*`) are included verbatim — they are page-authored
+    /// strings, shown as untrusted plain text by the shell.
+    /// Borders are unmodelled in Pluto, so no border properties
+    /// appear here at all (never invent border numbers).
+    pub fn to_pairs(&self) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut add = |name: &str, value: String| {
+            pairs.push((name.to_string(), value));
+        };
+        add(
+            "display",
+            match self.display {
+                DisplayKind::Block => "block",
+                DisplayKind::Flex => "flex",
+                DisplayKind::Grid => "grid",
+                DisplayKind::Inline => "inline",
+                DisplayKind::InlineBlock => "inline-block",
+                DisplayKind::FlowRoot => "flow-root",
+                DisplayKind::None => "none",
+            }
+            .to_string(),
+        );
+        add(
+            "position",
+            match self.position {
+                PositionKind::Static => "static",
+                PositionKind::Relative => "relative",
+                PositionKind::Absolute => "absolute",
+                PositionKind::Fixed => "fixed",
+                PositionKind::Sticky => "sticky",
+            }
+            .to_string(),
+        );
+        // `opt_dim` / `sides` return their pair instead of
+        // pushing: the `add` closure below holds `pairs`
+        // mutably, so nothing else in this body may touch it
+        // directly.
+        let opt_dim = |name: &str, v: Option<Dim>| {
+            v.map(|d| (name.to_string(), d.to_css()))
+        };
+        if let Some((n, v)) = opt_dim("width", self.width) {
+            add(&n, v);
+        }
+        if let Some((n, v)) = opt_dim("height", self.height) {
+            add(&n, v);
+        }
+        if let Some((n, v)) = opt_dim("min-width", self.min_width) {
+            add(&n, v);
+        }
+        if let Some((n, v)) = opt_dim("max-width", self.max_width) {
+            add(&n, v);
+        }
+        if let Some((n, v)) = opt_dim("min-height", self.min_height) {
+            add(&n, v);
+        }
+        if let Some((n, v)) = opt_dim("max-height", self.max_height) {
+            add(&n, v);
+        }
+        let sides = |name: &str, v: [Spacing; 4]| {
+            (
+                name.to_string(),
+                format!(
+                    "{} {} {} {}",
+                    v[0].to_css(),
+                    v[1].to_css(),
+                    v[2].to_css(),
+                    v[3].to_css()
+                ),
+            )
+        };
+        let (n, v) = sides("margin", self.margin);
+        add(&n, v);
+        let (n, v) = sides("padding", self.padding);
+        add(&n, v);
+        let inset_names = ["top", "right", "bottom", "left"];
+        for (i, v) in self.inset.iter().enumerate() {
+            if let Some(d) = v {
+                add(inset_names[i], d.to_css());
+            }
+        }
+        add("font-size", format!("{}px", fmt_num(self.font_size)));
+        add("line-height", format!("{}px", fmt_num(self.line_height)));
+        add("font-family", self.font_family.clone());
+        add(
+            "font-style",
+            match self.font_style {
+                FontStyle::Normal => "normal",
+                FontStyle::Italic => "italic",
+                FontStyle::Oblique => "oblique",
+            }
+            .to_string(),
+        );
+        add(
+            "font-weight",
+            if self.bold { "700".to_string() } else { "400".to_string() },
+        );
+        add("color", fmt_rgb(self.color));
+        if let Some(bg) = self.background {
+            add("background-color", fmt_rgb(bg));
+        }
+        if let Some(url) = &self.background_image {
+            add("background-image", format!("url({url})"));
+        }
+        add(
+            "text-align",
+            match self.text_align {
+                TextAlign::Left => "left",
+                TextAlign::Center => "center",
+                TextAlign::Right => "right",
+                TextAlign::Justify => "justify",
+            }
+            .to_string(),
+        );
+        add(
+            "white-space",
+            match self.white_space {
+                WhiteSpace::Normal => "normal",
+                WhiteSpace::Pre => "pre",
+                WhiteSpace::Nowrap => "nowrap",
+                WhiteSpace::PreWrap => "pre-wrap",
+                WhiteSpace::PreLine => "pre-line",
+            }
+            .to_string(),
+        );
+        let overflow = |k: OverflowKind| match k {
+            OverflowKind::Visible => "visible",
+            OverflowKind::Hidden => "hidden",
+            OverflowKind::Scroll => "scroll",
+            OverflowKind::Auto => "auto",
+            OverflowKind::Clip => "clip",
+        };
+        add("overflow-x", overflow(self.overflow_x).to_string());
+        add("overflow-y", overflow(self.overflow_y).to_string());
+        let overscroll = |b: OverscrollBehavior| match b {
+            OverscrollBehavior::Auto => "auto",
+            OverscrollBehavior::Contain => "contain",
+            OverscrollBehavior::None => "none",
+        };
+        add(
+            "overscroll-behavior-x",
+            overscroll(self.overscroll_behavior_x).to_string(),
+        );
+        add(
+            "overscroll-behavior-y",
+            overscroll(self.overscroll_behavior_y).to_string(),
+        );
+        add(
+            "box-sizing",
+            match self.box_sizing {
+                BoxSizingKind::ContentBox => "content-box",
+                BoxSizingKind::BorderBox => "border-box",
+            }
+            .to_string(),
+        );
+        if let Some(radii) = &self.border_radius {
+            add(
+                "border-radius",
+                format!(
+                    "{} {} {} {}",
+                    radii.top_left, radii.top_right, radii.bottom_right, radii.bottom_left
+                ),
+            );
+        }
+        if !self.box_shadow.is_empty() {
+            let layers: Vec<String> = self
+                .box_shadow
+                .iter()
+                .map(|s| {
+                    let mut parts: Vec<String> = Vec::new();
+                    if s.inset {
+                        parts.push("inset".to_string());
+                    }
+                    parts.push(format!("{}", s.offset_x));
+                    parts.push(format!("{}", s.offset_y));
+                    parts.push(format!("{}", s.blur));
+                    parts.push(format!("{}", s.spread));
+                    if let Some((r, g, b, _)) = s.color {
+                        parts.push(fmt_rgb([r, g, b]));
+                    }
+                    parts.join(" ")
+                })
+                .collect();
+            add("box-shadow", layers.join(", "));
+        }
+        if self.display == DisplayKind::Flex {
+            add(
+                "flex-direction",
+                match self.flex_direction {
+                    FlexDirection::Row => "row",
+                    FlexDirection::RowReverse => "row-reverse",
+                    FlexDirection::Column => "column",
+                    FlexDirection::ColumnReverse => "column-reverse",
+                }
+                .to_string(),
+            );
+            add(
+                "flex-wrap",
+                match self.flex_wrap {
+                    FlexWrap::NoWrap => "nowrap",
+                    FlexWrap::Wrap => "wrap",
+                    FlexWrap::WrapReverse => "wrap-reverse",
+                    _ => "nowrap",
+                }
+                .to_string(),
+            );
+            add("flex-grow", fmt_num(self.flex_grow));
+            add("flex-shrink", fmt_num(self.flex_shrink));
+            if let Some((n, v)) = opt_dim("flex-basis", self.flex_basis) {
+                add(&n, v);
+            }
+        }
+        if self.display == DisplayKind::Grid {
+            let tracks = |ts: &[GridTrack]| {
+                ts.iter()
+                    .map(|t| match t {
+                        GridTrack::Fixed(d) => d.to_css(),
+                        GridTrack::Fraction(f) => format!("{}fr", fmt_num(*f)),
+                        GridTrack::Auto => "auto".to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            if !self.grid_template_columns.is_empty() {
+                add(
+                    "grid-template-columns",
+                    tracks(&self.grid_template_columns),
+                );
+            }
+            if !self.grid_template_rows.is_empty() {
+                add("grid-template-rows", tracks(&self.grid_template_rows));
+            }
+            if self.grid_gap != (Dim::Px(0.0), Dim::Px(0.0)) {
+                add(
+                    "grid-gap",
+                    format!(
+                        "{} {}",
+                        self.grid_gap.0.to_css(),
+                        self.grid_gap.1.to_css()
+                    ),
+                );
+            }
+            let place = |p: (GridPlace, GridPlace)| {
+                let one = |g: GridPlace| match g {
+                    GridPlace::Auto => "auto".to_string(),
+                    GridPlace::Line(l) => format!("{l}"),
+                    GridPlace::Span(s) => format!("span {s}"),
+                };
+                format!("{} / {}", one(p.0), one(p.1))
+            };
+            if self.grid_column != (GridPlace::Auto, GridPlace::Auto) {
+                add("grid-column", place(self.grid_column));
+            }
+            if self.grid_row != (GridPlace::Auto, GridPlace::Auto) {
+                add("grid-row", place(self.grid_row));
+            }
+            add(
+                "grid-auto-flow",
+                match self.grid_auto_flow {
+                    GridAutoFlow::Row => "row",
+                    GridAutoFlow::Column => "column",
+                    GridAutoFlow::RowDense => "row dense",
+                    GridAutoFlow::ColumnDense => "column dense",
+                }
+                .to_string(),
+            );
+        }
+        if let Some(z) = self.z_index {
+            add("z-index", format!("{z}"));
+        }
+        if self.opacity != 1.0 {
+            add("opacity", fmt_num(self.opacity));
+        }
+        if self.contain_layout {
+            add("contain", "layout".to_string());
+        }
+        // Custom properties last, in key order for a stable
+        // read-out.
+        let mut custom: Vec<(&String, &Value)> = self.custom_properties.iter().collect();
+        custom.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, value) in custom {
+            add(name, format!("{value}"));
+        }
+        pairs
     }
 }
 
@@ -1212,6 +1546,17 @@ pub struct LayoutTree {
     /// coordinates, so this is NOT subtracted in `collect_boxes` —
     /// it drives sticky offsets and viewport-fixed hit-testing.
     pub viewport_scroll: (f32, f32),
+    /// The DevTools inspector's highlighted node (Stage 18, M9
+    /// stage 3): `Some(id)` outlines that node's border box(es)
+    /// in the next display list, `None` (the default) paints
+    /// nothing extra. Paint-only — it never shifts layout, and
+    /// it is never readable by page JS (no `getComputedStyle`
+    /// exposure, no hit-test exposure). A full rebuild carries
+    /// it over from the old tree (see the worker's
+    /// `LayoutTree` job handler); a navigation clears it (the
+    /// worker sends `SetHighlight { None }` at navigation
+    /// start, and a dead id draws nothing anyway).
+    pub highlight: Option<DomId>,
     /// Scroll-derived sticky offsets (M6 Phase 3, Rec 3), keyed by
     /// taffy node: `(dx, dy)` added to the sticky subtree's boxes
     /// when they are re-collected. Recomputed from scratch on every
@@ -1251,6 +1596,7 @@ impl LayoutTree {
             images: ImageMap::default(),
             theme: Theme::Light,
             viewport_scroll: (0.0, 0.0),
+            highlight: None,
             sticky_offsets: HashMap::new(),
             loaded_font_hashes: HashSet::new(),
             animation_overrides: Vec::new(),
@@ -1507,6 +1853,7 @@ impl LayoutTree {
             images: images.clone(),
             theme,
             viewport_scroll: (0.0, 0.0),
+            highlight: None,
             sticky_offsets: HashMap::new(),
             loaded_font_hashes: HashSet::new(),
             animation_overrides: Vec::new(),
@@ -6689,6 +7036,57 @@ mod tests {
         let sheet = Stylesheet::parse(css);
         let ua = Stylesheet::ua();
         resolve_document_styles(&dom, &ua, &sheet, false, viewport, &ElementState::default(), Theme::Light).0
+    }
+
+    #[test]
+    fn computed_style_to_pairs_renders_css_strings() {
+        // Stage 18 (M9 stage 3): the inspector's computed-style
+        // read-out renders the main properties as CSS strings —
+        // percentages stay percentages, never fake px, and the
+        // margin/padding shorthands keep source order.
+        let dom = parse_html("<html><body><div>hi</div></body></html>");
+        let sheet = Stylesheet::parse(
+            "div { display: block; width: 50%; margin: 5em auto; padding: 2em; color: #38488f; font-weight: bold; }",
+        );
+        let ua = Stylesheet::ua();
+        let styles = resolve_document_styles(
+            &dom,
+            &ua,
+            &sheet,
+            false,
+            (1024.0, 768.0),
+            &ElementState::default(),
+            Theme::Light,
+        )
+        .0;
+        let div = dom
+            .all_node_ids()
+            .into_iter()
+            .find(|&id| dom.tag(id) == Some("div"))
+            .expect("div exists");
+        let style = styles.get(&div).expect("div has a style");
+        let pairs: HashMap<String, String> = style.to_pairs().into_iter().collect();
+        assert_eq!(pairs.get("display").map(String::as_str), Some("block"));
+        assert_eq!(pairs.get("width").map(String::as_str), Some("50%"));
+        assert_eq!(
+            pairs.get("margin").map(String::as_str),
+            Some("80px auto 80px auto")
+        );
+        assert_eq!(
+            pairs.get("padding").map(String::as_str),
+            Some("32px 32px 32px 32px")
+        );
+        assert_eq!(pairs.get("color").map(String::as_str), Some("#38488f"));
+        assert_eq!(
+            pairs.get("font-weight").map(String::as_str),
+            Some("700")
+        );
+        // No border properties: borders are unmodelled, so the
+        // read-out must not invent border numbers.
+        assert!(
+            pairs.keys().all(|k| !k.starts_with("border")),
+            "no border keys: {pairs:?}"
+        );
     }
 
     #[test]

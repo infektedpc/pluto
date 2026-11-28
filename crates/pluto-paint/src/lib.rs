@@ -227,7 +227,28 @@ pub enum DisplayItem {
         vertices: Vec<VectorVertex>,
         bounds: [f32; 4],
     },
+    /// The DevTools inspector's highlight (Stage 18, M9 stage 3):
+    /// the border box of the selected node, in page coordinates.
+    /// The renderer draws it as an OUTLINE (four thin rects),
+    /// never a fill — a fill would hide the content it is meant
+    /// to point at. Emitted LAST by `build_inner`, so it draws
+    /// on top of everything else; paint-only, so it never shifts
+    /// layout, and page JS can never read it back. Appended last,
+    /// so the earlier postcard discriminants never move — the
+    /// wire bump is `PROTOCOL_VERSION` 14→15.
+    Highlight {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: [f32; 4],
+    },
 }
+
+/// The DevTools inspector's highlight colour (Stage 18, M9
+/// stage 3): a bright blue outline, readable on light and dark
+/// canvases alike.
+pub const DEVTOOLS_HIGHLIGHT_COLOR: [f32; 4] = [0.16, 0.47, 1.0, 1.0];
 
 /// One element's compositing state (M6 Phase 2, Rec 9): the
 /// transform/opacity of a single element, keyed by the same id its
@@ -281,6 +302,13 @@ impl DisplayItem {
                 ..
             }
             | DisplayItem::PushClip {
+                x,
+                y,
+                width,
+                height,
+                ..
+            }
+            | DisplayItem::Highlight {
                 x,
                 y,
                 width,
@@ -775,6 +803,23 @@ impl DisplayList {
                     }
                 }
                 DisplayItem::SelectionRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                    color,
+                } => {
+                    check_coord(*x)?;
+                    check_coord(*y)?;
+                    check_size(*width)?;
+                    check_size(*height)?;
+                    for c in color {
+                        if !c.is_finite() || !(0.0..=1.0).contains(c) {
+                            return Err(ValidationError::BadColor(*c));
+                        }
+                    }
+                }
+                DisplayItem::Highlight {
                     x,
                     y,
                     width,
@@ -1394,6 +1439,37 @@ impl DisplayList {
         while !fixed_stack.is_empty() {
             fixed_stack.pop();
             list.0.push(DisplayItem::PopFixed);
+        }
+        // Stage 18 (M9 stage 3): the DevTools highlight — one
+        // outline rect per border box of the highlighted node,
+        // LAST in the list so it draws on top of the page. The
+        // rect is the box's border box under its page transform
+        // (an AABB — exact for translate/scale, an
+        // over-approximation for rotate/skew, which is safe for
+        // an outline); a viewport-fixed box's coords are
+        // viewport-space, so the viewport scroll is added back
+        // to land it in page space. Zero-size boxes draw nothing
+        // and are skipped. A dead id (no boxes) emits nothing —
+        // a highlight never outlives its document.
+        if let Some(id) = layout.highlight {
+            for (bi, bx) in boxes.iter().enumerate() {
+                if bx.dom != Some(id) || bx.width <= 0.0 || bx.height <= 0.0 {
+                    continue;
+                }
+                let mut rect =
+                    transform_rect([bx.x, bx.y, bx.width, bx.height], &transforms[bi]);
+                if bx.is_viewport_fixed {
+                    rect[0] += layout.viewport_scroll.0;
+                    rect[1] += layout.viewport_scroll.1;
+                }
+                list.0.push(DisplayItem::Highlight {
+                    x: rect[0],
+                    y: rect[1],
+                    width: rect[2],
+                    height: rect[3],
+                    color: DEVTOOLS_HIGHLIGHT_COLOR,
+                });
+            }
         }
         // Damage, second half: every item's bounds under the
         // transform active at that point in the list — a shadow's
@@ -2148,6 +2224,103 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn devtools_highlight_outlines_the_node_and_clears() {
+        // Stage 18 (M9 stage 3): a highlighted node emits one
+        // `Highlight` item for its border box, LAST in the list
+        // (so it draws on top); clearing the highlight emits
+        // none. The item is an outline, never a fill — the
+        // renderer turns it into four thin rects.
+        let dom = parse_html(EXAMPLE_COM);
+        let style = dom
+            .children(dom.root().unwrap())
+            .iter()
+            .find_map(|&c| {
+                if dom.tag(c) == Some("html") {
+                    dom.children(c)
+                        .iter()
+                        .find(|&&n| dom.tag(n) == Some("head"))
+                        .and_then(|&head| {
+                            dom.children(head)
+                                .iter()
+                                .find(|&&n| dom.tag(n) == Some("style"))
+                                .copied()
+                        })
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let css: String = dom
+            .children(style)
+            .iter()
+            .filter_map(|&c| dom.text(c))
+            .collect();
+        let sheet = Stylesheet::parse(&css);
+        let div = dom
+            .all_node_ids()
+            .into_iter()
+            .find(|&id| dom.tag(id) == Some("div"))
+            .expect("div exists");
+        let div_box = LayoutTree::build(&dom, &sheet, 1024.0, 768.0, Theme::Light)
+            .expect("layout builds")
+            .boxes
+            .iter()
+            .find(|b| b.dom == Some(div))
+            .map(|b| (b.x, b.y, b.width, b.height))
+            .expect("div has a box");
+        let mut tree =
+            LayoutTree::build(&dom, &sheet, 1024.0, 768.0, Theme::Light).expect("layout builds");
+        tree.highlight = Some(div);
+        let list = DisplayList::build(&tree);
+        let highlights: Vec<&DisplayItem> = list
+            .0
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Highlight { .. }))
+            .collect();
+        assert_eq!(highlights.len(), 1, "one outline for the div");
+        assert!(
+            matches!(list.0.last(), Some(DisplayItem::Highlight { .. })),
+            "the highlight is last, so it draws on top"
+        );
+        match highlights[0] {
+            DisplayItem::Highlight {
+                x,
+                y,
+                width,
+                height,
+                color,
+            } => {
+                assert_eq!((*x, *y, *width, *height), div_box);
+                assert_eq!(*color, DEVTOOLS_HIGHLIGHT_COLOR);
+            }
+            other => panic!("expected Highlight, got {other:?}"),
+        }
+        // Clearing removes it; a node with no box emits nothing
+        // either — a text node has no box of its own, so it
+        // stands in for a dead id (a real dead id has no boxes
+        // by the same token).
+        tree.highlight = None;
+        let list = DisplayList::build(&tree);
+        assert!(
+            !list.0.iter().any(|i| matches!(i, DisplayItem::Highlight { .. })),
+            "no highlight once cleared"
+        );
+        let mut tree =
+            LayoutTree::build(&dom, &sheet, 1024.0, 768.0, Theme::Light).expect("layout builds");
+        let text = dom
+            .all_node_ids()
+            .into_iter()
+            .find(|&id| dom.text(id).is_some())
+            .expect("a text node exists");
+        tree.highlight = Some(text);
+        let list = DisplayList::build(&tree);
+        assert!(
+            !list.0.iter().any(|i| matches!(i, DisplayItem::Highlight { .. })),
+            "a node with no box emits no highlight"
+        );
     }
 
     /// The live example.com page as served 2026-11-23 (577 bytes):

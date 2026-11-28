@@ -58,6 +58,15 @@ pub mod transport;
 /// The protocol version every encoded message carries. Bump on any
 /// breaking change to the enums below.
 ///
+/// v15 (Stage 18, M9 stage 3): the DevTools inspector channel.
+/// [`BrowserToRenderer::DevToolsDomChildren`] /
+/// `DevToolsInspectNode` / `DevToolsPickNode` /
+/// `DevToolsHighlight` and
+/// [`RendererToBrowser::DevToolsChildren`] / `DevToolsNode` /
+/// `DevToolsPicked`, all appended at the end so existing
+/// variants keep their postcard discriminants. The bump is the
+/// shape change; v14 bytes are rejected by [`decode_message`].
+///
 /// v14 (Stage 17, M9 stages 1–2): the DevTools console channel.
 /// [`BrowserToRenderer::DevToolsEval`] (evaluate a snippet in the
 /// tab's realm) and [`RendererToBrowser::DevToolsEvalResult`] /
@@ -132,7 +141,7 @@ pub mod transport;
 /// `SetFocused` and `ScrollViewport`. v2 bytes are rejected by
 /// [`decode_message`] — Pluto ships one binary, so a bump is a
 /// clean break, not a migration.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// What went wrong decoding a versioned message.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -252,6 +261,45 @@ pub enum BrowserToRenderer {
     /// last eval. Appended at the end so existing variants keep
     /// their postcard discriminants.
     DevToolsEval { source: String },
+    /// Ask for one level of the DOM tree (Stage 18, M9 stage 3
+    /// — the read-only inspector): the lazy tree asks for the
+    /// root's children on open, then one node's children per
+    /// expansion. `node: None` is the document root. `epoch`
+    /// is the shell's idea of the tab's navigation epoch (see
+    /// [`RendererToBrowser::DevToolsChildren`]): the worker
+    /// answers against its CURRENT document either way, but a
+    /// keyed (`Some`) ask whose epoch is stale gets an empty
+    /// answer — a generational node id from the old document
+    /// could collide with a different node in the new one — so
+    /// the shell must re-ask after a navigation. Appended at
+    /// the end so existing variants keep their postcard
+    /// discriminants.
+    DevToolsDomChildren { node: Option<u64>, epoch: u64 },
+    /// Ask for one node's details (Stage 18, M9 stage 3): tag +
+    /// attributes from the live DOM, computed style + box from
+    /// the layout actor. A stale `epoch` gets the not-found
+    /// answer (empty tag — see
+    /// [`RendererToBrowser::DevToolsNode`]). Appended at the
+    /// end so existing variants keep their postcard
+    /// discriminants.
+    DevToolsInspectNode { node: u64, epoch: u64 },
+    /// Hit-test a point (Stage 18, M9 stage 3): the pick mode's
+    /// click, in page coordinates (the shell already added the
+    /// viewport scroll). Coordinates carry no node id, so the
+    /// epoch is advisory — the worker always answers against
+    /// its current tree. Appended at the end so existing
+    /// variants keep their postcard discriminants.
+    DevToolsPickNode { x: f32, y: f32, epoch: u64 },
+    /// Set or clear the inspector's highlight (Stage 18, M9
+    /// stage 3): `Some(id)` outlines that node's border box(es)
+    /// in the next display list, `None` clears it. A stale
+    /// `epoch` is ignored outright — a highlight for an old
+    /// document's node must not land on the new one. Fire and
+    /// forget: the worker re-collects + submits on its own
+    /// after applying it, with no layout pass. Appended at the
+    /// end so existing variants keep their postcard
+    /// discriminants.
+    DevToolsHighlight { node: Option<u64>, epoch: u64 },
 }
 
 /// Messages from the renderer worker to the browser (shell).
@@ -476,6 +524,83 @@ pub enum RendererToBrowser {
     /// lines, oldest evicted). Appended at the end so existing
     /// variants keep their postcard discriminants.
     ConsoleLines { lines: Vec<(String, String)> },
+    /// One level of the DOM tree (Stage 18, M9 stage 3): the
+    /// answer to [`BrowserToRenderer::DevToolsDomChildren`].
+    /// `epoch` is the worker's navigation epoch at answer time
+    /// — the shell drops the answer when it is older than the
+    /// epoch the shell already knows (a newer document has
+    /// superseded it) and adopts a newer one. `children` is
+    /// empty when the node is dead or has no children (the
+    /// root ask on a tab with no document yet is empty too).
+    /// Appended at the end so existing variants keep their
+    /// postcard discriminants.
+    DevToolsChildren {
+        epoch: u64,
+        node: Option<u64>,
+        children: Vec<DevToolsNodeSummary>,
+    },
+    /// One node's details (Stage 18, M9 stage 3): the answer
+    /// to [`BrowserToRenderer::DevToolsInspectNode`]. `tag` is
+    /// empty when the node no longer exists in the document —
+    /// the shell shows "node no longer in the document" for
+    /// that, never a dead id's stale data. `geometry` is `None`
+    /// when the node has no box (not laid out yet, or
+    /// `display: none`); `computed` is empty then too. Borders
+    /// are unmodelled in Pluto, so the box carries no border
+    /// fields: the padding box IS the border box. The box is
+    /// boxed: the `[String; 4]` margin/padding arrays make
+    /// `DevToolsBox` ~200 bytes, and an unboxed
+    /// `Option<DevToolsBox>` would push `RendererToBrowser`
+    /// (and `Message::RendererEvent`) over clippy's
+    /// `large_enum_variant` threshold — postcard serialises
+    /// `Box<T>` exactly like `T`, so the wire is unchanged.
+    /// Appended at the end so existing variants keep their
+    /// postcard discriminants.
+    DevToolsNode {
+        epoch: u64,
+        node: u64,
+        tag: String,
+        attrs: Vec<(String, String)>,
+        computed: Vec<(String, String)>,
+        geometry: Option<Box<DevToolsBox>>,
+    },
+    /// The pick mode's hit-test answer (Stage 18, M9 stage 3):
+    /// the node under the clicked point, if any — `None` when
+    /// the click hit nothing (or the ask's epoch was stale).
+    /// Appended at the end so existing variants keep their
+    /// postcard discriminants.
+    DevToolsPicked { epoch: u64, node: Option<u64> },
+}
+
+/// One row of the inspector's lazy DOM tree (Stage 18, M9
+/// stage 3): a node's identity on the wire (`id` is the
+/// slotmap key's ffi value, so the shell never interprets it,
+/// only echoes it back), its tag (`#text` / `#comment` /
+/// `#document` for non-elements), a short text preview for
+/// text nodes (whitespace-collapsed, capped), and whether it
+/// has children to expand into.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DevToolsNodeSummary {
+    pub id: u64,
+    pub tag: String,
+    pub text: Option<String>,
+    pub has_children: bool,
+}
+
+/// One node's border box for the inspector (Stage 18, M9
+/// stage 3): page coordinates, plus the computed margin and
+/// padding as CSS strings (`16px`, `5%`, `auto`) in
+/// top/right/bottom/left order — percentages are never resolved
+/// to fake px. No border fields: borders are unmodelled in
+/// Pluto, so the padding box == the border box.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DevToolsBox {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub margin: [String; 4],
+    pub padding: [String; 4],
 }
 
 /// A resource ask, frozen as v1 in Stage 5. This is the payload of
@@ -1139,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_fourteen() {
+    fn protocol_version_is_fifteen() {
         // Bumped 5 -> 6 (Stage 13: ResourceRequest.body for form
         // POSTs), 6 -> 7 (Stage 13 Rec 12: SandboxReport +
         // Heartbeat), 7 -> 8 (Stage 14 Rec 9: CompositingUpdate),
@@ -1158,8 +1283,12 @@ mod tests {
         // `socket_id` — the Phase 3 wire shapes, completed), and
         // 13 -> 14 (Stage 17, M9 stages 1–2: DevToolsEval /
         // DevToolsEvalResult / ConsoleLines, appended at the end
-        // of each enum).
-        assert_eq!(PROTOCOL_VERSION, 14);
+        // of each enum), and 14 -> 15 (Stage 18, M9 stage 3:
+        // DevToolsDomChildren / DevToolsInspectNode /
+        // DevToolsPickNode / DevToolsHighlight and
+        // DevToolsChildren / DevToolsNode / DevToolsPicked,
+        // appended at the end of each enum).
+        assert_eq!(PROTOCOL_VERSION, 15);
     }
 
     #[test]
@@ -1196,6 +1325,106 @@ mod tests {
         let empty = RendererToBrowser::ConsoleLines { lines: vec![] };
         let bytes = encode_message(&empty);
         assert_eq!(decode_message::<RendererToBrowser>(&bytes), Ok(empty));
+    }
+
+    #[test]
+    fn devtools_inspector_messages_round_trip_through_versioned_bytes() {
+        // Stage 18 (M9 stage 3): the inspector asks and answers
+        // all survive the versioned envelope — including a root
+        // ask (`node: None`), a clear-highlight (`node: None`),
+        // a not-found node answer (empty tag), and a node with no
+        // box (`geometry: None`).
+        let children = BrowserToRenderer::DevToolsDomChildren {
+            node: None,
+            epoch: 3,
+        };
+        let bytes = encode_message(&children);
+        assert_eq!(decode_message::<BrowserToRenderer>(&bytes), Ok(children));
+        let inspect = BrowserToRenderer::DevToolsInspectNode {
+            node: 42,
+            epoch: 3,
+        };
+        let bytes = encode_message(&inspect);
+        assert_eq!(decode_message::<BrowserToRenderer>(&bytes), Ok(inspect));
+        let pick = BrowserToRenderer::DevToolsPickNode {
+            x: 10.0,
+            y: 20.0,
+            epoch: 3,
+        };
+        let bytes = encode_message(&pick);
+        assert_eq!(decode_message::<BrowserToRenderer>(&bytes), Ok(pick));
+        let highlight = BrowserToRenderer::DevToolsHighlight {
+            node: None,
+            epoch: 3,
+        };
+        let bytes = encode_message(&highlight);
+        assert_eq!(
+            decode_message::<BrowserToRenderer>(&bytes),
+            Ok(highlight)
+        );
+        let answer = RendererToBrowser::DevToolsChildren {
+            epoch: 3,
+            node: None,
+            children: vec![
+                DevToolsNodeSummary {
+                    id: 1,
+                    tag: "html".to_string(),
+                    text: None,
+                    has_children: true,
+                },
+                DevToolsNodeSummary {
+                    id: 9,
+                    tag: "#text".to_string(),
+                    text: Some("hello".to_string()),
+                    has_children: false,
+                },
+            ],
+        };
+        let bytes = encode_message(&answer);
+        assert_eq!(decode_message::<RendererToBrowser>(&bytes), Ok(answer));
+        let node = RendererToBrowser::DevToolsNode {
+            epoch: 3,
+            node: 42,
+            tag: "div".to_string(),
+            attrs: vec![("id".to_string(), "a".to_string())],
+            computed: vec![("display".to_string(), "block".to_string())],
+            geometry: Some(Box::new(DevToolsBox {
+                x: 8.0,
+                y: 16.0,
+                width: 600.0,
+                height: 120.0,
+                margin: [
+                    "80px".to_string(),
+                    "auto".to_string(),
+                    "80px".to_string(),
+                    "auto".to_string(),
+                ],
+                padding: [
+                    "32px".to_string(),
+                    "32px".to_string(),
+                    "32px".to_string(),
+                    "32px".to_string(),
+                ],
+            })),
+        };
+        let bytes = encode_message(&node);
+        assert_eq!(decode_message::<RendererToBrowser>(&bytes), Ok(node));
+        let gone = RendererToBrowser::DevToolsNode {
+            epoch: 3,
+            node: 42,
+            tag: String::new(),
+            attrs: vec![],
+            computed: vec![],
+            geometry: None,
+        };
+        let bytes = encode_message(&gone);
+        assert_eq!(decode_message::<RendererToBrowser>(&bytes), Ok(gone));
+        let picked = RendererToBrowser::DevToolsPicked {
+            epoch: 3,
+            node: Some(42),
+        };
+        let bytes = encode_message(&picked);
+        assert_eq!(decode_message::<RendererToBrowser>(&bytes), Ok(picked));
     }
 
     #[test]
